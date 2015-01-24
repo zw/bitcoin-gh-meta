@@ -7,8 +7,9 @@ issue 1234:
  * `issues/12xx/1234-comments.json` is all comments, both issue comments and PR
    review comments, in `created_at` order
 
-Note that issue descriptions are rendered like a comment by GitHub's site but
-are seen as properties of the issues by the GitHub API, and therefore here too.
+Note that issue descriptions are rendered as the first comment by GitHub's web
+interface but are seen as properties of the issues by the GitHub API, and
+therefore here too.
 
 A few issues (about 10 in the first ~6000) are missing from the API, and
 therefore here too, presumably because they were autodetected as spam by
