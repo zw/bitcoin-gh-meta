@@ -1,0 +1,945 @@
+[
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17095234"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17095234"
+         }
+      },
+      "body" : "\"tx\" instead of \"netaskfor\"? And should this be added to the command line syntax messages in init.cpp?",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-04T04:30:16Z",
+      "diff_hunk" : "@@ -0,0 +1,302 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>\n+\n+#include \"net.h\"\n+#include \"util.h\"\n+\n+/**\n+ * Inventory item request management.\n+ *\n+ * Maintains state separate from CNode.\n+ * There is a two-way mapping between CNodeAskForState and mapInvRequests.\n+ */\n+namespace {\n+\n+/** Node specific state for netaskfor module */\n+class CNodeAskForState\n+{\n+public:\n+    CNodeAskForState(): node(0) {}\n+\n+    /** Set of inv items that are being requested from this node */\n+    std::set<CInv> setAskFor;\n+\n+    /** Network connection associated with this node */\n+    CNode *node; /// TODO ugly but needed for sending getdata\n+};\n+\n+typedef std::multimap<int64_t, CInv> InvRequestsWorkQueue;\n+\n+/** State of one inventory item request */\n+class CInvState\n+{\n+public:\n+    typedef std::set<NodeId> NodeSet;\n+    /** IDs of nodes that have this item */\n+    NodeSet nodes;\n+    /** IDs of nodes that we have not tried requesting this inv from already */\n+    NodeSet notRequestedFrom;\n+    /** Current node that this is being requested from */\n+    NodeId beingRequestedFrom;\n+    /** Must correspond to current entry in work queue for this\n+     *  inventory item (or invRequestsWorkQueue.end())\n+     */\n+    InvRequestsWorkQueue::iterator workQueueIter;\n+};\n+typedef std::map<CInv, CInvState> MapInvRequests;\n+\n+/** Local data, all protected by cs_invRequests */\n+CCriticalSection cs_invRequests;\n+std::map<NodeId, CNodeAskForState> mapNodeAskForState;\n+MapInvRequests mapInvRequests;\n+/** The work queue keeps track when is the next time an inv item request needs\n+ * to be revisited.\n+ * Invariant: Each inv item has at most one entry.\n+ */\n+InvRequestsWorkQueue invRequestsWorkQueue;\n+CTimeoutCondition condInvRequests;\n+/** Exit thread flag */\n+bool fStopThread;\n+\n+/** Get local state for a node id.\n+ * @note Requires that cs_invRequests is held\n+ */\n+CNodeAskForState *State(NodeId pnode)\n+{\n+    std::map<NodeId, CNodeAskForState>::iterator it = mapNodeAskForState.find(pnode);\n+    if (it == mapNodeAskForState.end())\n+        return NULL;\n+    return &it->second;\n+}\n+\n+/** Handler for when a new node appears */\n+void InitializeNode(NodeId nodeid, const CNode *pnode)\n+{\n+    LOCK(cs_invRequests);\n+    /*CNodeAskForState &state = */\n+    mapNodeAskForState.insert(std::make_pair(nodeid, CNodeAskForState())).first->second;\n+}\n+\n+/** Handler to clean up when a node goes away */\n+void FinalizeNode(NodeId nodeid)\n+{\n+    LOCK(cs_invRequests);\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    /// Clean up any requests that were underway to the node,\n+    /// or refer to the node.\n+    BOOST_FOREACH(const CInv &inv, state->setAskFor)\n+    {\n+        MapInvRequests::iterator i = mapInvRequests.find(inv);\n+        if (i != mapInvRequests.end())\n+        {\n+            i->second.nodes.erase(nodeid);\n+            i->second.notRequestedFrom.erase(nodeid);\n+\n+            if (i->second.beingRequestedFrom == nodeid)\n+            {\n+                LogPrint(\"netaskfor\", \"%s: Inv item %s was being requested from destructing node %i\\n\",\n+                        __func__,\n+                        inv.ToString(), nodeid);\n+                i->second.beingRequestedFrom = 0;\n+                /// Make sure the old workqueue item for the inv is removed,\n+                /// to avoid spurious retries\n+                if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+                    invRequestsWorkQueue.erase(i->second.workQueueIter);\n+                /// Re-trigger request logic\n+                i->second.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(0, inv));\n+                condInvRequests.notify_one();\n+            }\n+        }\n+    }\n+    mapNodeAskForState.erase(nodeid);\n+}\n+\n+/** Forget a certain inventory item request\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void Forget(MapInvRequests::iterator i)\n+{\n+    /// Remove reference to this inventory item request from nodes\n+    BOOST_FOREACH(NodeId nodeid, i->second.nodes)\n+    {\n+        CNodeAskForState *state = State(nodeid);\n+        assert(state);\n+        state->setAskFor.erase(i->first);\n+    }\n+    /// Remove from workqueue\n+    if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+        invRequestsWorkQueue.erase(i->second.workQueueIter);\n+    /// Remove from map\n+    mapInvRequests.erase(i);\n+}\n+\n+/** Actually request an item from a node.\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void RequestItem(NodeId nodeid, CInvState &invstate, const CInv &inv)\n+{\n+    /// TODO what locks on node to we need here?\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state && state->node);\n+    CNode *node = state->node;\n+\n+    LogPrint(\"netaskfor\", \"%s: Requesting item %s from node %i (%s)\\n\", __func__,\n+            inv.ToString(), nodeid,\n+            invRequestsWorkQueue.begin()->first ? \"retry\" : \"first request\");\n+    invstate.beingRequestedFrom = nodeid;\n+\n+    std::vector<CInv> vGetData;\n+    vGetData.push_back(inv);\n+    node->PushMessage(\"getdata\", vGetData);\n+}\n+\n+void ThreadHandleAskFor()\n+{\n+    while (!fStopThread)\n+    {\n+        LogPrint(\"netaskfor\", \"%s: iteration\\n\", __func__);\n+        int64_t timeToNext = std::numeric_limits<int64_t>::max();\n+        {\n+            LOCK(cs_invRequests);\n+            int64_t now = GetTimeMicros();\n+            /// Process work queue entries that are timestamped either now or before now\n+            while (!invRequestsWorkQueue.empty() && invRequestsWorkQueue.begin()->first <= now)\n+            {\n+                const CInv &inv = invRequestsWorkQueue.begin()->second;\n+                MapInvRequests::iterator it = mapInvRequests.find(inv);\n+                LogPrint(\"netaskfor\", \"%s: processing item %s\\n\", __func__, inv.ToString());\n+                if (it != mapInvRequests.end())\n+                {\n+                    CInvState &invstate = it->second;\n+                    invstate.workQueueIter = invRequestsWorkQueue.end();\n+                    /// Pick a node to request from, if available\n+                    if (invstate.notRequestedFrom.empty())\n+                    {\n+                        LogPrint(\"netaskfor\", \"%s: No more nodes to request item %s from, discarding request\\n\", __func__, inv.ToString());\n+                        Forget(it);\n+                    } else {\n+                        CInvState::NodeSet::iterator first = invstate.notRequestedFrom.begin();\n+                        NodeId nodeid = *first;\n+                        invstate.notRequestedFrom.erase(first);\n+\n+                        RequestItem(nodeid, invstate, inv);\n+\n+                        /// Need to revisit this request after timeout\n+                        invstate.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(now + NetAskFor::REQUEST_TIMEOUT, inv));\n+                    }\n+                } else {\n+                    LogPrint(\"netaskfor\", \"%s: request for item %s is missing!\\n\", __func__, inv.ToString());\n+                }\n+                invRequestsWorkQueue.erase(invRequestsWorkQueue.begin());\n+            }\n+\n+            /// Compute time to next event\n+            if (!invRequestsWorkQueue.empty())\n+                timeToNext = invRequestsWorkQueue.begin()->first - GetTimeMicros();\n+        }\n+        /// If we don't know how long until next work item, wait until woken up\n+        if (timeToNext == std::numeric_limits<int64_t>::max())\n+        {\n+            LogPrint(\"netaskfor\", \"%s: blocking\\n\", __func__);\n+            condInvRequests.wait();\n+        } else if (timeToNext > 0)\n+        {\n+            LogPrint(\"netaskfor\", \"%s: waiting for %d us\\n\", __func__, timeToNext);\n+            condInvRequests.timed_wait((timeToNext+999LL)/1000LL);\n+        }\n+    }\n+}\n+\n+void StartThreads(boost::thread_group& threadGroup)\n+{\n+    fStopThread = false;\n+    /// Inventory management thread\n+    threadGroup.create_thread(boost::bind(&TraceThread<void (*)()>, \"askfor\", &ThreadHandleAskFor));\n+}\n+\n+void StopThreads()\n+{\n+    fStopThread = true;\n+    condInvRequests.notify_one();\n+}\n+\n+}\n+\n+namespace NetAskFor\n+{\n+\n+void Completed(const CInv& inv)\n+{\n+    LOCK(cs_invRequests);\n+    MapInvRequests::iterator i = mapInvRequests.find(inv);\n+    if (i != mapInvRequests.end())\n+    {\n+        LogPrint(\"netaskfor\", \"%s: %s\\n\", __func__, inv.ToString());\n+        Forget(i);\n+    } else {\n+        LogPrint(\"netaskfor\", \"%s: %s not found!\\n\", __func__, inv.ToString());\n+    }\n+}\n+\n+void AskFor(CNode *node, const CInv& inv)\n+{\n+    LOCK(cs_invRequests);\n+    NodeId nodeid = node->GetId();\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+    state->node = node;\n+\n+    /// Bound number of concurrent inventory requests to each node, this has\n+    /// the indirect effect of bounding all data structures.\n+    if (state->setAskFor.size() > MAX_SETASKFOR_SZ)\n+        return;\n+\n+    LogPrint(\"netaskfor\", \"askfor %s  peer=%d\\n\", inv.ToString(), nodeid);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17095234",
+      "id" : 17095234,
+      "original_commit_id" : "57b0fa5adeddf54a4c43e4cedcc891ec92e61ac4",
+      "original_position" : 265,
+      "path" : "src/netaskfor.cpp",
+      "position" : 323,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-18T10:23:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17095234",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1530283?v=3",
+         "events_url" : "https://api.github.com/users/rebroad/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/rebroad/followers",
+         "following_url" : "https://api.github.com/users/rebroad/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/rebroad/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/rebroad",
+         "id" : 1530283,
+         "login" : "rebroad",
+         "organizations_url" : "https://api.github.com/users/rebroad/orgs",
+         "received_events_url" : "https://api.github.com/users/rebroad/received_events",
+         "repos_url" : "https://api.github.com/users/rebroad/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/rebroad/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/rebroad/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/rebroad"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17095733"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17095733"
+         }
+      },
+      "body" : "Just one inv per getdata message?\r\n\r\nWhy not use the old code to create a list of invs to getdata and use that one node at a time?",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-04T05:01:29Z",
+      "diff_hunk" : "@@ -0,0 +1,302 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>\n+\n+#include \"net.h\"\n+#include \"util.h\"\n+\n+/**\n+ * Inventory item request management.\n+ *\n+ * Maintains state separate from CNode.\n+ * There is a two-way mapping between CNodeAskForState and mapInvRequests.\n+ */\n+namespace {\n+\n+/** Node specific state for netaskfor module */\n+class CNodeAskForState\n+{\n+public:\n+    CNodeAskForState(): node(0) {}\n+\n+    /** Set of inv items that are being requested from this node */\n+    std::set<CInv> setAskFor;\n+\n+    /** Network connection associated with this node */\n+    CNode *node; /// TODO ugly but needed for sending getdata\n+};\n+\n+typedef std::multimap<int64_t, CInv> InvRequestsWorkQueue;\n+\n+/** State of one inventory item request */\n+class CInvState\n+{\n+public:\n+    typedef std::set<NodeId> NodeSet;\n+    /** IDs of nodes that have this item */\n+    NodeSet nodes;\n+    /** IDs of nodes that we have not tried requesting this inv from already */\n+    NodeSet notRequestedFrom;\n+    /** Current node that this is being requested from */\n+    NodeId beingRequestedFrom;\n+    /** Must correspond to current entry in work queue for this\n+     *  inventory item (or invRequestsWorkQueue.end())\n+     */\n+    InvRequestsWorkQueue::iterator workQueueIter;\n+};\n+typedef std::map<CInv, CInvState> MapInvRequests;\n+\n+/** Local data, all protected by cs_invRequests */\n+CCriticalSection cs_invRequests;\n+std::map<NodeId, CNodeAskForState> mapNodeAskForState;\n+MapInvRequests mapInvRequests;\n+/** The work queue keeps track when is the next time an inv item request needs\n+ * to be revisited.\n+ * Invariant: Each inv item has at most one entry.\n+ */\n+InvRequestsWorkQueue invRequestsWorkQueue;\n+CTimeoutCondition condInvRequests;\n+/** Exit thread flag */\n+bool fStopThread;\n+\n+/** Get local state for a node id.\n+ * @note Requires that cs_invRequests is held\n+ */\n+CNodeAskForState *State(NodeId pnode)\n+{\n+    std::map<NodeId, CNodeAskForState>::iterator it = mapNodeAskForState.find(pnode);\n+    if (it == mapNodeAskForState.end())\n+        return NULL;\n+    return &it->second;\n+}\n+\n+/** Handler for when a new node appears */\n+void InitializeNode(NodeId nodeid, const CNode *pnode)\n+{\n+    LOCK(cs_invRequests);\n+    /*CNodeAskForState &state = */\n+    mapNodeAskForState.insert(std::make_pair(nodeid, CNodeAskForState())).first->second;\n+}\n+\n+/** Handler to clean up when a node goes away */\n+void FinalizeNode(NodeId nodeid)\n+{\n+    LOCK(cs_invRequests);\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    /// Clean up any requests that were underway to the node,\n+    /// or refer to the node.\n+    BOOST_FOREACH(const CInv &inv, state->setAskFor)\n+    {\n+        MapInvRequests::iterator i = mapInvRequests.find(inv);\n+        if (i != mapInvRequests.end())\n+        {\n+            i->second.nodes.erase(nodeid);\n+            i->second.notRequestedFrom.erase(nodeid);\n+\n+            if (i->second.beingRequestedFrom == nodeid)\n+            {\n+                LogPrint(\"netaskfor\", \"%s: Inv item %s was being requested from destructing node %i\\n\",\n+                        __func__,\n+                        inv.ToString(), nodeid);\n+                i->second.beingRequestedFrom = 0;\n+                /// Make sure the old workqueue item for the inv is removed,\n+                /// to avoid spurious retries\n+                if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+                    invRequestsWorkQueue.erase(i->second.workQueueIter);\n+                /// Re-trigger request logic\n+                i->second.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(0, inv));\n+                condInvRequests.notify_one();\n+            }\n+        }\n+    }\n+    mapNodeAskForState.erase(nodeid);\n+}\n+\n+/** Forget a certain inventory item request\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void Forget(MapInvRequests::iterator i)\n+{\n+    /// Remove reference to this inventory item request from nodes\n+    BOOST_FOREACH(NodeId nodeid, i->second.nodes)\n+    {\n+        CNodeAskForState *state = State(nodeid);\n+        assert(state);\n+        state->setAskFor.erase(i->first);\n+    }\n+    /// Remove from workqueue\n+    if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+        invRequestsWorkQueue.erase(i->second.workQueueIter);\n+    /// Remove from map\n+    mapInvRequests.erase(i);\n+}\n+\n+/** Actually request an item from a node.\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void RequestItem(NodeId nodeid, CInvState &invstate, const CInv &inv)\n+{\n+    /// TODO what locks on node to we need here?\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state && state->node);\n+    CNode *node = state->node;\n+\n+    LogPrint(\"netaskfor\", \"%s: Requesting item %s from node %i (%s)\\n\", __func__,\n+            inv.ToString(), nodeid,\n+            invRequestsWorkQueue.begin()->first ? \"retry\" : \"first request\");\n+    invstate.beingRequestedFrom = nodeid;\n+\n+    std::vector<CInv> vGetData;\n+    vGetData.push_back(inv);\n+    node->PushMessage(\"getdata\", vGetData);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17095733",
+      "id" : 17095733,
+      "original_commit_id" : "57b0fa5adeddf54a4c43e4cedcc891ec92e61ac4",
+      "original_position" : 161,
+      "path" : "src/netaskfor.cpp",
+      "position" : null,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-18T10:23:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17095733",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1530283?v=3",
+         "events_url" : "https://api.github.com/users/rebroad/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/rebroad/followers",
+         "following_url" : "https://api.github.com/users/rebroad/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/rebroad/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/rebroad",
+         "id" : 1530283,
+         "login" : "rebroad",
+         "organizations_url" : "https://api.github.com/users/rebroad/orgs",
+         "received_events_url" : "https://api.github.com/users/rebroad/received_events",
+         "repos_url" : "https://api.github.com/users/rebroad/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/rebroad/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/rebroad/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/rebroad"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17097406"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17097406"
+         }
+      },
+      "body" : "Could be called 'tx' but I tried to keep it as general as possible. It requests inventory items.\r\nACK on adding it to command-line syntax.",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-04T06:29:26Z",
+      "diff_hunk" : "@@ -0,0 +1,302 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>\n+\n+#include \"net.h\"\n+#include \"util.h\"\n+\n+/**\n+ * Inventory item request management.\n+ *\n+ * Maintains state separate from CNode.\n+ * There is a two-way mapping between CNodeAskForState and mapInvRequests.\n+ */\n+namespace {\n+\n+/** Node specific state for netaskfor module */\n+class CNodeAskForState\n+{\n+public:\n+    CNodeAskForState(): node(0) {}\n+\n+    /** Set of inv items that are being requested from this node */\n+    std::set<CInv> setAskFor;\n+\n+    /** Network connection associated with this node */\n+    CNode *node; /// TODO ugly but needed for sending getdata\n+};\n+\n+typedef std::multimap<int64_t, CInv> InvRequestsWorkQueue;\n+\n+/** State of one inventory item request */\n+class CInvState\n+{\n+public:\n+    typedef std::set<NodeId> NodeSet;\n+    /** IDs of nodes that have this item */\n+    NodeSet nodes;\n+    /** IDs of nodes that we have not tried requesting this inv from already */\n+    NodeSet notRequestedFrom;\n+    /** Current node that this is being requested from */\n+    NodeId beingRequestedFrom;\n+    /** Must correspond to current entry in work queue for this\n+     *  inventory item (or invRequestsWorkQueue.end())\n+     */\n+    InvRequestsWorkQueue::iterator workQueueIter;\n+};\n+typedef std::map<CInv, CInvState> MapInvRequests;\n+\n+/** Local data, all protected by cs_invRequests */\n+CCriticalSection cs_invRequests;\n+std::map<NodeId, CNodeAskForState> mapNodeAskForState;\n+MapInvRequests mapInvRequests;\n+/** The work queue keeps track when is the next time an inv item request needs\n+ * to be revisited.\n+ * Invariant: Each inv item has at most one entry.\n+ */\n+InvRequestsWorkQueue invRequestsWorkQueue;\n+CTimeoutCondition condInvRequests;\n+/** Exit thread flag */\n+bool fStopThread;\n+\n+/** Get local state for a node id.\n+ * @note Requires that cs_invRequests is held\n+ */\n+CNodeAskForState *State(NodeId pnode)\n+{\n+    std::map<NodeId, CNodeAskForState>::iterator it = mapNodeAskForState.find(pnode);\n+    if (it == mapNodeAskForState.end())\n+        return NULL;\n+    return &it->second;\n+}\n+\n+/** Handler for when a new node appears */\n+void InitializeNode(NodeId nodeid, const CNode *pnode)\n+{\n+    LOCK(cs_invRequests);\n+    /*CNodeAskForState &state = */\n+    mapNodeAskForState.insert(std::make_pair(nodeid, CNodeAskForState())).first->second;\n+}\n+\n+/** Handler to clean up when a node goes away */\n+void FinalizeNode(NodeId nodeid)\n+{\n+    LOCK(cs_invRequests);\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    /// Clean up any requests that were underway to the node,\n+    /// or refer to the node.\n+    BOOST_FOREACH(const CInv &inv, state->setAskFor)\n+    {\n+        MapInvRequests::iterator i = mapInvRequests.find(inv);\n+        if (i != mapInvRequests.end())\n+        {\n+            i->second.nodes.erase(nodeid);\n+            i->second.notRequestedFrom.erase(nodeid);\n+\n+            if (i->second.beingRequestedFrom == nodeid)\n+            {\n+                LogPrint(\"netaskfor\", \"%s: Inv item %s was being requested from destructing node %i\\n\",\n+                        __func__,\n+                        inv.ToString(), nodeid);\n+                i->second.beingRequestedFrom = 0;\n+                /// Make sure the old workqueue item for the inv is removed,\n+                /// to avoid spurious retries\n+                if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+                    invRequestsWorkQueue.erase(i->second.workQueueIter);\n+                /// Re-trigger request logic\n+                i->second.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(0, inv));\n+                condInvRequests.notify_one();\n+            }\n+        }\n+    }\n+    mapNodeAskForState.erase(nodeid);\n+}\n+\n+/** Forget a certain inventory item request\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void Forget(MapInvRequests::iterator i)\n+{\n+    /// Remove reference to this inventory item request from nodes\n+    BOOST_FOREACH(NodeId nodeid, i->second.nodes)\n+    {\n+        CNodeAskForState *state = State(nodeid);\n+        assert(state);\n+        state->setAskFor.erase(i->first);\n+    }\n+    /// Remove from workqueue\n+    if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+        invRequestsWorkQueue.erase(i->second.workQueueIter);\n+    /// Remove from map\n+    mapInvRequests.erase(i);\n+}\n+\n+/** Actually request an item from a node.\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void RequestItem(NodeId nodeid, CInvState &invstate, const CInv &inv)\n+{\n+    /// TODO what locks on node to we need here?\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state && state->node);\n+    CNode *node = state->node;\n+\n+    LogPrint(\"netaskfor\", \"%s: Requesting item %s from node %i (%s)\\n\", __func__,\n+            inv.ToString(), nodeid,\n+            invRequestsWorkQueue.begin()->first ? \"retry\" : \"first request\");\n+    invstate.beingRequestedFrom = nodeid;\n+\n+    std::vector<CInv> vGetData;\n+    vGetData.push_back(inv);\n+    node->PushMessage(\"getdata\", vGetData);\n+}\n+\n+void ThreadHandleAskFor()\n+{\n+    while (!fStopThread)\n+    {\n+        LogPrint(\"netaskfor\", \"%s: iteration\\n\", __func__);\n+        int64_t timeToNext = std::numeric_limits<int64_t>::max();\n+        {\n+            LOCK(cs_invRequests);\n+            int64_t now = GetTimeMicros();\n+            /// Process work queue entries that are timestamped either now or before now\n+            while (!invRequestsWorkQueue.empty() && invRequestsWorkQueue.begin()->first <= now)\n+            {\n+                const CInv &inv = invRequestsWorkQueue.begin()->second;\n+                MapInvRequests::iterator it = mapInvRequests.find(inv);\n+                LogPrint(\"netaskfor\", \"%s: processing item %s\\n\", __func__, inv.ToString());\n+                if (it != mapInvRequests.end())\n+                {\n+                    CInvState &invstate = it->second;\n+                    invstate.workQueueIter = invRequestsWorkQueue.end();\n+                    /// Pick a node to request from, if available\n+                    if (invstate.notRequestedFrom.empty())\n+                    {\n+                        LogPrint(\"netaskfor\", \"%s: No more nodes to request item %s from, discarding request\\n\", __func__, inv.ToString());\n+                        Forget(it);\n+                    } else {\n+                        CInvState::NodeSet::iterator first = invstate.notRequestedFrom.begin();\n+                        NodeId nodeid = *first;\n+                        invstate.notRequestedFrom.erase(first);\n+\n+                        RequestItem(nodeid, invstate, inv);\n+\n+                        /// Need to revisit this request after timeout\n+                        invstate.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(now + NetAskFor::REQUEST_TIMEOUT, inv));\n+                    }\n+                } else {\n+                    LogPrint(\"netaskfor\", \"%s: request for item %s is missing!\\n\", __func__, inv.ToString());\n+                }\n+                invRequestsWorkQueue.erase(invRequestsWorkQueue.begin());\n+            }\n+\n+            /// Compute time to next event\n+            if (!invRequestsWorkQueue.empty())\n+                timeToNext = invRequestsWorkQueue.begin()->first - GetTimeMicros();\n+        }\n+        /// If we don't know how long until next work item, wait until woken up\n+        if (timeToNext == std::numeric_limits<int64_t>::max())\n+        {\n+            LogPrint(\"netaskfor\", \"%s: blocking\\n\", __func__);\n+            condInvRequests.wait();\n+        } else if (timeToNext > 0)\n+        {\n+            LogPrint(\"netaskfor\", \"%s: waiting for %d us\\n\", __func__, timeToNext);\n+            condInvRequests.timed_wait((timeToNext+999LL)/1000LL);\n+        }\n+    }\n+}\n+\n+void StartThreads(boost::thread_group& threadGroup)\n+{\n+    fStopThread = false;\n+    /// Inventory management thread\n+    threadGroup.create_thread(boost::bind(&TraceThread<void (*)()>, \"askfor\", &ThreadHandleAskFor));\n+}\n+\n+void StopThreads()\n+{\n+    fStopThread = true;\n+    condInvRequests.notify_one();\n+}\n+\n+}\n+\n+namespace NetAskFor\n+{\n+\n+void Completed(const CInv& inv)\n+{\n+    LOCK(cs_invRequests);\n+    MapInvRequests::iterator i = mapInvRequests.find(inv);\n+    if (i != mapInvRequests.end())\n+    {\n+        LogPrint(\"netaskfor\", \"%s: %s\\n\", __func__, inv.ToString());\n+        Forget(i);\n+    } else {\n+        LogPrint(\"netaskfor\", \"%s: %s not found!\\n\", __func__, inv.ToString());\n+    }\n+}\n+\n+void AskFor(CNode *node, const CInv& inv)\n+{\n+    LOCK(cs_invRequests);\n+    NodeId nodeid = node->GetId();\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+    state->node = node;\n+\n+    /// Bound number of concurrent inventory requests to each node, this has\n+    /// the indirect effect of bounding all data structures.\n+    if (state->setAskFor.size() > MAX_SETASKFOR_SZ)\n+        return;\n+\n+    LogPrint(\"netaskfor\", \"askfor %s  peer=%d\\n\", inv.ToString(), nodeid);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17097406",
+      "id" : 17097406,
+      "original_commit_id" : "57b0fa5adeddf54a4c43e4cedcc891ec92e61ac4",
+      "original_position" : 265,
+      "path" : "src/netaskfor.cpp",
+      "position" : 323,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-18T10:23:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17097406",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17097496"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17097496"
+         }
+      },
+      "body" : "It is a bit more difficult because we act per request here, not per node.\r\n\r\n~~It would be possible to accumulate getdatas per node, then submit them at once after an iteration, but as said under KNOWN ISSUES in the OP I'm not sure it's worth the extra complexity. Anyhow it's an obvious optimization that could be done.~~\r\nWorking on this right now...",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-04T06:33:12Z",
+      "diff_hunk" : "@@ -0,0 +1,302 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>\n+\n+#include \"net.h\"\n+#include \"util.h\"\n+\n+/**\n+ * Inventory item request management.\n+ *\n+ * Maintains state separate from CNode.\n+ * There is a two-way mapping between CNodeAskForState and mapInvRequests.\n+ */\n+namespace {\n+\n+/** Node specific state for netaskfor module */\n+class CNodeAskForState\n+{\n+public:\n+    CNodeAskForState(): node(0) {}\n+\n+    /** Set of inv items that are being requested from this node */\n+    std::set<CInv> setAskFor;\n+\n+    /** Network connection associated with this node */\n+    CNode *node; /// TODO ugly but needed for sending getdata\n+};\n+\n+typedef std::multimap<int64_t, CInv> InvRequestsWorkQueue;\n+\n+/** State of one inventory item request */\n+class CInvState\n+{\n+public:\n+    typedef std::set<NodeId> NodeSet;\n+    /** IDs of nodes that have this item */\n+    NodeSet nodes;\n+    /** IDs of nodes that we have not tried requesting this inv from already */\n+    NodeSet notRequestedFrom;\n+    /** Current node that this is being requested from */\n+    NodeId beingRequestedFrom;\n+    /** Must correspond to current entry in work queue for this\n+     *  inventory item (or invRequestsWorkQueue.end())\n+     */\n+    InvRequestsWorkQueue::iterator workQueueIter;\n+};\n+typedef std::map<CInv, CInvState> MapInvRequests;\n+\n+/** Local data, all protected by cs_invRequests */\n+CCriticalSection cs_invRequests;\n+std::map<NodeId, CNodeAskForState> mapNodeAskForState;\n+MapInvRequests mapInvRequests;\n+/** The work queue keeps track when is the next time an inv item request needs\n+ * to be revisited.\n+ * Invariant: Each inv item has at most one entry.\n+ */\n+InvRequestsWorkQueue invRequestsWorkQueue;\n+CTimeoutCondition condInvRequests;\n+/** Exit thread flag */\n+bool fStopThread;\n+\n+/** Get local state for a node id.\n+ * @note Requires that cs_invRequests is held\n+ */\n+CNodeAskForState *State(NodeId pnode)\n+{\n+    std::map<NodeId, CNodeAskForState>::iterator it = mapNodeAskForState.find(pnode);\n+    if (it == mapNodeAskForState.end())\n+        return NULL;\n+    return &it->second;\n+}\n+\n+/** Handler for when a new node appears */\n+void InitializeNode(NodeId nodeid, const CNode *pnode)\n+{\n+    LOCK(cs_invRequests);\n+    /*CNodeAskForState &state = */\n+    mapNodeAskForState.insert(std::make_pair(nodeid, CNodeAskForState())).first->second;\n+}\n+\n+/** Handler to clean up when a node goes away */\n+void FinalizeNode(NodeId nodeid)\n+{\n+    LOCK(cs_invRequests);\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    /// Clean up any requests that were underway to the node,\n+    /// or refer to the node.\n+    BOOST_FOREACH(const CInv &inv, state->setAskFor)\n+    {\n+        MapInvRequests::iterator i = mapInvRequests.find(inv);\n+        if (i != mapInvRequests.end())\n+        {\n+            i->second.nodes.erase(nodeid);\n+            i->second.notRequestedFrom.erase(nodeid);\n+\n+            if (i->second.beingRequestedFrom == nodeid)\n+            {\n+                LogPrint(\"netaskfor\", \"%s: Inv item %s was being requested from destructing node %i\\n\",\n+                        __func__,\n+                        inv.ToString(), nodeid);\n+                i->second.beingRequestedFrom = 0;\n+                /// Make sure the old workqueue item for the inv is removed,\n+                /// to avoid spurious retries\n+                if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+                    invRequestsWorkQueue.erase(i->second.workQueueIter);\n+                /// Re-trigger request logic\n+                i->second.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(0, inv));\n+                condInvRequests.notify_one();\n+            }\n+        }\n+    }\n+    mapNodeAskForState.erase(nodeid);\n+}\n+\n+/** Forget a certain inventory item request\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void Forget(MapInvRequests::iterator i)\n+{\n+    /// Remove reference to this inventory item request from nodes\n+    BOOST_FOREACH(NodeId nodeid, i->second.nodes)\n+    {\n+        CNodeAskForState *state = State(nodeid);\n+        assert(state);\n+        state->setAskFor.erase(i->first);\n+    }\n+    /// Remove from workqueue\n+    if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+        invRequestsWorkQueue.erase(i->second.workQueueIter);\n+    /// Remove from map\n+    mapInvRequests.erase(i);\n+}\n+\n+/** Actually request an item from a node.\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void RequestItem(NodeId nodeid, CInvState &invstate, const CInv &inv)\n+{\n+    /// TODO what locks on node to we need here?\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state && state->node);\n+    CNode *node = state->node;\n+\n+    LogPrint(\"netaskfor\", \"%s: Requesting item %s from node %i (%s)\\n\", __func__,\n+            inv.ToString(), nodeid,\n+            invRequestsWorkQueue.begin()->first ? \"retry\" : \"first request\");\n+    invstate.beingRequestedFrom = nodeid;\n+\n+    std::vector<CInv> vGetData;\n+    vGetData.push_back(inv);\n+    node->PushMessage(\"getdata\", vGetData);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17097496",
+      "id" : 17097496,
+      "original_commit_id" : "57b0fa5adeddf54a4c43e4cedcc891ec92e61ac4",
+      "original_position" : 161,
+      "path" : "src/netaskfor.cpp",
+      "position" : null,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-18T10:23:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17097496",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17098387"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17098387"
+         }
+      },
+      "body" : "I've added a pull request (https://github.com/laanwj/bitcoin/pull/3) to this branch that might help with this... (also makes it easier to collect stats in later commits of mine).",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-04T07:11:41Z",
+      "diff_hunk" : "@@ -0,0 +1,302 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>\n+\n+#include \"net.h\"\n+#include \"util.h\"\n+\n+/**\n+ * Inventory item request management.\n+ *\n+ * Maintains state separate from CNode.\n+ * There is a two-way mapping between CNodeAskForState and mapInvRequests.\n+ */\n+namespace {\n+\n+/** Node specific state for netaskfor module */\n+class CNodeAskForState\n+{\n+public:\n+    CNodeAskForState(): node(0) {}\n+\n+    /** Set of inv items that are being requested from this node */\n+    std::set<CInv> setAskFor;\n+\n+    /** Network connection associated with this node */\n+    CNode *node; /// TODO ugly but needed for sending getdata\n+};\n+\n+typedef std::multimap<int64_t, CInv> InvRequestsWorkQueue;\n+\n+/** State of one inventory item request */\n+class CInvState\n+{\n+public:\n+    typedef std::set<NodeId> NodeSet;\n+    /** IDs of nodes that have this item */\n+    NodeSet nodes;\n+    /** IDs of nodes that we have not tried requesting this inv from already */\n+    NodeSet notRequestedFrom;\n+    /** Current node that this is being requested from */\n+    NodeId beingRequestedFrom;\n+    /** Must correspond to current entry in work queue for this\n+     *  inventory item (or invRequestsWorkQueue.end())\n+     */\n+    InvRequestsWorkQueue::iterator workQueueIter;\n+};\n+typedef std::map<CInv, CInvState> MapInvRequests;\n+\n+/** Local data, all protected by cs_invRequests */\n+CCriticalSection cs_invRequests;\n+std::map<NodeId, CNodeAskForState> mapNodeAskForState;\n+MapInvRequests mapInvRequests;\n+/** The work queue keeps track when is the next time an inv item request needs\n+ * to be revisited.\n+ * Invariant: Each inv item has at most one entry.\n+ */\n+InvRequestsWorkQueue invRequestsWorkQueue;\n+CTimeoutCondition condInvRequests;\n+/** Exit thread flag */\n+bool fStopThread;\n+\n+/** Get local state for a node id.\n+ * @note Requires that cs_invRequests is held\n+ */\n+CNodeAskForState *State(NodeId pnode)\n+{\n+    std::map<NodeId, CNodeAskForState>::iterator it = mapNodeAskForState.find(pnode);\n+    if (it == mapNodeAskForState.end())\n+        return NULL;\n+    return &it->second;\n+}\n+\n+/** Handler for when a new node appears */\n+void InitializeNode(NodeId nodeid, const CNode *pnode)\n+{\n+    LOCK(cs_invRequests);\n+    /*CNodeAskForState &state = */\n+    mapNodeAskForState.insert(std::make_pair(nodeid, CNodeAskForState())).first->second;\n+}\n+\n+/** Handler to clean up when a node goes away */\n+void FinalizeNode(NodeId nodeid)\n+{\n+    LOCK(cs_invRequests);\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    /// Clean up any requests that were underway to the node,\n+    /// or refer to the node.\n+    BOOST_FOREACH(const CInv &inv, state->setAskFor)\n+    {\n+        MapInvRequests::iterator i = mapInvRequests.find(inv);\n+        if (i != mapInvRequests.end())\n+        {\n+            i->second.nodes.erase(nodeid);\n+            i->second.notRequestedFrom.erase(nodeid);\n+\n+            if (i->second.beingRequestedFrom == nodeid)\n+            {\n+                LogPrint(\"netaskfor\", \"%s: Inv item %s was being requested from destructing node %i\\n\",\n+                        __func__,\n+                        inv.ToString(), nodeid);\n+                i->second.beingRequestedFrom = 0;\n+                /// Make sure the old workqueue item for the inv is removed,\n+                /// to avoid spurious retries\n+                if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+                    invRequestsWorkQueue.erase(i->second.workQueueIter);\n+                /// Re-trigger request logic\n+                i->second.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(0, inv));\n+                condInvRequests.notify_one();\n+            }\n+        }\n+    }\n+    mapNodeAskForState.erase(nodeid);\n+}\n+\n+/** Forget a certain inventory item request\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void Forget(MapInvRequests::iterator i)\n+{\n+    /// Remove reference to this inventory item request from nodes\n+    BOOST_FOREACH(NodeId nodeid, i->second.nodes)\n+    {\n+        CNodeAskForState *state = State(nodeid);\n+        assert(state);\n+        state->setAskFor.erase(i->first);\n+    }\n+    /// Remove from workqueue\n+    if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+        invRequestsWorkQueue.erase(i->second.workQueueIter);\n+    /// Remove from map\n+    mapInvRequests.erase(i);\n+}\n+\n+/** Actually request an item from a node.\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void RequestItem(NodeId nodeid, CInvState &invstate, const CInv &inv)\n+{\n+    /// TODO what locks on node to we need here?\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state && state->node);\n+    CNode *node = state->node;\n+\n+    LogPrint(\"netaskfor\", \"%s: Requesting item %s from node %i (%s)\\n\", __func__,\n+            inv.ToString(), nodeid,\n+            invRequestsWorkQueue.begin()->first ? \"retry\" : \"first request\");\n+    invstate.beingRequestedFrom = nodeid;\n+\n+    std::vector<CInv> vGetData;\n+    vGetData.push_back(inv);\n+    node->PushMessage(\"getdata\", vGetData);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17098387",
+      "id" : 17098387,
+      "original_commit_id" : "57b0fa5adeddf54a4c43e4cedcc891ec92e61ac4",
+      "original_position" : 161,
+      "path" : "src/netaskfor.cpp",
+      "position" : null,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-18T10:23:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17098387",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1530283?v=3",
+         "events_url" : "https://api.github.com/users/rebroad/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/rebroad/followers",
+         "following_url" : "https://api.github.com/users/rebroad/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/rebroad/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/rebroad",
+         "id" : 1530283,
+         "login" : "rebroad",
+         "organizations_url" : "https://api.github.com/users/rebroad/orgs",
+         "received_events_url" : "https://api.github.com/users/rebroad/received_events",
+         "repos_url" : "https://api.github.com/users/rebroad/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/rebroad/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/rebroad/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/rebroad"
+      }
+   },
+   {
+      "body" : "https://github.com/rebroad/bitcoin/commit/a973b79e78cf4139efd8d778736cb7831ce775b6#diff-1 - this is my commit which uses your new patch (just to show you what I'm trying to do, but yes, there's probably a better way. It's kludgy but it outputs it to debug.log, which is where I prefer to see things for historical data).",
+      "created_at" : "2014-09-04T07:43:47Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-54423684",
+      "id" : 54423684,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-04T07:43:47Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/54423684",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1530283?v=3",
+         "events_url" : "https://api.github.com/users/rebroad/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/rebroad/followers",
+         "following_url" : "https://api.github.com/users/rebroad/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/rebroad/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/rebroad",
+         "id" : 1530283,
+         "login" : "rebroad",
+         "organizations_url" : "https://api.github.com/users/rebroad/orgs",
+         "received_events_url" : "https://api.github.com/users/rebroad/received_events",
+         "repos_url" : "https://api.github.com/users/rebroad/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/rebroad/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/rebroad/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/rebroad"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17151277"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17151277"
+         }
+      },
+      "body" : "What is the trailing .first->second for?",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-05T00:30:08Z",
+      "diff_hunk" : "@@ -0,0 +1,361 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>\n+\n+#include \"net.h\"\n+#include \"util.h\"\n+\n+/**\n+ * Inventory item request management.\n+ *\n+ * Maintains state separate from CNode.\n+ * There is a two-way mapping between CNodeAskForState and mapInvRequests.\n+ */\n+namespace {\n+\n+/** Node specific state for netaskfor module */\n+class CNodeAskForState\n+{\n+public:\n+    CNodeAskForState(): node(0) {}\n+\n+    /** Set of inv items that are being requested from this node */\n+    std::set<CInv> setAskFor;\n+\n+    /** Group up to 1000 outgoing requests per node */\n+    std::vector<CInv> outgoingRequests;\n+\n+    /** Network connection associated with this node */\n+    CNode *node; /// TODO ugly but needed for sending getdata\n+};\n+\n+typedef std::multimap<int64_t, CInv> InvRequestsWorkQueue;\n+\n+/** State of one inventory item request.\n+ * @note in this structure we store NodeIds instead of CNodeAskForState*, as this\n+ * would double memory usage on 64-bit (on the other hand, that would reduce the number of map\n+ * lookups needed...)\n+ */\n+class CInvState\n+{\n+public:\n+    typedef std::set<NodeId> NodeSet;\n+    /** IDs of nodes that have this item */\n+    NodeSet nodes;\n+    /** IDs of nodes that we have not tried requesting this inv from already */\n+    NodeSet notRequestedFrom;\n+    /** Current node that this is being requested from */\n+    NodeId beingRequestedFrom;\n+    /** Must correspond to current entry in work queue for this\n+     *  inventory item (or invRequestsWorkQueue.end())\n+     */\n+    InvRequestsWorkQueue::iterator workQueueIter;\n+};\n+typedef std::map<CInv, CInvState> MapInvRequests;\n+\n+/** Local data, all protected by cs_invRequests */\n+CCriticalSection cs_invRequests;\n+/** Map node id to local state */\n+std::map<NodeId, CNodeAskForState> mapNodeAskForState;\n+/** Map inv to current request state */\n+MapInvRequests mapInvRequests;\n+/** The work queue keeps track of when is the next time a request needs\n+ * to be revisited.\n+ * @invariant Each request has at most one entry.\n+ * @note Theoretically this could be a deque instead of a map, as we only add to\n+ * the end (assuming monotonic time) and to the beginning (first tries have\n+ * t=0), and remove from the beginning. However std::deque invalidates\n+ * iterators so we cannot keep around an iterator to remove the work queue item\n+ * on cancel.\n+ */\n+InvRequestsWorkQueue invRequestsWorkQueue;\n+CTimeoutCondition condInvRequests;\n+/** Exit thread flag */\n+bool fStopThread;\n+\n+/** Get local state for a node id.\n+ * @note Requires that cs_invRequests is held\n+ */\n+CNodeAskForState *State(NodeId pnode)\n+{\n+    std::map<NodeId, CNodeAskForState>::iterator it = mapNodeAskForState.find(pnode);\n+    if (it == mapNodeAskForState.end())\n+        return NULL;\n+    return &it->second;\n+}\n+\n+/** Handler for when a new node appears */\n+void InitializeNode(NodeId nodeid, const CNode *pnode)\n+{\n+    LOCK(cs_invRequests);\n+    /*CNodeAskForState &state = */\n+    mapNodeAskForState.insert(std::make_pair(nodeid, CNodeAskForState())).first->second;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17151277",
+      "id" : 17151277,
+      "original_commit_id" : "a2afa1d17bc99a26aa5dbc646ba300fd6cc694b7",
+      "original_position" : 100,
+      "path" : "src/netaskfor.cpp",
+      "position" : null,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-18T10:23:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17151277",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1752347?v=3",
+         "events_url" : "https://api.github.com/users/SergioDemianLerner/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/SergioDemianLerner/followers",
+         "following_url" : "https://api.github.com/users/SergioDemianLerner/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/SergioDemianLerner/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/SergioDemianLerner",
+         "id" : 1752347,
+         "login" : "SergioDemianLerner",
+         "organizations_url" : "https://api.github.com/users/SergioDemianLerner/orgs",
+         "received_events_url" : "https://api.github.com/users/SergioDemianLerner/received_events",
+         "repos_url" : "https://api.github.com/users/SergioDemianLerner/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/SergioDemianLerner/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/SergioDemianLerner/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/SergioDemianLerner"
+      }
+   },
+   {
+      "body" : "This is excellent. Could we unify the handling and scheduling of transactions getdata/invs with block getdata/invs ?\r\nBecause sooner or later block fetching will require a similar method to withstand malicious block invs.\r\nMaybe that can be done later on top of this patch.",
+      "created_at" : "2014-09-05T00:57:47Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-54565988",
+      "id" : 54565988,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-05T00:58:32Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/54565988",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1752347?v=3",
+         "events_url" : "https://api.github.com/users/SergioDemianLerner/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/SergioDemianLerner/followers",
+         "following_url" : "https://api.github.com/users/SergioDemianLerner/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/SergioDemianLerner/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/SergioDemianLerner",
+         "id" : 1752347,
+         "login" : "SergioDemianLerner",
+         "organizations_url" : "https://api.github.com/users/SergioDemianLerner/orgs",
+         "received_events_url" : "https://api.github.com/users/SergioDemianLerner/received_events",
+         "repos_url" : "https://api.github.com/users/SergioDemianLerner/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/SergioDemianLerner/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/SergioDemianLerner/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/SergioDemianLerner"
+      }
+   },
+   {
+      "body" : "We are actually doing already something very similar for blocks, and the headersfirst branch extends it (#4468). It's a bit more complicated there, as we want a moving window of block fetching to limit out-of-orderness in which blocks arrive.",
+      "created_at" : "2014-09-05T01:01:44Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-54566239",
+      "id" : 54566239,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-05T01:01:44Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/54566239",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=3",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "body" : "Big +1 on code organization: implementing independent pieces of protocol handling should definitely move to separate files, with separate data structures and separate locks (other examples that afaik could easily be converted into this style are ping/pong and alerts).\r\n\r\nIt's a bit unfortunate that the block fetching and tx fetching code are separated but implement similar functionality. It's a strict improvement though as they were already separate (originally my fault I guess, as I didn't touch the tx handling code when rewriting the block handling part), and unifying them now would probably interfere with other changes.",
+      "created_at" : "2014-09-05T01:08:05Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-54566663",
+      "id" : 54566663,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-05T01:08:05Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/54566663",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=3",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17164489"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17164489"
+         }
+      },
+      "body" : "That's a leftover from the commented code above it. Basically, the CNodeAskForState had some initial assignments here so a reference to it was stored. This is not necessary at the moment so both the commented code and the .first->second should go.\r\n",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-05T09:52:45Z",
+      "diff_hunk" : "@@ -0,0 +1,361 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>\n+\n+#include \"net.h\"\n+#include \"util.h\"\n+\n+/**\n+ * Inventory item request management.\n+ *\n+ * Maintains state separate from CNode.\n+ * There is a two-way mapping between CNodeAskForState and mapInvRequests.\n+ */\n+namespace {\n+\n+/** Node specific state for netaskfor module */\n+class CNodeAskForState\n+{\n+public:\n+    CNodeAskForState(): node(0) {}\n+\n+    /** Set of inv items that are being requested from this node */\n+    std::set<CInv> setAskFor;\n+\n+    /** Group up to 1000 outgoing requests per node */\n+    std::vector<CInv> outgoingRequests;\n+\n+    /** Network connection associated with this node */\n+    CNode *node; /// TODO ugly but needed for sending getdata\n+};\n+\n+typedef std::multimap<int64_t, CInv> InvRequestsWorkQueue;\n+\n+/** State of one inventory item request.\n+ * @note in this structure we store NodeIds instead of CNodeAskForState*, as this\n+ * would double memory usage on 64-bit (on the other hand, that would reduce the number of map\n+ * lookups needed...)\n+ */\n+class CInvState\n+{\n+public:\n+    typedef std::set<NodeId> NodeSet;\n+    /** IDs of nodes that have this item */\n+    NodeSet nodes;\n+    /** IDs of nodes that we have not tried requesting this inv from already */\n+    NodeSet notRequestedFrom;\n+    /** Current node that this is being requested from */\n+    NodeId beingRequestedFrom;\n+    /** Must correspond to current entry in work queue for this\n+     *  inventory item (or invRequestsWorkQueue.end())\n+     */\n+    InvRequestsWorkQueue::iterator workQueueIter;\n+};\n+typedef std::map<CInv, CInvState> MapInvRequests;\n+\n+/** Local data, all protected by cs_invRequests */\n+CCriticalSection cs_invRequests;\n+/** Map node id to local state */\n+std::map<NodeId, CNodeAskForState> mapNodeAskForState;\n+/** Map inv to current request state */\n+MapInvRequests mapInvRequests;\n+/** The work queue keeps track of when is the next time a request needs\n+ * to be revisited.\n+ * @invariant Each request has at most one entry.\n+ * @note Theoretically this could be a deque instead of a map, as we only add to\n+ * the end (assuming monotonic time) and to the beginning (first tries have\n+ * t=0), and remove from the beginning. However std::deque invalidates\n+ * iterators so we cannot keep around an iterator to remove the work queue item\n+ * on cancel.\n+ */\n+InvRequestsWorkQueue invRequestsWorkQueue;\n+CTimeoutCondition condInvRequests;\n+/** Exit thread flag */\n+bool fStopThread;\n+\n+/** Get local state for a node id.\n+ * @note Requires that cs_invRequests is held\n+ */\n+CNodeAskForState *State(NodeId pnode)\n+{\n+    std::map<NodeId, CNodeAskForState>::iterator it = mapNodeAskForState.find(pnode);\n+    if (it == mapNodeAskForState.end())\n+        return NULL;\n+    return &it->second;\n+}\n+\n+/** Handler for when a new node appears */\n+void InitializeNode(NodeId nodeid, const CNode *pnode)\n+{\n+    LOCK(cs_invRequests);\n+    /*CNodeAskForState &state = */\n+    mapNodeAskForState.insert(std::make_pair(nodeid, CNodeAskForState())).first->second;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17164489",
+      "id" : 17164489,
+      "original_commit_id" : "a2afa1d17bc99a26aa5dbc646ba300fd6cc694b7",
+      "original_position" : 100,
+      "path" : "src/netaskfor.cpp",
+      "position" : null,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-18T10:23:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17164489",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "body" : "@SergioDemianLerner As I see it, blocks handling is much more closely bound to main/core than this (basically independent) inventory item fetcher, making it enough of a separate concern to warrant being a different module. I'm not against unifying them if it can be done sanely, of course. But block handling is essentially different especially after headers-first.",
+      "created_at" : "2014-09-05T10:08:02Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-54606935",
+      "id" : 54606935,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-05T10:08:02Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/54606935",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "body" : "Malicious block invs? What is one of those?",
+      "created_at" : "2014-09-05T11:06:24Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-54612052",
+      "id" : 54612052,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-05T11:06:24Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/54612052",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1530283?v=3",
+         "events_url" : "https://api.github.com/users/rebroad/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/rebroad/followers",
+         "following_url" : "https://api.github.com/users/rebroad/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/rebroad/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/rebroad",
+         "id" : 1530283,
+         "login" : "rebroad",
+         "organizations_url" : "https://api.github.com/users/rebroad/orgs",
+         "received_events_url" : "https://api.github.com/users/rebroad/received_events",
+         "repos_url" : "https://api.github.com/users/rebroad/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/rebroad/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/rebroad/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/rebroad"
+      }
+   },
+   {
+      "body" : "Currently, the logic is such that large orphan txs are requested repeatedly and ignored repeatedly:-\r\n\r\n2014-09-06 00:01:46 ignoring large orphan tx (size: 5057, hash: 18098a192869ef0f9128be9bf1f3bb243575f88d072bb24f918c4e4f5a894b80) peer=1\r\n2014-09-06 00:01:46 ignoring large orphan tx (size: 5057, hash: 18098a192869ef0f9128be9bf1f3bb243575f88d072bb24f918c4e4f5a894b80) peer=11\r\n2014-09-06 00:01:47 ignoring large orphan tx (size: 5057, hash: 18098a192869ef0f9128be9bf1f3bb243575f88d072bb24f918c4e4f5a894b80) peer=27\r\n2014-09-06 00:01:48 ignoring large orphan tx (size: 5057, hash: 18098a192869ef0f9128be9bf1f3bb243575f88d072bb24f918c4e4f5a894b80) peer=23\r\n2014-09-06 00:01:49 ignoring large orphan tx (size: 5057, hash: 18098a192869ef0f9128be9bf1f3bb243575f88d072bb24f918c4e4f5a894b80) peer=12\r\n2014-09-06 00:01:50 ignoring large orphan tx (size: 5057, hash: 18098a192869ef0f9128be9bf1f3bb243575f88d072bb24f918c4e4f5a894b80) peer=26\r\n2014-09-06 00:01:51 ignoring large orphan tx (size: 5057, hash: 18098a192869ef0f9128be9bf1f3bb243575f88d072bb24f918c4e4f5a894b80) peer=24\r\n2014-09-06 00:01:53 ignoring large orphan tx (size: 5057, hash: 18098a192869ef0f9128be9bf1f3bb243575f88d072bb24f918c4e4f5a894b80) peer=20\r\n\r\nIs it possible to make the node remember recently ignored txs so that they don't keep being requested? This was working in the previous implementation thanks to #4542 ",
+      "created_at" : "2014-09-06T00:23:17Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-54696398",
+      "id" : 54696398,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-06T00:23:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/54696398",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1530283?v=3",
+         "events_url" : "https://api.github.com/users/rebroad/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/rebroad/followers",
+         "following_url" : "https://api.github.com/users/rebroad/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/rebroad/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/rebroad",
+         "id" : 1530283,
+         "login" : "rebroad",
+         "organizations_url" : "https://api.github.com/users/rebroad/orgs",
+         "received_events_url" : "https://api.github.com/users/rebroad/received_events",
+         "repos_url" : "https://api.github.com/users/rebroad/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/rebroad/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/rebroad/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/rebroad"
+      }
+   },
+   {
+      "body" : "@rebroad This should simply work with #4542? It doesn't touch any part of the same code.\r\n\r\nAs I see it, the logic of *whether* to request something is outside scope of this module. If you ask netaskfor to retrieve a transaction for you, it will do so, until being told to stop :) (or until it runs out of peers)",
+      "created_at" : "2014-09-06T02:36:36Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-54700082",
+      "id" : 54700082,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-06T02:39:11Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/54700082",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "body" : "@laanwj oh.. yes, you are right. Ok, I'll re-merge 4542 in that case (which didn't touch large orphan txs anyway I've just noticed!).",
+      "created_at" : "2014-09-06T07:25:30Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-54705180",
+      "id" : 54705180,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-06T07:25:51Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/54705180",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1530283?v=3",
+         "events_url" : "https://api.github.com/users/rebroad/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/rebroad/followers",
+         "following_url" : "https://api.github.com/users/rebroad/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/rebroad/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/rebroad",
+         "id" : 1530283,
+         "login" : "rebroad",
+         "organizations_url" : "https://api.github.com/users/rebroad/orgs",
+         "received_events_url" : "https://api.github.com/users/rebroad/received_events",
+         "repos_url" : "https://api.github.com/users/rebroad/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/rebroad/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/rebroad/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/rebroad"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17207604"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17207604"
+         }
+      },
+      "body" : "This should skip nodes whose sendbuffer is full.\r\n\r\nWhat is the correct way to check this? This would be something like `pnode->nSendSize < SendBufferSize()`, but I'm not sure what lock is needed for that.",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-06T08:21:06Z",
+      "diff_hunk" : "@@ -0,0 +1,361 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>\n+\n+#include \"net.h\"\n+#include \"util.h\"\n+\n+/**\n+ * Inventory item request management.\n+ *\n+ * Maintains state separate from CNode.\n+ * There is a two-way mapping between CNodeAskForState and mapInvRequests.\n+ */\n+namespace {\n+\n+/** Node specific state for netaskfor module */\n+class CNodeAskForState\n+{\n+public:\n+    CNodeAskForState(): node(0) {}\n+\n+    /** Set of inv items that are being requested from this node */\n+    std::set<CInv> setAskFor;\n+\n+    /** Group up to 1000 outgoing requests per node */\n+    std::vector<CInv> outgoingRequests;\n+\n+    /** Network connection associated with this node */\n+    CNode *node; /// TODO ugly but needed for sending getdata\n+};\n+\n+typedef std::multimap<int64_t, CInv> InvRequestsWorkQueue;\n+\n+/** State of one inventory item request.\n+ * @note in this structure we store NodeIds instead of CNodeAskForState*, as this\n+ * would double memory usage on 64-bit (on the other hand, that would reduce the number of map\n+ * lookups needed...)\n+ */\n+class CInvState\n+{\n+public:\n+    typedef std::set<NodeId> NodeSet;\n+    /** IDs of nodes that have this item */\n+    NodeSet nodes;\n+    /** IDs of nodes that we have not tried requesting this inv from already */\n+    NodeSet notRequestedFrom;\n+    /** Current node that this is being requested from */\n+    NodeId beingRequestedFrom;\n+    /** Must correspond to current entry in work queue for this\n+     *  inventory item (or invRequestsWorkQueue.end())\n+     */\n+    InvRequestsWorkQueue::iterator workQueueIter;\n+};\n+typedef std::map<CInv, CInvState> MapInvRequests;\n+\n+/** Local data, all protected by cs_invRequests */\n+CCriticalSection cs_invRequests;\n+/** Map node id to local state */\n+std::map<NodeId, CNodeAskForState> mapNodeAskForState;\n+/** Map inv to current request state */\n+MapInvRequests mapInvRequests;\n+/** The work queue keeps track of when is the next time a request needs\n+ * to be revisited.\n+ * @invariant Each request has at most one entry.\n+ * @note Theoretically this could be a deque instead of a map, as we only add to\n+ * the end (assuming monotonic time) and to the beginning (first tries have\n+ * t=0), and remove from the beginning. However std::deque invalidates\n+ * iterators so we cannot keep around an iterator to remove the work queue item\n+ * on cancel.\n+ */\n+InvRequestsWorkQueue invRequestsWorkQueue;\n+CTimeoutCondition condInvRequests;\n+/** Exit thread flag */\n+bool fStopThread;\n+\n+/** Get local state for a node id.\n+ * @note Requires that cs_invRequests is held\n+ */\n+CNodeAskForState *State(NodeId pnode)\n+{\n+    std::map<NodeId, CNodeAskForState>::iterator it = mapNodeAskForState.find(pnode);\n+    if (it == mapNodeAskForState.end())\n+        return NULL;\n+    return &it->second;\n+}\n+\n+/** Handler for when a new node appears */\n+void InitializeNode(NodeId nodeid, const CNode *pnode)\n+{\n+    LOCK(cs_invRequests);\n+    /*CNodeAskForState &state = */\n+    mapNodeAskForState.insert(std::make_pair(nodeid, CNodeAskForState())).first->second;\n+}\n+\n+/** Handler to clean up when a node goes away */\n+void FinalizeNode(NodeId nodeid)\n+{\n+    LOCK(cs_invRequests);\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    /// Clean up any requests that were underway to the node,\n+    /// or refer to the node.\n+    BOOST_FOREACH(const CInv &inv, state->setAskFor)\n+    {\n+        MapInvRequests::iterator i = mapInvRequests.find(inv);\n+        if (i != mapInvRequests.end())\n+        {\n+            i->second.nodes.erase(nodeid);\n+            i->second.notRequestedFrom.erase(nodeid);\n+\n+            if (i->second.beingRequestedFrom == nodeid)\n+            {\n+                LogPrint(\"netaskfor\", \"%s: Inv item %s was being requested from destructing node %i\\n\",\n+                        __func__,\n+                        inv.ToString(), nodeid);\n+                i->second.beingRequestedFrom = 0;\n+                /// Make sure the old workqueue item for the inv is removed,\n+                /// to avoid spurious retries\n+                if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+                    invRequestsWorkQueue.erase(i->second.workQueueIter);\n+                /// Re-trigger request logic\n+                i->second.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(0, inv));\n+                condInvRequests.notify_one();\n+            }\n+        }\n+    }\n+    mapNodeAskForState.erase(nodeid);\n+}\n+\n+/** Forget a certain inventory item request\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void Forget(MapInvRequests::iterator i)\n+{\n+    /// Remove reference to this inventory item request from nodes\n+    BOOST_FOREACH(NodeId nodeid, i->second.nodes)\n+    {\n+        CNodeAskForState *state = State(nodeid);\n+        assert(state);\n+        state->setAskFor.erase(i->first);\n+    }\n+    /// Remove from workqueue\n+    if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+        invRequestsWorkQueue.erase(i->second.workQueueIter);\n+    /// Remove from map\n+    mapInvRequests.erase(i);\n+}\n+\n+/** Flushes queued getdatas to a node by id.\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void FlushGetdata(NodeId nodeid)\n+{\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state && state->node);\n+    CNode *node = state->node;\n+\n+    /// Don't send empty getdatas, ever\n+    if (state->outgoingRequests.empty())\n+        return;\n+\n+    std::stringstream debug;\n+    BOOST_FOREACH(const CInv &inv, state->outgoingRequests)\n+        debug << inv.ToString() << \" \";\n+    LogPrint(\"netaskfor\", \"%s: peer=%i getdata %s\\n\", __func__, nodeid, debug.str());\n+\n+    node->PushMessage(\"getdata\", state->outgoingRequests);\n+    state->outgoingRequests.clear();\n+}\n+\n+/** Queues a getdata to a node by id\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void QueueGetdata(NodeId nodeid, const CInv &inv, bool isRetry)\n+{\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    LogPrint(\"netaskfor\", \"%s: Requesting item %s from node %i (%s)\\n\", __func__,\n+            inv.ToString(), nodeid,\n+            isRetry ? \"retry\" : \"first request\");\n+\n+    state->outgoingRequests.push_back(inv);\n+\n+    /// Make sure a getdata request doesn't contain more than 1000 entries\n+    /// Flush prematurely if this is going to be the case.\n+    if(state->outgoingRequests.size() >= 1000)\n+        FlushGetdata(nodeid);\n+}\n+\n+void ThreadHandleAskFor()\n+{\n+    while (!fStopThread)\n+    {\n+        LogPrint(\"netaskfor\", \"%s: iteration\\n\", __func__);\n+        int64_t timeToNext = std::numeric_limits<int64_t>::max();\n+\n+        {\n+            LOCK(cs_invRequests);\n+            int64_t now = GetTimeMillis();\n+            std::set<NodeId> nodesToFlush;\n+            /// Process work queue entries that are timestamped either now or before now\n+            while (!invRequestsWorkQueue.empty() && invRequestsWorkQueue.begin()->first <= now)\n+            {\n+                const CInv &inv = invRequestsWorkQueue.begin()->second;\n+                MapInvRequests::iterator it = mapInvRequests.find(inv);\n+                LogPrint(\"netaskfor\", \"%s: processing item %s\\n\", __func__, inv.ToString());\n+                if (it != mapInvRequests.end())\n+                {\n+                    CInvState &invstate = it->second;\n+                    invstate.workQueueIter = invRequestsWorkQueue.end();\n+                    /// Pick a node to request from, if available",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17207604",
+      "id" : 17207604,
+      "original_commit_id" : "a2afa1d17bc99a26aa5dbc646ba300fd6cc694b7",
+      "original_position" : 221,
+      "path" : "src/netaskfor.cpp",
+      "position" : 220,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-18T10:23:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17207604",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17207618"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17207618"
+         }
+      },
+      "body" : "In theory you would need pnode->cs_vSend, but if you can argue that the system keeps working correctly even if the test returns the right result only most of the time, put a big comment, and use no lock...",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-06T08:28:34Z",
+      "diff_hunk" : "@@ -0,0 +1,361 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>\n+\n+#include \"net.h\"\n+#include \"util.h\"\n+\n+/**\n+ * Inventory item request management.\n+ *\n+ * Maintains state separate from CNode.\n+ * There is a two-way mapping between CNodeAskForState and mapInvRequests.\n+ */\n+namespace {\n+\n+/** Node specific state for netaskfor module */\n+class CNodeAskForState\n+{\n+public:\n+    CNodeAskForState(): node(0) {}\n+\n+    /** Set of inv items that are being requested from this node */\n+    std::set<CInv> setAskFor;\n+\n+    /** Group up to 1000 outgoing requests per node */\n+    std::vector<CInv> outgoingRequests;\n+\n+    /** Network connection associated with this node */\n+    CNode *node; /// TODO ugly but needed for sending getdata\n+};\n+\n+typedef std::multimap<int64_t, CInv> InvRequestsWorkQueue;\n+\n+/** State of one inventory item request.\n+ * @note in this structure we store NodeIds instead of CNodeAskForState*, as this\n+ * would double memory usage on 64-bit (on the other hand, that would reduce the number of map\n+ * lookups needed...)\n+ */\n+class CInvState\n+{\n+public:\n+    typedef std::set<NodeId> NodeSet;\n+    /** IDs of nodes that have this item */\n+    NodeSet nodes;\n+    /** IDs of nodes that we have not tried requesting this inv from already */\n+    NodeSet notRequestedFrom;\n+    /** Current node that this is being requested from */\n+    NodeId beingRequestedFrom;\n+    /** Must correspond to current entry in work queue for this\n+     *  inventory item (or invRequestsWorkQueue.end())\n+     */\n+    InvRequestsWorkQueue::iterator workQueueIter;\n+};\n+typedef std::map<CInv, CInvState> MapInvRequests;\n+\n+/** Local data, all protected by cs_invRequests */\n+CCriticalSection cs_invRequests;\n+/** Map node id to local state */\n+std::map<NodeId, CNodeAskForState> mapNodeAskForState;\n+/** Map inv to current request state */\n+MapInvRequests mapInvRequests;\n+/** The work queue keeps track of when is the next time a request needs\n+ * to be revisited.\n+ * @invariant Each request has at most one entry.\n+ * @note Theoretically this could be a deque instead of a map, as we only add to\n+ * the end (assuming monotonic time) and to the beginning (first tries have\n+ * t=0), and remove from the beginning. However std::deque invalidates\n+ * iterators so we cannot keep around an iterator to remove the work queue item\n+ * on cancel.\n+ */\n+InvRequestsWorkQueue invRequestsWorkQueue;\n+CTimeoutCondition condInvRequests;\n+/** Exit thread flag */\n+bool fStopThread;\n+\n+/** Get local state for a node id.\n+ * @note Requires that cs_invRequests is held\n+ */\n+CNodeAskForState *State(NodeId pnode)\n+{\n+    std::map<NodeId, CNodeAskForState>::iterator it = mapNodeAskForState.find(pnode);\n+    if (it == mapNodeAskForState.end())\n+        return NULL;\n+    return &it->second;\n+}\n+\n+/** Handler for when a new node appears */\n+void InitializeNode(NodeId nodeid, const CNode *pnode)\n+{\n+    LOCK(cs_invRequests);\n+    /*CNodeAskForState &state = */\n+    mapNodeAskForState.insert(std::make_pair(nodeid, CNodeAskForState())).first->second;\n+}\n+\n+/** Handler to clean up when a node goes away */\n+void FinalizeNode(NodeId nodeid)\n+{\n+    LOCK(cs_invRequests);\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    /// Clean up any requests that were underway to the node,\n+    /// or refer to the node.\n+    BOOST_FOREACH(const CInv &inv, state->setAskFor)\n+    {\n+        MapInvRequests::iterator i = mapInvRequests.find(inv);\n+        if (i != mapInvRequests.end())\n+        {\n+            i->second.nodes.erase(nodeid);\n+            i->second.notRequestedFrom.erase(nodeid);\n+\n+            if (i->second.beingRequestedFrom == nodeid)\n+            {\n+                LogPrint(\"netaskfor\", \"%s: Inv item %s was being requested from destructing node %i\\n\",\n+                        __func__,\n+                        inv.ToString(), nodeid);\n+                i->second.beingRequestedFrom = 0;\n+                /// Make sure the old workqueue item for the inv is removed,\n+                /// to avoid spurious retries\n+                if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+                    invRequestsWorkQueue.erase(i->second.workQueueIter);\n+                /// Re-trigger request logic\n+                i->second.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(0, inv));\n+                condInvRequests.notify_one();\n+            }\n+        }\n+    }\n+    mapNodeAskForState.erase(nodeid);\n+}\n+\n+/** Forget a certain inventory item request\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void Forget(MapInvRequests::iterator i)\n+{\n+    /// Remove reference to this inventory item request from nodes\n+    BOOST_FOREACH(NodeId nodeid, i->second.nodes)\n+    {\n+        CNodeAskForState *state = State(nodeid);\n+        assert(state);\n+        state->setAskFor.erase(i->first);\n+    }\n+    /// Remove from workqueue\n+    if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+        invRequestsWorkQueue.erase(i->second.workQueueIter);\n+    /// Remove from map\n+    mapInvRequests.erase(i);\n+}\n+\n+/** Flushes queued getdatas to a node by id.\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void FlushGetdata(NodeId nodeid)\n+{\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state && state->node);\n+    CNode *node = state->node;\n+\n+    /// Don't send empty getdatas, ever\n+    if (state->outgoingRequests.empty())\n+        return;\n+\n+    std::stringstream debug;\n+    BOOST_FOREACH(const CInv &inv, state->outgoingRequests)\n+        debug << inv.ToString() << \" \";\n+    LogPrint(\"netaskfor\", \"%s: peer=%i getdata %s\\n\", __func__, nodeid, debug.str());\n+\n+    node->PushMessage(\"getdata\", state->outgoingRequests);\n+    state->outgoingRequests.clear();\n+}\n+\n+/** Queues a getdata to a node by id\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void QueueGetdata(NodeId nodeid, const CInv &inv, bool isRetry)\n+{\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    LogPrint(\"netaskfor\", \"%s: Requesting item %s from node %i (%s)\\n\", __func__,\n+            inv.ToString(), nodeid,\n+            isRetry ? \"retry\" : \"first request\");\n+\n+    state->outgoingRequests.push_back(inv);\n+\n+    /// Make sure a getdata request doesn't contain more than 1000 entries\n+    /// Flush prematurely if this is going to be the case.\n+    if(state->outgoingRequests.size() >= 1000)\n+        FlushGetdata(nodeid);\n+}\n+\n+void ThreadHandleAskFor()\n+{\n+    while (!fStopThread)\n+    {\n+        LogPrint(\"netaskfor\", \"%s: iteration\\n\", __func__);\n+        int64_t timeToNext = std::numeric_limits<int64_t>::max();\n+\n+        {\n+            LOCK(cs_invRequests);\n+            int64_t now = GetTimeMillis();\n+            std::set<NodeId> nodesToFlush;\n+            /// Process work queue entries that are timestamped either now or before now\n+            while (!invRequestsWorkQueue.empty() && invRequestsWorkQueue.begin()->first <= now)\n+            {\n+                const CInv &inv = invRequestsWorkQueue.begin()->second;\n+                MapInvRequests::iterator it = mapInvRequests.find(inv);\n+                LogPrint(\"netaskfor\", \"%s: processing item %s\\n\", __func__, inv.ToString());\n+                if (it != mapInvRequests.end())\n+                {\n+                    CInvState &invstate = it->second;\n+                    invstate.workQueueIter = invRequestsWorkQueue.end();\n+                    /// Pick a node to request from, if available",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17207618",
+      "id" : 17207618,
+      "original_commit_id" : "a2afa1d17bc99a26aa5dbc646ba300fd6cc694b7",
+      "original_position" : 221,
+      "path" : "src/netaskfor.cpp",
+      "position" : 220,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-18T10:23:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17207618",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=3",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "body" : "Looks like the timeout could indeed be reduced.\r\n```\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=7543\r\n2014-09-09 15:15:27 ThreadHandleAskFor: processing item tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698\r\n2014-09-09 15:15:27 QueueGetdata: Requesting item tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698 from node 7543 (first request)\r\n2014-09-09 15:15:27 FlushGetdata: peer=7543 getdata tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698 \r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=6150\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=633\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=7455\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=7018\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=330\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=7471\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=6306\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=978\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=7436\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=7596\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=7504\r\n2014-09-09 15:15:27 askfor tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698  peer=6215\r\n2014-09-09 15:15:27 Completed: tx b87fabfb19b9401f20c9bb9330db0916c4781a2d06efc914556776ae6715a698 peer=7543\r\n```\r\nIn by-far most cases the transaction is returned in a few seconds. At the same time, invs for it are still coming in from other nodes.\r\n\r\n",
+      "created_at" : "2014-09-09T15:19:35Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-54985231",
+      "id" : 54985231,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-09T15:22:42Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/54985231",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17350180"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17350180"
+         }
+      },
+      "body" : "There is nothing in place at the moment to make sure that data items are requested in the same order that they're announced (`std::multimap` does not preserve insertion order). There probably needs to be.\r\n\r\nOTOH when requesting from multiple nodes (or when timeouts are involved) there is no guarantee that the response will come in the same order as the requests. So maybe it's not an issue.",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-10T09:07:50Z",
+      "diff_hunk" : "@@ -0,0 +1,361 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>\n+\n+#include \"net.h\"\n+#include \"util.h\"\n+\n+/**\n+ * Inventory item request management.\n+ *\n+ * Maintains state separate from CNode.\n+ * There is a two-way mapping between CNodeAskForState and mapInvRequests.\n+ */\n+namespace {\n+\n+/** Node specific state for netaskfor module */\n+class CNodeAskForState\n+{\n+public:\n+    CNodeAskForState(): node(0) {}\n+\n+    /** Set of inv items that are being requested from this node */\n+    std::set<CInv> setAskFor;\n+\n+    /** Group up to 1000 outgoing requests per node */\n+    std::vector<CInv> outgoingRequests;\n+\n+    /** Network connection associated with this node */\n+    CNode *node; /// TODO ugly but needed for sending getdata\n+};\n+\n+typedef std::multimap<int64_t, CInv> InvRequestsWorkQueue;\n+\n+/** State of one inventory item request.\n+ * @note in this structure we store NodeIds instead of CNodeAskForState*, as this\n+ * would double memory usage on 64-bit (on the other hand, that would reduce the number of map\n+ * lookups needed...)\n+ */\n+class CInvState\n+{\n+public:\n+    typedef std::set<NodeId> NodeSet;\n+    /** IDs of nodes that have this item */\n+    NodeSet nodes;\n+    /** IDs of nodes that we have not tried requesting this inv from already */\n+    NodeSet notRequestedFrom;\n+    /** Current node that this is being requested from */\n+    NodeId beingRequestedFrom;\n+    /** Must correspond to current entry in work queue for this\n+     *  inventory item (or invRequestsWorkQueue.end())\n+     */\n+    InvRequestsWorkQueue::iterator workQueueIter;\n+};\n+typedef std::map<CInv, CInvState> MapInvRequests;\n+\n+/** Local data, all protected by cs_invRequests */\n+CCriticalSection cs_invRequests;\n+/** Map node id to local state */\n+std::map<NodeId, CNodeAskForState> mapNodeAskForState;\n+/** Map inv to current request state */\n+MapInvRequests mapInvRequests;\n+/** The work queue keeps track of when is the next time a request needs\n+ * to be revisited.\n+ * @invariant Each request has at most one entry.\n+ * @note Theoretically this could be a deque instead of a map, as we only add to\n+ * the end (assuming monotonic time) and to the beginning (first tries have\n+ * t=0), and remove from the beginning. However std::deque invalidates\n+ * iterators so we cannot keep around an iterator to remove the work queue item\n+ * on cancel.\n+ */\n+InvRequestsWorkQueue invRequestsWorkQueue;\n+CTimeoutCondition condInvRequests;\n+/** Exit thread flag */\n+bool fStopThread;\n+\n+/** Get local state for a node id.\n+ * @note Requires that cs_invRequests is held\n+ */\n+CNodeAskForState *State(NodeId pnode)\n+{\n+    std::map<NodeId, CNodeAskForState>::iterator it = mapNodeAskForState.find(pnode);\n+    if (it == mapNodeAskForState.end())\n+        return NULL;\n+    return &it->second;\n+}\n+\n+/** Handler for when a new node appears */\n+void InitializeNode(NodeId nodeid, const CNode *pnode)\n+{\n+    LOCK(cs_invRequests);\n+    /*CNodeAskForState &state = */\n+    mapNodeAskForState.insert(std::make_pair(nodeid, CNodeAskForState())).first->second;\n+}\n+\n+/** Handler to clean up when a node goes away */\n+void FinalizeNode(NodeId nodeid)\n+{\n+    LOCK(cs_invRequests);\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    /// Clean up any requests that were underway to the node,\n+    /// or refer to the node.\n+    BOOST_FOREACH(const CInv &inv, state->setAskFor)\n+    {\n+        MapInvRequests::iterator i = mapInvRequests.find(inv);\n+        if (i != mapInvRequests.end())\n+        {\n+            i->second.nodes.erase(nodeid);\n+            i->second.notRequestedFrom.erase(nodeid);\n+\n+            if (i->second.beingRequestedFrom == nodeid)\n+            {\n+                LogPrint(\"netaskfor\", \"%s: Inv item %s was being requested from destructing node %i\\n\",\n+                        __func__,\n+                        inv.ToString(), nodeid);\n+                i->second.beingRequestedFrom = 0;\n+                /// Make sure the old workqueue item for the inv is removed,\n+                /// to avoid spurious retries\n+                if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+                    invRequestsWorkQueue.erase(i->second.workQueueIter);\n+                /// Re-trigger request logic\n+                i->second.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(0, inv));\n+                condInvRequests.notify_one();\n+            }\n+        }\n+    }\n+    mapNodeAskForState.erase(nodeid);\n+}\n+\n+/** Forget a certain inventory item request\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void Forget(MapInvRequests::iterator i)\n+{\n+    /// Remove reference to this inventory item request from nodes\n+    BOOST_FOREACH(NodeId nodeid, i->second.nodes)\n+    {\n+        CNodeAskForState *state = State(nodeid);\n+        assert(state);\n+        state->setAskFor.erase(i->first);\n+    }\n+    /// Remove from workqueue\n+    if (i->second.workQueueIter != invRequestsWorkQueue.end())\n+        invRequestsWorkQueue.erase(i->second.workQueueIter);\n+    /// Remove from map\n+    mapInvRequests.erase(i);\n+}\n+\n+/** Flushes queued getdatas to a node by id.\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void FlushGetdata(NodeId nodeid)\n+{\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state && state->node);\n+    CNode *node = state->node;\n+\n+    /// Don't send empty getdatas, ever\n+    if (state->outgoingRequests.empty())\n+        return;\n+\n+    std::stringstream debug;\n+    BOOST_FOREACH(const CInv &inv, state->outgoingRequests)\n+        debug << inv.ToString() << \" \";\n+    LogPrint(\"netaskfor\", \"%s: peer=%i getdata %s\\n\", __func__, nodeid, debug.str());\n+\n+    node->PushMessage(\"getdata\", state->outgoingRequests);\n+    state->outgoingRequests.clear();\n+}\n+\n+/** Queues a getdata to a node by id\n+ * @note requires that cs_invRequests lock is held.\n+ */\n+void QueueGetdata(NodeId nodeid, const CInv &inv, bool isRetry)\n+{\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+\n+    LogPrint(\"netaskfor\", \"%s: Requesting item %s from node %i (%s)\\n\", __func__,\n+            inv.ToString(), nodeid,\n+            isRetry ? \"retry\" : \"first request\");\n+\n+    state->outgoingRequests.push_back(inv);\n+\n+    /// Make sure a getdata request doesn't contain more than 1000 entries\n+    /// Flush prematurely if this is going to be the case.\n+    if(state->outgoingRequests.size() >= 1000)\n+        FlushGetdata(nodeid);\n+}\n+\n+void ThreadHandleAskFor()\n+{\n+    while (!fStopThread)\n+    {\n+        LogPrint(\"netaskfor\", \"%s: iteration\\n\", __func__);\n+        int64_t timeToNext = std::numeric_limits<int64_t>::max();\n+\n+        {\n+            LOCK(cs_invRequests);\n+            int64_t now = GetTimeMillis();\n+            std::set<NodeId> nodesToFlush;\n+            /// Process work queue entries that are timestamped either now or before now\n+            while (!invRequestsWorkQueue.empty() && invRequestsWorkQueue.begin()->first <= now)\n+            {\n+                const CInv &inv = invRequestsWorkQueue.begin()->second;\n+                MapInvRequests::iterator it = mapInvRequests.find(inv);\n+                LogPrint(\"netaskfor\", \"%s: processing item %s\\n\", __func__, inv.ToString());\n+                if (it != mapInvRequests.end())\n+                {\n+                    CInvState &invstate = it->second;\n+                    invstate.workQueueIter = invRequestsWorkQueue.end();\n+                    /// Pick a node to request from, if available\n+                    ///\n+                    /// Currently this picks the node with the lowest node id\n+                    /// (notRequestedFrom is an ordered set) that offers the item\n+                    /// that we haven't tried yet. This is usually the\n+                    /// longest-connected node that we know to have the data.\n+                    if (invstate.notRequestedFrom.empty())\n+                    {\n+                        LogPrint(\"netaskfor\", \"%s: No more nodes to request item %s from, discarding request\\n\", __func__, inv.ToString());\n+                        Forget(it);\n+                    } else {\n+                        CInvState::NodeSet::iterator first = invstate.notRequestedFrom.begin();\n+                        NodeId nodeid = *first;\n+                        invstate.notRequestedFrom.erase(first);\n+                        invstate.beingRequestedFrom = nodeid;\n+\n+                        QueueGetdata(nodeid, inv, invRequestsWorkQueue.begin()->first != 0);\n+                        nodesToFlush.insert(nodeid);\n+\n+                        /// Need to revisit this request after timeout\n+                        invstate.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(now + NetAskFor::REQUEST_TIMEOUT, inv));\n+                    }\n+                } else {\n+                    LogPrint(\"netaskfor\", \"%s: request for item %s is missing!\\n\", __func__, inv.ToString());\n+                }\n+                invRequestsWorkQueue.erase(invRequestsWorkQueue.begin());\n+            }\n+\n+            /// Send remaining outgoing requests to nodes\n+            /// Not doing this after every iteration could save a few bytes at the\n+            /// expense of delaying getdatas for longer (would need to be taken into\n+            /// account in the timeout logic!).\n+            BOOST_FOREACH(NodeId nodeid, nodesToFlush)\n+                FlushGetdata(nodeid);\n+\n+            /// Compute time to next event\n+            if (!invRequestsWorkQueue.empty())\n+                timeToNext = invRequestsWorkQueue.begin()->first - GetTimeMillis();\n+        }\n+\n+\n+        /// If we don't know how long until next work item, wait until woken up\n+        if (timeToNext == std::numeric_limits<int64_t>::max())\n+        {\n+            LogPrint(\"netaskfor\", \"%s: blocking\\n\", __func__);\n+            condInvRequests.wait();\n+        } else if (timeToNext > 0)\n+        {\n+            LogPrint(\"netaskfor\", \"%s: waiting for %d ms\\n\", __func__, timeToNext);\n+            condInvRequests.timed_wait(timeToNext);\n+        }\n+    }\n+}\n+\n+void StartThreads(boost::thread_group& threadGroup)\n+{\n+    fStopThread = false;\n+    /// Inventory management thread\n+    threadGroup.create_thread(boost::bind(&TraceThread<void (*)()>, \"askfor\", &ThreadHandleAskFor));\n+}\n+\n+void StopThreads()\n+{\n+    fStopThread = true;\n+    condInvRequests.notify_one();\n+}\n+\n+}\n+\n+namespace NetAskFor\n+{\n+\n+void Completed(CNode *node, const CInv& inv)\n+{\n+    /// As soon as this is possible this should be subscribed to the 'tx' P2P\n+    /// message directly, instead of rely on being called from main.\n+    LOCK(cs_invRequests);\n+    MapInvRequests::iterator i = mapInvRequests.find(inv);\n+    if (i != mapInvRequests.end())\n+    {\n+        LogPrint(\"netaskfor\", \"%s: %s peer=%i\\n\", __func__, inv.ToString(), node->GetId());\n+        Forget(i);\n+    } else {\n+        /// This can happen if a node sends a transaction without unannouncing it with 'inv'\n+        /// first, or then we retry a request, which completes (and thus forget about), and then\n+        /// the original node comes back and sends our requested data anyway.\n+        LogPrint(\"netaskfor\", \"%s: %s not found! peer=%i\\n\", __func__, inv.ToString(), node->GetId());\n+    }\n+}\n+\n+void AskFor(CNode *node, const CInv& inv)\n+{\n+    LOCK(cs_invRequests);\n+    NodeId nodeid = node->GetId();\n+    CNodeAskForState *state = State(nodeid);\n+    assert(state);\n+    state->node = node;\n+\n+    /// Bound number of concurrent inventory requests to each node, this has\n+    /// the indirect effect of bounding all data structures.\n+    if (state->setAskFor.size() > MAX_SETASKFOR_SZ)\n+        return;\n+\n+    LogPrint(\"netaskfor\", \"askfor %s  peer=%d\\n\", inv.ToString(), nodeid);\n+\n+    MapInvRequests::iterator it = mapInvRequests.find(inv);\n+    if (it == mapInvRequests.end())\n+    {\n+        std::pair<MapInvRequests::iterator, bool> ins = mapInvRequests.insert(std::make_pair(inv, CInvState()));\n+        it = ins.first;\n+        /// As this is the first time that this item gets announced by anyone, add it to the work queue immediately\n+        it->second.workQueueIter = invRequestsWorkQueue.insert(std::make_pair(0, inv));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r17350180",
+      "id" : 17350180,
+      "original_commit_id" : "a2afa1d17bc99a26aa5dbc646ba300fd6cc694b7",
+      "original_position" : 332,
+      "path" : "src/netaskfor.cpp",
+      "position" : 331,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-18T10:23:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/17350180",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "body" : "Automatic sanity-testing: PASSED, see http://jenkins.bluematt.me/pull-tester/p4831_9cbaaf61ade4b91469f3d728795ec83859c25192/ for binaries and test log.\nThis test script verifies pulls every time they are updated. It, however, dies sometimes and fails to test properly.  If you are waiting on a test, please check timestamps to verify that the test.log is moving at http://jenkins.bluematt.me/pull-tester/current/\nContact BlueMatt on freenode if something looks broken.",
+      "created_at" : "2014-09-18T10:37:30Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-56021882",
+      "id" : 56021882,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-18T10:37:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/56021882",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/2110907?v=3",
+         "events_url" : "https://api.github.com/users/BitcoinPullTester/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/BitcoinPullTester/followers",
+         "following_url" : "https://api.github.com/users/BitcoinPullTester/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/BitcoinPullTester/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/BitcoinPullTester",
+         "id" : 2110907,
+         "login" : "BitcoinPullTester",
+         "organizations_url" : "https://api.github.com/users/BitcoinPullTester/orgs",
+         "received_events_url" : "https://api.github.com/users/BitcoinPullTester/received_events",
+         "repos_url" : "https://api.github.com/users/BitcoinPullTester/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/BitcoinPullTester/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/BitcoinPullTester/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/BitcoinPullTester"
+      }
+   },
+   {
+      "body" : "Going to test this.",
+      "created_at" : "2014-09-20T02:20:46Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-56254334",
+      "id" : 56254334,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-20T02:20:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/56254334",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=3",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "body" : "Works without problems (even in valgrind, after running for a few days). I didn't actually check whether it fetches/relays things correctly, though.",
+      "created_at" : "2014-09-29T03:52:46Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-57114497",
+      "id" : 57114497,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-29T03:52:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/57114497",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=3",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r18142682"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/18142682"
+         }
+      },
+      "body" : "Nit: This should go below our headers, so just flip this with the block below.",
+      "commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "created_at" : "2014-09-29T08:43:35Z",
+      "diff_hunk" : "@@ -0,0 +1,360 @@\n+// Copyright (c) 2009-2014 The Bitcoin developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include \"config/bitcoin-config.h\"\n+#endif\n+\n+#include \"netaskfor.h\"\n+\n+#include <boost/thread.hpp>",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#discussion_r18142682",
+      "id" : 18142682,
+      "original_commit_id" : "9cbaaf61ade4b91469f3d728795ec83859c25192",
+      "original_position" : 11,
+      "path" : "src/netaskfor.cpp",
+      "position" : 11,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/4831",
+      "updated_at" : "2014-09-29T08:43:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/18142682",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1419649?v=3",
+         "events_url" : "https://api.github.com/users/Diapolo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Diapolo/followers",
+         "following_url" : "https://api.github.com/users/Diapolo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Diapolo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Diapolo",
+         "id" : 1419649,
+         "login" : "Diapolo",
+         "organizations_url" : "https://api.github.com/users/Diapolo/orgs",
+         "received_events_url" : "https://api.github.com/users/Diapolo/received_events",
+         "repos_url" : "https://api.github.com/users/Diapolo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Diapolo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Diapolo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Diapolo"
+      }
+   },
+   {
+      "body" : "Just a general question, why are most/all comments beginning with ``///``?",
+      "created_at" : "2014-09-29T08:46:46Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-57132199",
+      "id" : 57132199,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-29T08:46:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/57132199",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1419649?v=3",
+         "events_url" : "https://api.github.com/users/Diapolo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Diapolo/followers",
+         "following_url" : "https://api.github.com/users/Diapolo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Diapolo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Diapolo",
+         "id" : 1419649,
+         "login" : "Diapolo",
+         "organizations_url" : "https://api.github.com/users/Diapolo/orgs",
+         "received_events_url" : "https://api.github.com/users/Diapolo/received_events",
+         "repos_url" : "https://api.github.com/users/Diapolo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Diapolo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Diapolo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Diapolo"
+      }
+   },
+   {
+      "body" : "@Diapolo I'm pretty sure it's so that they'll be picked up by doxygen. It doesn't recognise comments starting with //",
+      "created_at" : "2014-09-29T08:58:23Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-57133431",
+      "id" : 57133431,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-09-29T08:58:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/57133431",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/863730?v=3",
+         "events_url" : "https://api.github.com/users/fanquake/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/fanquake/followers",
+         "following_url" : "https://api.github.com/users/fanquake/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/fanquake/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/fanquake",
+         "id" : 863730,
+         "login" : "fanquake",
+         "organizations_url" : "https://api.github.com/users/fanquake/orgs",
+         "received_events_url" : "https://api.github.com/users/fanquake/received_events",
+         "repos_url" : "https://api.github.com/users/fanquake/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/fanquake/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/fanquake/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/fanquake"
+      }
+   },
+   {
+      "body" : "I hope you pick this up soon after 0.10 :)",
+      "created_at" : "2014-11-17T16:27:29Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/4831#issuecomment-63331043",
+      "id" : 63331043,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/4831",
+      "updated_at" : "2014-11-17T16:27:29Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/63331043",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=3",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   }
+]
