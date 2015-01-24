@@ -17,4 +17,6 @@ GitHub.
 Issues are split into groups of 100 to avoid upsetting GitHub's web interface,
 which won't show >1000 files on a page.
 
-This export was produced by [ghrip](/zw/ghrip), a work-in-progress.
+This export was produced by [ghrip] [], a work-in-progress.
+
+ [ghrip]: https://github.com/zw/ghrip
