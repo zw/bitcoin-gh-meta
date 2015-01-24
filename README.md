@@ -19,10 +19,12 @@ A few issues (about 10 in the first ~6000) are missing from the API, and
 therefore here too, presumably because they were autodetected as spam by
 GitHub.
 
-Issues are split into groups of 100 to avoid upsetting GitHub's web interface,
+While the point is mostly to survive GitHub downtime/removal, laanwj suggested
+folks may use this while GitHub is up, to view comment edit history.  So,
+issues are split into groups of 100 to avoid upsetting GitHub's web interface,
 which won't show >1000 files on a page.
 
-This export was produced by [ghrip] [], a work-in-progress.
+This export is produced/updated by [ghrip] [], a hack-in-progress.
 
  [issue]: https://developer.github.com/v3/issues/#get-a-single-issue
  [pull]: https://developer.github.com/v3/pulls/#get-a-single-pull-request
