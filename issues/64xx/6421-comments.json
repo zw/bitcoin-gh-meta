@@ -2138,5 +2138,123 @@
          "type" : "User",
          "url" : "https://api.github.com/users/morcos"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6421#discussion_r34612750"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6421"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/34612750"
+         }
+      },
+      "body" : "Agree with @morcos -- I'm running various tests of this code, and I think a significant number of transactions are being rejected because of this issue with large transaction packages preventing new transactions from being accepted, even if the new transactions have a large fee.\r\n\r\nI'll try to quantify this more precisely and carefully as I test further, but as an example, I ran an analysis of this code (modified with the fails >= 20 bugfix mentioned above) on July 7 with a 10MB mempool limit, and I think 32%  (roughly 7500 out of almost 23000) of the transactions rejected due to a full mempool were transactions with a feerate greater than twice the average feerate of the whole mempool.",
+      "commit_id" : "8dc3a5060473eb5f1955154325e8416aff455c40",
+      "created_at" : "2015-07-14T20:05:00Z",
+      "diff_hunk" : "@@ -429,5 +438,99 @@ bool CCoinsViewMemPool::HaveCoins(const uint256 &txid) const {\n \n size_t CTxMemPool::DynamicMemoryUsage() const {\n     LOCK(cs);\n-    return memusage::DynamicUsage(mapTx) + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + cachedInnerUsage;\n+    // Estimate the overhead of mapTx to be 5 pointers + an allocation, as no exact formula for boost::multi_index_contained is implemented.\n+    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 5 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + cachedInnerUsage;\n+}\n+\n+size_t CTxMemPool::GuessDynamicMemoryUsage(const CTxMemPoolEntry& entry) const {\n+    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 5 * sizeof(void*)) + entry.DynamicMemoryUsage() + memusage::IncrementalDynamicUsage(mapNextTx) * entry.GetTx().vin.size();\n+}\n+\n+bool CTxMemPool::StageTrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd, std::set<uint256>& stage, CAmount& nFeesRemoved) {\n+    size_t nSizeRemoved = 0;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin) {\n+        protect.insert(in.prevout.hash);\n+    }\n+\n+    size_t expsize = DynamicMemoryUsage() + GuessDynamicMemoryUsage(toadd); // Track the expected resulting memory usage of the mempool.\n+    indexed_transaction_set::nth_index<1>::type::reverse_iterator it = mapTx.get<1>().rbegin();\n+    int fails = 0; // Number of mempool transactions iterated over that were not included in the stage.\n+    // Iterate from lowest feerate to highest feerate in the mempool:\n+    while (expsize > sizelimit && it != mapTx.get<1>().rend()) {\n+        const uint256& hash = it->GetTx().GetHash();\n+        if (stage.count(hash)) {\n+            // If the transaction is already staged for deletion, we know its descendants are already processed, so skip it.\n+            it++;\n+            continue;\n+        }\n+        if (CompareTxMemPoolEntryByFeeRate()(*it, toadd)) {\n+            // If the transaction's feerate is worse than what we're looking for, we have processed everything in the mempool\n+            // that could improve the staged set. If we don't have an acceptable solution by now, bail out.\n+            return false;\n+        }\n+        std::deque<uint256> todo; // List of hashes that we still need to process (descendants of 'hash').\n+        std::set<uint256> now; // Set of hashes that will need to be added to stage if 'hash' is included.\n+        CAmount nowfee = 0; // Sum of the fees in 'now'.\n+        size_t nowsize = 0; // Sum of the tx sizes in 'now'.\n+        size_t nowusage = 0; // Sum of the memory usages of transactions in 'now'.\n+        int iternow = 0; // Transactions we've inspected so far while determining whether 'hash' is acceptable.\n+        todo.push_back(it->GetTx().GetHash()); // Add 'hash' to the todo list, to initiate processing its children.\n+        bool good = true; // Whether including 'hash' (and all its descendants) is a good idea.\n+        // Iterate breadth-first over all descendants of transaction with hash 'hash'.\n+        while (!todo.empty()) {\n+            uint256 hashnow = todo.front();\n+            if (protect.count(hashnow)) {\n+                // If this transaction is in the protected set, we're done with 'hash'.\n+                good = false;\n+                break;\n+            }\n+            iternow++; // We only count transactions we actually had to go find in the mempool.\n+            const CTxMemPoolEntry* origTx = &*mapTx.find(hashnow);\n+            nowfee += origTx->GetFee();\n+            if (nFeesRemoved + nowfee > toadd.GetFee()) {\n+                // If this pushes up to the total fees deleted too high, we're done with 'hash'.\n+                good = false;\n+                break;\n+            }\n+            todo.pop_front();\n+            // Add 'hashnow' to the 'now' set, and update its statistics.\n+            now.insert(hashnow);\n+            nowusage += GuessDynamicMemoryUsage(*origTx);\n+            nowsize += origTx->GetTxSize();\n+            // Find dependencies of 'hashnow' and them to todo.\n+            std::map<COutPoint, CInPoint>::iterator iter = mapNextTx.lower_bound(COutPoint(hashnow, 0));\n+            while (iter != mapNextTx.end() && iter->first.hash == hashnow) {\n+                const uint256& nexthash = iter->second.ptx->GetHash();\n+                if (!(stage.count(nexthash) || now.count(nexthash))) {\n+                    todo.push_back(nexthash);\n+                }\n+                iter++;\n+            }\n+        }\n+        if (good && (double)nowfee * toadd.GetTxSize() > (double)toadd.GetFee() * nowsize) {\n+            // The new transaction's feerate is below that of the set we're removing.\n+            good = false;\n+        }\n+        if (good) {\n+            stage.insert(now.begin(), now.end());\n+            nFeesRemoved += nowfee;\n+            nSizeRemoved += nowsize;\n+            expsize -= nowusage;\n+        } else {\n+            fails += iternow;\n+            if (fails == 20) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6421#discussion_r34612750",
+      "id" : 34612750,
+      "original_commit_id" : "8dc3a5060473eb5f1955154325e8416aff455c40",
+      "original_position" : 248,
+      "path" : "src/txmempool.cpp",
+      "position" : 248,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6421",
+      "updated_at" : "2015-07-14T20:05:00Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/34612750",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
+         "events_url" : "https://api.github.com/users/sdaftuar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sdaftuar/followers",
+         "following_url" : "https://api.github.com/users/sdaftuar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sdaftuar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sdaftuar",
+         "id" : 7463573,
+         "login" : "sdaftuar",
+         "organizations_url" : "https://api.github.com/users/sdaftuar/orgs",
+         "received_events_url" : "https://api.github.com/users/sdaftuar/received_events",
+         "repos_url" : "https://api.github.com/users/sdaftuar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sdaftuar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sdaftuar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sdaftuar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6421#discussion_r34612918"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6421"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/34612918"
+         }
+      },
+      "body" : "I'm testing a change in the code that skips entries randomly, to sample a\nlarger subset of transactions for replacement in the long term.\n",
+      "commit_id" : "8dc3a5060473eb5f1955154325e8416aff455c40",
+      "created_at" : "2015-07-14T20:06:35Z",
+      "diff_hunk" : "@@ -429,5 +438,99 @@ bool CCoinsViewMemPool::HaveCoins(const uint256 &txid) const {\n \n size_t CTxMemPool::DynamicMemoryUsage() const {\n     LOCK(cs);\n-    return memusage::DynamicUsage(mapTx) + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + cachedInnerUsage;\n+    // Estimate the overhead of mapTx to be 5 pointers + an allocation, as no exact formula for boost::multi_index_contained is implemented.\n+    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 5 * sizeof(void*)) * mapTx.size() + memusage::DynamicUsage(mapNextTx) + memusage::DynamicUsage(mapDeltas) + cachedInnerUsage;\n+}\n+\n+size_t CTxMemPool::GuessDynamicMemoryUsage(const CTxMemPoolEntry& entry) const {\n+    return memusage::MallocUsage(sizeof(CTxMemPoolEntry) + 5 * sizeof(void*)) + entry.DynamicMemoryUsage() + memusage::IncrementalDynamicUsage(mapNextTx) * entry.GetTx().vin.size();\n+}\n+\n+bool CTxMemPool::StageTrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd, std::set<uint256>& stage, CAmount& nFeesRemoved) {\n+    size_t nSizeRemoved = 0;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin) {\n+        protect.insert(in.prevout.hash);\n+    }\n+\n+    size_t expsize = DynamicMemoryUsage() + GuessDynamicMemoryUsage(toadd); // Track the expected resulting memory usage of the mempool.\n+    indexed_transaction_set::nth_index<1>::type::reverse_iterator it = mapTx.get<1>().rbegin();\n+    int fails = 0; // Number of mempool transactions iterated over that were not included in the stage.\n+    // Iterate from lowest feerate to highest feerate in the mempool:\n+    while (expsize > sizelimit && it != mapTx.get<1>().rend()) {\n+        const uint256& hash = it->GetTx().GetHash();\n+        if (stage.count(hash)) {\n+            // If the transaction is already staged for deletion, we know its descendants are already processed, so skip it.\n+            it++;\n+            continue;\n+        }\n+        if (CompareTxMemPoolEntryByFeeRate()(*it, toadd)) {\n+            // If the transaction's feerate is worse than what we're looking for, we have processed everything in the mempool\n+            // that could improve the staged set. If we don't have an acceptable solution by now, bail out.\n+            return false;\n+        }\n+        std::deque<uint256> todo; // List of hashes that we still need to process (descendants of 'hash').\n+        std::set<uint256> now; // Set of hashes that will need to be added to stage if 'hash' is included.\n+        CAmount nowfee = 0; // Sum of the fees in 'now'.\n+        size_t nowsize = 0; // Sum of the tx sizes in 'now'.\n+        size_t nowusage = 0; // Sum of the memory usages of transactions in 'now'.\n+        int iternow = 0; // Transactions we've inspected so far while determining whether 'hash' is acceptable.\n+        todo.push_back(it->GetTx().GetHash()); // Add 'hash' to the todo list, to initiate processing its children.\n+        bool good = true; // Whether including 'hash' (and all its descendants) is a good idea.\n+        // Iterate breadth-first over all descendants of transaction with hash 'hash'.\n+        while (!todo.empty()) {\n+            uint256 hashnow = todo.front();\n+            if (protect.count(hashnow)) {\n+                // If this transaction is in the protected set, we're done with 'hash'.\n+                good = false;\n+                break;\n+            }\n+            iternow++; // We only count transactions we actually had to go find in the mempool.\n+            const CTxMemPoolEntry* origTx = &*mapTx.find(hashnow);\n+            nowfee += origTx->GetFee();\n+            if (nFeesRemoved + nowfee > toadd.GetFee()) {\n+                // If this pushes up to the total fees deleted too high, we're done with 'hash'.\n+                good = false;\n+                break;\n+            }\n+            todo.pop_front();\n+            // Add 'hashnow' to the 'now' set, and update its statistics.\n+            now.insert(hashnow);\n+            nowusage += GuessDynamicMemoryUsage(*origTx);\n+            nowsize += origTx->GetTxSize();\n+            // Find dependencies of 'hashnow' and them to todo.\n+            std::map<COutPoint, CInPoint>::iterator iter = mapNextTx.lower_bound(COutPoint(hashnow, 0));\n+            while (iter != mapNextTx.end() && iter->first.hash == hashnow) {\n+                const uint256& nexthash = iter->second.ptx->GetHash();\n+                if (!(stage.count(nexthash) || now.count(nexthash))) {\n+                    todo.push_back(nexthash);\n+                }\n+                iter++;\n+            }\n+        }\n+        if (good && (double)nowfee * toadd.GetTxSize() > (double)toadd.GetFee() * nowsize) {\n+            // The new transaction's feerate is below that of the set we're removing.\n+            good = false;\n+        }\n+        if (good) {\n+            stage.insert(now.begin(), now.end());\n+            nFeesRemoved += nowfee;\n+            nSizeRemoved += nowsize;\n+            expsize -= nowusage;\n+        } else {\n+            fails += iternow;\n+            if (fails == 20) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6421#discussion_r34612918",
+      "id" : 34612918,
+      "original_commit_id" : "8dc3a5060473eb5f1955154325e8416aff455c40",
+      "original_position" : 248,
+      "path" : "src/txmempool.cpp",
+      "position" : 248,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6421",
+      "updated_at" : "2015-07-14T20:06:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/34612918",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=3",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "body" : "What about https://github.com/sipa/bitcoin/commit/44d29ff871c409670e7b09cb030886d7719680f6 and https://github.com/sipa/bitcoin/commit/2604e37866d289cad862c9e956a62509e3417427",
+      "created_at" : "2015-07-14T21:05:48Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6421#issuecomment-121386738",
+      "id" : 121386738,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/6421",
+      "updated_at" : "2015-07-14T21:05:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/121386738",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1008458?v=3",
+         "events_url" : "https://api.github.com/users/jtimon/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jtimon/followers",
+         "following_url" : "https://api.github.com/users/jtimon/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jtimon/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jtimon",
+         "id" : 1008458,
+         "login" : "jtimon",
+         "organizations_url" : "https://api.github.com/users/jtimon/orgs",
+         "received_events_url" : "https://api.github.com/users/jtimon/received_events",
+         "repos_url" : "https://api.github.com/users/jtimon/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jtimon/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jtimon/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jtimon"
+      }
    }
 ]
