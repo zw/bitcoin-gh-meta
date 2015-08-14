@@ -208,7 +208,7 @@
          }
       },
       "body" : "Deleting CNodes happens in the \"Delete disconnected nodes\" loop, which first makes sure that no one is using the node anymore. Adding a `delete pnode` here seems like a danger for race conditions?\r\n",
-      "commit_id" : "3b60778e185606fb8340809bcfaad154d58a5ea4",
+      "commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
       "created_at" : "2015-08-03T16:36:31Z",
       "diff_hunk" : "@@ -943,35 +981,95 @@ void ThreadSocketHandler()\n                             nInbound++;\n                 }\n \n+                CNode* pnode = new CNode(hSocket, addr, \"\", true);\n+                pnode->AddRef();\n+                pnode->fWhitelisted = whitelisted;\n+\n                 if (hSocket == INVALID_SOCKET)\n                 {\n                     int nErr = WSAGetLastError();\n                     if (nErr != WSAEWOULDBLOCK)\n                         LogPrintf(\"socket error accept failed: %s\\n\", NetworkErrorString(nErr));\n                 }\n-                else if (nInbound >= nMaxInbound)\n+                else if (CNode::IsBanned(addr) && !whitelisted)\n                 {\n-                    LogPrint(\"net\", \"connection from %s dropped (full)\\n\", addr.ToString());\n-                    CloseSocket(hSocket);\n+                    LogPrintf(\"connection from %s dropped (banned)\\n\", addr.ToString());\n+                    pnode->fDisconnect = true;\n                 }\n-                else if (!whitelisted && (nInbound >= (nMaxInbound - nWhiteConnections)))\n+                else if (nInbound >= nMaxConnections - MAX_OUTBOUND_CONNECTIONS)\n                 {\n-                    LogPrint(\"net\", \"connection from %s dropped (non-whitelisted)\\n\", addr.ToString());\n-                    CloseSocket(hSocket);\n+                    LogPrint(\"net\", \"over connection limit\\n\");\n+                    static std::vector<unsigned char> vSecretKey;\n+\n+                    if (vSecretKey.empty()) {\n+                        vSecretKey.resize(32, 0);\n+                        GetRandBytes(vSecretKey.data(), vSecretKey.size());\n+                    }\n+\n+                    {\n+                        LOCK(cs_vNodes);\n+                        std::vector<CNode*> vEvictionCandidates;\n+\n+                        BOOST_FOREACH(CNode *node, vNodes) {\n+                            if (node->fWhitelisted)\n+                                continue;\n+                            if (!node->fInbound)\n+                                continue;\n+                            if (node->fDisconnect)\n+                                continue;\n+                            if (node->addr.IsLocal())\n+                                continue;\n+                            vEvictionCandidates.push_back(node);\n+                        }\n+\n+                        // Protect connections with certain characteristics\n+\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(64, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        CompareNetGroupKeyed comparerNetGroupKeyed(vSecretKey);\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), comparerNetGroupKeyed);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(4, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeMinPingTime);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(8, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        if (!vEvictionCandidates.empty()) {\n+                            // Identify CNetAddr with the most connections\n+                            CNetAddr naMostConnections;\n+                            unsigned int nMostConnections = 0;\n+                            std::map<CNetAddr, std::vector<CNode*> > mapAddrCounts;\n+                            BOOST_FOREACH(CNode *node, vEvictionCandidates) {\n+                                mapAddrCounts[node->addr].push_back(node);\n+\n+                                if (mapAddrCounts[node->addr].size() > nMostConnections) {\n+                                    nMostConnections = mapAddrCounts[node->addr].size();\n+                                    naMostConnections = node->addr;\n+                                }\n+                            }\n+\n+                            vEvictionCandidates = mapAddrCounts[naMostConnections];\n+\n+                            // Disconnect the most recent connection from the CNetAddr with the most connections\n+                            std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+                            vEvictionCandidates[0]->fDisconnect = true;\n+\n+                            nInbound--;\n+                        }\n+                    }\n+\n+                    if (nInbound >= nMaxConnections - MAX_OUTBOUND_CONNECTIONS) {\n+                        LogPrint(\"net\", \"no peers to evict, disconnecting new client\\n\");\n+                        pnode->fDisconnect = true;\n+                    }\n                 }\n-                else if (CNode::IsBanned(addr) && !whitelisted)\n-                {\n-                    LogPrintf(\"connection from %s dropped (banned)\\n\", addr.ToString());\n+\n+                if (pnode->fDisconnect) {\n                     CloseSocket(hSocket);\n+                    delete pnode;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r36103572",
@@ -216,9 +216,9 @@
       "original_commit_id" : "5f33e1ec5d735eac9fb881cb02b7833cbd3b9f12",
       "original_position" : 143,
       "path" : "src/net.cpp",
-      "position" : 157,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374",
-      "updated_at" : "2015-08-06T10:39:13Z",
+      "updated_at" : "2015-08-14T00:34:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/36103572",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
@@ -253,7 +253,7 @@
          }
       },
       "body" : "This is deleting the CNode which was created at 984 and which was not added to vNodes.\r\n\r\nNot deleting it here would be a memory leak.",
-      "commit_id" : "3b60778e185606fb8340809bcfaad154d58a5ea4",
+      "commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
       "created_at" : "2015-08-03T21:52:16Z",
       "diff_hunk" : "@@ -943,35 +981,95 @@ void ThreadSocketHandler()\n                             nInbound++;\n                 }\n \n+                CNode* pnode = new CNode(hSocket, addr, \"\", true);\n+                pnode->AddRef();\n+                pnode->fWhitelisted = whitelisted;\n+\n                 if (hSocket == INVALID_SOCKET)\n                 {\n                     int nErr = WSAGetLastError();\n                     if (nErr != WSAEWOULDBLOCK)\n                         LogPrintf(\"socket error accept failed: %s\\n\", NetworkErrorString(nErr));\n                 }\n-                else if (nInbound >= nMaxInbound)\n+                else if (CNode::IsBanned(addr) && !whitelisted)\n                 {\n-                    LogPrint(\"net\", \"connection from %s dropped (full)\\n\", addr.ToString());\n-                    CloseSocket(hSocket);\n+                    LogPrintf(\"connection from %s dropped (banned)\\n\", addr.ToString());\n+                    pnode->fDisconnect = true;\n                 }\n-                else if (!whitelisted && (nInbound >= (nMaxInbound - nWhiteConnections)))\n+                else if (nInbound >= nMaxConnections - MAX_OUTBOUND_CONNECTIONS)\n                 {\n-                    LogPrint(\"net\", \"connection from %s dropped (non-whitelisted)\\n\", addr.ToString());\n-                    CloseSocket(hSocket);\n+                    LogPrint(\"net\", \"over connection limit\\n\");\n+                    static std::vector<unsigned char> vSecretKey;\n+\n+                    if (vSecretKey.empty()) {\n+                        vSecretKey.resize(32, 0);\n+                        GetRandBytes(vSecretKey.data(), vSecretKey.size());\n+                    }\n+\n+                    {\n+                        LOCK(cs_vNodes);\n+                        std::vector<CNode*> vEvictionCandidates;\n+\n+                        BOOST_FOREACH(CNode *node, vNodes) {\n+                            if (node->fWhitelisted)\n+                                continue;\n+                            if (!node->fInbound)\n+                                continue;\n+                            if (node->fDisconnect)\n+                                continue;\n+                            if (node->addr.IsLocal())\n+                                continue;\n+                            vEvictionCandidates.push_back(node);\n+                        }\n+\n+                        // Protect connections with certain characteristics\n+\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(64, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        CompareNetGroupKeyed comparerNetGroupKeyed(vSecretKey);\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), comparerNetGroupKeyed);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(4, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeMinPingTime);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(8, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        if (!vEvictionCandidates.empty()) {\n+                            // Identify CNetAddr with the most connections\n+                            CNetAddr naMostConnections;\n+                            unsigned int nMostConnections = 0;\n+                            std::map<CNetAddr, std::vector<CNode*> > mapAddrCounts;\n+                            BOOST_FOREACH(CNode *node, vEvictionCandidates) {\n+                                mapAddrCounts[node->addr].push_back(node);\n+\n+                                if (mapAddrCounts[node->addr].size() > nMostConnections) {\n+                                    nMostConnections = mapAddrCounts[node->addr].size();\n+                                    naMostConnections = node->addr;\n+                                }\n+                            }\n+\n+                            vEvictionCandidates = mapAddrCounts[naMostConnections];\n+\n+                            // Disconnect the most recent connection from the CNetAddr with the most connections\n+                            std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+                            vEvictionCandidates[0]->fDisconnect = true;\n+\n+                            nInbound--;\n+                        }\n+                    }\n+\n+                    if (nInbound >= nMaxConnections - MAX_OUTBOUND_CONNECTIONS) {\n+                        LogPrint(\"net\", \"no peers to evict, disconnecting new client\\n\");\n+                        pnode->fDisconnect = true;\n+                    }\n                 }\n-                else if (CNode::IsBanned(addr) && !whitelisted)\n-                {\n-                    LogPrintf(\"connection from %s dropped (banned)\\n\", addr.ToString());\n+\n+                if (pnode->fDisconnect) {\n                     CloseSocket(hSocket);\n+                    delete pnode;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r36136096",
@@ -261,9 +261,9 @@
       "original_commit_id" : "5f33e1ec5d735eac9fb881cb02b7833cbd3b9f12",
       "original_position" : 143,
       "path" : "src/net.cpp",
-      "position" : 157,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374",
-      "updated_at" : "2015-08-06T10:39:13Z",
+      "updated_at" : "2015-08-14T00:34:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/36136096",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/620611?v=3",
@@ -298,7 +298,7 @@
          }
       },
       "body" : "Bah.\r\nI wonder if we could use e.g. boost::scoped_ptr or auto_ptr to avoid this. It's too easy to get memory leaks with manual deallocation along a subset of code paths, especially when factoring in exceptions.\r\n",
-      "commit_id" : "3b60778e185606fb8340809bcfaad154d58a5ea4",
+      "commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
       "created_at" : "2015-08-07T07:09:16Z",
       "diff_hunk" : "@@ -943,35 +981,95 @@ void ThreadSocketHandler()\n                             nInbound++;\n                 }\n \n+                CNode* pnode = new CNode(hSocket, addr, \"\", true);\n+                pnode->AddRef();\n+                pnode->fWhitelisted = whitelisted;\n+\n                 if (hSocket == INVALID_SOCKET)\n                 {\n                     int nErr = WSAGetLastError();\n                     if (nErr != WSAEWOULDBLOCK)\n                         LogPrintf(\"socket error accept failed: %s\\n\", NetworkErrorString(nErr));\n                 }\n-                else if (nInbound >= nMaxInbound)\n+                else if (CNode::IsBanned(addr) && !whitelisted)\n                 {\n-                    LogPrint(\"net\", \"connection from %s dropped (full)\\n\", addr.ToString());\n-                    CloseSocket(hSocket);\n+                    LogPrintf(\"connection from %s dropped (banned)\\n\", addr.ToString());\n+                    pnode->fDisconnect = true;\n                 }\n-                else if (!whitelisted && (nInbound >= (nMaxInbound - nWhiteConnections)))\n+                else if (nInbound >= nMaxConnections - MAX_OUTBOUND_CONNECTIONS)\n                 {\n-                    LogPrint(\"net\", \"connection from %s dropped (non-whitelisted)\\n\", addr.ToString());\n-                    CloseSocket(hSocket);\n+                    LogPrint(\"net\", \"over connection limit\\n\");\n+                    static std::vector<unsigned char> vSecretKey;\n+\n+                    if (vSecretKey.empty()) {\n+                        vSecretKey.resize(32, 0);\n+                        GetRandBytes(vSecretKey.data(), vSecretKey.size());\n+                    }\n+\n+                    {\n+                        LOCK(cs_vNodes);\n+                        std::vector<CNode*> vEvictionCandidates;\n+\n+                        BOOST_FOREACH(CNode *node, vNodes) {\n+                            if (node->fWhitelisted)\n+                                continue;\n+                            if (!node->fInbound)\n+                                continue;\n+                            if (node->fDisconnect)\n+                                continue;\n+                            if (node->addr.IsLocal())\n+                                continue;\n+                            vEvictionCandidates.push_back(node);\n+                        }\n+\n+                        // Protect connections with certain characteristics\n+\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(64, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        CompareNetGroupKeyed comparerNetGroupKeyed(vSecretKey);\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), comparerNetGroupKeyed);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(4, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeMinPingTime);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(8, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        if (!vEvictionCandidates.empty()) {\n+                            // Identify CNetAddr with the most connections\n+                            CNetAddr naMostConnections;\n+                            unsigned int nMostConnections = 0;\n+                            std::map<CNetAddr, std::vector<CNode*> > mapAddrCounts;\n+                            BOOST_FOREACH(CNode *node, vEvictionCandidates) {\n+                                mapAddrCounts[node->addr].push_back(node);\n+\n+                                if (mapAddrCounts[node->addr].size() > nMostConnections) {\n+                                    nMostConnections = mapAddrCounts[node->addr].size();\n+                                    naMostConnections = node->addr;\n+                                }\n+                            }\n+\n+                            vEvictionCandidates = mapAddrCounts[naMostConnections];\n+\n+                            // Disconnect the most recent connection from the CNetAddr with the most connections\n+                            std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+                            vEvictionCandidates[0]->fDisconnect = true;\n+\n+                            nInbound--;\n+                        }\n+                    }\n+\n+                    if (nInbound >= nMaxConnections - MAX_OUTBOUND_CONNECTIONS) {\n+                        LogPrint(\"net\", \"no peers to evict, disconnecting new client\\n\");\n+                        pnode->fDisconnect = true;\n+                    }\n                 }\n-                else if (CNode::IsBanned(addr) && !whitelisted)\n-                {\n-                    LogPrintf(\"connection from %s dropped (banned)\\n\", addr.ToString());\n+\n+                if (pnode->fDisconnect) {\n                     CloseSocket(hSocket);\n+                    delete pnode;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r36495467",
@@ -306,9 +306,9 @@
       "original_commit_id" : "5f33e1ec5d735eac9fb881cb02b7833cbd3b9f12",
       "original_position" : 143,
       "path" : "src/net.cpp",
-      "position" : 157,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374",
-      "updated_at" : "2015-08-07T07:13:27Z",
+      "updated_at" : "2015-08-14T00:34:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/36495467",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
@@ -343,7 +343,7 @@
          }
       },
       "body" : "Alternatively I could just add it to vNodes and rely on the normal cleanup logic.",
-      "commit_id" : "3b60778e185606fb8340809bcfaad154d58a5ea4",
+      "commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
       "created_at" : "2015-08-07T21:39:26Z",
       "diff_hunk" : "@@ -943,35 +981,95 @@ void ThreadSocketHandler()\n                             nInbound++;\n                 }\n \n+                CNode* pnode = new CNode(hSocket, addr, \"\", true);\n+                pnode->AddRef();\n+                pnode->fWhitelisted = whitelisted;\n+\n                 if (hSocket == INVALID_SOCKET)\n                 {\n                     int nErr = WSAGetLastError();\n                     if (nErr != WSAEWOULDBLOCK)\n                         LogPrintf(\"socket error accept failed: %s\\n\", NetworkErrorString(nErr));\n                 }\n-                else if (nInbound >= nMaxInbound)\n+                else if (CNode::IsBanned(addr) && !whitelisted)\n                 {\n-                    LogPrint(\"net\", \"connection from %s dropped (full)\\n\", addr.ToString());\n-                    CloseSocket(hSocket);\n+                    LogPrintf(\"connection from %s dropped (banned)\\n\", addr.ToString());\n+                    pnode->fDisconnect = true;\n                 }\n-                else if (!whitelisted && (nInbound >= (nMaxInbound - nWhiteConnections)))\n+                else if (nInbound >= nMaxConnections - MAX_OUTBOUND_CONNECTIONS)\n                 {\n-                    LogPrint(\"net\", \"connection from %s dropped (non-whitelisted)\\n\", addr.ToString());\n-                    CloseSocket(hSocket);\n+                    LogPrint(\"net\", \"over connection limit\\n\");\n+                    static std::vector<unsigned char> vSecretKey;\n+\n+                    if (vSecretKey.empty()) {\n+                        vSecretKey.resize(32, 0);\n+                        GetRandBytes(vSecretKey.data(), vSecretKey.size());\n+                    }\n+\n+                    {\n+                        LOCK(cs_vNodes);\n+                        std::vector<CNode*> vEvictionCandidates;\n+\n+                        BOOST_FOREACH(CNode *node, vNodes) {\n+                            if (node->fWhitelisted)\n+                                continue;\n+                            if (!node->fInbound)\n+                                continue;\n+                            if (node->fDisconnect)\n+                                continue;\n+                            if (node->addr.IsLocal())\n+                                continue;\n+                            vEvictionCandidates.push_back(node);\n+                        }\n+\n+                        // Protect connections with certain characteristics\n+\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(64, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        CompareNetGroupKeyed comparerNetGroupKeyed(vSecretKey);\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), comparerNetGroupKeyed);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(4, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeMinPingTime);\n+                        vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(8, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+                        if (!vEvictionCandidates.empty()) {\n+                            // Identify CNetAddr with the most connections\n+                            CNetAddr naMostConnections;\n+                            unsigned int nMostConnections = 0;\n+                            std::map<CNetAddr, std::vector<CNode*> > mapAddrCounts;\n+                            BOOST_FOREACH(CNode *node, vEvictionCandidates) {\n+                                mapAddrCounts[node->addr].push_back(node);\n+\n+                                if (mapAddrCounts[node->addr].size() > nMostConnections) {\n+                                    nMostConnections = mapAddrCounts[node->addr].size();\n+                                    naMostConnections = node->addr;\n+                                }\n+                            }\n+\n+                            vEvictionCandidates = mapAddrCounts[naMostConnections];\n+\n+                            // Disconnect the most recent connection from the CNetAddr with the most connections\n+                            std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+                            vEvictionCandidates[0]->fDisconnect = true;\n+\n+                            nInbound--;\n+                        }\n+                    }\n+\n+                    if (nInbound >= nMaxConnections - MAX_OUTBOUND_CONNECTIONS) {\n+                        LogPrint(\"net\", \"no peers to evict, disconnecting new client\\n\");\n+                        pnode->fDisconnect = true;\n+                    }\n                 }\n-                else if (CNode::IsBanned(addr) && !whitelisted)\n-                {\n-                    LogPrintf(\"connection from %s dropped (banned)\\n\", addr.ToString());\n+\n+                if (pnode->fDisconnect) {\n                     CloseSocket(hSocket);\n+                    delete pnode;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r36563756",
@@ -351,9 +351,9 @@
       "original_commit_id" : "5f33e1ec5d735eac9fb881cb02b7833cbd3b9f12",
       "original_position" : 143,
       "path" : "src/net.cpp",
-      "position" : 157,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374",
-      "updated_at" : "2015-08-07T21:39:26Z",
+      "updated_at" : "2015-08-14T00:34:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/36563756",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/620611?v=3",
@@ -429,6 +429,231 @@
          "subscriptions_url" : "https://api.github.com/users/pstratem/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/pstratem"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r37051343"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/37051343"
+         }
+      },
+      "body" : "size_t to unsigned int is safe? You could use size_t for nMostConnections also.",
+      "commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
+      "created_at" : "2015-08-14T05:53:42Z",
+      "diff_hunk" : "@@ -776,6 +775,173 @@ void SocketSendData(CNode *pnode)\n \n static list<CNode*> vNodesDisconnected;\n \n+static bool ReverseCompareNodeMinPingTime(CNode *a, CNode *b)\n+{\n+    return a->nMinPingUsecTime > b->nMinPingUsecTime;\n+}\n+\n+static bool ReverseCompareNodeTimeConnected(CNode *a, CNode *b)\n+{\n+    return a->nTimeConnected > b->nTimeConnected;\n+}\n+\n+class CompareNetGroupKeyed\n+{\n+    std::vector<unsigned char> vchSecretKey;\n+public:\n+    CompareNetGroupKeyed()\n+    {\n+        vchSecretKey.resize(32, 0);\n+        GetRandBytes(vchSecretKey.data(), vchSecretKey.size());\n+    }\n+\n+    bool operator()(CNode *a, CNode *b)\n+    {\n+        std::vector<unsigned char> vchGroupA, vchGroupB;\n+        CSHA256 hashA, hashB;\n+        std::vector<unsigned char> vchA(32), vchB(32);\n+\n+        vchGroupA = a->addr.GetGroup();\n+        vchGroupB = b->addr.GetGroup();\n+\n+        hashA.Write(begin_ptr(vchGroupA), vchGroupA.size());\n+        hashB.Write(begin_ptr(vchGroupB), vchGroupB.size());\n+\n+        hashA.Write(begin_ptr(vchSecretKey), vchSecretKey.size());\n+        hashB.Write(begin_ptr(vchSecretKey), vchSecretKey.size());\n+\n+        hashA.Finalize(begin_ptr(vchA));\n+        hashB.Finalize(begin_ptr(vchB));\n+\n+        return vchA < vchB;\n+    }\n+};\n+\n+static bool AttemptToEvictConnection(bool fPreferNewConnection) {\n+    std::vector<CNode*> vEvictionCandidates;\n+    {\n+        LOCK(cs_vNodes);\n+\n+        BOOST_FOREACH(CNode *node, vNodes) {\n+            if (node->fWhitelisted)\n+                continue;\n+            if (!node->fInbound)\n+                continue;\n+            if (node->fDisconnect)\n+                continue;\n+            if (node->addr.IsLocal())\n+                continue;\n+            vEvictionCandidates.push_back(node);\n+        }\n+    }\n+\n+    // Protect connections with certain characteristics\n+    static CompareNetGroupKeyed comparerNetGroupKeyed;\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), comparerNetGroupKeyed);\n+    vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(4, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeMinPingTime);\n+    vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(8, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+    vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(64, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+    if (vEvictionCandidates.empty())\n+        return false;\n+\n+    // Identify CNetAddr with the most connections\n+    CNetAddr naMostConnections;\n+    unsigned int nMostConnections = 0;\n+    std::map<CNetAddr, std::vector<CNode*> > mapAddrCounts;\n+    BOOST_FOREACH(CNode *node, vEvictionCandidates) {\n+        mapAddrCounts[node->addr].push_back(node);\n+\n+        if (mapAddrCounts[node->addr].size() > nMostConnections) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r37051343",
+      "id" : 37051343,
+      "original_commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
+      "original_position" : 93,
+      "path" : "src/net.cpp",
+      "position" : 93,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374",
+      "updated_at" : "2015-08-14T05:53:42Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/37051343",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1419649?v=3",
+         "events_url" : "https://api.github.com/users/Diapolo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Diapolo/followers",
+         "following_url" : "https://api.github.com/users/Diapolo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Diapolo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Diapolo",
+         "id" : 1419649,
+         "login" : "Diapolo",
+         "organizations_url" : "https://api.github.com/users/Diapolo/orgs",
+         "received_events_url" : "https://api.github.com/users/Diapolo/received_events",
+         "repos_url" : "https://api.github.com/users/Diapolo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Diapolo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Diapolo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Diapolo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r37051366"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/37051366"
+         }
+      },
+      "body" : "This should be a more detailed comment IMHO.",
+      "commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
+      "created_at" : "2015-08-14T05:54:41Z",
+      "diff_hunk" : "@@ -776,6 +775,173 @@ void SocketSendData(CNode *pnode)\n \n static list<CNode*> vNodesDisconnected;\n \n+static bool ReverseCompareNodeMinPingTime(CNode *a, CNode *b)\n+{\n+    return a->nMinPingUsecTime > b->nMinPingUsecTime;\n+}\n+\n+static bool ReverseCompareNodeTimeConnected(CNode *a, CNode *b)\n+{\n+    return a->nTimeConnected > b->nTimeConnected;\n+}\n+\n+class CompareNetGroupKeyed\n+{\n+    std::vector<unsigned char> vchSecretKey;\n+public:\n+    CompareNetGroupKeyed()\n+    {\n+        vchSecretKey.resize(32, 0);\n+        GetRandBytes(vchSecretKey.data(), vchSecretKey.size());\n+    }\n+\n+    bool operator()(CNode *a, CNode *b)\n+    {\n+        std::vector<unsigned char> vchGroupA, vchGroupB;\n+        CSHA256 hashA, hashB;\n+        std::vector<unsigned char> vchA(32), vchB(32);\n+\n+        vchGroupA = a->addr.GetGroup();\n+        vchGroupB = b->addr.GetGroup();\n+\n+        hashA.Write(begin_ptr(vchGroupA), vchGroupA.size());\n+        hashB.Write(begin_ptr(vchGroupB), vchGroupB.size());\n+\n+        hashA.Write(begin_ptr(vchSecretKey), vchSecretKey.size());\n+        hashB.Write(begin_ptr(vchSecretKey), vchSecretKey.size());\n+\n+        hashA.Finalize(begin_ptr(vchA));\n+        hashB.Finalize(begin_ptr(vchB));\n+\n+        return vchA < vchB;\n+    }\n+};\n+\n+static bool AttemptToEvictConnection(bool fPreferNewConnection) {\n+    std::vector<CNode*> vEvictionCandidates;\n+    {\n+        LOCK(cs_vNodes);\n+\n+        BOOST_FOREACH(CNode *node, vNodes) {\n+            if (node->fWhitelisted)\n+                continue;\n+            if (!node->fInbound)\n+                continue;\n+            if (node->fDisconnect)\n+                continue;\n+            if (node->addr.IsLocal())\n+                continue;\n+            vEvictionCandidates.push_back(node);\n+        }\n+    }\n+\n+    // Protect connections with certain characteristics",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r37051366",
+      "id" : 37051366,
+      "original_commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
+      "original_position" : 72,
+      "path" : "src/net.cpp",
+      "position" : 72,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374",
+      "updated_at" : "2015-08-14T05:54:41Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/37051366",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1419649?v=3",
+         "events_url" : "https://api.github.com/users/Diapolo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Diapolo/followers",
+         "following_url" : "https://api.github.com/users/Diapolo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Diapolo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Diapolo",
+         "id" : 1419649,
+         "login" : "Diapolo",
+         "organizations_url" : "https://api.github.com/users/Diapolo/orgs",
+         "received_events_url" : "https://api.github.com/users/Diapolo/received_events",
+         "repos_url" : "https://api.github.com/users/Diapolo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Diapolo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Diapolo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Diapolo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r37051432"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/37051432"
+         }
+      },
+      "body" : "You seem to use this bool first at line 916, why not move the check there? At first look I had the impression it belongs to the LOCK block.",
+      "commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
+      "created_at" : "2015-08-14T05:56:58Z",
+      "diff_hunk" : "@@ -776,6 +775,173 @@ void SocketSendData(CNode *pnode)\n \n static list<CNode*> vNodesDisconnected;\n \n+static bool ReverseCompareNodeMinPingTime(CNode *a, CNode *b)\n+{\n+    return a->nMinPingUsecTime > b->nMinPingUsecTime;\n+}\n+\n+static bool ReverseCompareNodeTimeConnected(CNode *a, CNode *b)\n+{\n+    return a->nTimeConnected > b->nTimeConnected;\n+}\n+\n+class CompareNetGroupKeyed\n+{\n+    std::vector<unsigned char> vchSecretKey;\n+public:\n+    CompareNetGroupKeyed()\n+    {\n+        vchSecretKey.resize(32, 0);\n+        GetRandBytes(vchSecretKey.data(), vchSecretKey.size());\n+    }\n+\n+    bool operator()(CNode *a, CNode *b)\n+    {\n+        std::vector<unsigned char> vchGroupA, vchGroupB;\n+        CSHA256 hashA, hashB;\n+        std::vector<unsigned char> vchA(32), vchB(32);\n+\n+        vchGroupA = a->addr.GetGroup();\n+        vchGroupB = b->addr.GetGroup();\n+\n+        hashA.Write(begin_ptr(vchGroupA), vchGroupA.size());\n+        hashB.Write(begin_ptr(vchGroupB), vchGroupB.size());\n+\n+        hashA.Write(begin_ptr(vchSecretKey), vchSecretKey.size());\n+        hashB.Write(begin_ptr(vchSecretKey), vchSecretKey.size());\n+\n+        hashA.Finalize(begin_ptr(vchA));\n+        hashB.Finalize(begin_ptr(vchB));\n+\n+        return vchA < vchB;\n+    }\n+};\n+\n+static bool AttemptToEvictConnection(bool fPreferNewConnection) {\n+    std::vector<CNode*> vEvictionCandidates;\n+    {\n+        LOCK(cs_vNodes);\n+\n+        BOOST_FOREACH(CNode *node, vNodes) {\n+            if (node->fWhitelisted)\n+                continue;\n+            if (!node->fInbound)\n+                continue;\n+            if (node->fDisconnect)\n+                continue;\n+            if (node->addr.IsLocal())\n+                continue;\n+            vEvictionCandidates.push_back(node);\n+        }\n+    }\n+\n+    // Protect connections with certain characteristics\n+    static CompareNetGroupKeyed comparerNetGroupKeyed;\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), comparerNetGroupKeyed);\n+    vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(4, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeMinPingTime);\n+    vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(8, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+    vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(64, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+    if (vEvictionCandidates.empty())\n+        return false;\n+\n+    // Identify CNetAddr with the most connections\n+    CNetAddr naMostConnections;\n+    unsigned int nMostConnections = 0;\n+    std::map<CNetAddr, std::vector<CNode*> > mapAddrCounts;\n+    BOOST_FOREACH(CNode *node, vEvictionCandidates) {\n+        mapAddrCounts[node->addr].push_back(node);\n+\n+        if (mapAddrCounts[node->addr].size() > nMostConnections) {\n+            nMostConnections = mapAddrCounts[node->addr].size();\n+            naMostConnections = node->addr;\n+        }\n+    }\n+\n+    // Reduce to the CNetAddr with the most connections\n+    vEvictionCandidates = mapAddrCounts[naMostConnections];\n+\n+    // Do not disconnect peers who have only 1 evictable connection\n+    if (vEvictionCandidates.size() <= 1)\n+        // unless we prefer the new connection (for whitelisted peers)\n+        if (!fPreferNewConnection)\n+            return false;\n+\n+    // Disconnect the most recent connection from the CNetAddr with the most connections\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+    vEvictionCandidates[0]->fDisconnect = true;\n+\n+    return true;\n+}\n+\n+static void AcceptConnection(const ListenSocket& hListenSocket) {\n+    struct sockaddr_storage sockaddr;\n+    socklen_t len = sizeof(sockaddr);\n+    SOCKET hSocket = accept(hListenSocket.socket, (struct sockaddr*)&sockaddr, &len);\n+    CAddress addr;\n+    int nInbound = 0;\n+    int nMaxInbound = nMaxConnections - MAX_OUTBOUND_CONNECTIONS;\n+\n+    if (hSocket != INVALID_SOCKET)\n+        if (!addr.SetSockAddr((const struct sockaddr*)&sockaddr))\n+            LogPrintf(\"Warning: Unknown socket family\\n\");\n+\n+    bool whitelisted = hListenSocket.whitelisted || CNode::IsWhitelistedRange(addr);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r37051432",
+      "id" : 37051432,
+      "original_commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
+      "original_position" : 127,
+      "path" : "src/net.cpp",
+      "position" : 127,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374",
+      "updated_at" : "2015-08-14T05:56:58Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/37051432",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1419649?v=3",
+         "events_url" : "https://api.github.com/users/Diapolo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Diapolo/followers",
+         "following_url" : "https://api.github.com/users/Diapolo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Diapolo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Diapolo",
+         "id" : 1419649,
+         "login" : "Diapolo",
+         "organizations_url" : "https://api.github.com/users/Diapolo/orgs",
+         "received_events_url" : "https://api.github.com/users/Diapolo/received_events",
+         "repos_url" : "https://api.github.com/users/Diapolo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Diapolo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Diapolo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Diapolo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r37051503"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/37051503"
+         }
+      },
+      "body" : "Is this the check for the accept call? Would be cleaner if it was below the call. You also wouldn't need the ``hSocket != INVALID_SOCKET`` check at the top.",
+      "commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
+      "created_at" : "2015-08-14T05:58:08Z",
+      "diff_hunk" : "@@ -776,6 +775,173 @@ void SocketSendData(CNode *pnode)\n \n static list<CNode*> vNodesDisconnected;\n \n+static bool ReverseCompareNodeMinPingTime(CNode *a, CNode *b)\n+{\n+    return a->nMinPingUsecTime > b->nMinPingUsecTime;\n+}\n+\n+static bool ReverseCompareNodeTimeConnected(CNode *a, CNode *b)\n+{\n+    return a->nTimeConnected > b->nTimeConnected;\n+}\n+\n+class CompareNetGroupKeyed\n+{\n+    std::vector<unsigned char> vchSecretKey;\n+public:\n+    CompareNetGroupKeyed()\n+    {\n+        vchSecretKey.resize(32, 0);\n+        GetRandBytes(vchSecretKey.data(), vchSecretKey.size());\n+    }\n+\n+    bool operator()(CNode *a, CNode *b)\n+    {\n+        std::vector<unsigned char> vchGroupA, vchGroupB;\n+        CSHA256 hashA, hashB;\n+        std::vector<unsigned char> vchA(32), vchB(32);\n+\n+        vchGroupA = a->addr.GetGroup();\n+        vchGroupB = b->addr.GetGroup();\n+\n+        hashA.Write(begin_ptr(vchGroupA), vchGroupA.size());\n+        hashB.Write(begin_ptr(vchGroupB), vchGroupB.size());\n+\n+        hashA.Write(begin_ptr(vchSecretKey), vchSecretKey.size());\n+        hashB.Write(begin_ptr(vchSecretKey), vchSecretKey.size());\n+\n+        hashA.Finalize(begin_ptr(vchA));\n+        hashB.Finalize(begin_ptr(vchB));\n+\n+        return vchA < vchB;\n+    }\n+};\n+\n+static bool AttemptToEvictConnection(bool fPreferNewConnection) {\n+    std::vector<CNode*> vEvictionCandidates;\n+    {\n+        LOCK(cs_vNodes);\n+\n+        BOOST_FOREACH(CNode *node, vNodes) {\n+            if (node->fWhitelisted)\n+                continue;\n+            if (!node->fInbound)\n+                continue;\n+            if (node->fDisconnect)\n+                continue;\n+            if (node->addr.IsLocal())\n+                continue;\n+            vEvictionCandidates.push_back(node);\n+        }\n+    }\n+\n+    // Protect connections with certain characteristics\n+    static CompareNetGroupKeyed comparerNetGroupKeyed;\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), comparerNetGroupKeyed);\n+    vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(4, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeMinPingTime);\n+    vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(8, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+    vEvictionCandidates.erase(vEvictionCandidates.end() - std::min(64, static_cast<int>(vEvictionCandidates.size())), vEvictionCandidates.end());\n+\n+    if (vEvictionCandidates.empty())\n+        return false;\n+\n+    // Identify CNetAddr with the most connections\n+    CNetAddr naMostConnections;\n+    unsigned int nMostConnections = 0;\n+    std::map<CNetAddr, std::vector<CNode*> > mapAddrCounts;\n+    BOOST_FOREACH(CNode *node, vEvictionCandidates) {\n+        mapAddrCounts[node->addr].push_back(node);\n+\n+        if (mapAddrCounts[node->addr].size() > nMostConnections) {\n+            nMostConnections = mapAddrCounts[node->addr].size();\n+            naMostConnections = node->addr;\n+        }\n+    }\n+\n+    // Reduce to the CNetAddr with the most connections\n+    vEvictionCandidates = mapAddrCounts[naMostConnections];\n+\n+    // Do not disconnect peers who have only 1 evictable connection\n+    if (vEvictionCandidates.size() <= 1)\n+        // unless we prefer the new connection (for whitelisted peers)\n+        if (!fPreferNewConnection)\n+            return false;\n+\n+    // Disconnect the most recent connection from the CNetAddr with the most connections\n+    std::sort(vEvictionCandidates.begin(), vEvictionCandidates.end(), ReverseCompareNodeTimeConnected);\n+    vEvictionCandidates[0]->fDisconnect = true;\n+\n+    return true;\n+}\n+\n+static void AcceptConnection(const ListenSocket& hListenSocket) {\n+    struct sockaddr_storage sockaddr;\n+    socklen_t len = sizeof(sockaddr);\n+    SOCKET hSocket = accept(hListenSocket.socket, (struct sockaddr*)&sockaddr, &len);\n+    CAddress addr;\n+    int nInbound = 0;\n+    int nMaxInbound = nMaxConnections - MAX_OUTBOUND_CONNECTIONS;\n+\n+    if (hSocket != INVALID_SOCKET)\n+        if (!addr.SetSockAddr((const struct sockaddr*)&sockaddr))\n+            LogPrintf(\"Warning: Unknown socket family\\n\");\n+\n+    bool whitelisted = hListenSocket.whitelisted || CNode::IsWhitelistedRange(addr);\n+    {\n+        LOCK(cs_vNodes);\n+        BOOST_FOREACH(CNode* pnode, vNodes)\n+            if (pnode->fInbound)\n+                nInbound++;\n+    }\n+\n+    if (hSocket == INVALID_SOCKET)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r37051503",
+      "id" : 37051503,
+      "original_commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
+      "original_position" : 135,
+      "path" : "src/net.cpp",
+      "position" : 135,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374",
+      "updated_at" : "2015-08-14T05:58:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/37051503",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1419649?v=3",
+         "events_url" : "https://api.github.com/users/Diapolo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Diapolo/followers",
+         "following_url" : "https://api.github.com/users/Diapolo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Diapolo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Diapolo",
+         "id" : 1419649,
+         "login" : "Diapolo",
+         "organizations_url" : "https://api.github.com/users/Diapolo/orgs",
+         "received_events_url" : "https://api.github.com/users/Diapolo/received_events",
+         "repos_url" : "https://api.github.com/users/Diapolo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Diapolo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Diapolo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Diapolo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r37051576"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/37051576"
+         }
+      },
+      "body" : "Is this interresting for ``getpeerinfo``?",
+      "commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
+      "created_at" : "2015-08-14T06:00:43Z",
+      "diff_hunk" : "@@ -4522,6 +4522,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv,\n                     if (pingUsecTime > 0) {\n                         // Successful ping time measurement, replace previous\n                         pfrom->nPingUsecTime = pingUsecTime;\n+                        pfrom->nMinPingUsecTime = std::min(pfrom->nMinPingUsecTime, pingUsecTime);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6374#discussion_r37051576",
+      "id" : 37051576,
+      "original_commit_id" : "1f1c87438db3e707b2bfc0e35b12e054df5c0661",
+      "original_position" : 4,
+      "path" : "src/main.cpp",
+      "position" : 4,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6374",
+      "updated_at" : "2015-08-14T06:00:43Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/37051576",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1419649?v=3",
+         "events_url" : "https://api.github.com/users/Diapolo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Diapolo/followers",
+         "following_url" : "https://api.github.com/users/Diapolo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Diapolo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Diapolo",
+         "id" : 1419649,
+         "login" : "Diapolo",
+         "organizations_url" : "https://api.github.com/users/Diapolo/orgs",
+         "received_events_url" : "https://api.github.com/users/Diapolo/received_events",
+         "repos_url" : "https://api.github.com/users/Diapolo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Diapolo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Diapolo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Diapolo"
       }
    }
 ]
