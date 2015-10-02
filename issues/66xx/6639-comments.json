@@ -166,5 +166,78 @@
          "type" : "User",
          "url" : "https://api.github.com/users/laanwj"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6639#discussion_r41033302"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6639"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/41033302"
+         }
+      },
+      "body" : "false case needs fclose too",
+      "commit_id" : "4ed85cff18ef419830b41b8cee2778d763c338e4",
+      "created_at" : "2015-10-02T15:24:04Z",
+      "diff_hunk" : "@@ -0,0 +1,580 @@\n+#include \"torcontrol.h\"\n+#include \"utilstrencodings.h\"\n+#include \"net.h\"\n+#include \"util.h\"\n+#include \"init.h\" // Just for ShutdownRequested\n+\n+#include <vector>\n+#include <deque>\n+#include <set>\n+#include <stdlib.h>\n+\n+#include <boost/function.hpp>\n+#include <boost/bind.hpp>\n+#include <boost/signals2/signal.hpp>\n+#include <boost/foreach.hpp>\n+#include <boost/algorithm/string/predicate.hpp>\n+#include <boost/algorithm/string/split.hpp>\n+#include <boost/algorithm/string/classification.hpp>\n+\n+#include <event2/bufferevent.h>\n+#include <event2/buffer.h>\n+#include <event2/util.h>\n+#include <event2/event.h>\n+\n+const std::string DEFAULT_TOR_CONTROL = \"127.0.0.1:9051\";\n+\n+/****** Low-level TorControlConnection ********/\n+\n+/** Reply from Tor, can be single or multi-line */\n+class TorControlReply\n+{\n+public:\n+    TorControlReply() { Clear(); }\n+\n+    int code;\n+    std::vector<std::string> lines;\n+\n+    void Clear()\n+    {\n+        code = 0;\n+        lines.clear();\n+    }\n+};\n+\n+/** Low-level handling for Tor control connection.\n+ * Speaks the SMTP-like protocol as defined in torspec/control-spec.txt\n+ */\n+class TorControlConnection\n+{\n+public:\n+    typedef boost::function<void(TorControlConnection&)> ConnectionCB;\n+    typedef boost::function<void(TorControlConnection &,const TorControlReply &)> ReplyHandlerCB;\n+\n+    /** Create a new TorControlConnection.\n+     */\n+    TorControlConnection(struct event_base *base);\n+    ~TorControlConnection();\n+\n+    /**\n+     * Connect to a Tor control port.\n+     * target is address of the form host:port.\n+     * connected is the handler that is called when connection is succesfully established.\n+     * disconnected is a handler that is called when the connection is broken.\n+     * Return true on success.\n+     */\n+    bool Connect(const std::string &target, const ConnectionCB& connected, const ConnectionCB& disconnected);\n+\n+    /**\n+     * Disconnect from Tor control port.\n+     */\n+    bool Disconnect();\n+\n+    /** Send a command, register a handler for the reply.\n+     * A trailing CRLF is automatically added.\n+     * Return true on success.\n+     */\n+    bool Command(const std::string &cmd, const ReplyHandlerCB& reply_handler);\n+\n+    /** Response handlers for async replies */\n+    boost::signals2::signal<void(TorControlConnection &,const TorControlReply &)> async_handler;\n+private:\n+    /** Callback when ready for use */\n+    boost::function<void(TorControlConnection&)> connected;\n+    /** Callback when connection lost */\n+    boost::function<void(TorControlConnection&)> disconnected;\n+    /** Libevent event base */\n+    struct event_base *base;\n+    /** Connection to control socket */\n+    struct bufferevent *b_conn;\n+    /** Message being received */\n+    TorControlReply message;\n+    /** Response handlers */\n+    std::deque<ReplyHandlerCB> reply_handlers;\n+\n+    /** Libevent handlers: internal */\n+    static void readcb(struct bufferevent *bev, void *ctx);\n+    static void eventcb(struct bufferevent *bev, short what, void *ctx);\n+};\n+\n+TorControlConnection::TorControlConnection(struct event_base *base):\n+    base(base), b_conn(0)\n+{\n+}\n+\n+TorControlConnection::~TorControlConnection()\n+{\n+    if (b_conn)\n+        bufferevent_free(b_conn);\n+}\n+\n+void TorControlConnection::readcb(struct bufferevent *bev, void *ctx)\n+{\n+    TorControlConnection *self = (TorControlConnection*)ctx;\n+    struct evbuffer *input = bufferevent_get_input(bev);\n+    size_t n_read_out = 0;\n+    char *line;\n+    assert(input);\n+    //  If there is not a whole line to read, evbuffer_readln returns NULL\n+    while((line = evbuffer_readln(input, &n_read_out, EVBUFFER_EOL_CRLF)) != NULL)\n+    {\n+        std::string s(line, n_read_out);\n+        free(line);\n+        if (s.size() < 4) // Short line\n+            continue;\n+        // <status>(-|+| )<data><CRLF>\n+        self->message.code = atoi(s.substr(0,3).c_str());\n+        self->message.lines.push_back(s.substr(4));\n+        char ch = s[3]; // '-','+' or ' '\n+        if (ch == ' ') {\n+            // Final line, dispatch reply and clean up\n+            if (self->message.code >= 600) {\n+                // Dispatch async notifications to async handler\n+                // Synchronous and asynchronous messages are never interleaved\n+                self->async_handler(*self, self->message);\n+            } else {\n+                if (!self->reply_handlers.empty()) {\n+                    // Invoke reply handler with message\n+                    self->reply_handlers.front()(*self, self->message);\n+                    self->reply_handlers.pop_front();\n+                } else {\n+                    LogPrint(\"tor\", \"tor: Received unexpected sync reply %i\\n\", self->message.code);\n+                }\n+            }\n+            self->message.Clear();\n+        }\n+    }\n+}\n+\n+void TorControlConnection::eventcb(struct bufferevent *bev, short what, void *ctx)\n+{\n+    TorControlConnection *self = (TorControlConnection*)ctx;\n+    if (what & BEV_EVENT_CONNECTED) {\n+        LogPrint(\"tor\", \"tor: Succesfully connected!\\n\");\n+        self->connected(*self);\n+    } else if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {\n+        if (what & BEV_EVENT_ERROR)\n+            LogPrint(\"tor\", \"tor: Error connecting to Tor control socket\\n\");\n+        else\n+            LogPrint(\"tor\", \"tor: End of stream\\n\");\n+        self->Disconnect();\n+        self->disconnected(*self);\n+    }\n+}\n+\n+bool TorControlConnection::Connect(const std::string &target, const ConnectionCB& connected, const ConnectionCB& disconnected)\n+{\n+    if (b_conn)\n+        Disconnect();\n+    // Parse target address:port\n+    struct sockaddr_storage connect_to_addr;\n+    int connect_to_addrlen = sizeof(connect_to_addr);\n+    if (evutil_parse_sockaddr_port(target.c_str(),\n+        (struct sockaddr*)&connect_to_addr, &connect_to_addrlen)<0) {\n+        LogPrintf(\"tor: Error parsing socket address %s\\n\", target);\n+        return false;\n+    }\n+\n+    // Create a new socket, set up callbacks and enable notification bits\n+    b_conn = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);\n+    if (!b_conn)\n+        return false;\n+    bufferevent_setcb(b_conn, TorControlConnection::readcb, NULL, TorControlConnection::eventcb, this);\n+    bufferevent_enable(b_conn, EV_READ|EV_WRITE);\n+    this->connected = connected;\n+    this->disconnected = disconnected;\n+\n+    // Finally, connect to target\n+    if (bufferevent_socket_connect(b_conn, (struct sockaddr*)&connect_to_addr, connect_to_addrlen) < 0) {\n+        LogPrintf(\"tor: Error connecting to address %s\\n\", target);\n+        return false;\n+    }\n+    return true;\n+}\n+\n+bool TorControlConnection::Disconnect()\n+{\n+    if (b_conn)\n+        bufferevent_free(b_conn);\n+    b_conn = 0;\n+    return true;\n+}\n+\n+bool TorControlConnection::Command(const std::string &cmd, const ReplyHandlerCB& reply_handler)\n+{\n+    if (!b_conn)\n+        return false;\n+    struct evbuffer *buf = bufferevent_get_output(b_conn);\n+    if (!buf)\n+        return false;\n+    evbuffer_add(buf, cmd.data(), cmd.size());\n+    evbuffer_add(buf, \"\\r\\n\", 2);\n+    reply_handlers.push_back(reply_handler);\n+    return true;\n+}\n+\n+/****** General parsing utilities ********/\n+\n+/* Split reply line in the form 'AUTH METHODS=...' into a type\n+ * 'AUTH' and arguments 'METHODS=...'.\n+ */\n+static std::pair<std::string,std::string> SplitTorReplyLine(const std::string &s)\n+{\n+    size_t ptr=0;\n+    std::string type;\n+    while (ptr < s.size() && s[ptr] != ' ') {\n+        type.push_back(s[ptr]);\n+        ++ptr;\n+    }\n+    if (ptr < s.size())\n+        ++ptr; // skip ' '\n+    return make_pair(type, s.substr(ptr));\n+}\n+\n+/** Parse reply arguments in the form 'METHODS=COOKIE,SAFECOOKIE COOKIEFILE=\".../control_auth_cookie\"'.\n+ */\n+static std::map<std::string,std::string> ParseTorReplyMapping(const std::string &s)\n+{\n+    std::map<std::string,std::string> mapping;\n+    size_t ptr=0;\n+    while (ptr < s.size()) {\n+        std::string key, value;\n+        while (ptr < s.size() && s[ptr] != '=') {\n+            key.push_back(s[ptr]);\n+            ++ptr;\n+        }\n+        if (ptr == s.size()) // unexpected end of line\n+            return std::map<std::string,std::string>();\n+        ++ptr; // skip '='\n+        if (ptr < s.size() && s[ptr] == '\"') { // Quoted string\n+            ++ptr; // skip '='\n+            bool escape_next = false;\n+            while (ptr < s.size() && (!escape_next && s[ptr] != '\"')) {\n+                escape_next = (s[ptr] == '\\\\');\n+                value.push_back(s[ptr]);\n+                ++ptr;\n+            }\n+            if (ptr == s.size()) // unexpected end of line\n+                return std::map<std::string,std::string>();\n+            ++ptr; // skip closing '\"'\n+            /* TODO: unescape value - according to the spec this depends on the\n+             * context, some strings use C-LogPrintf style escape codes, some\n+             * don't. So may be better handled at the call site.\n+             */\n+        } else { // Unquoted value. Note that values can contain '=' at will, just no spaces\n+            while (ptr < s.size() && s[ptr] != ' ') {\n+                value.push_back(s[ptr]);\n+                ++ptr;\n+            }\n+        }\n+        if (ptr < s.size() && s[ptr] == ' ')\n+            ++ptr; // skip ' ' after key=value\n+        mapping[key] = value;\n+    }\n+    return mapping;\n+}\n+\n+/** Read full contents of a file and return them in a std::string. */\n+static std::pair<bool,std::string> ReadBinaryFile(const std::string &filename, size_t maxsize=std::numeric_limits<size_t>::max())\n+{\n+    FILE *f = fopen(filename.c_str(), \"rb\");\n+    if (f == NULL)\n+        return std::make_pair(false,\"\");\n+    std::string retval;\n+    char buffer[128];\n+    size_t n;\n+    while ((n=fread(buffer, 1, sizeof(buffer), f)) > 0) {\n+        retval.append(buffer, buffer+n);\n+        if (retval.size() > maxsize) {\n+            fclose(f);\n+            return std::make_pair(false,\"\");\n+        }\n+    }\n+    fclose(f);\n+    return std::make_pair(true,retval);\n+}\n+\n+/** Write contents of std::string to a file.\n+ * @return true on success.\n+ */\n+static bool WriteBinaryFile(const std::string &filename, const std::string &data)\n+{\n+    FILE *f = fopen(filename.c_str(), \"wb\");\n+    if (f == NULL)\n+        return false;\n+    if (fwrite(data.data(), 1, data.size(), f) != data.size())\n+        return false;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6639#discussion_r41033302",
+      "id" : 41033302,
+      "original_commit_id" : "4ed85cff18ef419830b41b8cee2778d763c338e4",
+      "original_position" : 306,
+      "path" : "src/torcontrol.cpp",
+      "position" : 306,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6639",
+      "updated_at" : "2015-10-02T15:24:04Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/41033302",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/417043?v=3",
+         "events_url" : "https://api.github.com/users/theuni/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theuni/followers",
+         "following_url" : "https://api.github.com/users/theuni/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theuni/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theuni",
+         "id" : 417043,
+         "login" : "theuni",
+         "organizations_url" : "https://api.github.com/users/theuni/orgs",
+         "received_events_url" : "https://api.github.com/users/theuni/received_events",
+         "repos_url" : "https://api.github.com/users/theuni/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theuni/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theuni/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theuni"
+      }
+   },
+   {
+      "body" : "Can the shutdown detection be changed to work like the httpserver? ie Init calls InterruptTorControl() which starts the immediate shutdown process?",
+      "created_at" : "2015-10-02T15:54:15Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6639#issuecomment-145069722",
+      "id" : 145069722,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/6639",
+      "updated_at" : "2015-10-02T15:54:15Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/145069722",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/417043?v=3",
+         "events_url" : "https://api.github.com/users/theuni/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theuni/followers",
+         "following_url" : "https://api.github.com/users/theuni/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theuni/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theuni",
+         "id" : 417043,
+         "login" : "theuni",
+         "organizations_url" : "https://api.github.com/users/theuni/orgs",
+         "received_events_url" : "https://api.github.com/users/theuni/received_events",
+         "repos_url" : "https://api.github.com/users/theuni/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theuni/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theuni/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theuni"
+      }
    }
 ]
