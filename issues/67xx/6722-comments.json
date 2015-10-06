@@ -12,7 +12,7 @@
          }
       },
       "body" : "travis complains about a missing `mutable bool blockSinceLastRollingFeeUpdate;` here.",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-25T09:22:40Z",
       "diff_hunk" : "@@ -284,6 +284,13 @@ class CTxMemPool\n     uint64_t totalTxSize; //! sum of all mempool tx' byte sizes\n     uint64_t cachedInnerUsage; //! sum of dynamic memory usage of all the map elements (NOT the maps themselves)\n \n+    mutable int64_t lastRollingFeeUpdate;\n+    mutable bool blockSinceLastRollingFeeBump;\n+    mutable double rollingMinimumFeeRate; //! minimum fee to get into the pool, decreases exponentially\n+    static const double ROLLING_FEE_HALFLIFE = 60 * 60 * 24;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40412933",
@@ -20,9 +20,9 @@
       "original_commit_id" : "7ef6af92b293417515a36a29fb659c9e9c5c8ed2",
       "original_position" : 16,
       "path" : "src/txmempool.h",
-      "position" : 28,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40412933",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/178464?v=3",
@@ -113,7 +113,7 @@
          }
       },
       "body" : "You can't call this by itself anymore.  Use removeStaged",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-25T17:20:39Z",
       "diff_hunk" : "@@ -837,3 +845,111 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);\n+        lastRollingFeeUpdate = time;\n+    }\n+    return CFeeRate(rollingMinimumFeeRate);\n+}\n+\n+void CTxMemPool::trackRemovedOrAddFailed(const CFeeRate& rate) {\n+    AssertLockHeld(cs);\n+    if (rate.GetFeePerK() > rollingMinimumFeeRate) {\n+        rollingMinimumFeeRate = rate.GetFeePerK();\n+        blockSinceLastRollingFeeBump = false;\n+    }\n+}\n+\n+bool CTxMemPool::TrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd) {\n+    AssertLockHeld(cs);\n+\n+    CFeeRate bestFeeRateRemoved;\n+    setEntries stage;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin)\n+        protect.insert(in.prevout.hash);\n+\n+    size_t expsize = DynamicMemoryUsage() + toadd.DynamicMemoryUsage(); // Track the expected resulting memory usage of the mempool.\n+    indexed_transaction_set::nth_index<1>::type::reverse_iterator it = mapTx.get<1>().rbegin();\n+    // Iterate from lowest feerate to highest feerate in the mempool:\n+    while (expsize > sizelimit && it != mapTx.get<1>().rend()) {\n+        if (CompareTxMemPoolEntryByFee()(*it, toadd)) {\n+            // If the transaction's feerate is worse than what we're looking for, we have processed everything in the mempool\n+            // that could improve the staged set. If we don't have an acceptable solution by now, bail out.\n+            break;\n+        }\n+        txiter rootit = mapTx.project<0>(it.base());\n+        rootit--;\n+        if (stage.count(rootit)) {\n+            // If the transaction is already staged for deletion, we know its descendants are already processed, so skip it.\n+            it++;\n+            continue;\n+        }\n+\n+        // Iterate breadth-first over all descendants of transaction 'rootit'...\n+        std::deque<txiter> todo; // List of hashes that we still need to process (descendants of 'rootit').\n+        setEntries now; // Set of tx entries that will need to be added to stage if 'rootit' is included.\n+        CAmount nowfee = 0; // Sum of the fees in 'now'.\n+        size_t nowsize = 0; // Sum of the tx sizes in 'now'.\n+        size_t nowusage = 0; // Sum of the memory usages of transactions in 'now'.\n+        todo.push_back(rootit); // Add 'rootit' to the todo list, to initiate processing its children.\n+        bool good = true; // Whether including 'rootit' (and all its descendants) is a good idea.\n+\n+        while (!todo.empty()) {\n+            const txiter& itnow = todo.front();\n+            if (now.count(itnow))\n+                continue;\n+\n+            const uint256& hashnow = itnow->GetTx().GetHash();\n+            if (protect.count(hashnow)) {\n+                // If this transaction is in the protected set, we're done with 'rootit'.\n+                good = false;\n+                break;\n+            }\n+            // Add 'hashnow' to the 'now' set, and update its statistics.\n+            now.insert(itnow);\n+            nowfee += itnow->GetFee();\n+            nowsize += itnow->GetTxSize();\n+            nowusage += itnow->DynamicMemoryUsage();\n+            todo.pop_front();\n+\n+            // Find dependencies of 'hashnow' and them to todo.\n+            std::map<COutPoint, CInPoint>::iterator iter = mapNextTx.lower_bound(COutPoint(hashnow, 0));\n+            while (iter != mapNextTx.end() && iter->first.hash == hashnow) {\n+                const uint256& nexthash = iter->second.ptx->GetHash();\n+                txiter nextit = mapTx.find(nexthash);\n+                assert(nextit != mapTx.end());\n+                if (!stage.count(nextit) && !now.count(nextit))\n+                    todo.push_back(nextit);\n+                iter++;\n+            }\n+        }\n+\n+        // Check that we aren't removing a set who's total feerate is below that of the set we're removing\n+        // ... and then add now to stage\n+        if (good && (double)nowfee * toadd.GetTxSize() <= (double)toadd.GetFee() * nowsize) {\n+            stage.insert(now.begin(), now.end());\n+            expsize -= nowusage;\n+            bestFeeRateRemoved = std::max(bestFeeRateRemoved, CFeeRate(nowfee, nowsize));\n+        }\n+        it++;\n+    }\n+\n+    if (expsize <= sizelimit) {\n+        BOOST_FOREACH(const txiter& it, stage)\n+            removeUnchecked(it);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40453419",
@@ -123,7 +123,7 @@
       "path" : "src/txmempool.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40453419",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/4360349?v=3",
@@ -158,7 +158,7 @@
          }
       },
       "body" : "It doesn't make sense to bump the rolling fee for a tx that didn't get in.   A very high fee tx might not make it in if there are large packages or transactions (even of low fee rate) at the bottom of the mempool.  That's a problem in and of itself for the tx that doesn't get in, but it's even worse if you make that the new minimum relay rate.",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-25T17:23:33Z",
       "diff_hunk" : "@@ -837,3 +845,111 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);\n+        lastRollingFeeUpdate = time;\n+    }\n+    return CFeeRate(rollingMinimumFeeRate);\n+}\n+\n+void CTxMemPool::trackRemovedOrAddFailed(const CFeeRate& rate) {\n+    AssertLockHeld(cs);\n+    if (rate.GetFeePerK() > rollingMinimumFeeRate) {\n+        rollingMinimumFeeRate = rate.GetFeePerK();\n+        blockSinceLastRollingFeeBump = false;\n+    }\n+}\n+\n+bool CTxMemPool::TrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd) {\n+    AssertLockHeld(cs);\n+\n+    CFeeRate bestFeeRateRemoved;\n+    setEntries stage;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin)\n+        protect.insert(in.prevout.hash);\n+\n+    size_t expsize = DynamicMemoryUsage() + toadd.DynamicMemoryUsage(); // Track the expected resulting memory usage of the mempool.\n+    indexed_transaction_set::nth_index<1>::type::reverse_iterator it = mapTx.get<1>().rbegin();\n+    // Iterate from lowest feerate to highest feerate in the mempool:\n+    while (expsize > sizelimit && it != mapTx.get<1>().rend()) {\n+        if (CompareTxMemPoolEntryByFee()(*it, toadd)) {\n+            // If the transaction's feerate is worse than what we're looking for, we have processed everything in the mempool\n+            // that could improve the staged set. If we don't have an acceptable solution by now, bail out.\n+            break;\n+        }\n+        txiter rootit = mapTx.project<0>(it.base());\n+        rootit--;\n+        if (stage.count(rootit)) {\n+            // If the transaction is already staged for deletion, we know its descendants are already processed, so skip it.\n+            it++;\n+            continue;\n+        }\n+\n+        // Iterate breadth-first over all descendants of transaction 'rootit'...\n+        std::deque<txiter> todo; // List of hashes that we still need to process (descendants of 'rootit').\n+        setEntries now; // Set of tx entries that will need to be added to stage if 'rootit' is included.\n+        CAmount nowfee = 0; // Sum of the fees in 'now'.\n+        size_t nowsize = 0; // Sum of the tx sizes in 'now'.\n+        size_t nowusage = 0; // Sum of the memory usages of transactions in 'now'.\n+        todo.push_back(rootit); // Add 'rootit' to the todo list, to initiate processing its children.\n+        bool good = true; // Whether including 'rootit' (and all its descendants) is a good idea.\n+\n+        while (!todo.empty()) {\n+            const txiter& itnow = todo.front();\n+            if (now.count(itnow))\n+                continue;\n+\n+            const uint256& hashnow = itnow->GetTx().GetHash();\n+            if (protect.count(hashnow)) {\n+                // If this transaction is in the protected set, we're done with 'rootit'.\n+                good = false;\n+                break;\n+            }\n+            // Add 'hashnow' to the 'now' set, and update its statistics.\n+            now.insert(itnow);\n+            nowfee += itnow->GetFee();\n+            nowsize += itnow->GetTxSize();\n+            nowusage += itnow->DynamicMemoryUsage();\n+            todo.pop_front();\n+\n+            // Find dependencies of 'hashnow' and them to todo.\n+            std::map<COutPoint, CInPoint>::iterator iter = mapNextTx.lower_bound(COutPoint(hashnow, 0));\n+            while (iter != mapNextTx.end() && iter->first.hash == hashnow) {\n+                const uint256& nexthash = iter->second.ptx->GetHash();\n+                txiter nextit = mapTx.find(nexthash);\n+                assert(nextit != mapTx.end());\n+                if (!stage.count(nextit) && !now.count(nextit))\n+                    todo.push_back(nextit);\n+                iter++;\n+            }\n+        }\n+\n+        // Check that we aren't removing a set who's total feerate is below that of the set we're removing\n+        // ... and then add now to stage\n+        if (good && (double)nowfee * toadd.GetTxSize() <= (double)toadd.GetFee() * nowsize) {\n+            stage.insert(now.begin(), now.end());\n+            expsize -= nowusage;\n+            bestFeeRateRemoved = std::max(bestFeeRateRemoved, CFeeRate(nowfee, nowsize));\n+        }\n+        it++;\n+    }\n+\n+    if (expsize <= sizelimit) {\n+        BOOST_FOREACH(const txiter& it, stage)\n+            removeUnchecked(it);\n+\n+        trackRemovedOrAddFailed(bestFeeRateRemoved);\n+        return true;\n+    } else {\n+        trackRemovedOrAddFailed(CFeeRate(toadd.GetFee(), toadd.GetTxSize()));",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40453689",
@@ -168,7 +168,7 @@
       "path" : "src/txmempool.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40453689",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/4360349?v=3",
@@ -203,7 +203,7 @@
          }
       },
       "body" : "I'd be concerned about the tradeoff here between one-time cost to stuff the mempool full of very high fee txs, and the length of time that stuffing causes the min relay rate to remain high.   Expecially with 100MB mempool, thats only about 30MB of txs.  So for example at 100k sat / kb fee rate, for 30 BTC you can knock the min relay fee up to 100k satoshis and the effect lasts for some time.",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-25T17:26:05Z",
       "diff_hunk" : "@@ -837,3 +845,111 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40453957",
@@ -211,9 +211,9 @@
       "original_commit_id" : "152dcb6abaa5c218fa98b3d71e3804585ea791a0",
       "original_position" : 61,
       "path" : "src/txmempool.cpp",
-      "position" : 61,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40453957",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/4360349?v=3",
@@ -248,7 +248,7 @@
          }
       },
       "body" : "Hmm? No a very high fee tx will always evict transactions with lower feerate even if it ends up evicting a very large package to do so.",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-25T20:29:02Z",
       "diff_hunk" : "@@ -837,3 +845,111 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);\n+        lastRollingFeeUpdate = time;\n+    }\n+    return CFeeRate(rollingMinimumFeeRate);\n+}\n+\n+void CTxMemPool::trackRemovedOrAddFailed(const CFeeRate& rate) {\n+    AssertLockHeld(cs);\n+    if (rate.GetFeePerK() > rollingMinimumFeeRate) {\n+        rollingMinimumFeeRate = rate.GetFeePerK();\n+        blockSinceLastRollingFeeBump = false;\n+    }\n+}\n+\n+bool CTxMemPool::TrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd) {\n+    AssertLockHeld(cs);\n+\n+    CFeeRate bestFeeRateRemoved;\n+    setEntries stage;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin)\n+        protect.insert(in.prevout.hash);\n+\n+    size_t expsize = DynamicMemoryUsage() + toadd.DynamicMemoryUsage(); // Track the expected resulting memory usage of the mempool.\n+    indexed_transaction_set::nth_index<1>::type::reverse_iterator it = mapTx.get<1>().rbegin();\n+    // Iterate from lowest feerate to highest feerate in the mempool:\n+    while (expsize > sizelimit && it != mapTx.get<1>().rend()) {\n+        if (CompareTxMemPoolEntryByFee()(*it, toadd)) {\n+            // If the transaction's feerate is worse than what we're looking for, we have processed everything in the mempool\n+            // that could improve the staged set. If we don't have an acceptable solution by now, bail out.\n+            break;\n+        }\n+        txiter rootit = mapTx.project<0>(it.base());\n+        rootit--;\n+        if (stage.count(rootit)) {\n+            // If the transaction is already staged for deletion, we know its descendants are already processed, so skip it.\n+            it++;\n+            continue;\n+        }\n+\n+        // Iterate breadth-first over all descendants of transaction 'rootit'...\n+        std::deque<txiter> todo; // List of hashes that we still need to process (descendants of 'rootit').\n+        setEntries now; // Set of tx entries that will need to be added to stage if 'rootit' is included.\n+        CAmount nowfee = 0; // Sum of the fees in 'now'.\n+        size_t nowsize = 0; // Sum of the tx sizes in 'now'.\n+        size_t nowusage = 0; // Sum of the memory usages of transactions in 'now'.\n+        todo.push_back(rootit); // Add 'rootit' to the todo list, to initiate processing its children.\n+        bool good = true; // Whether including 'rootit' (and all its descendants) is a good idea.\n+\n+        while (!todo.empty()) {\n+            const txiter& itnow = todo.front();\n+            if (now.count(itnow))\n+                continue;\n+\n+            const uint256& hashnow = itnow->GetTx().GetHash();\n+            if (protect.count(hashnow)) {\n+                // If this transaction is in the protected set, we're done with 'rootit'.\n+                good = false;\n+                break;\n+            }\n+            // Add 'hashnow' to the 'now' set, and update its statistics.\n+            now.insert(itnow);\n+            nowfee += itnow->GetFee();\n+            nowsize += itnow->GetTxSize();\n+            nowusage += itnow->DynamicMemoryUsage();\n+            todo.pop_front();\n+\n+            // Find dependencies of 'hashnow' and them to todo.\n+            std::map<COutPoint, CInPoint>::iterator iter = mapNextTx.lower_bound(COutPoint(hashnow, 0));\n+            while (iter != mapNextTx.end() && iter->first.hash == hashnow) {\n+                const uint256& nexthash = iter->second.ptx->GetHash();\n+                txiter nextit = mapTx.find(nexthash);\n+                assert(nextit != mapTx.end());\n+                if (!stage.count(nextit) && !now.count(nextit))\n+                    todo.push_back(nextit);\n+                iter++;\n+            }\n+        }\n+\n+        // Check that we aren't removing a set who's total feerate is below that of the set we're removing\n+        // ... and then add now to stage\n+        if (good && (double)nowfee * toadd.GetTxSize() <= (double)toadd.GetFee() * nowsize) {\n+            stage.insert(now.begin(), now.end());\n+            expsize -= nowusage;\n+            bestFeeRateRemoved = std::max(bestFeeRateRemoved, CFeeRate(nowfee, nowsize));\n+        }\n+        it++;\n+    }\n+\n+    if (expsize <= sizelimit) {\n+        BOOST_FOREACH(const txiter& it, stage)\n+            removeUnchecked(it);\n+\n+        trackRemovedOrAddFailed(bestFeeRateRemoved);\n+        return true;\n+    } else {\n+        trackRemovedOrAddFailed(CFeeRate(toadd.GetFee(), toadd.GetTxSize()));",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40472178",
@@ -258,7 +258,7 @@
       "path" : "src/txmempool.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40472178",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/649246?v=3",
@@ -293,7 +293,7 @@
          }
       },
       "body" : "Sure, the ROLLING_FEE_HALFLIFE could be dropped a lot. I had originally figured it based on decreasing the mempool right away, but since it now waits at least for one block before it lets the min feerate drop, I think it probably could be dropped a lot. Maybe we even dont want an exponential decrease either.",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-25T20:32:56Z",
       "diff_hunk" : "@@ -837,3 +845,111 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40472516",
@@ -301,9 +301,9 @@
       "original_commit_id" : "152dcb6abaa5c218fa98b3d71e3804585ea791a0",
       "original_position" : 61,
       "path" : "src/txmempool.cpp",
-      "position" : 61,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40472516",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/649246?v=3",
@@ -422,7 +422,7 @@
          }
       },
       "body" : "need to pop_front() before continuing, otherwise its an infinite loop",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-26T00:51:29Z",
       "diff_hunk" : "@@ -837,3 +845,109 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);\n+        lastRollingFeeUpdate = time;\n+    }\n+    return CFeeRate(rollingMinimumFeeRate);\n+}\n+\n+void CTxMemPool::trackRemovedOrAddFailed(const CFeeRate& rate) {\n+    AssertLockHeld(cs);\n+    if (rate.GetFeePerK() > rollingMinimumFeeRate) {\n+        rollingMinimumFeeRate = rate.GetFeePerK();\n+        blockSinceLastRollingFeeBump = false;\n+    }\n+}\n+\n+bool CTxMemPool::TrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd) {\n+    LOCK(cs);\n+\n+    CFeeRate bestFeeRateRemoved;\n+    setEntries stage;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin)\n+        protect.insert(in.prevout.hash);\n+\n+    size_t expsize = DynamicMemoryUsage() + toadd.DynamicMemoryUsage(); // Track the expected resulting memory usage of the mempool.\n+    indexed_transaction_set::nth_index<1>::type::reverse_iterator it = mapTx.get<1>().rbegin();\n+    // Iterate from lowest feerate to highest feerate in the mempool:\n+    while (expsize > sizelimit && it != mapTx.get<1>().rend()) {\n+        if (CompareTxMemPoolEntryByFee()(*it, toadd)) {\n+            // If the transaction's feerate is worse than what we're looking for, we have processed everything in the mempool\n+            // that could improve the staged set. If we don't have an acceptable solution by now, bail out.\n+            break;\n+        }\n+        txiter rootit = mapTx.project<0>(it.base());\n+        rootit--;\n+        if (stage.count(rootit)) {\n+            // If the transaction is already staged for deletion, we know its descendants are already processed, so skip it.\n+            it++;\n+            continue;\n+        }\n+\n+        // Iterate breadth-first over all descendants of transaction 'rootit'...\n+        std::deque<txiter> todo; // List of hashes that we still need to process (descendants of 'rootit').\n+        setEntries now; // Set of tx entries that will need to be added to stage if 'rootit' is included.\n+        CAmount nowfee = 0; // Sum of the fees in 'now'.\n+        size_t nowsize = 0; // Sum of the tx sizes in 'now'.\n+        size_t nowusage = 0; // Sum of the memory usages of transactions in 'now'.\n+        todo.push_back(rootit); // Add 'rootit' to the todo list, to initiate processing its children.\n+        bool good = true; // Whether including 'rootit' (and all its descendants) is a good idea.\n+\n+        while (!todo.empty()) {\n+            const txiter& itnow = todo.front();\n+            if (now.count(itnow))\n+                continue;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40487766",
@@ -432,7 +432,7 @@
       "path" : "src/txmempool.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40487766",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/4360349?v=3",
@@ -495,7 +495,7 @@
          }
       },
       "body" : "LOL, oops...",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-26T01:53:09Z",
       "diff_hunk" : "@@ -837,3 +845,109 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);\n+        lastRollingFeeUpdate = time;\n+    }\n+    return CFeeRate(rollingMinimumFeeRate);\n+}\n+\n+void CTxMemPool::trackRemovedOrAddFailed(const CFeeRate& rate) {\n+    AssertLockHeld(cs);\n+    if (rate.GetFeePerK() > rollingMinimumFeeRate) {\n+        rollingMinimumFeeRate = rate.GetFeePerK();\n+        blockSinceLastRollingFeeBump = false;\n+    }\n+}\n+\n+bool CTxMemPool::TrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd) {\n+    LOCK(cs);\n+\n+    CFeeRate bestFeeRateRemoved;\n+    setEntries stage;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin)\n+        protect.insert(in.prevout.hash);\n+\n+    size_t expsize = DynamicMemoryUsage() + toadd.DynamicMemoryUsage(); // Track the expected resulting memory usage of the mempool.\n+    indexed_transaction_set::nth_index<1>::type::reverse_iterator it = mapTx.get<1>().rbegin();\n+    // Iterate from lowest feerate to highest feerate in the mempool:\n+    while (expsize > sizelimit && it != mapTx.get<1>().rend()) {\n+        if (CompareTxMemPoolEntryByFee()(*it, toadd)) {\n+            // If the transaction's feerate is worse than what we're looking for, we have processed everything in the mempool\n+            // that could improve the staged set. If we don't have an acceptable solution by now, bail out.\n+            break;\n+        }\n+        txiter rootit = mapTx.project<0>(it.base());\n+        rootit--;\n+        if (stage.count(rootit)) {\n+            // If the transaction is already staged for deletion, we know its descendants are already processed, so skip it.\n+            it++;\n+            continue;\n+        }\n+\n+        // Iterate breadth-first over all descendants of transaction 'rootit'...\n+        std::deque<txiter> todo; // List of hashes that we still need to process (descendants of 'rootit').\n+        setEntries now; // Set of tx entries that will need to be added to stage if 'rootit' is included.\n+        CAmount nowfee = 0; // Sum of the fees in 'now'.\n+        size_t nowsize = 0; // Sum of the tx sizes in 'now'.\n+        size_t nowusage = 0; // Sum of the memory usages of transactions in 'now'.\n+        todo.push_back(rootit); // Add 'rootit' to the todo list, to initiate processing its children.\n+        bool good = true; // Whether including 'rootit' (and all its descendants) is a good idea.\n+\n+        while (!todo.empty()) {\n+            const txiter& itnow = todo.front();\n+            if (now.count(itnow))\n+                continue;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40488841",
@@ -505,7 +505,7 @@
       "path" : "src/txmempool.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40488841",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/649246?v=3",
@@ -568,7 +568,7 @@
          }
       },
       "body" : "this is a bug.  rootit is an iterator by txid hash, so decrementing it puts you at a completely random transaction.\r\nthe base iterator needs to be decremented before projecting.\r\n\r\n@sdaftuar and i didn't like this oddness, so the first commit in #6557 reverses the feerate sort.  there was no reason to do it the other way in the first place.  maybe you should just grab that?",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-26T17:30:15Z",
       "diff_hunk" : "@@ -837,3 +845,111 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);\n+        lastRollingFeeUpdate = time;\n+    }\n+    return CFeeRate(rollingMinimumFeeRate);\n+}\n+\n+void CTxMemPool::trackRemovedOrAddFailed(const CFeeRate& rate) {\n+    AssertLockHeld(cs);\n+    if (rate.GetFeePerK() > rollingMinimumFeeRate) {\n+        rollingMinimumFeeRate = rate.GetFeePerK();\n+        blockSinceLastRollingFeeBump = false;\n+    }\n+}\n+\n+bool CTxMemPool::TrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd) {\n+    LOCK(cs);\n+\n+    CFeeRate bestFeeRateRemoved;\n+    setEntries stage;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin)\n+        protect.insert(in.prevout.hash);\n+\n+    size_t expsize = DynamicMemoryUsage() + toadd.DynamicMemoryUsage(); // Track the expected resulting memory usage of the mempool.\n+    indexed_transaction_set::nth_index<1>::type::reverse_iterator it = mapTx.get<1>().rbegin();\n+    // Iterate from lowest feerate to highest feerate in the mempool:\n+    while (expsize > sizelimit && it != mapTx.get<1>().rend()) {\n+        if (CompareTxMemPoolEntryByFee()(*it, toadd)) {\n+            // If the transaction's feerate is worse than what we're looking for, we have processed everything in the mempool\n+            // that could improve the staged set. If we don't have an acceptable solution by now, bail out.\n+            break;\n+        }\n+        txiter rootit = mapTx.project<0>(it.base());\n+        rootit--;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40495966",
@@ -578,7 +578,7 @@
       "path" : "src/txmempool.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40495966",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/4360349?v=3",
@@ -613,7 +613,7 @@
          }
       },
       "body" : "Keep in mind this is a ratio of 2 different measurements.  Serialized transaction size for descendant limit and mempool memory usage for maxmempool.  There is about a 3x ratio between those measurements.  So a 25MB mempool would actually only fit about 3 maximum sized packages...  (I used 4x as a conservative ratio, and similarly wanted a 10x difference so ended up with 40x between the arguments.)",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-26T22:22:38Z",
       "diff_hunk" : "@@ -841,6 +842,12 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)\n     fCheckBlockIndex = GetBoolArg(\"-checkblockindex\", chainparams.DefaultConsistencyChecks());\n     fCheckpointsEnabled = GetBoolArg(\"-checkpoints\", true);\n \n+    // -mempoollimit limits\n+    int64_t nMempoolSizeLimit = GetArg(\"-maxmempool\", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000;\n+    int64_t nMempoolDescendantSizeLimit = GetArg(\"-limitdescendantsize\", DEFAULT_DESCENDANT_SIZE_LIMIT) * 1000;\n+    if (nMempoolSizeLimit < 0 || nMempoolSizeLimit < nMempoolDescendantSizeLimit * 10)\n+        return InitError(strprintf(_(\"Error: -maxmempool must be at least %d MB\"), GetArg(\"-limitdescendantsize\", DEFAULT_DESCENDANT_SIZE_LIMIT) / 100));",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40499037",
@@ -623,7 +623,7 @@
       "path" : "src/init.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40499037",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/4360349?v=3",
@@ -714,7 +714,7 @@
          }
       },
       "body" : "Oops, yea, my notes to fix this from earlier were saying do something like 100MB, for this reason...Last time I ignore my notes and just do what I think when I'm sick :/",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-26T22:38:15Z",
       "diff_hunk" : "@@ -841,6 +842,12 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)\n     fCheckBlockIndex = GetBoolArg(\"-checkblockindex\", chainparams.DefaultConsistencyChecks());\n     fCheckpointsEnabled = GetBoolArg(\"-checkpoints\", true);\n \n+    // -mempoollimit limits\n+    int64_t nMempoolSizeLimit = GetArg(\"-maxmempool\", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000;\n+    int64_t nMempoolDescendantSizeLimit = GetArg(\"-limitdescendantsize\", DEFAULT_DESCENDANT_SIZE_LIMIT) * 1000;\n+    if (nMempoolSizeLimit < 0 || nMempoolSizeLimit < nMempoolDescendantSizeLimit * 10)\n+        return InitError(strprintf(_(\"Error: -maxmempool must be at least %d MB\"), GetArg(\"-limitdescendantsize\", DEFAULT_DESCENDANT_SIZE_LIMIT) / 100));",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40499174",
@@ -724,7 +724,7 @@
       "path" : "src/init.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-27T03:05:34Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40499174",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/649246?v=3",
@@ -759,7 +759,7 @@
          }
       },
       "body" : "These functions will be called every time through even if the mempool wasn't full to start with",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-30T17:36:38Z",
       "diff_hunk" : "@@ -837,3 +845,110 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);\n+        lastRollingFeeUpdate = time;\n+    }\n+    return CFeeRate(rollingMinimumFeeRate);\n+}\n+\n+void CTxMemPool::trackRemovedOrAddFailed(const CFeeRate& rate) {\n+    AssertLockHeld(cs);\n+    if (rate.GetFeePerK() > rollingMinimumFeeRate) {\n+        rollingMinimumFeeRate = rate.GetFeePerK();\n+        blockSinceLastRollingFeeBump = false;\n+    }\n+}\n+\n+bool CTxMemPool::TrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd) {\n+    LOCK(cs);\n+\n+    CFeeRate bestFeeRateRemoved;\n+    setEntries stage;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin)\n+        protect.insert(in.prevout.hash);\n+\n+    size_t expsize = DynamicMemoryUsage() + toadd.DynamicMemoryUsage(); // Track the expected resulting memory usage of the mempool.\n+    indexed_transaction_set::nth_index<1>::type::iterator it = mapTx.get<1>().begin();\n+    // Iterate from lowest feerate to highest feerate in the mempool:\n+    while (expsize > sizelimit && it != mapTx.get<1>().end()) {\n+        if (CompareTxMemPoolEntryByFee()(*it, toadd)) {\n+            // If the transaction's feerate is worse than what we're looking for, we have processed everything in the mempool\n+            // that could improve the staged set. If we don't have an acceptable solution by now, bail out.\n+            break;\n+        }\n+        txiter rootit = mapTx.project<0>(it);\n+        if (stage.count(rootit)) {\n+            // If the transaction is already staged for deletion, we know its descendants are already processed, so skip it.\n+            it++;\n+            continue;\n+        }\n+\n+        // Iterate breadth-first over all descendants of transaction 'rootit'...\n+        std::deque<txiter> todo; // List of hashes that we still need to process (descendants of 'rootit').\n+        setEntries now; // Set of tx entries that will need to be added to stage if 'rootit' is included.\n+        CAmount nowfee = 0; // Sum of the fees in 'now'.\n+        size_t nowsize = 0; // Sum of the tx sizes in 'now'.\n+        size_t nowusage = 0; // Sum of the memory usages of transactions in 'now'.\n+        todo.push_back(rootit); // Add 'rootit' to the todo list, to initiate processing its children.\n+        bool good = true; // Whether including 'rootit' (and all its descendants) is a good idea.\n+\n+        while (!todo.empty()) {\n+            const txiter& itnow = todo.front();\n+            if (now.count(itnow)) {\n+                todo.pop_front();\n+                continue;\n+            }\n+\n+            const uint256& hashnow = itnow->GetTx().GetHash();\n+            if (protect.count(hashnow)) {\n+                // If this transaction is in the protected set, we're done with 'rootit'.\n+                good = false;\n+                break;\n+            }\n+            // Add 'hashnow' to the 'now' set, and update its statistics.\n+            now.insert(itnow);\n+            nowfee += itnow->GetFee();\n+            nowsize += itnow->GetTxSize();\n+            nowusage += itnow->DynamicMemoryUsage();\n+            todo.pop_front();\n+\n+            // Find dependencies of 'hashnow' and them to todo.\n+            std::map<COutPoint, CInPoint>::iterator iter = mapNextTx.lower_bound(COutPoint(hashnow, 0));\n+            while (iter != mapNextTx.end() && iter->first.hash == hashnow) {\n+                const uint256& nexthash = iter->second.ptx->GetHash();\n+                txiter nextit = mapTx.find(nexthash);\n+                assert(nextit != mapTx.end());\n+                if (!stage.count(nextit) && !now.count(nextit))\n+                    todo.push_back(nextit);\n+                iter++;\n+            }\n+        }\n+\n+        // Check that we aren't removing a set who's total feerate is below that of the set we're removing\n+        // ... and then add now to stage\n+        if (good && (double)nowfee * toadd.GetTxSize() <= (double)toadd.GetFee() * nowsize) {\n+            stage.insert(now.begin(), now.end());\n+            expsize -= nowusage;\n+            bestFeeRateRemoved = std::max(bestFeeRateRemoved, CFeeRate(nowfee, nowsize));\n+        }\n+        it++;\n+    }\n+\n+    if (expsize <= sizelimit) {\n+        RemoveStaged(stage);\n+        trackRemovedOrAddFailed(bestFeeRateRemoved);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40824946",
@@ -767,9 +767,9 @@
       "original_commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
       "original_position" : 153,
       "path" : "src/txmempool.cpp",
-      "position" : 153,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-30T17:36:38Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40824946",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/4360349?v=3",
@@ -804,7 +804,7 @@
          }
       },
       "body" : "With the way the half-life calculation works, I believe it would take a very long time before mempoolRejectFee will reach 0 again, after an eviction; this in turn would cause us to wait a really long time before being willing to relay low-fee transactions that have high priority.  Perhaps the mempool could round the min fee it returns down to 0 at some point so that this doesn't take forever, or we can adjust the way we use it here to allow for the priority calculation to kick in even if the mempoolRejectFee isn't exactly 0?",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-30T18:02:13Z",
       "diff_hunk" : "@@ -879,17 +876,20 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n         CAmount nFees = nValueIn-nValueOut;\n         double dPriority = view.GetPriority(tx, chainActive.Height());\n \n-        CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height(), mempool.HasNoInputsOf(tx));\n+        CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height(), pool.HasNoInputsOf(tx));\n         unsigned int nSize = entry.GetTxSize();\n \n         // Don't accept it if it can't get into a block\n-        CAmount txMinFee = GetMinRelayFee(tx, nSize, true);\n+        CAmount txMinFee = GetMinRelayFee(tx, pool, nSize, true);\n         if (fLimitFree && nFees < txMinFee)\n             return state.DoS(0, false, REJECT_INSUFFICIENTFEE, \"insufficient fee\", false,\n                 strprintf(\"%d < %d\", nFees, txMinFee));\n \n-        // Require that free transactions have sufficient priority to be mined in the next block.\n-        if (GetBoolArg(\"-relaypriority\", true) && nFees < ::minRelayTxFee.GetFee(nSize) && !AllowFree(view.GetPriority(tx, chainActive.Height() + 1))) {\n+        CAmount mempoolRejectFee = pool.GetMinFee().GetFee(nSize);\n+        if (mempoolRejectFee > 0 && nFees < ::minRelayTxFee.GetFee(nSize) + mempoolRejectFee) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40828264",
@@ -812,9 +812,9 @@
       "original_commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
       "original_position" : 43,
       "path" : "src/main.cpp",
-      "position" : 43,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-30T18:02:13Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40828264",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -849,7 +849,7 @@
          }
       },
       "body" : "I think it'd be better to make this default value as large as we think users can reasonably live with. 100MB of memory is only about 30MB of actual transactions, or 30 full blocks.  It seems to me like all the attacks someone could do on a limited mempool involve trying to play games with the effects of eviction, so having a bigger default mempool just causes all attacks to scale up in cost to carry out, because an attacker has to generate more transactions just to trigger eviction.\r\n\r\n#6557 has a 500MB default; if we're concerned that may be too big, how about 250 or 300MB?",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-30T18:31:47Z",
       "diff_hunk" : "@@ -51,6 +51,8 @@ static const unsigned int DEFAULT_ANCESTOR_SIZE_LIMIT = 900;\n static const unsigned int DEFAULT_DESCENDANT_LIMIT = 1000;\n /** Default for -limitdescendantsize, maximum kilobytes of in-mempool descendants */\n static const unsigned int DEFAULT_DESCENDANT_SIZE_LIMIT = 2500;\n+/** Default for -maxmempool, maximum megabytes of mempool memory usage */\n+static const unsigned int DEFAULT_MAX_MEMPOOL_SIZE = 100;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40832241",
@@ -857,9 +857,9 @@
       "original_commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
       "original_position" : 5,
       "path" : "src/main.h",
-      "position" : 5,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-30T18:31:47Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40832241",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -922,7 +922,7 @@
          }
       },
       "body" : "I haven't thought about how much this is likely to matter but I don't think this is the best way to guess the expected size of the resulting mempool -- it misses the extra overhead from mapLinks, mapNextTx, and the multi_index pointers itself.  \r\n\r\nI think this code here is almost correct:\r\nhttps://github.com/sdaftuar/bitcoin/blob/7008233767bd5e03521d96cde414394975e940d7/src/txmempool.cpp#L797\r\n\r\n[There is an error though; the value of \"9\" that is used in the multi_index memory estimator should actually be a \"6\" I think in both DynamicMemoryUsage and GuessDynamicMemoryUsage.]",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-30T18:43:59Z",
       "diff_hunk" : "@@ -837,3 +845,110 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);\n+        lastRollingFeeUpdate = time;\n+    }\n+    return CFeeRate(rollingMinimumFeeRate);\n+}\n+\n+void CTxMemPool::trackRemovedOrAddFailed(const CFeeRate& rate) {\n+    AssertLockHeld(cs);\n+    if (rate.GetFeePerK() > rollingMinimumFeeRate) {\n+        rollingMinimumFeeRate = rate.GetFeePerK();\n+        blockSinceLastRollingFeeBump = false;\n+    }\n+}\n+\n+bool CTxMemPool::TrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd) {\n+    LOCK(cs);\n+\n+    CFeeRate bestFeeRateRemoved;\n+    setEntries stage;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin)\n+        protect.insert(in.prevout.hash);\n+\n+    size_t expsize = DynamicMemoryUsage() + toadd.DynamicMemoryUsage(); // Track the expected resulting memory usage of the mempool.",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40833980",
@@ -930,9 +930,9 @@
       "original_commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
       "original_position" : 84,
       "path" : "src/txmempool.cpp",
-      "position" : 84,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-30T18:43:59Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40833980",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -967,7 +967,7 @@
          }
       },
       "body" : "If you change ```TrimToSize()``` to take as an argument the ancestors of the entry being considered (which is calculated earlier in ```AcceptToMemoryPool()```), then you can get rid of ```protect```, and instead just check that each package root that you consider isn't an ancestor of the entry being added.  (This is what I did in #6557 and I think it helps make the code a lot simpler, especially combined with using ```CalculateDescendants()``` to grab all the descendants instead of writing a new loop here.)",
-      "commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
       "created_at" : "2015-09-30T18:58:44Z",
       "diff_hunk" : "@@ -837,3 +845,110 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee() const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / ROLLING_FEE_HALFLIFE);\n+        lastRollingFeeUpdate = time;\n+    }\n+    return CFeeRate(rollingMinimumFeeRate);\n+}\n+\n+void CTxMemPool::trackRemovedOrAddFailed(const CFeeRate& rate) {\n+    AssertLockHeld(cs);\n+    if (rate.GetFeePerK() > rollingMinimumFeeRate) {\n+        rollingMinimumFeeRate = rate.GetFeePerK();\n+        blockSinceLastRollingFeeBump = false;\n+    }\n+}\n+\n+bool CTxMemPool::TrimToSize(size_t sizelimit, const CTxMemPoolEntry& toadd) {\n+    LOCK(cs);\n+\n+    CFeeRate bestFeeRateRemoved;\n+    setEntries stage;\n+    std::set<uint256> protect;\n+    BOOST_FOREACH(const CTxIn& in, toadd.GetTx().vin)\n+        protect.insert(in.prevout.hash);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r40836107",
@@ -975,9 +975,9 @@
       "original_commit_id" : "104c63dad6c3b0a463df1829fe41643f99ac6bd5",
       "original_position" : 82,
       "path" : "src/txmempool.cpp",
-      "position" : 82,
+      "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
-      "updated_at" : "2015-09-30T18:58:55Z",
+      "updated_at" : "2015-10-02T21:51:25Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/40836107",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -1277,6 +1277,124 @@
          "subscriptions_url" : "https://api.github.com/users/morcos/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/morcos"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r41306866"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/41306866"
+         }
+      },
+      "body" : "\"is was\" -> \"was\"",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
+      "created_at" : "2015-10-06T18:58:09Z",
+      "diff_hunk" : "@@ -954,6 +954,17 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n \n         // Store transaction in memory\n         pool.addUnchecked(hash, entry, setAncestors, !IsInitialBlockDownload());\n+\n+        // trim mempool and check if tx is was trimmed",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r41306866",
+      "id" : 41306866,
+      "original_commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
+      "original_position" : 64,
+      "path" : "src/main.cpp",
+      "position" : 64,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
+      "updated_at" : "2015-10-06T18:58:09Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/41306866",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
+         "events_url" : "https://api.github.com/users/sdaftuar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sdaftuar/followers",
+         "following_url" : "https://api.github.com/users/sdaftuar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sdaftuar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sdaftuar",
+         "id" : 7463573,
+         "login" : "sdaftuar",
+         "organizations_url" : "https://api.github.com/users/sdaftuar/orgs",
+         "received_events_url" : "https://api.github.com/users/sdaftuar/received_events",
+         "repos_url" : "https://api.github.com/users/sdaftuar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sdaftuar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sdaftuar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sdaftuar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r41307526"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/41307526"
+         }
+      },
+      "body" : "Would it perhaps be better to pass the minRelayTxFee in, so that we're not needing to access globals inside the mempool?",
+      "commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
+      "created_at" : "2015-10-06T19:02:53Z",
+      "diff_hunk" : "@@ -837,3 +869,45 @@ const CTxMemPool::setEntries & CTxMemPool::GetMemPoolChildren(txiter entry) cons\n     assert(it != mapLinks.end());\n     return it->second.children;\n }\n+\n+CFeeRate CTxMemPool::GetMinFee(size_t sizelimit) const {\n+    LOCK(cs);\n+    if (!blockSinceLastRollingFeeBump || rollingMinimumFeeRate == 0)\n+        return CFeeRate(rollingMinimumFeeRate);\n+\n+    int64_t time = GetTime();\n+    if (time > lastRollingFeeUpdate + 10) {\n+        double halflife = ROLLING_FEE_HALFLIFE;\n+        if (DynamicMemoryUsage() < sizelimit / 4)\n+            halflife /= 4;\n+        else if (DynamicMemoryUsage() < sizelimit / 2)\n+            halflife /= 2;\n+\n+        rollingMinimumFeeRate = rollingMinimumFeeRate / pow(2.0, (time - lastRollingFeeUpdate) / halflife);\n+        lastRollingFeeUpdate = time;\n+\n+        if (rollingMinimumFeeRate < ::minRelayTxFee.GetFeePerK())",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#discussion_r41307526",
+      "id" : 41307526,
+      "original_commit_id" : "f23d7ab4ac3ac5ed2137591ec9fd7266ba4bbad8",
+      "original_position" : 108,
+      "path" : "src/txmempool.cpp",
+      "position" : 108,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6722",
+      "updated_at" : "2015-10-06T19:02:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/41307526",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
+         "events_url" : "https://api.github.com/users/sdaftuar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sdaftuar/followers",
+         "following_url" : "https://api.github.com/users/sdaftuar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sdaftuar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sdaftuar",
+         "id" : 7463573,
+         "login" : "sdaftuar",
+         "organizations_url" : "https://api.github.com/users/sdaftuar/orgs",
+         "received_events_url" : "https://api.github.com/users/sdaftuar/received_events",
+         "repos_url" : "https://api.github.com/users/sdaftuar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sdaftuar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sdaftuar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sdaftuar"
+      }
+   },
+   {
+      "body" : "```\r\nIn file included from wallet/wallet.cpp:24:\r\n./txmempool.h:291:25: warning: in-class initializer for static data member of type 'const double' is a GNU extension [-Wgnu-static-float-init]\r\n    static const double ROLLING_FEE_HALFLIFE = 60 * 60 * 12;\r\n                        ^                      ~~~~~~~~~~~~\r\n1 warning generated.\r\n```",
+      "created_at" : "2015-10-06T19:19:13Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6722#issuecomment-145970517",
+      "id" : 145970517,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/6722",
+      "updated_at" : "2015-10-06T19:19:13Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/145970517",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6848764?v=3",
+         "events_url" : "https://api.github.com/users/paveljanik/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/paveljanik/followers",
+         "following_url" : "https://api.github.com/users/paveljanik/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/paveljanik/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/paveljanik",
+         "id" : 6848764,
+         "login" : "paveljanik",
+         "organizations_url" : "https://api.github.com/users/paveljanik/orgs",
+         "received_events_url" : "https://api.github.com/users/paveljanik/received_events",
+         "repos_url" : "https://api.github.com/users/paveljanik/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/paveljanik/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/paveljanik/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/paveljanik"
       }
    }
 ]
