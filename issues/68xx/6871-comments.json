@@ -320,7 +320,7 @@
          }
       },
       "body" : "I'm not sure this comparison makes sense. The existence of a low-fee-rate descendant doesn't make a transaction worse for miners, but it would cause the feerate to look worse in this comparison.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-23T20:55:39Z",
       "diff_hunk" : "@@ -932,6 +959,85 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 hashAncestor = ancestorIt->GetTx().GetHash();\n+            if (setConflicts.count(hashAncestor))\n+            {\n+                return state.DoS(10, error(\"AcceptToMemoryPool: %s spends conflicting transaction %s\",\n+                                           hash.ToString(),\n+                                           hashAncestor.ToString()),\n+                                 REJECT_INVALID, \"bad-txns-spends-conflicting-tx\");\n+            }\n+        }\n+\n+        // Check if it's economically rational to mine this transaction rather\n+        // than the ones it replaces.\n+        CAmount nConflictingFees = 0;\n+        size_t nConflictingSize = 0;\n+        if (setConflicts.size())\n+        {\n+            LOCK(pool.cs);\n+\n+            // Check if it's economically rational to mine this transaction\n+            // rather than the ones it replaces. For efficiency we simply sum\n+            // up the pre-calculated fees/size-with-descendants values from the\n+            // mempool package tracking; this does mean the pathological case\n+            // of diamond tx graphs will be overcounted.\n+            BOOST_FOREACH(const uint256 hashConflicting, setConflicts)\n+            {\n+                CTxMemPool::txiter mi = pool.mapTx.find(hashConflicting);\n+                if (mi == pool.mapTx.end())\n+                    continue;\n+                nConflictingFees += mi->GetFeesWithDescendants();\n+                nConflictingSize += mi->GetSizeWithDescendants();\n+            }\n+\n+            // Replace?\n+            //\n+            // First of all we can't allow a replacement unless it pays greater\n+            // fees than the transactions it conflicts with - if we did the\n+            // bandwidth used by those conflicting transactions would not be\n+            // paid for\n+            if (nFees < nConflictingFees)\n+            {\n+                return state.DoS(0, error(\"AcceptToMemoryPool: rejecting replacement %s, less fees than conflicting txs; %s < %s\",\n+                                          hash.ToString(), FormatMoney(nFees), FormatMoney(nConflictingFees)),\n+                                 REJECT_INSUFFICIENTFEE, \"insufficient fee\");\n+            }\n+\n+            // Secondly in addition to paying more fees than the conflicts the\n+            // new transaction must additionally pay for its own bandwidth.\n+            CAmount nDeltaFees = nFees - nConflictingFees;\n+            if (nDeltaFees < ::minRelayTxFee.GetFee(nSize))\n+            {\n+                return state.DoS(0,\n+                        error(\"AcceptToMemoryPool: rejecting replacement %s, not enough additional fees to relay; %s < %s\",\n+                              hash.ToString(),\n+                              FormatMoney(nDeltaFees),\n+                              FormatMoney(::minRelayTxFee.GetFee(nSize))),\n+                        REJECT_INSUFFICIENTFEE, \"insufficient fee\");\n+            }\n+\n+            // Finally replace only if we end up with a larger fees-per-kb than\n+            // the replacements.\n+            CFeeRate oldFeeRate(nConflictingFees, nConflictingSize);\n+            CFeeRate newFeeRate(nFees, nSize);\n+            if (newFeeRate <= oldFeeRate)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r42913338",
@@ -330,7 +330,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/42913338",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -365,7 +365,7 @@
          }
       },
       "body" : "So, you mean the scenario where we have a high fee-rate transaction that is spent by one or more low fee-rate transactions? For instance suppose we have two transactions in our mempool: tx1a, 1KB w/ 1mBTC fee, which is spent by tx2, 10KB w/ 1mBTC fee. We get tx1b, 10KB w/ 2.1mBTC fee. Since the overall feerate of tx1b is higher than tx1a+tx2, it'll be accepted, even though a miner might have rather mined tx1a instead, ignoring tx2 (for now).\r\n\r\nI agree that's less than optimal. If we make the assumption that there's always more demand for blockchain space than supply, it might be reasonable for the replacement logic criteria to be whether or not we're increasing the fee-rate of any subset of the mempool. (while still paying more fees than the replaced transactions)\r\n\r\nWithout taking CPFP into account, you could simply use the same kind of priority heap logic as in CreateNewBlock() on the list of transactions that would be replaced by the new transaction. You'd iterate through the heap from highest priority to lowest, stopping once you had found as many bytes worth of transactions as the candidate replacement. If the fee-rate of the replacement is higher than the fee-rate of those transactions, accept the replacement into the mempool.\r\n\r\nTo take CPFP into account... Thinking about it more the mempool package tracking is probably backwards from what we want. Right now it tracks descendants, when really what we want to know is \"what's the total fee-rate if I mine this transaction, and all ancestors?\" If we kept track of \"packages\" that way, we'd be able to do the comparison by determining if the total fee-rate of the new package created by the replacement is higher than the fee-rates of all the packages invalidated by it. I actually did some work on something along these lines a few years ago, though didn't finish it - the implementation is a lot simpler now that we have strict ancestor limits. (when limiting, just throw away the tx associated with the lowest fee-rate package, which is guaranteed to have no descendants)\r\n\r\nFor now though I'd be inclined to merge this PR as-is, as all the above options are pretty complex. I also don't see any way this code could be used in an DoS attack.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-23T23:03:07Z",
       "diff_hunk" : "@@ -932,6 +959,85 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 hashAncestor = ancestorIt->GetTx().GetHash();\n+            if (setConflicts.count(hashAncestor))\n+            {\n+                return state.DoS(10, error(\"AcceptToMemoryPool: %s spends conflicting transaction %s\",\n+                                           hash.ToString(),\n+                                           hashAncestor.ToString()),\n+                                 REJECT_INVALID, \"bad-txns-spends-conflicting-tx\");\n+            }\n+        }\n+\n+        // Check if it's economically rational to mine this transaction rather\n+        // than the ones it replaces.\n+        CAmount nConflictingFees = 0;\n+        size_t nConflictingSize = 0;\n+        if (setConflicts.size())\n+        {\n+            LOCK(pool.cs);\n+\n+            // Check if it's economically rational to mine this transaction\n+            // rather than the ones it replaces. For efficiency we simply sum\n+            // up the pre-calculated fees/size-with-descendants values from the\n+            // mempool package tracking; this does mean the pathological case\n+            // of diamond tx graphs will be overcounted.\n+            BOOST_FOREACH(const uint256 hashConflicting, setConflicts)\n+            {\n+                CTxMemPool::txiter mi = pool.mapTx.find(hashConflicting);\n+                if (mi == pool.mapTx.end())\n+                    continue;\n+                nConflictingFees += mi->GetFeesWithDescendants();\n+                nConflictingSize += mi->GetSizeWithDescendants();\n+            }\n+\n+            // Replace?\n+            //\n+            // First of all we can't allow a replacement unless it pays greater\n+            // fees than the transactions it conflicts with - if we did the\n+            // bandwidth used by those conflicting transactions would not be\n+            // paid for\n+            if (nFees < nConflictingFees)\n+            {\n+                return state.DoS(0, error(\"AcceptToMemoryPool: rejecting replacement %s, less fees than conflicting txs; %s < %s\",\n+                                          hash.ToString(), FormatMoney(nFees), FormatMoney(nConflictingFees)),\n+                                 REJECT_INSUFFICIENTFEE, \"insufficient fee\");\n+            }\n+\n+            // Secondly in addition to paying more fees than the conflicts the\n+            // new transaction must additionally pay for its own bandwidth.\n+            CAmount nDeltaFees = nFees - nConflictingFees;\n+            if (nDeltaFees < ::minRelayTxFee.GetFee(nSize))\n+            {\n+                return state.DoS(0,\n+                        error(\"AcceptToMemoryPool: rejecting replacement %s, not enough additional fees to relay; %s < %s\",\n+                              hash.ToString(),\n+                              FormatMoney(nDeltaFees),\n+                              FormatMoney(::minRelayTxFee.GetFee(nSize))),\n+                        REJECT_INSUFFICIENTFEE, \"insufficient fee\");\n+            }\n+\n+            // Finally replace only if we end up with a larger fees-per-kb than\n+            // the replacements.\n+            CFeeRate oldFeeRate(nConflictingFees, nConflictingSize);\n+            CFeeRate newFeeRate(nFees, nSize);\n+            if (newFeeRate <= oldFeeRate)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r42923364",
@@ -375,7 +375,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/42923364",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -438,7 +438,7 @@
          }
       },
       "body" : "When I check out the commit referenced in the README and run the test, I get an error:\r\n`AttributeError: 'Proxy' object has no attribute 'generate'`\r\n\r\nI think this function is not defined in the Proxy class?  Adding it in the appropriate place in python-bitcoinlib seems to fix it.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-26T17:25:03Z",
       "diff_hunk" : "@@ -0,0 +1,280 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2015 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#\n+# Test replace-by-fee\n+#\n+\n+import os\n+import sys\n+\n+# Add python-bitcoinlib to module search path:\n+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), \"python-bitcoinlib\"))\n+\n+import unittest\n+\n+import bitcoin\n+bitcoin.SelectParams('regtest')\n+\n+import bitcoin.rpc\n+\n+from bitcoin.core import *\n+from bitcoin.core.script import *\n+from bitcoin.wallet import *\n+\n+MAX_REPLACEMENT_LIMIT = 100\n+\n+class Test_ReplaceByFee(unittest.TestCase):\n+    proxy = None\n+\n+    @classmethod\n+    def setUpClass(cls):\n+        if cls.proxy is None:\n+            cls.proxy = bitcoin.rpc.Proxy()\n+\n+    @classmethod\n+    def tearDownClass(cls):\n+        # Make sure mining works\n+        mempool_size = 1\n+        while mempool_size:\n+            cls.proxy.generate(1)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43024249",
@@ -448,7 +448,7 @@
       "path" : "qa/replace-by-fee/rbf-tests.py",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43024249",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -483,7 +483,7 @@
          }
       },
       "body" : "Any reason not to make this `const CTxIn &txin`, here and at line 832 below? ",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-26T17:25:13Z",
       "diff_hunk" : "@@ -806,15 +806,42 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n         return state.Invalid(false, REJECT_ALREADY_KNOWN, \"txn-already-in-mempool\");\n \n     // Check for conflicts with in-memory transactions\n+    set<uint256> setConflicts;\n     {\n     LOCK(pool.cs); // protect pool.mapNextTx\n-    for (unsigned int i = 0; i < tx.vin.size(); i++)\n+    BOOST_FOREACH(const CTxIn txin, tx.vin)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43024293",
@@ -493,7 +493,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43024293",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -528,7 +528,7 @@
          }
       },
       "body" : "This could also be `const uint256 &hashAncestor`.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-26T17:26:24Z",
       "diff_hunk" : "@@ -932,6 +959,85 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 hashAncestor = ancestorIt->GetTx().GetHash();",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43024496",
@@ -538,7 +538,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43024496",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -573,7 +573,7 @@
          }
       },
       "body" : "It's not included, no. You can just do a \"call\" instead. \r\n\r\n>proxy.call(\"generate\", 1)\r\n",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-26T17:30:34Z",
       "diff_hunk" : "@@ -0,0 +1,280 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2015 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#\n+# Test replace-by-fee\n+#\n+\n+import os\n+import sys\n+\n+# Add python-bitcoinlib to module search path:\n+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), \"python-bitcoinlib\"))\n+\n+import unittest\n+\n+import bitcoin\n+bitcoin.SelectParams('regtest')\n+\n+import bitcoin.rpc\n+\n+from bitcoin.core import *\n+from bitcoin.core.script import *\n+from bitcoin.wallet import *\n+\n+MAX_REPLACEMENT_LIMIT = 100\n+\n+class Test_ReplaceByFee(unittest.TestCase):\n+    proxy = None\n+\n+    @classmethod\n+    def setUpClass(cls):\n+        if cls.proxy is None:\n+            cls.proxy = bitcoin.rpc.Proxy()\n+\n+    @classmethod\n+    def tearDownClass(cls):\n+        # Make sure mining works\n+        mempool_size = 1\n+        while mempool_size:\n+            cls.proxy.generate(1)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43025108",
@@ -583,7 +583,7 @@
       "path" : "qa/replace-by-fee/rbf-tests.py",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43025108",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=3",
@@ -618,7 +618,7 @@
          }
       },
       "body" : "I think this logic needlessly overcounts the descendants.  Why not just call CalculateDescendants on the entries in setConflicts, and then loop over all of them?\r\n\r\nAssuming the replacing transaction is successful, you don't end up wasting any time, because you can pass the descendant set directly into RemoveStaged later.\r\n\r\nIf the replacing transaction were to fail, and we're worried about the amount of work an attacker might try to make us do, then we could just put a work bound here where we fail to replace if there are too many things to look at.\r\n\r\nI think it's a good idea to address though because a simple pattern where you have two parent transactions that are spent by a single child of both couldn't be consolidated down to a single transaction without paying for that child twice, if we went with this algorithm; that seems like a needless overhead.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-26T17:34:32Z",
       "diff_hunk" : "@@ -932,6 +959,85 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 hashAncestor = ancestorIt->GetTx().GetHash();\n+            if (setConflicts.count(hashAncestor))\n+            {\n+                return state.DoS(10, error(\"AcceptToMemoryPool: %s spends conflicting transaction %s\",\n+                                           hash.ToString(),\n+                                           hashAncestor.ToString()),\n+                                 REJECT_INVALID, \"bad-txns-spends-conflicting-tx\");\n+            }\n+        }\n+\n+        // Check if it's economically rational to mine this transaction rather\n+        // than the ones it replaces.\n+        CAmount nConflictingFees = 0;\n+        size_t nConflictingSize = 0;\n+        if (setConflicts.size())\n+        {\n+            LOCK(pool.cs);\n+\n+            // Check if it's economically rational to mine this transaction\n+            // rather than the ones it replaces. For efficiency we simply sum\n+            // up the pre-calculated fees/size-with-descendants values from the\n+            // mempool package tracking; this does mean the pathological case\n+            // of diamond tx graphs will be overcounted.\n+            BOOST_FOREACH(const uint256 hashConflicting, setConflicts)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43025671",
@@ -628,7 +628,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43025671",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -663,7 +663,7 @@
          }
       },
       "body" : "nit: \"descendants\"",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-26T17:40:39Z",
       "diff_hunk" : "@@ -806,15 +806,42 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n         return state.Invalid(false, REJECT_ALREADY_KNOWN, \"txn-already-in-mempool\");\n \n     // Check for conflicts with in-memory transactions\n+    set<uint256> setConflicts;\n     {\n     LOCK(pool.cs); // protect pool.mapNextTx\n-    for (unsigned int i = 0; i < tx.vin.size(); i++)\n+    BOOST_FOREACH(const CTxIn txin, tx.vin)\n     {\n-        COutPoint outpoint = tx.vin[i].prevout;\n-        if (pool.mapNextTx.count(outpoint))\n+        if (pool.mapNextTx.count(txin.prevout))\n         {\n-            // Disable replacement feature for now\n-            return state.Invalid(false, REJECT_CONFLICT, \"txn-mempool-conflict\");\n+            const CTransaction *ptxConflicting = pool.mapNextTx[txin.prevout].ptx;\n+            if (!setConflicts.count(ptxConflicting->GetHash()))\n+            {\n+                // Allow opt-out of transaction replacement by setting\n+                // nSequence >= maxint-1 on all inputs.\n+                //\n+                // maxint-1 is picked to still allow use of nLockTime by\n+                // non-replacable transactions. All inputs rather than just one\n+                // is for the sake of multi-party protocols, where we don't\n+                // want a single party to be able to disable replacement.\n+                //\n+                // The opt-out ignores decendents as anyone relying on",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43026591",
@@ -673,7 +673,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43026591",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -708,7 +708,7 @@
          }
       },
       "body" : "Right, the distinction between ancestor and descendant package is what I was getting at.\r\n\r\nDescendant packages are I think the right thing to use for mempool limiting.  I don't follow what you're saying about a limiting algorithm that uses fee with ancestors -- it's entirely possible that the worst thing under that sort would have descendants in the mempool.\r\n\r\n(FYI I have a branch that implements [ancestor packages] (https://github.com/sdaftuar/bitcoin/tree/ancestor-tracking).  I might propose merging it at some point if it looks like we can take advantage of it in the mining code, but I'm not ready to advocate that now.)\r\n\r\nAnyway in this code, we are comparing the feerate of the replacing transaction (with uncalculated/unknown fee rate including its ancestors) to an estimate of the feerate of the descendants of all the conflicting transactions.  This strikes me as incorrect on both fronts; by not putting any bounds on the ancestor fee rate, we might be accepting a replacement transaction that is unlikely to confirm anytime soon.  On the other hand, by looking at feerate with children (and overcounting those children, at least in the current implementation), we might be making it so that miners would prefer the original transactions to the replacing one.\r\n\r\nI don't know that either of these issues constitutes an attack, but I do think it's useful to try to help users avoid shooting themselves in the foot, say by accidentally adding an input that is part of a long unconfirmed chain (causing the replacing transaction to be worse), and to give miners code that doesn't require further optimization to do the economically rational thing.\r\n\r\nSo with that in mind, how about this:\r\n * Require that any new inputs that show up in the replacing transaction be already confirmed.  In the future, if we do merge something like ancestor package tracking and better mining code, we could update this test appropriately.\r\n * Require that for each entry E in setConflicts, \r\n ```feerate(replacing transaction) > max(feerate of E, feerate of E with descendants)```.  That doesn't completely eliminate the possibility that it could be somehow worse for a miner to accept the new transaction, but it eliminates some degenerate cases (where a high fee rate transaction is dragged down by lower fee rate transactions) and is easy to calculate.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-26T18:18:30Z",
       "diff_hunk" : "@@ -932,6 +959,85 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 hashAncestor = ancestorIt->GetTx().GetHash();\n+            if (setConflicts.count(hashAncestor))\n+            {\n+                return state.DoS(10, error(\"AcceptToMemoryPool: %s spends conflicting transaction %s\",\n+                                           hash.ToString(),\n+                                           hashAncestor.ToString()),\n+                                 REJECT_INVALID, \"bad-txns-spends-conflicting-tx\");\n+            }\n+        }\n+\n+        // Check if it's economically rational to mine this transaction rather\n+        // than the ones it replaces.\n+        CAmount nConflictingFees = 0;\n+        size_t nConflictingSize = 0;\n+        if (setConflicts.size())\n+        {\n+            LOCK(pool.cs);\n+\n+            // Check if it's economically rational to mine this transaction\n+            // rather than the ones it replaces. For efficiency we simply sum\n+            // up the pre-calculated fees/size-with-descendants values from the\n+            // mempool package tracking; this does mean the pathological case\n+            // of diamond tx graphs will be overcounted.\n+            BOOST_FOREACH(const uint256 hashConflicting, setConflicts)\n+            {\n+                CTxMemPool::txiter mi = pool.mapTx.find(hashConflicting);\n+                if (mi == pool.mapTx.end())\n+                    continue;\n+                nConflictingFees += mi->GetFeesWithDescendants();\n+                nConflictingSize += mi->GetSizeWithDescendants();\n+            }\n+\n+            // Replace?\n+            //\n+            // First of all we can't allow a replacement unless it pays greater\n+            // fees than the transactions it conflicts with - if we did the\n+            // bandwidth used by those conflicting transactions would not be\n+            // paid for\n+            if (nFees < nConflictingFees)\n+            {\n+                return state.DoS(0, error(\"AcceptToMemoryPool: rejecting replacement %s, less fees than conflicting txs; %s < %s\",\n+                                          hash.ToString(), FormatMoney(nFees), FormatMoney(nConflictingFees)),\n+                                 REJECT_INSUFFICIENTFEE, \"insufficient fee\");\n+            }\n+\n+            // Secondly in addition to paying more fees than the conflicts the\n+            // new transaction must additionally pay for its own bandwidth.\n+            CAmount nDeltaFees = nFees - nConflictingFees;\n+            if (nDeltaFees < ::minRelayTxFee.GetFee(nSize))\n+            {\n+                return state.DoS(0,\n+                        error(\"AcceptToMemoryPool: rejecting replacement %s, not enough additional fees to relay; %s < %s\",\n+                              hash.ToString(),\n+                              FormatMoney(nDeltaFees),\n+                              FormatMoney(::minRelayTxFee.GetFee(nSize))),\n+                        REJECT_INSUFFICIENTFEE, \"insufficient fee\");\n+            }\n+\n+            // Finally replace only if we end up with a larger fees-per-kb than\n+            // the replacements.\n+            CFeeRate oldFeeRate(nConflictingFees, nConflictingSize);\n+            CFeeRate newFeeRate(nFees, nSize);\n+            if (newFeeRate <= oldFeeRate)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43031583",
@@ -718,7 +718,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43031583",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -753,7 +753,7 @@
          }
       },
       "body" : "Just to add on to my comment above -- if you call `CalculateDescendants` above and use `RemoveStaged` here, then we don't have to copy all these transactions...",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-26T18:28:13Z",
       "diff_hunk" : "@@ -952,6 +1058,19 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n                 __func__, hash.ToString(), FormatStateMessage(state));\n         }\n \n+        // Remove conflicting transactions from the mempool\n+        list<CTransaction> ltxConflicted;\n+        pool.removeConflicts(tx, ltxConflicted);\n+\n+        BOOST_FOREACH(const CTransaction &txConflicted, ltxConflicted)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43032924",
@@ -763,7 +763,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43032924",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=3",
@@ -798,7 +798,7 @@
          }
       },
       "body" : "Fixed.\r\n\r\nI forgot to add generate() when python-bitcoinlib dropped support for calling RPC commands implicitly; replaced with .call() so as to continue to use the official v0.5.0 release rather than git master.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-30T01:51:05Z",
       "diff_hunk" : "@@ -0,0 +1,280 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2015 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#\n+# Test replace-by-fee\n+#\n+\n+import os\n+import sys\n+\n+# Add python-bitcoinlib to module search path:\n+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), \"python-bitcoinlib\"))\n+\n+import unittest\n+\n+import bitcoin\n+bitcoin.SelectParams('regtest')\n+\n+import bitcoin.rpc\n+\n+from bitcoin.core import *\n+from bitcoin.core.script import *\n+from bitcoin.wallet import *\n+\n+MAX_REPLACEMENT_LIMIT = 100\n+\n+class Test_ReplaceByFee(unittest.TestCase):\n+    proxy = None\n+\n+    @classmethod\n+    def setUpClass(cls):\n+        if cls.proxy is None:\n+            cls.proxy = bitcoin.rpc.Proxy()\n+\n+    @classmethod\n+    def tearDownClass(cls):\n+        # Make sure mining works\n+        mempool_size = 1\n+        while mempool_size:\n+            cls.proxy.generate(1)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43465297",
@@ -808,7 +808,7 @@
       "path" : "qa/replace-by-fee/rbf-tests.py",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43465297",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -843,7 +843,7 @@
          }
       },
       "body" : "Good point! Fixed.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-30T01:53:55Z",
       "diff_hunk" : "@@ -806,15 +806,42 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n         return state.Invalid(false, REJECT_ALREADY_KNOWN, \"txn-already-in-mempool\");\n \n     // Check for conflicts with in-memory transactions\n+    set<uint256> setConflicts;\n     {\n     LOCK(pool.cs); // protect pool.mapNextTx\n-    for (unsigned int i = 0; i < tx.vin.size(); i++)\n+    BOOST_FOREACH(const CTxIn txin, tx.vin)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43465406",
@@ -853,7 +853,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43465406",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -888,7 +888,7 @@
          }
       },
       "body" : "Also fixed.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-30T01:54:00Z",
       "diff_hunk" : "@@ -932,6 +959,85 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 hashAncestor = ancestorIt->GetTx().GetHash();",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43465409",
@@ -898,7 +898,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43465409",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -933,7 +933,7 @@
          }
       },
       "body" : "Well, I'm trying to keep this pull as simple as possible, while writing it in a way that isn't likely to lead to any DoS attacks; a previous version of this patch did do exactly what you suggest, but given that descendant tracking exists I figured I'd use it. (after all, I'm writing this patch pro bono)\r\n\r\nAs for your example where it would matter, that'd require wallets that attempted to both get txs to non-RBF miners and RBF miners simultaneously by broadcasting one then the other. It's a good idea, but doing that doesn't yet save you any money due to the rule that replacements must pay >= the fees of the transactions being replaced.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-30T02:00:08Z",
       "diff_hunk" : "@@ -932,6 +959,85 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 hashAncestor = ancestorIt->GetTx().GetHash();\n+            if (setConflicts.count(hashAncestor))\n+            {\n+                return state.DoS(10, error(\"AcceptToMemoryPool: %s spends conflicting transaction %s\",\n+                                           hash.ToString(),\n+                                           hashAncestor.ToString()),\n+                                 REJECT_INVALID, \"bad-txns-spends-conflicting-tx\");\n+            }\n+        }\n+\n+        // Check if it's economically rational to mine this transaction rather\n+        // than the ones it replaces.\n+        CAmount nConflictingFees = 0;\n+        size_t nConflictingSize = 0;\n+        if (setConflicts.size())\n+        {\n+            LOCK(pool.cs);\n+\n+            // Check if it's economically rational to mine this transaction\n+            // rather than the ones it replaces. For efficiency we simply sum\n+            // up the pre-calculated fees/size-with-descendants values from the\n+            // mempool package tracking; this does mean the pathological case\n+            // of diamond tx graphs will be overcounted.\n+            BOOST_FOREACH(const uint256 hashConflicting, setConflicts)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43465634",
@@ -943,7 +943,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43465634",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -978,7 +978,7 @@
          }
       },
       "body" : "Fixed",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-30T02:01:19Z",
       "diff_hunk" : "@@ -806,15 +806,42 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n         return state.Invalid(false, REJECT_ALREADY_KNOWN, \"txn-already-in-mempool\");\n \n     // Check for conflicts with in-memory transactions\n+    set<uint256> setConflicts;\n     {\n     LOCK(pool.cs); // protect pool.mapNextTx\n-    for (unsigned int i = 0; i < tx.vin.size(); i++)\n+    BOOST_FOREACH(const CTxIn txin, tx.vin)\n     {\n-        COutPoint outpoint = tx.vin[i].prevout;\n-        if (pool.mapNextTx.count(outpoint))\n+        if (pool.mapNextTx.count(txin.prevout))\n         {\n-            // Disable replacement feature for now\n-            return state.Invalid(false, REJECT_CONFLICT, \"txn-mempool-conflict\");\n+            const CTransaction *ptxConflicting = pool.mapNextTx[txin.prevout].ptx;\n+            if (!setConflicts.count(ptxConflicting->GetHash()))\n+            {\n+                // Allow opt-out of transaction replacement by setting\n+                // nSequence >= maxint-1 on all inputs.\n+                //\n+                // maxint-1 is picked to still allow use of nLockTime by\n+                // non-replacable transactions. All inputs rather than just one\n+                // is for the sake of multi-party protocols, where we don't\n+                // want a single party to be able to disable replacement.\n+                //\n+                // The opt-out ignores decendents as anyone relying on",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43465684",
@@ -988,7 +988,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43465684",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -1023,7 +1023,7 @@
          }
       },
       "body" : "Agreed. Although again, I'm not worried about the case where the transactions do end up replaced; I'm worried about the possible DoS attack case where they aren't.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-30T02:02:05Z",
       "diff_hunk" : "@@ -952,6 +1058,19 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n                 __func__, hash.ToString(), FormatStateMessage(state));\n         }\n \n+        // Remove conflicting transactions from the mempool\n+        list<CTransaction> ltxConflicted;\n+        pool.removeConflicts(tx, ltxConflicted);\n+\n+        BOOST_FOREACH(const CTransaction &txConflicted, ltxConflicted)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43465707",
@@ -1033,7 +1033,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43465707",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -1068,7 +1068,7 @@
          }
       },
       "body" : "Fixed both these issues.\r\n\r\nI decided not to do the max() version of this, as I think the requirement that the new fees > total-replaced-fees is sufficient; might help to get txs unstuck in some cases, and non-CPFP miners aren't evaluating that anyway.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-10-30T04:07:53Z",
       "diff_hunk" : "@@ -932,6 +959,85 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 hashAncestor = ancestorIt->GetTx().GetHash();\n+            if (setConflicts.count(hashAncestor))\n+            {\n+                return state.DoS(10, error(\"AcceptToMemoryPool: %s spends conflicting transaction %s\",\n+                                           hash.ToString(),\n+                                           hashAncestor.ToString()),\n+                                 REJECT_INVALID, \"bad-txns-spends-conflicting-tx\");\n+            }\n+        }\n+\n+        // Check if it's economically rational to mine this transaction rather\n+        // than the ones it replaces.\n+        CAmount nConflictingFees = 0;\n+        size_t nConflictingSize = 0;\n+        if (setConflicts.size())\n+        {\n+            LOCK(pool.cs);\n+\n+            // Check if it's economically rational to mine this transaction\n+            // rather than the ones it replaces. For efficiency we simply sum\n+            // up the pre-calculated fees/size-with-descendants values from the\n+            // mempool package tracking; this does mean the pathological case\n+            // of diamond tx graphs will be overcounted.\n+            BOOST_FOREACH(const uint256 hashConflicting, setConflicts)\n+            {\n+                CTxMemPool::txiter mi = pool.mapTx.find(hashConflicting);\n+                if (mi == pool.mapTx.end())\n+                    continue;\n+                nConflictingFees += mi->GetFeesWithDescendants();\n+                nConflictingSize += mi->GetSizeWithDescendants();\n+            }\n+\n+            // Replace?\n+            //\n+            // First of all we can't allow a replacement unless it pays greater\n+            // fees than the transactions it conflicts with - if we did the\n+            // bandwidth used by those conflicting transactions would not be\n+            // paid for\n+            if (nFees < nConflictingFees)\n+            {\n+                return state.DoS(0, error(\"AcceptToMemoryPool: rejecting replacement %s, less fees than conflicting txs; %s < %s\",\n+                                          hash.ToString(), FormatMoney(nFees), FormatMoney(nConflictingFees)),\n+                                 REJECT_INSUFFICIENTFEE, \"insufficient fee\");\n+            }\n+\n+            // Secondly in addition to paying more fees than the conflicts the\n+            // new transaction must additionally pay for its own bandwidth.\n+            CAmount nDeltaFees = nFees - nConflictingFees;\n+            if (nDeltaFees < ::minRelayTxFee.GetFee(nSize))\n+            {\n+                return state.DoS(0,\n+                        error(\"AcceptToMemoryPool: rejecting replacement %s, not enough additional fees to relay; %s < %s\",\n+                              hash.ToString(),\n+                              FormatMoney(nDeltaFees),\n+                              FormatMoney(::minRelayTxFee.GetFee(nSize))),\n+                        REJECT_INSUFFICIENTFEE, \"insufficient fee\");\n+            }\n+\n+            // Finally replace only if we end up with a larger fees-per-kb than\n+            // the replacements.\n+            CFeeRate oldFeeRate(nConflictingFees, nConflictingSize);\n+            CFeeRate newFeeRate(nFees, nSize);\n+            if (newFeeRate <= oldFeeRate)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r43470275",
@@ -1078,7 +1078,7 @@
       "path" : "src/main.cpp",
       "position" : null,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-10T23:01:09Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/43470275",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -1449,7 +1449,7 @@
          }
       },
       "body" : "I don't like hard-coding a commit ID here. It will go out of date very soon. If this requires v0.5.x, Can we do something like:\r\n\r\n    git clone --branch 0.5 https://github.com/petertodd/python-bitcoinlib\r\n",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-11-12T14:13:16Z",
       "diff_hunk" : "@@ -0,0 +1,13 @@\n+Replace-by-fee regression tests\n+===============================\n+\n+First get version v0.5.0 of the python-bitcoinlib library. In this directory\n+run:\n+\n+    git clone -n https://github.com/petertodd/python-bitcoinlib",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r44660476",
@@ -1459,7 +1459,7 @@
       "path" : "qa/replace-by-fee/README.md",
       "position" : 7,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-12T14:13:16Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/44660476",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=3",
@@ -1522,7 +1522,7 @@
          }
       },
       "body" : "My thinking re: hard-coding is reproducability; if we're out of date, we should explicitly update it rather than implicitly.\r\n\r\nAlso, this set of tests will likely get removed fairly soon, and kept just for historical reference now that they've been mostly rewritten.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-11-12T19:03:54Z",
       "diff_hunk" : "@@ -0,0 +1,13 @@\n+Replace-by-fee regression tests\n+===============================\n+\n+First get version v0.5.0 of the python-bitcoinlib library. In this directory\n+run:\n+\n+    git clone -n https://github.com/petertodd/python-bitcoinlib",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r44699335",
@@ -1532,7 +1532,7 @@
       "path" : "qa/replace-by-fee/README.md",
       "position" : 7,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-12T19:03:54Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/44699335",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -1875,7 +1875,7 @@
          }
       },
       "body" : "Can't all this new code (1003 to 1140) be a new function?\r\nEDIT: since it uses the mempool, it's probably better that this doesn't move to policy.cpp yet. In main.cpp is fine, just apart from AcceptToMemoryPool().",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-11-18T16:08:38Z",
       "diff_hunk" : "@@ -957,6 +984,160 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 &hashAncestor = ancestorIt->GetTx().GetHash();\n+            if (setConflicts.count(hashAncestor))\n+            {\n+                return state.DoS(10, error(\"AcceptToMemoryPool: %s spends conflicting transaction %s\",\n+                                           hash.ToString(),\n+                                           hashAncestor.ToString()),\n+                                 REJECT_INVALID, \"bad-txns-spends-conflicting-tx\");\n+            }\n+        }\n+\n+        // Check if it's economically rational to mine this transaction rather",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r45219187",
@@ -1885,7 +1885,7 @@
       "path" : "src/main.cpp",
       "position" : 68,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-18T16:18:23Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/45219187",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/1008458?v=3",
@@ -1948,7 +1948,7 @@
          }
       },
       "body" : "(maybe out of scope for this PR)\r\n\r\nDo we need a new signal here? How can the wallet detect removed (or replaced) transactions? Maybe the signal needs to be emitted from `void CTxMemPool::RemoveStaged(setEntries &stage)` (or nearby) to also include the mempool limiting behavior.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-11-19T20:30:43Z",
       "diff_hunk" : "@@ -977,6 +1158,17 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n                 __func__, hash.ToString(), FormatStateMessage(state));\n         }\n \n+        // Remove conflicting transactions from the mempool\n+        BOOST_FOREACH(const CTxMemPool::txiter it, allConflicting)\n+        {\n+            LogPrint(\"mempool\", \"replacing tx %s with %s for %s BTC additional fees, %d delta bytes\\n\",\n+                    it->GetTx().GetHash().ToString(),\n+                    hash.ToString(),\n+                    FormatMoney(nFees - nConflictingFees),\n+                    (int)nSize - (int)nConflictingSize);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r45396057",
@@ -1958,7 +1958,7 @@
       "path" : "src/main.cpp",
       "position" : 220,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-19T20:30:43Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/45396057",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/178464?v=3",
@@ -2021,7 +2021,7 @@
          }
       },
       "body" : "Agree with @jtimon . It's hard to read a function spanning over 400 lines not knowing which parts belong together.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-11-20T14:29:56Z",
       "diff_hunk" : "@@ -957,6 +984,160 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 &hashAncestor = ancestorIt->GetTx().GetHash();\n+            if (setConflicts.count(hashAncestor))\n+            {\n+                return state.DoS(10, error(\"AcceptToMemoryPool: %s spends conflicting transaction %s\",\n+                                           hash.ToString(),\n+                                           hashAncestor.ToString()),\n+                                 REJECT_INVALID, \"bad-txns-spends-conflicting-tx\");\n+            }\n+        }\n+\n+        // Check if it's economically rational to mine this transaction rather",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r45473643",
@@ -2031,7 +2031,7 @@
       "path" : "src/main.cpp",
       "position" : 68,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-20T14:29:56Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/45473643",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=3",
@@ -2066,7 +2066,7 @@
          }
       },
       "body" : "We probably do. But yeah, I think adding that can wait for another pull-req; belongs as a wallet code change IMO, so might as well let whomever ends up writing that decide what they need.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-11-20T19:49:10Z",
       "diff_hunk" : "@@ -977,6 +1158,17 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n                 __func__, hash.ToString(), FormatStateMessage(state));\n         }\n \n+        // Remove conflicting transactions from the mempool\n+        BOOST_FOREACH(const CTxMemPool::txiter it, allConflicting)\n+        {\n+            LogPrint(\"mempool\", \"replacing tx %s with %s for %s BTC additional fees, %d delta bytes\\n\",\n+                    it->GetTx().GetHash().ToString(),\n+                    hash.ToString(),\n+                    FormatMoney(nFees - nConflictingFees),\n+                    (int)nSize - (int)nConflictingSize);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r45510187",
@@ -2076,7 +2076,7 @@
       "path" : "src/main.cpp",
       "position" : 220,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-20T19:49:10Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/45510187",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -2111,7 +2111,7 @@
          }
       },
       "body" : "@jtimon Yeah, it's tricky though, because we reuse allConflicting later in the removal code for performance, and that in turn requires us to hold a lock; the way the code works isn't really modularized yet. That said compared to my previous patch we do at least take advantage of other mempool-related code, CalculateDescendants(), so we're a bit ahead.\r\n\r\nI'd be inclined to leave it as-is right now, and do the refactor later when we add RBF-related code to the wallet and/or RPC - that's when we'll have a better idea of what the refactor should look like and how the refactored code should interact with both uses. For instance, the ability to calculate on demand how expensive it would be to replace a specific transaction would be useful.",
-      "commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
       "created_at" : "2015-11-20T20:05:16Z",
       "diff_hunk" : "@@ -957,6 +984,160 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 &hashAncestor = ancestorIt->GetTx().GetHash();\n+            if (setConflicts.count(hashAncestor))\n+            {\n+                return state.DoS(10, error(\"AcceptToMemoryPool: %s spends conflicting transaction %s\",\n+                                           hash.ToString(),\n+                                           hashAncestor.ToString()),\n+                                 REJECT_INVALID, \"bad-txns-spends-conflicting-tx\");\n+            }\n+        }\n+\n+        // Check if it's economically rational to mine this transaction rather",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r45512199",
@@ -2121,7 +2121,7 @@
       "path" : "src/main.cpp",
       "position" : 68,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
-      "updated_at" : "2015-11-20T20:05:16Z",
+      "updated_at" : "2015-11-20T21:25:10Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/45512199",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7042?v=3",
@@ -2169,6 +2169,51 @@
          "subscriptions_url" : "https://api.github.com/users/petertodd/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/petertodd"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r45586305"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/45586305"
+         }
+      },
+      "body" : "I don't see how is tricky, if you need something inside the new function and in the caller, just pass it as reference. If you were holding the lock, well keep holding it, etc...It should be basically cut the code I said and paste it out as a (for now static) function, and adapt the parameters until it compiles, I think.\r\nOf course we can always leave refactors for later, but they often become harder with time (because the code keeps evolving from its current form, not from \"what we plan to do with it in a later refactor\".\r\nI'm fine with not doing it within this PR (although it would be less disruptive to squash that with the commit that introduces the new code), but I highly dislike when people insist to \"postpone refactor X until after feature Y\". If X is ready 6months before Y starts being coded...should we wait there too?\r\nThat kind of thinking is what has led us to, for example, wait more than 1 year to introduce a CPolicy class (and I'm still waiting because apparently #6068 would be too disruptive for this and other mempool-related changes [I disagree but was tired of rebasing]).\r\nIf we leave this PR as it is, fine. But please don't postpone or restrict any kind of development unnecessarily. Complain in the PRs when they exist, but don't plan how to serialize refactors between features or I predict: new important features will be proposed and the refactors will never happen (and encapsulations will become increasingly hard).\r\n",
+      "commit_id" : "63b5840257a0b892228dfa9cce943b5a2bb94e1a",
+      "created_at" : "2015-11-23T10:02:19Z",
+      "diff_hunk" : "@@ -957,6 +984,160 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa\n             return state.DoS(0, false, REJECT_NONSTANDARD, \"too-long-mempool-chain\", false, errString);\n         }\n \n+        // A transaction that spends outputs that would be replaced by it is invalid. Now\n+        // that we have the set of all ancestors we can detect this\n+        // pathological case by making sure setConflicts and setAncestors don't\n+        // intersect.\n+        BOOST_FOREACH(CTxMemPool::txiter ancestorIt, setAncestors)\n+        {\n+            const uint256 &hashAncestor = ancestorIt->GetTx().GetHash();\n+            if (setConflicts.count(hashAncestor))\n+            {\n+                return state.DoS(10, error(\"AcceptToMemoryPool: %s spends conflicting transaction %s\",\n+                                           hash.ToString(),\n+                                           hashAncestor.ToString()),\n+                                 REJECT_INVALID, \"bad-txns-spends-conflicting-tx\");\n+            }\n+        }\n+\n+        // Check if it's economically rational to mine this transaction rather",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/6871#discussion_r45586305",
+      "id" : 45586305,
+      "original_commit_id" : "16a2f93629f75d182871f288f0396afe6cdc8504",
+      "original_position" : 68,
+      "path" : "src/main.cpp",
+      "position" : 68,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/6871",
+      "updated_at" : "2015-11-23T10:02:19Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/45586305",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1008458?v=3",
+         "events_url" : "https://api.github.com/users/jtimon/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jtimon/followers",
+         "following_url" : "https://api.github.com/users/jtimon/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jtimon/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jtimon",
+         "id" : 1008458,
+         "login" : "jtimon",
+         "organizations_url" : "https://api.github.com/users/jtimon/orgs",
+         "received_events_url" : "https://api.github.com/users/jtimon/received_events",
+         "repos_url" : "https://api.github.com/users/jtimon/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jtimon/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jtimon/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jtimon"
       }
    }
 ]
