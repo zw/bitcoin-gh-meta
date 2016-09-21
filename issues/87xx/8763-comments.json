@@ -1207,5 +1207,185 @@
          "type" : "User",
          "url" : "https://api.github.com/users/MarcoFalke"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/8763#discussion_r79777484"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8763"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/79777484"
+         }
+      },
+      "body" : "@CryptAxe I think @luke-jr means that the risk is having funds to the imported key. Is this what you mean, @luke-jr ?  I'm not sure how this would happen, but as part of making a key autoswept, I would hope this pull would make it less easy to select for receipt of funds as part of this.",
+      "commit_id" : "58afbb2868902669b17d8084afe55d3615bf9f6d",
+      "created_at" : "2016-09-21T07:55:32Z",
+      "diff_hunk" : "@@ -74,19 +77,166 @@ std::string DecodeDumpString(const std::string &str) {\n     return ret.str();\n }\n \n+bool SweepPrivKey(CBitcoinSecret key, CBitcoinAddress destAddress) {\n+    // Get the private key to be swept and validate it\n+    CKey dirtyKey = key.GetKey();\n+    if (!dirtyKey.IsValid())\n+        return false;\n+\n+    // Generate public key and verify it\n+    CPubKey pubkey = dirtyKey.GetPubKey();\n+    if (!dirtyKey.VerifyPubKey(pubkey))\n+        return false;\n+\n+    LOCK2(cs_main, pwalletMain->cs_wallet);\n+\n+    // Get outputs from wallet\n+    std::vector<COutput> vCoins;\n+    pwalletMain->AvailableCoins(vCoins, false);\n+\n+    // Find all outputs of the key\n+    std::vector<COutput> vToSweep;\n+    BOOST_FOREACH(COutput output, vCoins)\n+    {\n+        vector<vector<unsigned char>> vSolution;\n+        txnouttype whichType;\n+        if (!Solver(output.tx->vout[output.i].scriptPubKey, whichType, vSolution))\n+            continue;\n+\n+        CKeyID keyID;\n+        if (whichType == TX_PUBKEY)\n+            keyID = CPubKey(vSolution[0]).GetID();\n+        else\n+        if (whichType == TX_PUBKEYHASH || whichType == TX_WITNESS_V0_KEYHASH)\n+            keyID = CKeyID(uint160(vSolution[0]));\n+\n+        if (keyID == pubkey.GetID())\n+            vToSweep.push_back(output);\n+    }\n+\n+    // Add inputs to sweep transaction\n+    CMutableTransaction mtx;\n+    CAmount total = 0;\n+    BOOST_FOREACH(COutput output, vToSweep)\n+    {\n+        mtx.vin.push_back(CTxIn(output.tx->GetHash(), output.i));\n+        total += output.tx->vout[output.i].nValue;\n+    }\n+\n+    if (!mtx.vin.size() || !(total > 0))\n+        return false;\n+\n+    // Add sweep destination - fee\n+    mtx.vout.push_back(CTxOut(total, GetScriptForDestination(destAddress.Get())));\n+    mtx.vout[0].nValue -= 3*CWallet::GetMinimumFee(GetVirtualTransactionSize(mtx), DEFAULT_TX_CONFIRM_TARGET, mempool);\n+\n+    mtx.nLockTime = chainActive.Height();\n+\n+    // Add the private key to a keystore\n+    CBasicKeyStore tempKeystore;\n+    tempKeystore.AddKey(dirtyKey);\n+\n+    const CTransaction txConst(mtx);\n+    const CKeyStore& keystoreConst = tempKeystore;\n+    for (uint32_t i = 0; i < mtx.vin.size(); i++)\n+    {\n+        CTxIn& input = mtx.vin[i];\n+        TransactionSignatureCreator creator(&keystoreConst, &txConst, i, mtx.vout[input.prevout.n].nValue);\n+\n+        SignatureData sigdata;\n+        bool sigCreated = ProduceSignature(creator, vToSweep[i].tx->vout[input.prevout.n].scriptPubKey, sigdata);\n+\n+        if (sigCreated && i < mtx.vin.size()) {\n+            mtx.vin[i].scriptSig = sigdata.scriptSig;\n+        }\n+    }\n+\n+    // Commit the transaction\n+    const CTransaction commit(mtx);\n+    CValidationState state;\n+    bool fMissingInputs;\n+    if (!AcceptToMemoryPool(mempool, state, commit, false, &fMissingInputs, false, maxTxFee)) {\n+        if (state.IsInvalid()) {\n+            throw JSONRPCError(RPC_TRANSACTION_REJECTED, strprintf(\"%i: %s\", state.GetRejectCode(), state.GetRejectReason()));\n+        } else {\n+            if (fMissingInputs) {\n+                throw JSONRPCError(RPC_TRANSACTION_ERROR, \"Missing inputs\");\n+            }\n+            throw JSONRPCError(RPC_TRANSACTION_ERROR, state.GetRejectReason());\n+        }\n+\n+        LogPrintf(\"SweepPrivKey(): Error: Transaction not valid\\n\");\n+        return false;\n+    }\n+\n+    if (pwalletMain->GetBroadcastTransactions() && !g_connman)\n+        throw JSONRPCError(RPC_CLIENT_P2P_DISABLED, \"Error: Peer-to-peer functionality missing or disabled\");\n+\n+    // Broadcast the transaction\n+    CInv inv(MSG_TX, commit.GetHash());\n+    g_connman->ForEachNode([&inv](CNode* pnode)\n+    {\n+        pnode->PushInventory(inv);\n+    });\n+\n+    return true;\n+}\n+\n+UniValue sweepkey(const UniValue& params, bool fHelp)\n+{\n+    if (!EnsureWalletIsAvailable(fHelp))\n+        return NullUniValue;\n+\n+    if (fHelp || params.size() != 2)\n+        throw runtime_error(\n+            \"sweepkey \\\"bitcoinprivkey\\\" \\\"bitcoinaddress\\\"\\n\"\n+            \"\\nSweep the privkey's outputs to the specified address.\\n\"\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"bitcoinprivkey\\\"   (string, required) The private key (see dumpprivkey)\\n\"\n+            \"2. \\\"bitcoinaddress\\\"   (bitcoinaddress, required) The destination address\\n\"\n+            \"\\nExamples:\\n\"\n+            \"\\nSweep a private key\\n\"\n+            + HelpExampleCli(\"sweepkey\", \"\\\"mykey\\\" \\\"myaddress\\\"\") +\n+            \"\\nAs a JSON-RPC call\\n\"\n+            + HelpExampleRpc(\"sweepkey\", \"\\\"mykey\\\" \\\"myaddress\\\"\")\n+        );\n+\n+    LOCK2(cs_main, pwalletMain->cs_wallet);\n+\n+    EnsureWalletIsUnlocked();\n+\n+    string strSecret = params[0].get_str();\n+    string strAddress = params[1].get_str();\n+\n+    CBitcoinSecret vchSecret;\n+    if (!vchSecret.SetString(strSecret))\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Invalid private key encoding\");\n+\n+    CBitcoinAddress address(strAddress);\n+    if (!address.IsValid())\n+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Invalid Bitcoin address\");\n+\n+    if (!SweepPrivKey(vchSecret, address))\n+        throw JSONRPCError(RPC_INTERNAL_ERROR, \"SweepPrivKey failed!\");\n+\n+    return NullUniValue;\n+}\n+\n UniValue importprivkey(const UniValue& params, bool fHelp)\n {\n     if (!EnsureWalletIsAvailable(fHelp))\n         return NullUniValue;\n-    \n-    if (fHelp || params.size() < 1 || params.size() > 3)\n+\n+    if (fHelp || params.size() < 1 || params.size() > 5)\n         throw runtime_error(\n             \"importprivkey \\\"bitcoinprivkey\\\" ( \\\"label\\\" rescan )\\n\"\n             \"\\nAdds a private key (as returned by dumpprivkey) to your wallet.\\n\"\n             \"\\nArguments:\\n\"\n             \"1. \\\"bitcoinprivkey\\\"   (string, required) The private key (see dumpprivkey)\\n\"\n             \"2. \\\"label\\\"            (string, optional, default=\\\"\\\") An optional label\\n\"\n             \"3. rescan               (boolean, optional, default=true) Rescan the wallet for transactions\\n\"\n+            \"4. sweepkey             (boolean, optional, default=false) Sweep imported key for improved security\\n\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/8763#discussion_r79777484",
+      "id" : 79777484,
+      "original_commit_id" : "58afbb2868902669b17d8084afe55d3615bf9f6d",
+      "original_position" : 179,
+      "path" : "src/wallet/rpcdump.cpp",
+      "position" : 179,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8763",
+      "updated_at" : "2016-09-21T07:55:32Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/79777484",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1530283?v=3",
+         "events_url" : "https://api.github.com/users/rebroad/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/rebroad/followers",
+         "following_url" : "https://api.github.com/users/rebroad/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/rebroad/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/rebroad",
+         "id" : 1530283,
+         "login" : "rebroad",
+         "organizations_url" : "https://api.github.com/users/rebroad/orgs",
+         "received_events_url" : "https://api.github.com/users/rebroad/received_events",
+         "repos_url" : "https://api.github.com/users/rebroad/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/rebroad/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/rebroad/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/rebroad"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/8763#discussion_r79778487"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8763"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/79778487"
+         }
+      },
+      "body" : "Why would you sweep it, if it's in the wallet (and thereby trusted to be exclusively yours)?",
+      "commit_id" : "58afbb2868902669b17d8084afe55d3615bf9f6d",
+      "created_at" : "2016-09-21T08:02:03Z",
+      "diff_hunk" : "@@ -74,19 +77,166 @@ std::string DecodeDumpString(const std::string &str) {\n     return ret.str();\n }\n \n+bool SweepPrivKey(CBitcoinSecret key, CBitcoinAddress destAddress) {\n+    // Get the private key to be swept and validate it\n+    CKey dirtyKey = key.GetKey();\n+    if (!dirtyKey.IsValid())\n+        return false;\n+\n+    // Generate public key and verify it\n+    CPubKey pubkey = dirtyKey.GetPubKey();\n+    if (!dirtyKey.VerifyPubKey(pubkey))\n+        return false;\n+\n+    LOCK2(cs_main, pwalletMain->cs_wallet);\n+\n+    // Get outputs from wallet",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/8763#discussion_r79778487",
+      "id" : 79778487,
+      "original_commit_id" : "58afbb2868902669b17d8084afe55d3615bf9f6d",
+      "original_position" : 32,
+      "path" : "src/wallet/rpcdump.cpp",
+      "position" : 32,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8763",
+      "updated_at" : "2016-09-21T08:02:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/79778487",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1095675?v=3",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/8763#discussion_r79778603"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8763"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/79778603"
+         }
+      },
+      "body" : "n/a if create and broadcast are split up.",
+      "commit_id" : "58afbb2868902669b17d8084afe55d3615bf9f6d",
+      "created_at" : "2016-09-21T08:02:52Z",
+      "diff_hunk" : "@@ -74,19 +77,166 @@ std::string DecodeDumpString(const std::string &str) {\n     return ret.str();\n }\n \n+bool SweepPrivKey(CBitcoinSecret key, CBitcoinAddress destAddress) {\n+    // Get the private key to be swept and validate it\n+    CKey dirtyKey = key.GetKey();\n+    if (!dirtyKey.IsValid())\n+        return false;\n+\n+    // Generate public key and verify it\n+    CPubKey pubkey = dirtyKey.GetPubKey();\n+    if (!dirtyKey.VerifyPubKey(pubkey))\n+        return false;\n+\n+    LOCK2(cs_main, pwalletMain->cs_wallet);\n+\n+    // Get outputs from wallet\n+    std::vector<COutput> vCoins;\n+    pwalletMain->AvailableCoins(vCoins, false);\n+\n+    // Find all outputs of the key\n+    std::vector<COutput> vToSweep;\n+    BOOST_FOREACH(COutput output, vCoins)\n+    {\n+        vector<vector<unsigned char>> vSolution;\n+        txnouttype whichType;\n+        if (!Solver(output.tx->vout[output.i].scriptPubKey, whichType, vSolution))\n+            continue;\n+\n+        CKeyID keyID;\n+        if (whichType == TX_PUBKEY)\n+            keyID = CPubKey(vSolution[0]).GetID();\n+        else\n+        if (whichType == TX_PUBKEYHASH || whichType == TX_WITNESS_V0_KEYHASH)\n+            keyID = CKeyID(uint160(vSolution[0]));\n+\n+        if (keyID == pubkey.GetID())\n+            vToSweep.push_back(output);\n+    }\n+\n+    // Add inputs to sweep transaction\n+    CMutableTransaction mtx;\n+    CAmount total = 0;\n+    BOOST_FOREACH(COutput output, vToSweep)\n+    {\n+        mtx.vin.push_back(CTxIn(output.tx->GetHash(), output.i));\n+        total += output.tx->vout[output.i].nValue;\n+    }\n+\n+    if (!mtx.vin.size() || !(total > 0))\n+        return false;\n+\n+    // Add sweep destination - fee\n+    mtx.vout.push_back(CTxOut(total, GetScriptForDestination(destAddress.Get())));\n+    mtx.vout[0].nValue -= 3*CWallet::GetMinimumFee(GetVirtualTransactionSize(mtx), DEFAULT_TX_CONFIRM_TARGET, mempool);\n+\n+    mtx.nLockTime = chainActive.Height();\n+\n+    // Add the private key to a keystore\n+    CBasicKeyStore tempKeystore;\n+    tempKeystore.AddKey(dirtyKey);\n+\n+    const CTransaction txConst(mtx);\n+    const CKeyStore& keystoreConst = tempKeystore;\n+    for (uint32_t i = 0; i < mtx.vin.size(); i++)\n+    {\n+        CTxIn& input = mtx.vin[i];\n+        TransactionSignatureCreator creator(&keystoreConst, &txConst, i, mtx.vout[input.prevout.n].nValue);\n+\n+        SignatureData sigdata;\n+        bool sigCreated = ProduceSignature(creator, vToSweep[i].tx->vout[input.prevout.n].scriptPubKey, sigdata);\n+\n+        if (sigCreated && i < mtx.vin.size()) {\n+            mtx.vin[i].scriptSig = sigdata.scriptSig;\n+        }\n+    }\n+\n+    // Commit the transaction\n+    const CTransaction commit(mtx);\n+    CValidationState state;\n+    bool fMissingInputs;\n+    if (!AcceptToMemoryPool(mempool, state, commit, false, &fMissingInputs, false, maxTxFee)) {\n+        if (state.IsInvalid()) {\n+            throw JSONRPCError(RPC_TRANSACTION_REJECTED, strprintf(\"%i: %s\", state.GetRejectCode(), state.GetRejectReason()));\n+        } else {\n+            if (fMissingInputs) {\n+                throw JSONRPCError(RPC_TRANSACTION_ERROR, \"Missing inputs\");\n+            }\n+            throw JSONRPCError(RPC_TRANSACTION_ERROR, state.GetRejectReason());\n+        }\n+\n+        LogPrintf(\"SweepPrivKey(): Error: Transaction not valid\\n\");\n+        return false;\n+    }\n+\n+    if (pwalletMain->GetBroadcastTransactions() && !g_connman)\n+        throw JSONRPCError(RPC_CLIENT_P2P_DISABLED, \"Error: Peer-to-peer functionality missing or disabled\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/8763#discussion_r79778603",
+      "id" : 79778603,
+      "original_commit_id" : "58afbb2868902669b17d8084afe55d3615bf9f6d",
+      "original_position" : 112,
+      "path" : "src/wallet/rpcdump.cpp",
+      "position" : 112,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8763",
+      "updated_at" : "2016-09-21T08:02:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/79778603",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1095675?v=3",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/8763#discussion_r79779172"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8763"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/79779172"
+         }
+      },
+      "body" : "The first \"use case\" in #2751 I assume is poorly phrased. You never want to import such a key. What makes sense, and what @jgarzik probably meant, is that *instead* of importing the key, you sweep it, and keep a copy of the private key in an as-of-yet-non-existent part of the wallet to be continually swept in case someone sends funds to it in the future.\r\n\r\nThe second use case is not likely to occur often in practice, but would benefit from the old keys being moved into a separated sweep-only keystore as well.",
+      "commit_id" : "58afbb2868902669b17d8084afe55d3615bf9f6d",
+      "created_at" : "2016-09-21T08:06:36Z",
+      "diff_hunk" : "@@ -74,19 +77,166 @@ std::string DecodeDumpString(const std::string &str) {\n     return ret.str();\n }\n \n+bool SweepPrivKey(CBitcoinSecret key, CBitcoinAddress destAddress) {\n+    // Get the private key to be swept and validate it\n+    CKey dirtyKey = key.GetKey();\n+    if (!dirtyKey.IsValid())\n+        return false;\n+\n+    // Generate public key and verify it\n+    CPubKey pubkey = dirtyKey.GetPubKey();\n+    if (!dirtyKey.VerifyPubKey(pubkey))\n+        return false;\n+\n+    LOCK2(cs_main, pwalletMain->cs_wallet);\n+\n+    // Get outputs from wallet\n+    std::vector<COutput> vCoins;\n+    pwalletMain->AvailableCoins(vCoins, false);\n+\n+    // Find all outputs of the key\n+    std::vector<COutput> vToSweep;\n+    BOOST_FOREACH(COutput output, vCoins)\n+    {\n+        vector<vector<unsigned char>> vSolution;\n+        txnouttype whichType;\n+        if (!Solver(output.tx->vout[output.i].scriptPubKey, whichType, vSolution))\n+            continue;\n+\n+        CKeyID keyID;\n+        if (whichType == TX_PUBKEY)\n+            keyID = CPubKey(vSolution[0]).GetID();\n+        else\n+        if (whichType == TX_PUBKEYHASH || whichType == TX_WITNESS_V0_KEYHASH)\n+            keyID = CKeyID(uint160(vSolution[0]));\n+\n+        if (keyID == pubkey.GetID())\n+            vToSweep.push_back(output);\n+    }\n+\n+    // Add inputs to sweep transaction\n+    CMutableTransaction mtx;\n+    CAmount total = 0;\n+    BOOST_FOREACH(COutput output, vToSweep)\n+    {\n+        mtx.vin.push_back(CTxIn(output.tx->GetHash(), output.i));\n+        total += output.tx->vout[output.i].nValue;\n+    }\n+\n+    if (!mtx.vin.size() || !(total > 0))\n+        return false;\n+\n+    // Add sweep destination - fee\n+    mtx.vout.push_back(CTxOut(total, GetScriptForDestination(destAddress.Get())));\n+    mtx.vout[0].nValue -= 3*CWallet::GetMinimumFee(GetVirtualTransactionSize(mtx), DEFAULT_TX_CONFIRM_TARGET, mempool);\n+\n+    mtx.nLockTime = chainActive.Height();\n+\n+    // Add the private key to a keystore\n+    CBasicKeyStore tempKeystore;\n+    tempKeystore.AddKey(dirtyKey);\n+\n+    const CTransaction txConst(mtx);\n+    const CKeyStore& keystoreConst = tempKeystore;\n+    for (uint32_t i = 0; i < mtx.vin.size(); i++)\n+    {\n+        CTxIn& input = mtx.vin[i];\n+        TransactionSignatureCreator creator(&keystoreConst, &txConst, i, mtx.vout[input.prevout.n].nValue);\n+\n+        SignatureData sigdata;\n+        bool sigCreated = ProduceSignature(creator, vToSweep[i].tx->vout[input.prevout.n].scriptPubKey, sigdata);\n+\n+        if (sigCreated && i < mtx.vin.size()) {\n+            mtx.vin[i].scriptSig = sigdata.scriptSig;\n+        }\n+    }\n+\n+    // Commit the transaction\n+    const CTransaction commit(mtx);\n+    CValidationState state;\n+    bool fMissingInputs;\n+    if (!AcceptToMemoryPool(mempool, state, commit, false, &fMissingInputs, false, maxTxFee)) {\n+        if (state.IsInvalid()) {\n+            throw JSONRPCError(RPC_TRANSACTION_REJECTED, strprintf(\"%i: %s\", state.GetRejectCode(), state.GetRejectReason()));\n+        } else {\n+            if (fMissingInputs) {\n+                throw JSONRPCError(RPC_TRANSACTION_ERROR, \"Missing inputs\");\n+            }\n+            throw JSONRPCError(RPC_TRANSACTION_ERROR, state.GetRejectReason());\n+        }\n+\n+        LogPrintf(\"SweepPrivKey(): Error: Transaction not valid\\n\");\n+        return false;\n+    }\n+\n+    if (pwalletMain->GetBroadcastTransactions() && !g_connman)\n+        throw JSONRPCError(RPC_CLIENT_P2P_DISABLED, \"Error: Peer-to-peer functionality missing or disabled\");\n+\n+    // Broadcast the transaction\n+    CInv inv(MSG_TX, commit.GetHash());\n+    g_connman->ForEachNode([&inv](CNode* pnode)\n+    {\n+        pnode->PushInventory(inv);\n+    });\n+\n+    return true;\n+}\n+\n+UniValue sweepkey(const UniValue& params, bool fHelp)\n+{\n+    if (!EnsureWalletIsAvailable(fHelp))\n+        return NullUniValue;\n+\n+    if (fHelp || params.size() != 2)\n+        throw runtime_error(\n+            \"sweepkey \\\"bitcoinprivkey\\\" \\\"bitcoinaddress\\\"\\n\"\n+            \"\\nSweep the privkey's outputs to the specified address.\\n\"\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"bitcoinprivkey\\\"   (string, required) The private key (see dumpprivkey)\\n\"\n+            \"2. \\\"bitcoinaddress\\\"   (bitcoinaddress, required) The destination address\\n\"\n+            \"\\nExamples:\\n\"\n+            \"\\nSweep a private key\\n\"\n+            + HelpExampleCli(\"sweepkey\", \"\\\"mykey\\\" \\\"myaddress\\\"\") +\n+            \"\\nAs a JSON-RPC call\\n\"\n+            + HelpExampleRpc(\"sweepkey\", \"\\\"mykey\\\" \\\"myaddress\\\"\")\n+        );\n+\n+    LOCK2(cs_main, pwalletMain->cs_wallet);\n+\n+    EnsureWalletIsUnlocked();\n+\n+    string strSecret = params[0].get_str();\n+    string strAddress = params[1].get_str();\n+\n+    CBitcoinSecret vchSecret;\n+    if (!vchSecret.SetString(strSecret))\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Invalid private key encoding\");\n+\n+    CBitcoinAddress address(strAddress);\n+    if (!address.IsValid())\n+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Invalid Bitcoin address\");\n+\n+    if (!SweepPrivKey(vchSecret, address))\n+        throw JSONRPCError(RPC_INTERNAL_ERROR, \"SweepPrivKey failed!\");\n+\n+    return NullUniValue;\n+}\n+\n UniValue importprivkey(const UniValue& params, bool fHelp)\n {\n     if (!EnsureWalletIsAvailable(fHelp))\n         return NullUniValue;\n-    \n-    if (fHelp || params.size() < 1 || params.size() > 3)\n+\n+    if (fHelp || params.size() < 1 || params.size() > 5)\n         throw runtime_error(\n             \"importprivkey \\\"bitcoinprivkey\\\" ( \\\"label\\\" rescan )\\n\"\n             \"\\nAdds a private key (as returned by dumpprivkey) to your wallet.\\n\"\n             \"\\nArguments:\\n\"\n             \"1. \\\"bitcoinprivkey\\\"   (string, required) The private key (see dumpprivkey)\\n\"\n             \"2. \\\"label\\\"            (string, optional, default=\\\"\\\") An optional label\\n\"\n             \"3. rescan               (boolean, optional, default=true) Rescan the wallet for transactions\\n\"\n+            \"4. sweepkey             (boolean, optional, default=false) Sweep imported key for improved security\\n\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/8763#discussion_r79779172",
+      "id" : 79779172,
+      "original_commit_id" : "58afbb2868902669b17d8084afe55d3615bf9f6d",
+      "original_position" : 179,
+      "path" : "src/wallet/rpcdump.cpp",
+      "position" : 179,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8763",
+      "updated_at" : "2016-09-21T08:06:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/79779172",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1095675?v=3",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
    }
 ]
