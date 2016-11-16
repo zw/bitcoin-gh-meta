@@ -730,5 +730,143 @@
          "type" : "User",
          "url" : "https://api.github.com/users/sipa"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/8895#discussion_r88169538"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8895"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/88169538"
+         }
+      },
+      "body" : "Yes there is a reason.\r\n\r\nThe locks aren't actually needed at all how the cache is currently used. All that needs to happen is per thread: at the beginning of a block processing, a memory acquire; at the end of block processing a memory release. Additionally, one more lock must be acquired before block processing by the master to ensure that there are no concurrent writers (from addtomempool) and that master must not release until all slaves release as well. This is much better than the repeated acquire/release of locking/unlocking on every single signature operation.\r\n\r\nI have written a version of the code which has this semantics, but some feedback from others felt that it was fragile & prone to someone else breaking that behavior down the line (bad for maintainability). In the interest of keeping that optimization available and not introducing a maintenance hazard, I kept the locking where it was in the \"layer up\".",
+      "commit_id" : "78f1c92e5c363725ed1d1a9e47a9e27bb0c7c073",
+      "created_at" : "2016-11-16T05:11:24Z",
+      "diff_hunk" : "@@ -0,0 +1,452 @@\n+// Copyright (c) 2016 Jeremy Rubin\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef _BITCOIN_CUCKOOCACHE_H_\n+#define _BITCOIN_CUCKOOCACHE_H_\n+\n+#include <array>\n+#include <algorithm>\n+#include <atomic>\n+#include <cstring>\n+#include <cmath>\n+#include <memory>\n+#include <vector>\n+\n+\n+/** namespace CuckooCache provides high performance cache primitives\n+ *\n+ * Summary:\n+ *\n+ * 1) bit_packed_atomic_flags is bit-packed atomic flags for garbage collection\n+ *\n+ * 2) cache is a cache which is performant in memory usage and lookup speed. It\n+ * is lockfree for erase operations. Elements are lazily erased on the next\n+ * insert.\n+ */\n+namespace CuckooCache\n+{\n+/** bit_packed_atomic_flags implements a container for garbage collection flags\n+ * that is only thread unsafe on calls to setup. This class bit-packs collection\n+ * flags for memory efficiency.\n+ *\n+ * All operations are std::memory_order_relaxed so external mechanisms must\n+ * ensure that writes and reads are properly synchronized.\n+ *\n+ * On setup(n), all bits up to n are marked as collected.\n+ *\n+ * Under the hood, because it is an 8-bit type, it makes sense to use a multiple\n+ * of 8 for setup, but it will be safe if that is not the case as well.\n+ *\n+ */\n+class bit_packed_atomic_flags\n+{\n+    std::unique_ptr<std::atomic<uint8_t>[]> mem;\n+\n+public:\n+    /** No default constructor as there must be some size */\n+    bit_packed_atomic_flags() = delete;\n+\n+    /**\n+     * bit_packed_atomic_flags constructor creates memory to sufficiently\n+     * keep track of garbage collection information for size entries.\n+     *\n+     * @param size the number of elements to allocate space for\n+     *\n+     * @post bit_set, bit_unset, and bit_is_set function properly forall x. x <\n+     * size\n+     * @post All calls to bit_is_set (without subsequent bit_unset) will return\n+     * true.\n+     */\n+    bit_packed_atomic_flags(uint32_t size)\n+    {\n+        // pad out the size if needed\n+        size = (size + 7) / 8;\n+        mem.reset(new std::atomic<uint8_t>[size]);\n+        for (uint32_t i = 0; i < size; ++i)\n+            mem[i].store(0xFF);\n+    };\n+\n+    /** setup marks all entries and ensures that bit_packed_atomic_flags can store\n+     * at least size entries\n+     *\n+     * @param b the number of elements to allocate space for\n+     * @post bit_set, bit_unset, and bit_is_set function properly forall x. x <\n+     * b\n+     * @post All calls to bit_is_set (without subsequent bit_unset) will return\n+     * true.\n+     */\n+    inline void setup(uint32_t b)\n+    {\n+        bit_packed_atomic_flags d(b);\n+        std::swap(mem, d.mem);\n+    }\n+\n+    /** bit_set sets an entry as discardable. \n+     *\n+     * @param s the index of the entry to bit_set.\n+     * @post immediately subsequent call (assuming proper external memory\n+     * ordering) to bit_is_set(s) == true.\n+     *\n+     */\n+    inline void bit_set(uint32_t s)\n+    {\n+        mem[s >> 3].fetch_or(1 << (s & 7), std::memory_order_relaxed);\n+    }\n+\n+    /**  bit_unset marks an entry as something that should not be overwritten  \n+     *\n+     * @param s the index of the entry to bit_unset.\n+     * @post immediately subsequent call (assuming proper external memory\n+     * ordering) to bit_is_set(s) == false.\n+     */\n+    inline void bit_unset(uint32_t s)\n+    {\n+        mem[s >> 3].fetch_and(~(1 << (s & 7)), std::memory_order_relaxed);\n+    }\n+\n+    /** bit_is_set queries the table for discardability at s\n+     *\n+     * @param s the index of the entry to read.\n+     * @returns if the bit at index s was set.\n+     * */\n+    inline bool bit_is_set(uint32_t s) const\n+    {\n+        return (1 << (s & 7)) & mem[s >> 3].load(std::memory_order_relaxed);\n+    }\n+};\n+\n+/** cache implements a cache with properties similar to a cuckoo-set\n+ *\n+ *  The cache is able to hold up to (~(uint32_t) 1) elements.\n+ *\n+ *  Read Operations:\n+ *      - contains(*, false)\n+ *\n+ *  Read/Erase Operations:\n+ *      - contains(*, true)\n+ *      - allow_erase()\n+ *\n+ *  Write Operations:\n+ *      - setup()\n+ *      - setup_bytes()\n+ *      - insert()\n+ *      - please_keep()\n+ *      - rehash()\n+ *\n+ *  Synchronization Free Operations:\n+ *      - invalid()\n+ *      - compute_hashes()\n+ *\n+ * User Must Guarantee:\n+ *\n+ * 1) Write Requires synchronized access (e.g., a lock)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/8895#discussion_r88169538",
+      "id" : 88169538,
+      "original_commit_id" : "78f1c92e5c363725ed1d1a9e47a9e27bb0c7c073",
+      "original_position" : 143,
+      "path" : "src/cuckoocache.h",
+      "position" : 143,
+      "pull_request_review_id" : 8750626,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8895",
+      "updated_at" : "2016-11-16T05:11:24Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/88169538",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/886523?v=3",
+         "events_url" : "https://api.github.com/users/JeremyRubin/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/JeremyRubin/followers",
+         "following_url" : "https://api.github.com/users/JeremyRubin/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/JeremyRubin/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/JeremyRubin",
+         "id" : 886523,
+         "login" : "JeremyRubin",
+         "organizations_url" : "https://api.github.com/users/JeremyRubin/orgs",
+         "received_events_url" : "https://api.github.com/users/JeremyRubin/received_events",
+         "repos_url" : "https://api.github.com/users/JeremyRubin/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/JeremyRubin/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/JeremyRubin/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/JeremyRubin"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/8895#discussion_r88169799"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8895"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/88169799"
+         }
+      },
+      "body" : "I suppose the way it is currently written (using swap and move) it should be safe to remove both requirements (POD and 32-alignable). \r\n\r\nPrior versions of the code I think were unsafe for that use case.",
+      "commit_id" : "78f1c92e5c363725ed1d1a9e47a9e27bb0c7c073",
+      "created_at" : "2016-11-16T05:15:35Z",
+      "diff_hunk" : "@@ -0,0 +1,450 @@\n+// Copyright (c) 2016 Jeremy Rubin\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef _BITCOIN_CUCKOOCACHE_H_\n+#define _BITCOIN_CUCKOOCACHE_H_\n+\n+#include <algorithm>\n+#include <atomic>\n+#include <cstring>\n+#include <cmath>\n+#include <memory>\n+#include <vector>\n+\n+\n+/** namespace CuckooCache provides high performance cache primitives\n+ *\n+ * Summary:\n+ *\n+ * 1) bit_packed_atomic_flags is bit-packed atomic flags for garbage collection\n+ *\n+ * 2) cache is a cache which is performant in memory usage and lookup speed. It\n+ * is lockfree for erase operations. Elements are lazily erased on the next\n+ * insert.\n+ */\n+namespace CuckooCache\n+{\n+/** bit_packed_atomic_flags implements a container for garbage collection flags\n+ * that is only thread unsafe on calls to setup. This class bit-packs collection\n+ * flags for memory efficiency.\n+ *\n+ * All operations are std::memory_order_relaxed so external mechanisms must\n+ * ensure that writes and reads are properly synchronized.\n+ *\n+ * On setup(n), all bits up to n are marked as collected.\n+ *\n+ * Under the hood, because it is an 8-bit type, it makes sense to use a multiple\n+ * of 8 for setup, but it will be safe if that is not the case as well.\n+ *\n+ */\n+class bit_packed_atomic_flags\n+{\n+    std::unique_ptr<std::atomic<uint8_t>[]> mem;\n+\n+public:\n+    /** No default constructor as there must be some size */\n+    bit_packed_atomic_flags() = delete;\n+\n+    /**\n+     * bit_packed_atomic_flags constructor creates memory to sufficiently\n+     * keep track of garbage collection information for size entries.\n+     *\n+     * @param size the number of elements to allocate space for\n+     *\n+     * @post bit_set, bit_unset, and bit_is_set function properly forall x. x <\n+     * size\n+     * @post All calls to bit_is_set (without subsequent bit_unset) will return\n+     * true.\n+     */\n+    bit_packed_atomic_flags(uint32_t size)\n+    {\n+        // pad out the size if needed\n+        size = (size + 7) / 8;\n+        mem.reset(new std::atomic<uint8_t>[size]);\n+        for (uint32_t i = 0; i < size; ++i)\n+            mem[i].store(0xFF);\n+    };\n+\n+    /** setup marks all entries and ensures that bit_packed_atomic_flags can store\n+     * at least size entries\n+     *\n+     * @param b the number of elements to allocate space for\n+     * @post bit_set, bit_unset, and bit_is_set function properly forall x. x <\n+     * b\n+     * @post All calls to bit_is_set (without subsequent bit_unset) will return\n+     * true.\n+     */\n+    inline void setup(uint32_t b)\n+    {\n+        bit_packed_atomic_flags d(b);\n+        std::swap(mem, d.mem);\n+    }\n+\n+    /** bit_set sets an entry as discardable. \n+     *\n+     * @param s the index of the entry to bit_set.\n+     * @post immediately subsequent call (assuming proper external memory\n+     * ordering) to bit_is_set(s) == true.\n+     *\n+     */\n+    inline void bit_set(uint32_t s)\n+    {\n+        mem[s >> 3].fetch_or(1 << (s & 7), std::memory_order_relaxed);\n+    }\n+\n+    /**  bit_unset marks an entry as something that should not be overwritten  \n+     *\n+     * @param s the index of the entry to bit_unset.\n+     * @post immediately subsequent call (assuming proper external memory\n+     * ordering) to bit_is_set(s) == false.\n+     */\n+    inline void bit_unset(uint32_t s)\n+    {\n+        mem[s >> 3].fetch_and(~(1 << (s & 7)), std::memory_order_relaxed);\n+    }\n+\n+    /** bit_is_set queries the table for discardability at s\n+     *\n+     * @param s the index of the entry to read.\n+     * @returns if the bit at index s was set.\n+     * */\n+    inline bool bit_is_set(uint32_t s) const\n+    {\n+        return (1 << (s & 7)) & mem[s >> 3].load(std::memory_order_relaxed);\n+    }\n+};\n+\n+/** cache implements a cache with properties similar to a cuckoo-set\n+ *\n+ *  The cache is able to hold up to (~(uint32_t) 1) elements.\n+ *\n+ *  Read Operations:\n+ *      - contains(*, false)\n+ *\n+ *  Read/Erase Operations:\n+ *      - contains(*, true)\n+ *      - allow_erase()\n+ *\n+ *  Write Operations:\n+ *      - setup()\n+ *      - setup_bytes()\n+ *      - insert()\n+ *      - please_keep()\n+ *      - rehash()\n+ *\n+ *  Synchronization Free Operations:\n+ *      - invalid()\n+ *      - compute_hashes()\n+ *\n+ * User Must Guarantee:\n+ *\n+ * 1) Write Requires synchronized access (e.g., a lock)\n+ * 2) Read Requires no concurrent Write, synchronized with the last insert.\n+ * 3) Erase requires no concurrent Write, synchronized with last insert.\n+ * 4) An Eraser must release all Erases before allowing a new Writer.\n+ *\n+ *\n+ * Note on function names:\n+ *   - The name \"allow_erase\" is used because the real discard happens later.\n+ *   - The name \"please_keep\" is used because elements may be erased anyways on insert.\n+ *\n+ * @tparam Element should be a POD type that is 32-alignable",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/8895#discussion_r88169799",
+      "id" : 88169799,
+      "original_commit_id" : "5ec14c8b4a4d00ee654bb342d3f37f09e0264cfa",
+      "original_position" : 152,
+      "path" : "src/cuckoocache.h",
+      "position" : 153,
+      "pull_request_review_id" : 8750868,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8895",
+      "updated_at" : "2016-11-16T05:15:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/88169799",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/886523?v=3",
+         "events_url" : "https://api.github.com/users/JeremyRubin/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/JeremyRubin/followers",
+         "following_url" : "https://api.github.com/users/JeremyRubin/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/JeremyRubin/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/JeremyRubin",
+         "id" : 886523,
+         "login" : "JeremyRubin",
+         "organizations_url" : "https://api.github.com/users/JeremyRubin/orgs",
+         "received_events_url" : "https://api.github.com/users/JeremyRubin/received_events",
+         "repos_url" : "https://api.github.com/users/JeremyRubin/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/JeremyRubin/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/JeremyRubin/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/JeremyRubin"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/8895#discussion_r88169876"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8895"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/88169876"
+         }
+      },
+      "body" : "(I can do a squashme with just that unless you have other small feedbacks)",
+      "commit_id" : "78f1c92e5c363725ed1d1a9e47a9e27bb0c7c073",
+      "created_at" : "2016-11-16T05:16:43Z",
+      "diff_hunk" : "@@ -0,0 +1,450 @@\n+// Copyright (c) 2016 Jeremy Rubin\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef _BITCOIN_CUCKOOCACHE_H_\n+#define _BITCOIN_CUCKOOCACHE_H_\n+\n+#include <algorithm>\n+#include <atomic>\n+#include <cstring>\n+#include <cmath>\n+#include <memory>\n+#include <vector>\n+\n+\n+/** namespace CuckooCache provides high performance cache primitives\n+ *\n+ * Summary:\n+ *\n+ * 1) bit_packed_atomic_flags is bit-packed atomic flags for garbage collection\n+ *\n+ * 2) cache is a cache which is performant in memory usage and lookup speed. It\n+ * is lockfree for erase operations. Elements are lazily erased on the next\n+ * insert.\n+ */\n+namespace CuckooCache\n+{\n+/** bit_packed_atomic_flags implements a container for garbage collection flags\n+ * that is only thread unsafe on calls to setup. This class bit-packs collection\n+ * flags for memory efficiency.\n+ *\n+ * All operations are std::memory_order_relaxed so external mechanisms must\n+ * ensure that writes and reads are properly synchronized.\n+ *\n+ * On setup(n), all bits up to n are marked as collected.\n+ *\n+ * Under the hood, because it is an 8-bit type, it makes sense to use a multiple\n+ * of 8 for setup, but it will be safe if that is not the case as well.\n+ *\n+ */\n+class bit_packed_atomic_flags\n+{\n+    std::unique_ptr<std::atomic<uint8_t>[]> mem;\n+\n+public:\n+    /** No default constructor as there must be some size */\n+    bit_packed_atomic_flags() = delete;\n+\n+    /**\n+     * bit_packed_atomic_flags constructor creates memory to sufficiently\n+     * keep track of garbage collection information for size entries.\n+     *\n+     * @param size the number of elements to allocate space for\n+     *\n+     * @post bit_set, bit_unset, and bit_is_set function properly forall x. x <\n+     * size\n+     * @post All calls to bit_is_set (without subsequent bit_unset) will return\n+     * true.\n+     */\n+    bit_packed_atomic_flags(uint32_t size)\n+    {\n+        // pad out the size if needed\n+        size = (size + 7) / 8;\n+        mem.reset(new std::atomic<uint8_t>[size]);\n+        for (uint32_t i = 0; i < size; ++i)\n+            mem[i].store(0xFF);\n+    };\n+\n+    /** setup marks all entries and ensures that bit_packed_atomic_flags can store\n+     * at least size entries\n+     *\n+     * @param b the number of elements to allocate space for\n+     * @post bit_set, bit_unset, and bit_is_set function properly forall x. x <\n+     * b\n+     * @post All calls to bit_is_set (without subsequent bit_unset) will return\n+     * true.\n+     */\n+    inline void setup(uint32_t b)\n+    {\n+        bit_packed_atomic_flags d(b);\n+        std::swap(mem, d.mem);\n+    }\n+\n+    /** bit_set sets an entry as discardable. \n+     *\n+     * @param s the index of the entry to bit_set.\n+     * @post immediately subsequent call (assuming proper external memory\n+     * ordering) to bit_is_set(s) == true.\n+     *\n+     */\n+    inline void bit_set(uint32_t s)\n+    {\n+        mem[s >> 3].fetch_or(1 << (s & 7), std::memory_order_relaxed);\n+    }\n+\n+    /**  bit_unset marks an entry as something that should not be overwritten  \n+     *\n+     * @param s the index of the entry to bit_unset.\n+     * @post immediately subsequent call (assuming proper external memory\n+     * ordering) to bit_is_set(s) == false.\n+     */\n+    inline void bit_unset(uint32_t s)\n+    {\n+        mem[s >> 3].fetch_and(~(1 << (s & 7)), std::memory_order_relaxed);\n+    }\n+\n+    /** bit_is_set queries the table for discardability at s\n+     *\n+     * @param s the index of the entry to read.\n+     * @returns if the bit at index s was set.\n+     * */\n+    inline bool bit_is_set(uint32_t s) const\n+    {\n+        return (1 << (s & 7)) & mem[s >> 3].load(std::memory_order_relaxed);\n+    }\n+};\n+\n+/** cache implements a cache with properties similar to a cuckoo-set\n+ *\n+ *  The cache is able to hold up to (~(uint32_t) 1) elements.\n+ *\n+ *  Read Operations:\n+ *      - contains(*, false)\n+ *\n+ *  Read/Erase Operations:\n+ *      - contains(*, true)\n+ *      - allow_erase()\n+ *\n+ *  Write Operations:\n+ *      - setup()\n+ *      - setup_bytes()\n+ *      - insert()\n+ *      - please_keep()\n+ *      - rehash()\n+ *\n+ *  Synchronization Free Operations:\n+ *      - invalid()\n+ *      - compute_hashes()\n+ *\n+ * User Must Guarantee:\n+ *\n+ * 1) Write Requires synchronized access (e.g., a lock)\n+ * 2) Read Requires no concurrent Write, synchronized with the last insert.\n+ * 3) Erase requires no concurrent Write, synchronized with last insert.\n+ * 4) An Eraser must release all Erases before allowing a new Writer.\n+ *\n+ *\n+ * Note on function names:\n+ *   - The name \"allow_erase\" is used because the real discard happens later.\n+ *   - The name \"please_keep\" is used because elements may be erased anyways on insert.\n+ *\n+ * @tparam Element should be a POD type that is 32-alignable",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/8895#discussion_r88169876",
+      "id" : 88169876,
+      "original_commit_id" : "5ec14c8b4a4d00ee654bb342d3f37f09e0264cfa",
+      "original_position" : 152,
+      "path" : "src/cuckoocache.h",
+      "position" : 153,
+      "pull_request_review_id" : 8750929,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8895",
+      "updated_at" : "2016-11-16T05:16:43Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/88169876",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/886523?v=3",
+         "events_url" : "https://api.github.com/users/JeremyRubin/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/JeremyRubin/followers",
+         "following_url" : "https://api.github.com/users/JeremyRubin/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/JeremyRubin/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/JeremyRubin",
+         "id" : 886523,
+         "login" : "JeremyRubin",
+         "organizations_url" : "https://api.github.com/users/JeremyRubin/orgs",
+         "received_events_url" : "https://api.github.com/users/JeremyRubin/received_events",
+         "repos_url" : "https://api.github.com/users/JeremyRubin/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/JeremyRubin/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/JeremyRubin/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/JeremyRubin"
+      }
    }
 ]
