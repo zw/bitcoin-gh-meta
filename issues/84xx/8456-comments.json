@@ -5232,5 +5232,79 @@
          "type" : "User",
          "url" : "https://api.github.com/users/morcos"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/8456#discussion_r95228707"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8456"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/95228707"
+         }
+      },
+      "body" : "i'd abandon bumpid here so it doesn't accidentally rereplace rbfid if its reaccepted from the wallet\r\n\r\nif later abandoning conflicts/replacements frees up the original to spend again then thats a change in behavior that can result in changing the test",
+      "commit_id" : "f4fa93b29a59c6d0f0341f442fd1805972b43ca1",
+      "created_at" : "2017-01-09T19:33:43Z",
+      "diff_hunk" : "@@ -0,0 +1,223 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2016 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework import blocktools\n+from test_framework.mininode import CTransaction\n+from test_framework.util import *\n+from test_framework.util import *\n+\n+import io\n+import time\n+\n+# Sequence number that is BIP 125 opt-in and BIP 68-compliant\n+BIP125_SEQUENCE_NUMBER = 0xfffffffd\n+\n+\n+class BumpFeeTest(BitcoinTestFramework):\n+    def __init__(self):\n+        super().__init__()\n+        self.num_nodes = 2\n+        self.setup_clean_chain = True\n+\n+    def setup_network(self, split=False):\n+        self.nodes = []\n+        self.nodes.append(start_node(0, self.options.tmpdir, [\"-debug\", \"-walletrbf\"]))\n+        self.nodes.append(start_node(1, self.options.tmpdir, [\"-debug\"]))\n+        connect_nodes_bi(self.nodes, 0, 1)\n+        self.is_network_split = False\n+        self.sync_all()\n+\n+    def run_test(self):\n+        rbf_node, peer_node = self.nodes\n+        rbf_node_address = rbf_node.getnewaddress()\n+\n+        # fund rbf node with 10 coins of 0.001 btc (100,000 satoshis)\n+        print(\"Mining blocks...\")\n+        self.nodes[1].generate(110)\n+        self.sync_all()\n+        for i in range(10):\n+            self.nodes[1].sendtoaddress(rbf_node_address, 0.001)\n+        self.sync_all()\n+        self.nodes[1].generate(1)\n+        self.sync_all()\n+        assert_equal(self.nodes[0].getbalance(), Decimal(\"0.01\"))\n+\n+        print(\"Running tests\")\n+        dest_address = peer_node.getnewaddress()\n+        test_simple_bumpfee_succeeds(rbf_node, peer_node, dest_address)\n+        test_nonrbf_bumpfee_fails(peer_node, dest_address)\n+        test_notmine_bumpfee_fails(rbf_node, peer_node, dest_address)\n+        test_bumpfee_with_descendant_fails(rbf_node, rbf_node_address, dest_address)\n+        test_small_output_fails(rbf_node, dest_address)\n+        test_dust_to_fee(rbf_node, dest_address)\n+        test_settxfee(rbf_node, dest_address)\n+        test_rebumping(rbf_node, dest_address)\n+        test_unconfirmed_not_spendable(rbf_node, rbf_node_address)\n+        print(\"Success\")\n+\n+\n+def test_simple_bumpfee_succeeds(rbf_node, peer_node, dest_address):\n+    rbfid = create_fund_sign_send(rbf_node, {dest_address: 0.00090000})\n+    rbftx = rbf_node.gettransaction(rbfid)\n+    sync_mempools((rbf_node, peer_node))\n+    assert rbfid in rbf_node.getrawmempool() and rbfid in peer_node.getrawmempool()\n+    bumped_tx = rbf_node.bumpfee(rbfid)\n+    assert bumped_tx[\"fee\"] - abs(rbftx[\"fee\"]) > 0\n+    # check that bumped_tx propogates, original tx was evicted and has a wallet conflict\n+    sync_mempools((rbf_node, peer_node))\n+    assert bumped_tx[\"txid\"] in rbf_node.getrawmempool()\n+    assert bumped_tx[\"txid\"] in peer_node.getrawmempool()\n+    assert rbfid not in rbf_node.getrawmempool()\n+    assert rbfid not in peer_node.getrawmempool()\n+    oldwtx = rbf_node.gettransaction(rbfid)\n+    assert len(oldwtx[\"walletconflicts\"]) > 0\n+    # check wallet transaction replaces and replaced_by values\n+    bumpedwtx = rbf_node.gettransaction(bumped_tx[\"txid\"])\n+    assert_equal(oldwtx[\"replaced_by_txid\"], bumped_tx[\"txid\"])\n+    assert_equal(bumpedwtx[\"replaces_txid\"], rbfid)\n+\n+\n+def test_nonrbf_bumpfee_fails(peer_node, dest_address):\n+    # cannot replace a non RBF transaction (from node which did not enable RBF)\n+    not_rbfid = create_fund_sign_send(peer_node, {dest_address: 0.00090000})\n+    assert_raises_message(JSONRPCException, \"not BIP 125 replaceable\", peer_node.bumpfee, not_rbfid)\n+\n+\n+def test_notmine_bumpfee_fails(rbf_node, peer_node, dest_address):\n+    # cannot bump fee unless the tx has only inputs that we own.\n+    # here, the rbftx has a peer_node coin and then adds a rbf_node input\n+    # Note that this test depends upon the RPC code checking input ownership prior to change outputs\n+    # (since it can't use fundrawtransaction, it lacks a proper change output)\n+    utxos = [node.listunspent()[-1] for node in (rbf_node, peer_node)]\n+    inputs = [{\n+        \"txid\": utxo[\"txid\"],\n+        \"vout\": utxo[\"vout\"],\n+        \"address\": utxo[\"address\"],\n+        \"sequence\": BIP125_SEQUENCE_NUMBER\n+    } for utxo in utxos]\n+    output_val = sum(utxo[\"amount\"] for utxo in utxos) - Decimal(\"0.001\")\n+    rawtx = rbf_node.createrawtransaction(inputs, {dest_address: output_val})\n+    signedtx = rbf_node.signrawtransaction(rawtx)\n+    signedtx = peer_node.signrawtransaction(signedtx[\"hex\"])\n+    rbfid = rbf_node.sendrawtransaction(signedtx[\"hex\"])\n+    assert_raises_message(JSONRPCException, \"Transaction contains inputs that don't belong to this wallet\",\n+                          rbf_node.bumpfee, rbfid)\n+\n+\n+def test_bumpfee_with_descendant_fails(rbf_node, rbf_node_address, dest_address):\n+    # cannot bump fee if the transaction has a descendant\n+    # parent is send-to-self, so we don't have to check which output is change when creating the child tx\n+    parent_id = create_fund_sign_send(rbf_node, {rbf_node_address: 0.00050000})\n+    tx = rbf_node.createrawtransaction([{\"txid\": parent_id, \"vout\": 0}], {dest_address: 0.00020000})\n+    tx = rbf_node.signrawtransaction(tx)\n+    txid = rbf_node.sendrawtransaction(tx[\"hex\"])\n+    assert_raises_message(JSONRPCException, \"Transaction has descendants in the wallet\", rbf_node.bumpfee, parent_id)\n+\n+\n+def test_small_output_fails(rbf_node, dest_address):\n+    # cannot bump fee with a too-small output\n+    rbfid = create_fund_sign_send(rbf_node, {dest_address: 0.00090000})\n+    rbf_node.bumpfee(rbfid, {\"totalFee\": 10000})\n+    rbfid = create_fund_sign_send(rbf_node, {dest_address: 0.00090000})\n+    assert_raises_message(JSONRPCException, \"Change output is too small\", rbf_node.bumpfee, rbfid, {\"totalFee\": 10001})\n+\n+\n+def test_dust_to_fee(rbf_node, dest_address):\n+    # check that if output is reduced to dust, it will be converted to fee\n+    # the bumped tx sets fee=9900, but it converts to 10,000\n+    rbfid = create_fund_sign_send(rbf_node, {dest_address: 0.00090000})\n+    fulltx = rbf_node.getrawtransaction(rbfid, 1)\n+    bumped_tx = rbf_node.bumpfee(rbfid, {\"totalFee\": 9900})\n+    full_bumped_tx = rbf_node.getrawtransaction(bumped_tx[\"txid\"], 1)\n+    assert_equal(bumped_tx[\"fee\"], Decimal(\"0.00010000\"))\n+    assert_equal(len(fulltx[\"vout\"]), 2)\n+    assert_equal(len(full_bumped_tx[\"vout\"]), 1)  #change output is eliminated\n+\n+\n+def test_settxfee(rbf_node, dest_address):\n+    # check that bumpfee reacts correctly to the use of settxfee (paytxfee)\n+    # increase feerate by 2.5x, test that fee increased at least 2x\n+    rbf_node.settxfee(Decimal(\"0.00001000\"))\n+    rbfid = create_fund_sign_send(rbf_node, {dest_address: 0.00090000})\n+    rbftx = rbf_node.gettransaction(rbfid)\n+    rbf_node.settxfee(Decimal(\"0.00002500\"))\n+    bumped_tx = rbf_node.bumpfee(rbfid)\n+    assert bumped_tx[\"fee\"] > 2 * abs(rbftx[\"fee\"])\n+    rbf_node.settxfee(Decimal(\"0.00000000\"))  # unset paytxfee\n+\n+\n+def test_rebumping(rbf_node, dest_address):\n+    # check that re-bumping the original tx fails, but bumping the bumper succeeds\n+    rbfid = create_fund_sign_send(rbf_node, {dest_address: 0.00090000}, Decimal(\"0.00001000\"))\n+    bumped = rbf_node.bumpfee(rbfid, {\"totalFee\": 1000})\n+    assert_raises_message(JSONRPCException, \"already bumped\", rbf_node.bumpfee, rbfid, {\"totalFee\": 2000})\n+    rbf_node.bumpfee(bumped[\"txid\"], {\"totalFee\": 2000})\n+\n+\n+def test_unconfirmed_not_spendable(rbf_node, rbf_node_address):\n+    # check that unconfirmed outputs from bumped transactions are not spendable\n+    rbfid = create_fund_sign_send(rbf_node, {rbf_node_address: 0.00090000})\n+    rbftx = rbf_node.gettransaction(rbfid)[\"hex\"]\n+    assert rbfid in rbf_node.getrawmempool()\n+    bumpid = rbf_node.bumpfee(rbfid)[\"txid\"]\n+    assert bumpid in rbf_node.getrawmempool()\n+    assert rbfid not in rbf_node.getrawmempool()\n+\n+    # check that outputs from the bump transaction are not spendable\n+    # due to the replaces_txid check in CWallet::AvailableCoins\n+    assert_equal([t for t in rbf_node.listunspent(0) if t[\"txid\"] == bumpid], [])\n+\n+    # submit a block with the rbf tx to clear the bump transaction out\n+    # of the mempool, then invalidate the block so the rbf transaction will be\n+    # put back in the mempool. this makes it possible to check whether the rbf\n+    # transaction outputs are spendable before the rbf tx is confirmed.\n+    block = submit_block_with_tx(rbf_node, rbftx)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/8456#discussion_r95228707",
+      "id" : 95228707,
+      "original_commit_id" : "f4fa93b29a59c6d0f0341f442fd1805972b43ca1",
+      "original_position" : 177,
+      "path" : "qa/rpc-tests/bumpfee.py",
+      "position" : 177,
+      "pull_request_review_id" : 15777019,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/8456",
+      "updated_at" : "2017-01-09T19:33:43Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/95228707",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/4360349?v=3",
+         "events_url" : "https://api.github.com/users/morcos/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/morcos/followers",
+         "following_url" : "https://api.github.com/users/morcos/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/morcos/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/morcos",
+         "id" : 4360349,
+         "login" : "morcos",
+         "organizations_url" : "https://api.github.com/users/morcos/orgs",
+         "received_events_url" : "https://api.github.com/users/morcos/received_events",
+         "repos_url" : "https://api.github.com/users/morcos/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/morcos/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/morcos/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/morcos"
+      }
+   },
+   {
+      "body" : "ACK modulo comments above.  ",
+      "created_at" : "2017-01-09T19:35:09Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/8456#issuecomment-271384781",
+      "id" : 271384781,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/8456",
+      "updated_at" : "2017-01-09T19:35:09Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/271384781",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/4360349?v=3",
+         "events_url" : "https://api.github.com/users/morcos/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/morcos/followers",
+         "following_url" : "https://api.github.com/users/morcos/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/morcos/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/morcos",
+         "id" : 4360349,
+         "login" : "morcos",
+         "organizations_url" : "https://api.github.com/users/morcos/orgs",
+         "received_events_url" : "https://api.github.com/users/morcos/received_events",
+         "repos_url" : "https://api.github.com/users/morcos/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/morcos/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/morcos/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/morcos"
+      }
    }
 ]
