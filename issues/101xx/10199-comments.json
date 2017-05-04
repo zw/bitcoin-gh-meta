@@ -1566,5 +1566,97 @@
          "type" : "User",
          "url" : "https://api.github.com/users/morcos"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/10199#discussion_r114836148"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/10199"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/114836148"
+         }
+      },
+      "body" : "The design of estimateSmartFee is to be used by the wallet to intelligently as possible automatically put a fee on a transaction being sent.  In the GUI, the slider clearly indicates what target the fee is being returned for.  For the RPC call estimatesmartfee, this is also clearly returned.  The difficulty comes with automatic estimation that happens from a sendtoaddress or sendmany RPC call.  If in the future we add a way to select a transaction confirm target with the desired RPC call, perhaps it would make sense to fail, but for now it seems to me that its more important for the transaction to go out, even if its paying a fee for a much faster target.",
+      "commit_id" : "57e71c819d7653555b048288eee717d53d493924",
+      "created_at" : "2017-05-04T17:10:42Z",
+      "diff_hunk" : "@@ -503,67 +586,220 @@ void CBlockPolicyEstimator::processBlock(unsigned int nBlockHeight,\n     // of unconfirmed txs to remove from tracking.\n     nBestSeenHeight = nBlockHeight;\n \n-    // Clear the current block state and update unconfirmed circular buffer\n+    // Update unconfirmed circular buffer\n     feeStats->ClearCurrent(nBlockHeight);\n+    shortStats->ClearCurrent(nBlockHeight);\n+    longStats->ClearCurrent(nBlockHeight);\n+\n+    // Decay all exponential averages\n+    feeStats->UpdateMovingAverages();\n+    shortStats->UpdateMovingAverages();\n+    longStats->UpdateMovingAverages();\n \n     unsigned int countedTxs = 0;\n-    // Repopulate the current block states\n+    // Update averages with data points from current block\n     for (unsigned int i = 0; i < entries.size(); i++) {\n         if (processBlockTx(nBlockHeight, entries[i]))\n             countedTxs++;\n     }\n \n-    // Update all exponential averages with the current block state\n-    feeStats->UpdateMovingAverages();\n+    if (firstRecordedHeight == 0 && countedTxs > 0) {\n+        firstRecordedHeight = nBestSeenHeight;\n+        LogPrint(BCLog::ESTIMATEFEE, \"Blockpolicy first recorded height %u\\n\", firstRecordedHeight);\n+    }\n+\n \n-    LogPrint(BCLog::ESTIMATEFEE, \"Blockpolicy after updating estimates for %u of %u txs in block, since last block %u of %u tracked, new mempool map size %u\\n\",\n-             countedTxs, entries.size(), trackedTxs, trackedTxs + untrackedTxs, mapMemPoolTxs.size());\n+    LogPrint(BCLog::ESTIMATEFEE, \"Blockpolicy estimates updated by %u of %u block txs, since last block %u of %u tracked, mempool map size %u, max target %u from %s\\n\",\n+             countedTxs, entries.size(), trackedTxs, trackedTxs + untrackedTxs, mapMemPoolTxs.size(),\n+             MaxUsableEstimate(), HistoricalBlockSpan() > BlockSpan() ? \"historical\" : \"current\");\n \n     trackedTxs = 0;\n     untrackedTxs = 0;\n }\n \n CFeeRate CBlockPolicyEstimator::estimateFee(int confTarget) const\n {\n+    // It's not possible to get reasonable estimates for confTarget of 1\n+    if (confTarget <= 1)\n+        return CFeeRate(0);\n+\n+    return estimateRawFee(confTarget, DOUBLE_SUCCESS_PCT, FeeEstimateHorizon::MED_HALFLIFE);\n+}\n+\n+CFeeRate CBlockPolicyEstimator::estimateRawFee(int confTarget, double successThreshold, FeeEstimateHorizon horizon, EstimationResult* result) const\n+{\n+    TxConfirmStats* stats;\n+    double sufficientTxs = SUFFICIENT_FEETXS;\n+    switch (horizon) {\n+    case FeeEstimateHorizon::SHORT_HALFLIFE: {\n+        stats = shortStats;\n+        sufficientTxs = SUFFICIENT_TXS_SHORT;\n+        break;\n+    }\n+    case FeeEstimateHorizon::MED_HALFLIFE: {\n+        stats = feeStats;\n+        break;\n+    }\n+    case FeeEstimateHorizon::LONG_HALFLIFE: {\n+        stats = longStats;\n+        break;\n+    }\n+    default: {\n+        return CFeeRate(0);\n+    }\n+    }\n+\n     LOCK(cs_feeEstimator);\n     // Return failure if trying to analyze a target we're not tracking\n-    // It's not possible to get reasonable estimates for confTarget of 1\n-    if (confTarget <= 1 || (unsigned int)confTarget > feeStats->GetMaxConfirms())\n+    if (confTarget <= 0 || (unsigned int)confTarget > stats->GetMaxConfirms())\n+        return CFeeRate(0);\n+    if (successThreshold > 1)\n         return CFeeRate(0);\n \n-    double median = feeStats->EstimateMedianVal(confTarget, SUFFICIENT_FEETXS, MIN_SUCCESS_PCT, true, nBestSeenHeight);\n+    double median = stats->EstimateMedianVal(confTarget, sufficientTxs, successThreshold, true, nBestSeenHeight, result);\n \n     if (median < 0)\n         return CFeeRate(0);\n \n     return CFeeRate(median);\n }\n \n-CFeeRate CBlockPolicyEstimator::estimateSmartFee(int confTarget, int *answerFoundAtTarget, const CTxMemPool& pool) const\n+unsigned int CBlockPolicyEstimator::BlockSpan() const\n+{\n+    if (firstRecordedHeight == 0) return 0;\n+    assert(nBestSeenHeight >= firstRecordedHeight);\n+\n+    return nBestSeenHeight - firstRecordedHeight;\n+}\n+\n+unsigned int CBlockPolicyEstimator::HistoricalBlockSpan() const\n+{\n+    if (historicalFirst == 0) return 0;\n+    assert(historicalBest >= historicalFirst);\n+\n+    if (nBestSeenHeight - historicalBest > OLDEST_ESTIMATE_HISTORY) return 0;\n+\n+    return historicalBest - historicalFirst;\n+}\n+\n+unsigned int CBlockPolicyEstimator::MaxUsableEstimate() const\n+{\n+    // Block spans are divided by 2 to make sure there are enough potential failing data points for the estimate\n+    return std::min(longStats->GetMaxConfirms(), std::max(BlockSpan(), HistoricalBlockSpan()) / 2);\n+}\n+\n+/** Return a fee estimate at the required successThreshold from the shortest\n+ * time horizon which tracks confirmations up to the desired target.  If\n+ * conservative answer is not requested, also allow short time horizon estimates\n+ * for a lower target to reduce the given answer */\n+double CBlockPolicyEstimator::estimateCombinedFee(unsigned int confTarget, double successThreshold, bool conservative) const\n+{\n+    double estimate = -1;\n+    if (confTarget >= 1 && confTarget <= longStats->GetMaxConfirms()) {\n+        if (confTarget <= shortStats->GetMaxConfirms()) {\n+            estimate = shortStats->EstimateMedianVal(confTarget, SUFFICIENT_TXS_SHORT, successThreshold, true, nBestSeenHeight);\n+        }\n+        else {\n+            if (!conservative) {\n+                // When we aren't using conservative estimates, if a lower confTarget from a more recent horizon returns a lower answer use it.\n+                estimate = shortStats->EstimateMedianVal(shortStats->GetMaxConfirms(), SUFFICIENT_TXS_SHORT, successThreshold, true, nBestSeenHeight);\n+            }\n+            if (confTarget <= feeStats->GetMaxConfirms()) {\n+                double medEstimate = feeStats->EstimateMedianVal(confTarget, SUFFICIENT_FEETXS, successThreshold, true, nBestSeenHeight);\n+                if (estimate == -1 || medEstimate < estimate) {\n+                    estimate = medEstimate;\n+                }\n+            }\n+            else {\n+                if (!conservative) {\n+                    // When we aren't using conservative estimates, if a lower confTarget from a more recent horizon returns a lower answer use it.\n+                    double medMax = feeStats->EstimateMedianVal(feeStats->GetMaxConfirms(), SUFFICIENT_FEETXS, successThreshold, true, nBestSeenHeight);\n+                    if (estimate == -1 ||  medMax < estimate) {\n+                        estimate = medMax;\n+                    }\n+                }\n+                double longEstimate = longStats->EstimateMedianVal(confTarget, SUFFICIENT_FEETXS, successThreshold, true, nBestSeenHeight);\n+                if (estimate == -1 || longEstimate < estimate) {\n+                    estimate = longEstimate;\n+                }\n+            }\n+        }\n+    }\n+    return estimate;\n+}\n+\n+/** Ensure that for a conservative estimate, the DOUBLE_SUCCESS_PCT is also met\n+ * at 2 * target for any longer time horizons.\n+ */\n+double CBlockPolicyEstimator::estimateConservativeFee(unsigned int doubleTarget) const\n+{\n+    double estimate = -1;\n+    if (doubleTarget <= shortStats->GetMaxConfirms()) {\n+        estimate = feeStats->EstimateMedianVal(doubleTarget, SUFFICIENT_FEETXS, DOUBLE_SUCCESS_PCT, true, nBestSeenHeight);\n+    }\n+    if (doubleTarget <= feeStats->GetMaxConfirms()) {\n+        double longEstimate = longStats->EstimateMedianVal(doubleTarget, SUFFICIENT_FEETXS, DOUBLE_SUCCESS_PCT, true, nBestSeenHeight);\n+        if (longEstimate > estimate) {\n+            estimate = longEstimate;\n+        }\n+    }\n+    return estimate;\n+}\n+\n+/** estimateSmartFee returns the max of the feerates calculated with a 60%\n+ * threshold required at target / 2, an 85% threshold required at target and a\n+ * 95% threshold required at 2 * target.  Each calculation is performed at the\n+ * shortest time horizon which tracks the required target.  Conservative\n+ * estimates, however, required the 95% threshold at 2 * target be met for any\n+ * longer time horizons also.\n+ */\n+CFeeRate CBlockPolicyEstimator::estimateSmartFee(int confTarget, int *answerFoundAtTarget, const CTxMemPool& pool, bool conservative) const\n {\n     if (answerFoundAtTarget)\n         *answerFoundAtTarget = confTarget;\n \n     double median = -1;\n-\n     {\n         LOCK(cs_feeEstimator);\n \n         // Return failure if trying to analyze a target we're not tracking\n-        if (confTarget <= 0 || (unsigned int)confTarget > feeStats->GetMaxConfirms())\n+        if (confTarget <= 0 || (unsigned int)confTarget > longStats->GetMaxConfirms())\n             return CFeeRate(0);\n \n         // It's not possible to get reasonable estimates for confTarget of 1\n         if (confTarget == 1)\n             confTarget = 2;\n \n-        while (median < 0 && (unsigned int)confTarget <= feeStats->GetMaxConfirms()) {\n-            median = feeStats->EstimateMedianVal(confTarget++, SUFFICIENT_FEETXS, MIN_SUCCESS_PCT, true, nBestSeenHeight);\n+        unsigned int maxUsableEstimate = MaxUsableEstimate();\n+        if (maxUsableEstimate <= 1)\n+            return CFeeRate(0);\n+\n+        if ((unsigned int)confTarget > maxUsableEstimate) {\n+            confTarget = maxUsableEstimate;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/10199#discussion_r114836148",
+      "id" : 114836148,
+      "original_commit_id" : "57e71c819d7653555b048288eee717d53d493924",
+      "original_position" : 764,
+      "path" : "src/policy/fees.cpp",
+      "position" : 764,
+      "pull_request_review_id" : 36330166,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/10199",
+      "updated_at" : "2017-05-04T17:10:42Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/114836148",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/4360349?v=3",
+         "events_url" : "https://api.github.com/users/morcos/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/morcos/followers",
+         "following_url" : "https://api.github.com/users/morcos/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/morcos/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/morcos",
+         "id" : 4360349,
+         "login" : "morcos",
+         "organizations_url" : "https://api.github.com/users/morcos/orgs",
+         "received_events_url" : "https://api.github.com/users/morcos/received_events",
+         "repos_url" : "https://api.github.com/users/morcos/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/morcos/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/morcos/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/morcos"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/10199#discussion_r114836308"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/10199"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/114836308"
+         }
+      },
+      "body" : "After discussion, I agree that this logic could be more intelligent, but I think that can be left for a later improvement.",
+      "commit_id" : "57e71c819d7653555b048288eee717d53d493924",
+      "created_at" : "2017-05-04T17:11:22Z",
+      "diff_hunk" : "@@ -576,14 +812,24 @@ CFeeRate CBlockPolicyEstimator::estimateSmartFee(int confTarget, int *answerFoun\n     return CFeeRate(median);\n }\n \n+\n bool CBlockPolicyEstimator::Write(CAutoFile& fileout) const\n {\n     try {\n         LOCK(cs_feeEstimator);\n-        fileout << 139900; // version required to read: 0.13.99 or later\n+        fileout << 149900; // version required to read: 0.14.99 or later\n         fileout << CLIENT_VERSION; // version that wrote the file\n         fileout << nBestSeenHeight;\n+        if (BlockSpan() > HistoricalBlockSpan()/2) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/10199#discussion_r114836308",
+      "id" : 114836308,
+      "original_commit_id" : "57e71c819d7653555b048288eee717d53d493924",
+      "original_position" : 806,
+      "path" : "src/policy/fees.cpp",
+      "position" : 806,
+      "pull_request_review_id" : 36330328,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/10199",
+      "updated_at" : "2017-05-04T17:11:22Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/114836308",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/4360349?v=3",
+         "events_url" : "https://api.github.com/users/morcos/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/morcos/followers",
+         "following_url" : "https://api.github.com/users/morcos/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/morcos/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/morcos",
+         "id" : 4360349,
+         "login" : "morcos",
+         "organizations_url" : "https://api.github.com/users/morcos/orgs",
+         "received_events_url" : "https://api.github.com/users/morcos/received_events",
+         "repos_url" : "https://api.github.com/users/morcos/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/morcos/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/morcos/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/morcos"
+      }
    }
 ]
