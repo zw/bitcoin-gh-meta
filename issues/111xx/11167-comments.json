@@ -5625,5 +5625,805 @@
          "type" : "User",
          "url" : "https://api.github.com/users/danra"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141701098"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141701098"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Would be nice to extract the common functionality here (validating some prefix+size+extracting hash) into a function",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T18:34:40Z",
+      "diff_hunk" : "@@ -212,86 +215,108 @@ int CBase58Data::CompareTo(const CBase58Data& b58) const\n \n namespace\n {\n-/** base58-encoded Bitcoin addresses.\n- * Public-key-hash-addresses have version 0 (or 111 testnet).\n- * The data vector contains RIPEMD160(SHA256(pubkey)), where pubkey is the serialized public key.\n- * Script-hash-addresses have version 5 (or 196 testnet).\n- * The data vector contains RIPEMD160(SHA256(cscript)), where cscript is the serialized redemption script.\n- */\n-class CBitcoinAddress : public CBase58Data {\n-public:\n-    bool Set(const CKeyID &id);\n-    bool Set(const CScriptID &id);\n-    bool Set(const CTxDestination &dest);\n-    bool IsValid() const;\n-    bool IsValid(const CChainParams &params) const;\n-\n-    CBitcoinAddress() {}\n-    CBitcoinAddress(const CTxDestination &dest) { Set(dest); }\n-    CBitcoinAddress(const std::string& strAddress) { SetString(strAddress); }\n-    CBitcoinAddress(const char* pszAddress) { SetString(pszAddress); }\n-\n-    CTxDestination Get() const;\n-};\n-\n-class CBitcoinAddressVisitor : public boost::static_visitor<bool>\n+class DestinationEncoder : public boost::static_visitor<std::string>\n {\n private:\n-    CBitcoinAddress* addr;\n+    const CChainParams& m_params;\n \n public:\n-    explicit CBitcoinAddressVisitor(CBitcoinAddress* addrIn) : addr(addrIn) {}\n+    DestinationEncoder(const CChainParams& params) : m_params(params) {}\n \n-    bool operator()(const CKeyID& id) const { return addr->Set(id); }\n-    bool operator()(const CScriptID& id) const { return addr->Set(id); }\n-    bool operator()(const CNoDestination& no) const { return false; }\n-};\n-\n-} // namespace\n+    std::string operator()(const CKeyID& id) const\n+    {\n+        std::vector<unsigned char> data = m_params.Base58Prefix(CChainParams::PUBKEY_ADDRESS);\n+        data.insert(data.end(), id.begin(), id.end());\n+        return EncodeBase58Check(data);\n+    }\n \n-bool CBitcoinAddress::Set(const CKeyID& id)\n-{\n-    SetData(Params().Base58Prefix(CChainParams::PUBKEY_ADDRESS), &id, 20);\n-    return true;\n-}\n+    std::string operator()(const CScriptID& id) const\n+    {\n+        std::vector<unsigned char> data = m_params.Base58Prefix(CChainParams::SCRIPT_ADDRESS);\n+        data.insert(data.end(), id.begin(), id.end());\n+        return EncodeBase58Check(data);\n+    }\n \n-bool CBitcoinAddress::Set(const CScriptID& id)\n-{\n-    SetData(Params().Base58Prefix(CChainParams::SCRIPT_ADDRESS), &id, 20);\n-    return true;\n-}\n+    std::string operator()(const WitnessV0KeyHash& id) const\n+    {\n+        std::vector<unsigned char> data = {0};\n+        ConvertBits<8, 5, true>(data, id.begin(), id.end());\n+        return bech32::Encode(m_params.Bech32HRP(), data);\n+    }\n \n-bool CBitcoinAddress::Set(const CTxDestination& dest)\n-{\n-    return boost::apply_visitor(CBitcoinAddressVisitor(this), dest);\n-}\n+    std::string operator()(const WitnessV0ScriptHash& id) const\n+    {\n+        std::vector<unsigned char> data = {0};\n+        ConvertBits<8, 5, true>(data, id.begin(), id.end());\n+        return bech32::Encode(m_params.Bech32HRP(), data);\n+    }\n \n-bool CBitcoinAddress::IsValid() const\n-{\n-    return IsValid(Params());\n-}\n+    std::string operator()(const WitnessUnknown& id) const\n+    {\n+        if (id.version < 1 || id.version > 16 || id.length < 2 || id.length > 40) {\n+            return {};\n+        }\n+        std::vector<unsigned char> data = {(unsigned char)id.version};\n+        ConvertBits<8, 5, true>(data, id.program, id.program + id.length);\n+        return bech32::Encode(m_params.Bech32HRP(), data);\n+    }\n \n-bool CBitcoinAddress::IsValid(const CChainParams& params) const\n-{\n-    bool fCorrectSize = vchData.size() == 20;\n-    bool fKnownVersion = vchVersion == params.Base58Prefix(CChainParams::PUBKEY_ADDRESS) ||\n-                         vchVersion == params.Base58Prefix(CChainParams::SCRIPT_ADDRESS);\n-    return fCorrectSize && fKnownVersion;\n-}\n+    std::string operator()(const CNoDestination& no) const { return {}; }\n+};\n \n-CTxDestination CBitcoinAddress::Get() const\n+CTxDestination DecodeDestination(const std::string& str, const CChainParams& params)\n {\n-    if (!IsValid())\n-        return CNoDestination();\n-    uint160 id;\n-    memcpy(&id, vchData.data(), 20);\n-    if (vchVersion == Params().Base58Prefix(CChainParams::PUBKEY_ADDRESS))\n-        return CKeyID(id);\n-    else if (vchVersion == Params().Base58Prefix(CChainParams::SCRIPT_ADDRESS))\n-        return CScriptID(id);\n-    else\n-        return CNoDestination();\n+    std::vector<unsigned char> data;\n+    uint160 hash;\n+    if (DecodeBase58Check(str, data)) {\n+        // base58-encoded Bitcoin addresses.\n+        // Public-key-hash-addresses have version 0 (or 111 testnet).\n+        // The data vector contains RIPEMD160(SHA256(pubkey)), where pubkey is the serialized public key.\n+        const std::vector<unsigned char>& pubkey_prefix = params.Base58Prefix(CChainParams::PUBKEY_ADDRESS);\n+        if (data.size() == hash.size() + pubkey_prefix.size() && std::equal(pubkey_prefix.begin(), pubkey_prefix.end(), data.begin())) {\n+            std::copy(data.begin() + pubkey_prefix.size(), data.end(), hash.begin());\n+            return CKeyID(hash);\n+        }\n+        // Script-hash-addresses have version 5 (or 196 testnet).\n+        // The data vector contains RIPEMD160(SHA256(cscript)), where cscript is the serialized redemption script.\n+        const std::vector<unsigned char>& script_prefix = params.Base58Prefix(CChainParams::SCRIPT_ADDRESS);\n+        if (data.size() == hash.size() + script_prefix.size() && std::equal(script_prefix.begin(), script_prefix.end(), data.begin())) {\n+            std::copy(data.begin() + script_prefix.size(), data.end(), hash.begin());\n+            return CScriptID(hash);\n+        }\n+    }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141701098",
+      "id" : 141701098,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 166,
+      "path" : "src/base58.cpp",
+      "position" : 166,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141701098",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141702040"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141702040"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Perhaps add that copyright as well?",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T18:38:18Z",
+      "diff_hunk" : "@@ -0,0 +1,140 @@\n+// Copyright (c) 2017 Pieter Wuille",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141702040",
+      "id" : 141702040,
+      "in_reply_to_id" : 139183195,
+      "original_commit_id" : "0571b9271b27ce2767e9c7034c23facb495fab65",
+      "original_position" : 1,
+      "path" : "src/bech32.cpp",
+      "position" : 1,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141702040",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141702241"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141702241"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Suggest adding a comment here explaining reasoning for the CHARSET (similar to how it's explained in BIP 173).\r\nAlso, is there an implementation available showing how the visual similarity was minimized, or was this minimization just done manually? In case of the former, suggest adding a link to that here or in the BIP (or in both)",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T18:39:13Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141702241",
+      "id" : 141702241,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 13,
+      "path" : "src/bech32.cpp",
+      "position" : 13,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141702241",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141702391"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141702391"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "This can probably be directly derived from `CHARSET` at compilation time using `constexpr` functions and making `CHARSET` and this `constexpr` as well, making it more robust.\r\nI can try implementing it, if you agree it's of interest.",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T18:39:49Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141702391",
+      "id" : 141702391,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 25,
+      "path" : "src/bech32.cpp",
+      "position" : 25,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141702391",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141705025"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141705025"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I suggest rephrasing, IIRC multiplication requires some irreducible polynomial, a^5 + a^3 + 1 is just one possibility which was specifically chosen here. Current phrasing implies multiplication \"requires\" this specific polynomial.",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T18:50:16Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};\n+\n+/** Concatenate two byte arrays. */\n+data Cat(data x, const data& y)\n+{\n+    x.insert(x.end(), y.begin(), y.end());\n+    return x;\n+}\n+\n+/** This function will compute what 6 5-bit values to XOR into the last 6 input values, in order to\n+ *  make the checksum 0. These 6 values are packed together in a single 30-bit integer. The higher\n+ *  bits correspond to earlier values. */\n+uint32_t PolyMod(const data& v)\n+{\n+    // The input is interpreted as a list of coefficients of a polynomial over F = GF(32), with an\n+    // implicit 1 in front. If the input is [v0,v1,v2,v3,v4], that polynomial is v(x) =\n+    // 1*x^5 + v0*x^4 + v1*x^3 + v2*x^2 + v3*x + v4. The implicit 1 guarantees that\n+    // [v0,v1,v2,...] has a distinct checksum from [0,v0,v1,v2,...].\n+\n+    // The output is a 30-bit integer whose 5-bit groups are the coefficients of the remainder of\n+    // v(x) mod g(x), where g(x) is the Bech32 generator,\n+    // x^6 + {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}. g(x) is chosen in such a way\n+    // that the resulting code is a BCH code, guaranteeing detection of up to 3 errors within a\n+    // window of 1023 characters. Among the various possible BCH codes, one was selected to in\n+    // fact guarantee detection of up to 4 errors within a window of 89 characters.\n+\n+    // Note that the coefficients are elements of GF(32), here represented as decimal numbers\n+    // between {}. In this finite field, addition is just XOR of the corresponding numbers. For\n+    // example, {27} + {13} = {27 ^ 13} = {22}. Multiplication is more complicated, and requires\n+    // treating the bits of values themselves as coefficients of a polynomial over a smaller field,\n+    // GF(2), and multiplying those polynomials mod a^5 + a^3 + 1. For example, {5} * {26} =",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141705025",
+      "id" : 141705025,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 55,
+      "path" : "src/bech32.cpp",
+      "position" : 55,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141705025",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141709639"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141709639"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Use a range-for loop, `i` isn't used except for accessing element (and in comments)",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T19:09:19Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};\n+\n+/** Concatenate two byte arrays. */\n+data Cat(data x, const data& y)\n+{\n+    x.insert(x.end(), y.begin(), y.end());\n+    return x;\n+}\n+\n+/** This function will compute what 6 5-bit values to XOR into the last 6 input values, in order to\n+ *  make the checksum 0. These 6 values are packed together in a single 30-bit integer. The higher\n+ *  bits correspond to earlier values. */\n+uint32_t PolyMod(const data& v)\n+{\n+    // The input is interpreted as a list of coefficients of a polynomial over F = GF(32), with an\n+    // implicit 1 in front. If the input is [v0,v1,v2,v3,v4], that polynomial is v(x) =\n+    // 1*x^5 + v0*x^4 + v1*x^3 + v2*x^2 + v3*x + v4. The implicit 1 guarantees that\n+    // [v0,v1,v2,...] has a distinct checksum from [0,v0,v1,v2,...].\n+\n+    // The output is a 30-bit integer whose 5-bit groups are the coefficients of the remainder of\n+    // v(x) mod g(x), where g(x) is the Bech32 generator,\n+    // x^6 + {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}. g(x) is chosen in such a way\n+    // that the resulting code is a BCH code, guaranteeing detection of up to 3 errors within a\n+    // window of 1023 characters. Among the various possible BCH codes, one was selected to in\n+    // fact guarantee detection of up to 4 errors within a window of 89 characters.\n+\n+    // Note that the coefficients are elements of GF(32), here represented as decimal numbers\n+    // between {}. In this finite field, addition is just XOR of the corresponding numbers. For\n+    // example, {27} + {13} = {27 ^ 13} = {22}. Multiplication is more complicated, and requires\n+    // treating the bits of values themselves as coefficients of a polynomial over a smaller field,\n+    // GF(2), and multiplying those polynomials mod a^5 + a^3 + 1. For example, {5} * {26} =\n+    // (a^2 + 1) * (a^4 + a^3 + a) = (a^4 + a^3 + a) * a^2 + (a^4 + a^3 + a) = a^6 + a^5 + a^4 + a\n+    // = a^3 + 1 (mod a^5 + a^3 + 1) = {9}.\n+\n+    // During the course of the loop below, `c` contains the bitpacked coefficients of the\n+    // polynomial constructed from just the values of v that were processed so far, mod g(x). In\n+    // the above example, `c` initially corresponds to 1 mod (x), and after processing 2 inputs of\n+    // v, it corresponds to x^2 + v0*x + v1 mod g(x). As 1 mod g(x) = 1, that is the starting value\n+    // for `c`.\n+    uint32_t c = 1;\n+    for (size_t i = 0; i < v.size(); ++i) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141709639",
+      "id" : 141709639,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 65,
+      "path" : "src/bech32.cpp",
+      "position" : 65,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141709639",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141710179"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141710179"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Here and later, `'A' <= c && c <= 'Z'` is better style (`c` is 'between' the values. Easier to read, harder to get wrong when used consistently)",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T19:11:44Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};\n+\n+/** Concatenate two byte arrays. */\n+data Cat(data x, const data& y)\n+{\n+    x.insert(x.end(), y.begin(), y.end());\n+    return x;\n+}\n+\n+/** This function will compute what 6 5-bit values to XOR into the last 6 input values, in order to\n+ *  make the checksum 0. These 6 values are packed together in a single 30-bit integer. The higher\n+ *  bits correspond to earlier values. */\n+uint32_t PolyMod(const data& v)\n+{\n+    // The input is interpreted as a list of coefficients of a polynomial over F = GF(32), with an\n+    // implicit 1 in front. If the input is [v0,v1,v2,v3,v4], that polynomial is v(x) =\n+    // 1*x^5 + v0*x^4 + v1*x^3 + v2*x^2 + v3*x + v4. The implicit 1 guarantees that\n+    // [v0,v1,v2,...] has a distinct checksum from [0,v0,v1,v2,...].\n+\n+    // The output is a 30-bit integer whose 5-bit groups are the coefficients of the remainder of\n+    // v(x) mod g(x), where g(x) is the Bech32 generator,\n+    // x^6 + {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}. g(x) is chosen in such a way\n+    // that the resulting code is a BCH code, guaranteeing detection of up to 3 errors within a\n+    // window of 1023 characters. Among the various possible BCH codes, one was selected to in\n+    // fact guarantee detection of up to 4 errors within a window of 89 characters.\n+\n+    // Note that the coefficients are elements of GF(32), here represented as decimal numbers\n+    // between {}. In this finite field, addition is just XOR of the corresponding numbers. For\n+    // example, {27} + {13} = {27 ^ 13} = {22}. Multiplication is more complicated, and requires\n+    // treating the bits of values themselves as coefficients of a polynomial over a smaller field,\n+    // GF(2), and multiplying those polynomials mod a^5 + a^3 + 1. For example, {5} * {26} =\n+    // (a^2 + 1) * (a^4 + a^3 + a) = (a^4 + a^3 + a) * a^2 + (a^4 + a^3 + a) = a^6 + a^5 + a^4 + a\n+    // = a^3 + 1 (mod a^5 + a^3 + 1) = {9}.\n+\n+    // During the course of the loop below, `c` contains the bitpacked coefficients of the\n+    // polynomial constructed from just the values of v that were processed so far, mod g(x). In\n+    // the above example, `c` initially corresponds to 1 mod (x), and after processing 2 inputs of\n+    // v, it corresponds to x^2 + v0*x + v1 mod g(x). As 1 mod g(x) = 1, that is the starting value\n+    // for `c`.\n+    uint32_t c = 1;\n+    for (size_t i = 0; i < v.size(); ++i) {\n+        // We want to update `c` to correspond to a polynomial with one extra term. If the initial\n+        // value of `c` consists of the coefficients of c(x) = f(x) mod g(x), we modify it to\n+        // correspond to c'(x) = (f(x) * x + v[i]) mod g(x), where v[i] is the next input to\n+        // process. Simplifying:\n+        // c'(x) = (f(x) * x + v[i]) mod g(x)\n+        //         ((f(x) mod g(x)) * x + v[i]) mod g(x)\n+        //         (c(x) * x + v[i]) mod g(x)\n+        // If c(x) = c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5, we want to compute\n+        // c'(x) = (c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5) * x + v[i] mod g(x)\n+        //       = c0*x^6 + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i] mod g(x)\n+        //       = c0*(x^6 mod g(x)) + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]\n+        // If we call (x^6 mod g(x)) = k(x), this can be written as\n+        // c'(x) = (c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]) + c0*k(x)\n+\n+        // First, determine the value of c0:\n+        uint8_t c0 = c >> 25;\n+\n+        // Then compute c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]:\n+        c = ((c & 0x1ffffff) << 5) ^ v[i];\n+\n+        // Finally, for each set bit n in c0, conditionally add {2^n}k(x):\n+        if (c0 & 1)  c ^= 0x3b6a57b2; //     k(x) = {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}\n+        if (c0 & 2)  c ^= 0x26508e6d; //  {2}k(x) = {19}x^5 +  {5}x^4 +     x^3 +  {3}x^2 + {19}x + {13}\n+        if (c0 & 4)  c ^= 0x1ea119fa; //  {4}k(x) = {15}x^5 + {10}x^4 +  {2}x^3 +  {6}x^2 + {15}x + {26}\n+        if (c0 & 8)  c ^= 0x3d4233dd; //  {8}k(x) = {30}x^5 + {20}x^4 +  {4}x^3 + {12}x^2 + {30}x + {29}\n+        if (c0 & 16) c ^= 0x2a1462b3; // {16}k(x) = {21}x^5 +     x^4 +  {8}x^3 + {24}x^2 + {21}x + {19}\n+    }\n+    return c;\n+}\n+\n+/** Convert to lower case. */\n+inline unsigned char LowerCase(unsigned char c)\n+{\n+    return (c >= 'A' && c <= 'Z') ? (c - 'A') + 'a' : c;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141710179",
+      "id" : 141710179,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 99,
+      "path" : "src/bech32.cpp",
+      "position" : 99,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141710179",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141711422"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141711422"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "data.clear()",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T19:17:37Z",
+      "diff_hunk" : "@@ -212,86 +215,108 @@ int CBase58Data::CompareTo(const CBase58Data& b58) const\n \n namespace\n {\n-/** base58-encoded Bitcoin addresses.\n- * Public-key-hash-addresses have version 0 (or 111 testnet).\n- * The data vector contains RIPEMD160(SHA256(pubkey)), where pubkey is the serialized public key.\n- * Script-hash-addresses have version 5 (or 196 testnet).\n- * The data vector contains RIPEMD160(SHA256(cscript)), where cscript is the serialized redemption script.\n- */\n-class CBitcoinAddress : public CBase58Data {\n-public:\n-    bool Set(const CKeyID &id);\n-    bool Set(const CScriptID &id);\n-    bool Set(const CTxDestination &dest);\n-    bool IsValid() const;\n-    bool IsValid(const CChainParams &params) const;\n-\n-    CBitcoinAddress() {}\n-    CBitcoinAddress(const CTxDestination &dest) { Set(dest); }\n-    CBitcoinAddress(const std::string& strAddress) { SetString(strAddress); }\n-    CBitcoinAddress(const char* pszAddress) { SetString(pszAddress); }\n-\n-    CTxDestination Get() const;\n-};\n-\n-class CBitcoinAddressVisitor : public boost::static_visitor<bool>\n+class DestinationEncoder : public boost::static_visitor<std::string>\n {\n private:\n-    CBitcoinAddress* addr;\n+    const CChainParams& m_params;\n \n public:\n-    explicit CBitcoinAddressVisitor(CBitcoinAddress* addrIn) : addr(addrIn) {}\n+    DestinationEncoder(const CChainParams& params) : m_params(params) {}\n \n-    bool operator()(const CKeyID& id) const { return addr->Set(id); }\n-    bool operator()(const CScriptID& id) const { return addr->Set(id); }\n-    bool operator()(const CNoDestination& no) const { return false; }\n-};\n-\n-} // namespace\n+    std::string operator()(const CKeyID& id) const\n+    {\n+        std::vector<unsigned char> data = m_params.Base58Prefix(CChainParams::PUBKEY_ADDRESS);\n+        data.insert(data.end(), id.begin(), id.end());\n+        return EncodeBase58Check(data);\n+    }\n \n-bool CBitcoinAddress::Set(const CKeyID& id)\n-{\n-    SetData(Params().Base58Prefix(CChainParams::PUBKEY_ADDRESS), &id, 20);\n-    return true;\n-}\n+    std::string operator()(const CScriptID& id) const\n+    {\n+        std::vector<unsigned char> data = m_params.Base58Prefix(CChainParams::SCRIPT_ADDRESS);\n+        data.insert(data.end(), id.begin(), id.end());\n+        return EncodeBase58Check(data);\n+    }\n \n-bool CBitcoinAddress::Set(const CScriptID& id)\n-{\n-    SetData(Params().Base58Prefix(CChainParams::SCRIPT_ADDRESS), &id, 20);\n-    return true;\n-}\n+    std::string operator()(const WitnessV0KeyHash& id) const\n+    {\n+        std::vector<unsigned char> data = {0};\n+        ConvertBits<8, 5, true>(data, id.begin(), id.end());\n+        return bech32::Encode(m_params.Bech32HRP(), data);\n+    }\n \n-bool CBitcoinAddress::Set(const CTxDestination& dest)\n-{\n-    return boost::apply_visitor(CBitcoinAddressVisitor(this), dest);\n-}\n+    std::string operator()(const WitnessV0ScriptHash& id) const\n+    {\n+        std::vector<unsigned char> data = {0};\n+        ConvertBits<8, 5, true>(data, id.begin(), id.end());\n+        return bech32::Encode(m_params.Bech32HRP(), data);\n+    }\n \n-bool CBitcoinAddress::IsValid() const\n-{\n-    return IsValid(Params());\n-}\n+    std::string operator()(const WitnessUnknown& id) const\n+    {\n+        if (id.version < 1 || id.version > 16 || id.length < 2 || id.length > 40) {\n+            return {};\n+        }\n+        std::vector<unsigned char> data = {(unsigned char)id.version};\n+        ConvertBits<8, 5, true>(data, id.program, id.program + id.length);\n+        return bech32::Encode(m_params.Bech32HRP(), data);\n+    }\n \n-bool CBitcoinAddress::IsValid(const CChainParams& params) const\n-{\n-    bool fCorrectSize = vchData.size() == 20;\n-    bool fKnownVersion = vchVersion == params.Base58Prefix(CChainParams::PUBKEY_ADDRESS) ||\n-                         vchVersion == params.Base58Prefix(CChainParams::SCRIPT_ADDRESS);\n-    return fCorrectSize && fKnownVersion;\n-}\n+    std::string operator()(const CNoDestination& no) const { return {}; }\n+};\n \n-CTxDestination CBitcoinAddress::Get() const\n+CTxDestination DecodeDestination(const std::string& str, const CChainParams& params)\n {\n-    if (!IsValid())\n-        return CNoDestination();\n-    uint160 id;\n-    memcpy(&id, vchData.data(), 20);\n-    if (vchVersion == Params().Base58Prefix(CChainParams::PUBKEY_ADDRESS))\n-        return CKeyID(id);\n-    else if (vchVersion == Params().Base58Prefix(CChainParams::SCRIPT_ADDRESS))\n-        return CScriptID(id);\n-    else\n-        return CNoDestination();\n+    std::vector<unsigned char> data;\n+    uint160 hash;\n+    if (DecodeBase58Check(str, data)) {\n+        // base58-encoded Bitcoin addresses.\n+        // Public-key-hash-addresses have version 0 (or 111 testnet).\n+        // The data vector contains RIPEMD160(SHA256(pubkey)), where pubkey is the serialized public key.\n+        const std::vector<unsigned char>& pubkey_prefix = params.Base58Prefix(CChainParams::PUBKEY_ADDRESS);\n+        if (data.size() == hash.size() + pubkey_prefix.size() && std::equal(pubkey_prefix.begin(), pubkey_prefix.end(), data.begin())) {\n+            std::copy(data.begin() + pubkey_prefix.size(), data.end(), hash.begin());\n+            return CKeyID(hash);\n+        }\n+        // Script-hash-addresses have version 5 (or 196 testnet).\n+        // The data vector contains RIPEMD160(SHA256(cscript)), where cscript is the serialized redemption script.\n+        const std::vector<unsigned char>& script_prefix = params.Base58Prefix(CChainParams::SCRIPT_ADDRESS);\n+        if (data.size() == hash.size() + script_prefix.size() && std::equal(script_prefix.begin(), script_prefix.end(), data.begin())) {\n+            std::copy(data.begin() + script_prefix.size(), data.end(), hash.begin());\n+            return CScriptID(hash);\n+        }\n+    }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141711422",
+      "id" : 141711422,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 166,
+      "path" : "src/base58.cpp",
+      "position" : 166,
+      "pull_request_review_id" : 65970068,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:17:37Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141711422",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/417043?v=4",
+         "events_url" : "https://api.github.com/users/theuni/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theuni/followers",
+         "following_url" : "https://api.github.com/users/theuni/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theuni/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theuni",
+         "id" : 417043,
+         "login" : "theuni",
+         "organizations_url" : "https://api.github.com/users/theuni/orgs",
+         "received_events_url" : "https://api.github.com/users/theuni/received_events",
+         "repos_url" : "https://api.github.com/users/theuni/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theuni/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theuni/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theuni"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141712157"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141712157"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I might be wrong, but isn't the problem with prepending a 0, rather than appending one?",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T19:21:03Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};\n+\n+/** Concatenate two byte arrays. */\n+data Cat(data x, const data& y)\n+{\n+    x.insert(x.end(), y.begin(), y.end());\n+    return x;\n+}\n+\n+/** This function will compute what 6 5-bit values to XOR into the last 6 input values, in order to\n+ *  make the checksum 0. These 6 values are packed together in a single 30-bit integer. The higher\n+ *  bits correspond to earlier values. */\n+uint32_t PolyMod(const data& v)\n+{\n+    // The input is interpreted as a list of coefficients of a polynomial over F = GF(32), with an\n+    // implicit 1 in front. If the input is [v0,v1,v2,v3,v4], that polynomial is v(x) =\n+    // 1*x^5 + v0*x^4 + v1*x^3 + v2*x^2 + v3*x + v4. The implicit 1 guarantees that\n+    // [v0,v1,v2,...] has a distinct checksum from [0,v0,v1,v2,...].\n+\n+    // The output is a 30-bit integer whose 5-bit groups are the coefficients of the remainder of\n+    // v(x) mod g(x), where g(x) is the Bech32 generator,\n+    // x^6 + {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}. g(x) is chosen in such a way\n+    // that the resulting code is a BCH code, guaranteeing detection of up to 3 errors within a\n+    // window of 1023 characters. Among the various possible BCH codes, one was selected to in\n+    // fact guarantee detection of up to 4 errors within a window of 89 characters.\n+\n+    // Note that the coefficients are elements of GF(32), here represented as decimal numbers\n+    // between {}. In this finite field, addition is just XOR of the corresponding numbers. For\n+    // example, {27} + {13} = {27 ^ 13} = {22}. Multiplication is more complicated, and requires\n+    // treating the bits of values themselves as coefficients of a polynomial over a smaller field,\n+    // GF(2), and multiplying those polynomials mod a^5 + a^3 + 1. For example, {5} * {26} =\n+    // (a^2 + 1) * (a^4 + a^3 + a) = (a^4 + a^3 + a) * a^2 + (a^4 + a^3 + a) = a^6 + a^5 + a^4 + a\n+    // = a^3 + 1 (mod a^5 + a^3 + 1) = {9}.\n+\n+    // During the course of the loop below, `c` contains the bitpacked coefficients of the\n+    // polynomial constructed from just the values of v that were processed so far, mod g(x). In\n+    // the above example, `c` initially corresponds to 1 mod (x), and after processing 2 inputs of\n+    // v, it corresponds to x^2 + v0*x + v1 mod g(x). As 1 mod g(x) = 1, that is the starting value\n+    // for `c`.\n+    uint32_t c = 1;\n+    for (size_t i = 0; i < v.size(); ++i) {\n+        // We want to update `c` to correspond to a polynomial with one extra term. If the initial\n+        // value of `c` consists of the coefficients of c(x) = f(x) mod g(x), we modify it to\n+        // correspond to c'(x) = (f(x) * x + v[i]) mod g(x), where v[i] is the next input to\n+        // process. Simplifying:\n+        // c'(x) = (f(x) * x + v[i]) mod g(x)\n+        //         ((f(x) mod g(x)) * x + v[i]) mod g(x)\n+        //         (c(x) * x + v[i]) mod g(x)\n+        // If c(x) = c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5, we want to compute\n+        // c'(x) = (c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5) * x + v[i] mod g(x)\n+        //       = c0*x^6 + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i] mod g(x)\n+        //       = c0*(x^6 mod g(x)) + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]\n+        // If we call (x^6 mod g(x)) = k(x), this can be written as\n+        // c'(x) = (c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]) + c0*k(x)\n+\n+        // First, determine the value of c0:\n+        uint8_t c0 = c >> 25;\n+\n+        // Then compute c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]:\n+        c = ((c & 0x1ffffff) << 5) ^ v[i];\n+\n+        // Finally, for each set bit n in c0, conditionally add {2^n}k(x):\n+        if (c0 & 1)  c ^= 0x3b6a57b2; //     k(x) = {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}\n+        if (c0 & 2)  c ^= 0x26508e6d; //  {2}k(x) = {19}x^5 +  {5}x^4 +     x^3 +  {3}x^2 + {19}x + {13}\n+        if (c0 & 4)  c ^= 0x1ea119fa; //  {4}k(x) = {15}x^5 + {10}x^4 +  {2}x^3 +  {6}x^2 + {15}x + {26}\n+        if (c0 & 8)  c ^= 0x3d4233dd; //  {8}k(x) = {30}x^5 + {20}x^4 +  {4}x^3 + {12}x^2 + {30}x + {29}\n+        if (c0 & 16) c ^= 0x2a1462b3; // {16}k(x) = {21}x^5 +     x^4 +  {8}x^3 + {24}x^2 + {21}x + {19}\n+    }\n+    return c;\n+}\n+\n+/** Convert to lower case. */\n+inline unsigned char LowerCase(unsigned char c)\n+{\n+    return (c >= 'A' && c <= 'Z') ? (c - 'A') + 'a' : c;\n+}\n+\n+/** Expand a HRP for use in checksum computation. */\n+data ExpandHRP(const std::string& hrp)\n+{\n+    data ret;\n+    ret.resize(hrp.size() * 2 + 1);\n+    for (size_t i = 0; i < hrp.size(); ++i) {\n+        unsigned char c = hrp[i];\n+        ret[i] = c >> 5;\n+        ret[i + hrp.size() + 1] = c & 0x1f;\n+    }\n+    ret[hrp.size()] = 0;\n+    return ret;\n+}\n+\n+/** Verify a checksum. */\n+bool VerifyChecksum(const std::string& hrp, const data& values)\n+{\n+    // PolyMod computes what value to xor into the final values to make the checksum 0. However,\n+    // if we required that the checksum was 0, it would be the case that appending a 0 to a valid\n+    // list of values would result in a new valid list. For that reason, Bech32 requires the\n+    // resulting checksum to be 1 instead.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141712157",
+      "id" : 141712157,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 122,
+      "path" : "src/bech32.cpp",
+      "position" : 122,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141712157",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141713104"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141713104"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Just `data ret(6);`",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T19:25:39Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};\n+\n+/** Concatenate two byte arrays. */\n+data Cat(data x, const data& y)\n+{\n+    x.insert(x.end(), y.begin(), y.end());\n+    return x;\n+}\n+\n+/** This function will compute what 6 5-bit values to XOR into the last 6 input values, in order to\n+ *  make the checksum 0. These 6 values are packed together in a single 30-bit integer. The higher\n+ *  bits correspond to earlier values. */\n+uint32_t PolyMod(const data& v)\n+{\n+    // The input is interpreted as a list of coefficients of a polynomial over F = GF(32), with an\n+    // implicit 1 in front. If the input is [v0,v1,v2,v3,v4], that polynomial is v(x) =\n+    // 1*x^5 + v0*x^4 + v1*x^3 + v2*x^2 + v3*x + v4. The implicit 1 guarantees that\n+    // [v0,v1,v2,...] has a distinct checksum from [0,v0,v1,v2,...].\n+\n+    // The output is a 30-bit integer whose 5-bit groups are the coefficients of the remainder of\n+    // v(x) mod g(x), where g(x) is the Bech32 generator,\n+    // x^6 + {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}. g(x) is chosen in such a way\n+    // that the resulting code is a BCH code, guaranteeing detection of up to 3 errors within a\n+    // window of 1023 characters. Among the various possible BCH codes, one was selected to in\n+    // fact guarantee detection of up to 4 errors within a window of 89 characters.\n+\n+    // Note that the coefficients are elements of GF(32), here represented as decimal numbers\n+    // between {}. In this finite field, addition is just XOR of the corresponding numbers. For\n+    // example, {27} + {13} = {27 ^ 13} = {22}. Multiplication is more complicated, and requires\n+    // treating the bits of values themselves as coefficients of a polynomial over a smaller field,\n+    // GF(2), and multiplying those polynomials mod a^5 + a^3 + 1. For example, {5} * {26} =\n+    // (a^2 + 1) * (a^4 + a^3 + a) = (a^4 + a^3 + a) * a^2 + (a^4 + a^3 + a) = a^6 + a^5 + a^4 + a\n+    // = a^3 + 1 (mod a^5 + a^3 + 1) = {9}.\n+\n+    // During the course of the loop below, `c` contains the bitpacked coefficients of the\n+    // polynomial constructed from just the values of v that were processed so far, mod g(x). In\n+    // the above example, `c` initially corresponds to 1 mod (x), and after processing 2 inputs of\n+    // v, it corresponds to x^2 + v0*x + v1 mod g(x). As 1 mod g(x) = 1, that is the starting value\n+    // for `c`.\n+    uint32_t c = 1;\n+    for (size_t i = 0; i < v.size(); ++i) {\n+        // We want to update `c` to correspond to a polynomial with one extra term. If the initial\n+        // value of `c` consists of the coefficients of c(x) = f(x) mod g(x), we modify it to\n+        // correspond to c'(x) = (f(x) * x + v[i]) mod g(x), where v[i] is the next input to\n+        // process. Simplifying:\n+        // c'(x) = (f(x) * x + v[i]) mod g(x)\n+        //         ((f(x) mod g(x)) * x + v[i]) mod g(x)\n+        //         (c(x) * x + v[i]) mod g(x)\n+        // If c(x) = c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5, we want to compute\n+        // c'(x) = (c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5) * x + v[i] mod g(x)\n+        //       = c0*x^6 + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i] mod g(x)\n+        //       = c0*(x^6 mod g(x)) + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]\n+        // If we call (x^6 mod g(x)) = k(x), this can be written as\n+        // c'(x) = (c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]) + c0*k(x)\n+\n+        // First, determine the value of c0:\n+        uint8_t c0 = c >> 25;\n+\n+        // Then compute c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]:\n+        c = ((c & 0x1ffffff) << 5) ^ v[i];\n+\n+        // Finally, for each set bit n in c0, conditionally add {2^n}k(x):\n+        if (c0 & 1)  c ^= 0x3b6a57b2; //     k(x) = {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}\n+        if (c0 & 2)  c ^= 0x26508e6d; //  {2}k(x) = {19}x^5 +  {5}x^4 +     x^3 +  {3}x^2 + {19}x + {13}\n+        if (c0 & 4)  c ^= 0x1ea119fa; //  {4}k(x) = {15}x^5 + {10}x^4 +  {2}x^3 +  {6}x^2 + {15}x + {26}\n+        if (c0 & 8)  c ^= 0x3d4233dd; //  {8}k(x) = {30}x^5 + {20}x^4 +  {4}x^3 + {12}x^2 + {30}x + {29}\n+        if (c0 & 16) c ^= 0x2a1462b3; // {16}k(x) = {21}x^5 +     x^4 +  {8}x^3 + {24}x^2 + {21}x + {19}\n+    }\n+    return c;\n+}\n+\n+/** Convert to lower case. */\n+inline unsigned char LowerCase(unsigned char c)\n+{\n+    return (c >= 'A' && c <= 'Z') ? (c - 'A') + 'a' : c;\n+}\n+\n+/** Expand a HRP for use in checksum computation. */\n+data ExpandHRP(const std::string& hrp)\n+{\n+    data ret;\n+    ret.resize(hrp.size() * 2 + 1);\n+    for (size_t i = 0; i < hrp.size(); ++i) {\n+        unsigned char c = hrp[i];\n+        ret[i] = c >> 5;\n+        ret[i + hrp.size() + 1] = c & 0x1f;\n+    }\n+    ret[hrp.size()] = 0;\n+    return ret;\n+}\n+\n+/** Verify a checksum. */\n+bool VerifyChecksum(const std::string& hrp, const data& values)\n+{\n+    // PolyMod computes what value to xor into the final values to make the checksum 0. However,\n+    // if we required that the checksum was 0, it would be the case that appending a 0 to a valid\n+    // list of values would result in a new valid list. For that reason, Bech32 requires the\n+    // resulting checksum to be 1 instead.\n+    return PolyMod(Cat(ExpandHRP(hrp), values)) == 1;\n+}\n+\n+/** Create a checksum. */\n+data CreateChecksum(const std::string& hrp, const data& values)\n+{\n+    data enc = Cat(ExpandHRP(hrp), values);\n+    enc.resize(enc.size() + 6); // Append 6 zeroes\n+    uint32_t mod = PolyMod(enc) ^ 1; // Determine what to XOR into those 6 zeroes.\n+    data ret;\n+    ret.resize(6);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141713104",
+      "id" : 141713104,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 133,
+      "path" : "src/bech32.cpp",
+      "position" : 133,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141713104",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141714069"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141714069"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Use range-for loop",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T19:29:37Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};\n+\n+/** Concatenate two byte arrays. */\n+data Cat(data x, const data& y)\n+{\n+    x.insert(x.end(), y.begin(), y.end());\n+    return x;\n+}\n+\n+/** This function will compute what 6 5-bit values to XOR into the last 6 input values, in order to\n+ *  make the checksum 0. These 6 values are packed together in a single 30-bit integer. The higher\n+ *  bits correspond to earlier values. */\n+uint32_t PolyMod(const data& v)\n+{\n+    // The input is interpreted as a list of coefficients of a polynomial over F = GF(32), with an\n+    // implicit 1 in front. If the input is [v0,v1,v2,v3,v4], that polynomial is v(x) =\n+    // 1*x^5 + v0*x^4 + v1*x^3 + v2*x^2 + v3*x + v4. The implicit 1 guarantees that\n+    // [v0,v1,v2,...] has a distinct checksum from [0,v0,v1,v2,...].\n+\n+    // The output is a 30-bit integer whose 5-bit groups are the coefficients of the remainder of\n+    // v(x) mod g(x), where g(x) is the Bech32 generator,\n+    // x^6 + {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}. g(x) is chosen in such a way\n+    // that the resulting code is a BCH code, guaranteeing detection of up to 3 errors within a\n+    // window of 1023 characters. Among the various possible BCH codes, one was selected to in\n+    // fact guarantee detection of up to 4 errors within a window of 89 characters.\n+\n+    // Note that the coefficients are elements of GF(32), here represented as decimal numbers\n+    // between {}. In this finite field, addition is just XOR of the corresponding numbers. For\n+    // example, {27} + {13} = {27 ^ 13} = {22}. Multiplication is more complicated, and requires\n+    // treating the bits of values themselves as coefficients of a polynomial over a smaller field,\n+    // GF(2), and multiplying those polynomials mod a^5 + a^3 + 1. For example, {5} * {26} =\n+    // (a^2 + 1) * (a^4 + a^3 + a) = (a^4 + a^3 + a) * a^2 + (a^4 + a^3 + a) = a^6 + a^5 + a^4 + a\n+    // = a^3 + 1 (mod a^5 + a^3 + 1) = {9}.\n+\n+    // During the course of the loop below, `c` contains the bitpacked coefficients of the\n+    // polynomial constructed from just the values of v that were processed so far, mod g(x). In\n+    // the above example, `c` initially corresponds to 1 mod (x), and after processing 2 inputs of\n+    // v, it corresponds to x^2 + v0*x + v1 mod g(x). As 1 mod g(x) = 1, that is the starting value\n+    // for `c`.\n+    uint32_t c = 1;\n+    for (size_t i = 0; i < v.size(); ++i) {\n+        // We want to update `c` to correspond to a polynomial with one extra term. If the initial\n+        // value of `c` consists of the coefficients of c(x) = f(x) mod g(x), we modify it to\n+        // correspond to c'(x) = (f(x) * x + v[i]) mod g(x), where v[i] is the next input to\n+        // process. Simplifying:\n+        // c'(x) = (f(x) * x + v[i]) mod g(x)\n+        //         ((f(x) mod g(x)) * x + v[i]) mod g(x)\n+        //         (c(x) * x + v[i]) mod g(x)\n+        // If c(x) = c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5, we want to compute\n+        // c'(x) = (c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5) * x + v[i] mod g(x)\n+        //       = c0*x^6 + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i] mod g(x)\n+        //       = c0*(x^6 mod g(x)) + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]\n+        // If we call (x^6 mod g(x)) = k(x), this can be written as\n+        // c'(x) = (c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]) + c0*k(x)\n+\n+        // First, determine the value of c0:\n+        uint8_t c0 = c >> 25;\n+\n+        // Then compute c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]:\n+        c = ((c & 0x1ffffff) << 5) ^ v[i];\n+\n+        // Finally, for each set bit n in c0, conditionally add {2^n}k(x):\n+        if (c0 & 1)  c ^= 0x3b6a57b2; //     k(x) = {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}\n+        if (c0 & 2)  c ^= 0x26508e6d; //  {2}k(x) = {19}x^5 +  {5}x^4 +     x^3 +  {3}x^2 + {19}x + {13}\n+        if (c0 & 4)  c ^= 0x1ea119fa; //  {4}k(x) = {15}x^5 + {10}x^4 +  {2}x^3 +  {6}x^2 + {15}x + {26}\n+        if (c0 & 8)  c ^= 0x3d4233dd; //  {8}k(x) = {30}x^5 + {20}x^4 +  {4}x^3 + {12}x^2 + {30}x + {29}\n+        if (c0 & 16) c ^= 0x2a1462b3; // {16}k(x) = {21}x^5 +     x^4 +  {8}x^3 + {24}x^2 + {21}x + {19}\n+    }\n+    return c;\n+}\n+\n+/** Convert to lower case. */\n+inline unsigned char LowerCase(unsigned char c)\n+{\n+    return (c >= 'A' && c <= 'Z') ? (c - 'A') + 'a' : c;\n+}\n+\n+/** Expand a HRP for use in checksum computation. */\n+data ExpandHRP(const std::string& hrp)\n+{\n+    data ret;\n+    ret.resize(hrp.size() * 2 + 1);\n+    for (size_t i = 0; i < hrp.size(); ++i) {\n+        unsigned char c = hrp[i];\n+        ret[i] = c >> 5;\n+        ret[i + hrp.size() + 1] = c & 0x1f;\n+    }\n+    ret[hrp.size()] = 0;\n+    return ret;\n+}\n+\n+/** Verify a checksum. */\n+bool VerifyChecksum(const std::string& hrp, const data& values)\n+{\n+    // PolyMod computes what value to xor into the final values to make the checksum 0. However,\n+    // if we required that the checksum was 0, it would be the case that appending a 0 to a valid\n+    // list of values would result in a new valid list. For that reason, Bech32 requires the\n+    // resulting checksum to be 1 instead.\n+    return PolyMod(Cat(ExpandHRP(hrp), values)) == 1;\n+}\n+\n+/** Create a checksum. */\n+data CreateChecksum(const std::string& hrp, const data& values)\n+{\n+    data enc = Cat(ExpandHRP(hrp), values);\n+    enc.resize(enc.size() + 6); // Append 6 zeroes\n+    uint32_t mod = PolyMod(enc) ^ 1; // Determine what to XOR into those 6 zeroes.\n+    data ret;\n+    ret.resize(6);\n+    for (size_t i = 0; i < 6; ++i) {\n+        // Convert the 5-bit groups in mod to checksum values.\n+        ret[i] = (mod >> (5 * (5 - i))) & 31;\n+    }\n+    return ret;\n+}\n+\n+} // namespace\n+\n+namespace bech32\n+{\n+\n+/** Encode a Bech32 string. */\n+std::string Encode(const std::string& hrp, const data& values) {\n+    data checksum = CreateChecksum(hrp, values);\n+    data combined = Cat(values, checksum);\n+    std::string ret = hrp + '1';\n+    ret.reserve(ret.size() + combined.size());\n+    for (size_t i = 0; i < combined.size(); ++i) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141714069",
+      "id" : 141714069,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 152,
+      "path" : "src/bech32.cpp",
+      "position" : 152,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141714069",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141717000"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141717000"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Just `data values(str.size() - 1 - pos);`",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T19:43:07Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};\n+\n+/** Concatenate two byte arrays. */\n+data Cat(data x, const data& y)\n+{\n+    x.insert(x.end(), y.begin(), y.end());\n+    return x;\n+}\n+\n+/** This function will compute what 6 5-bit values to XOR into the last 6 input values, in order to\n+ *  make the checksum 0. These 6 values are packed together in a single 30-bit integer. The higher\n+ *  bits correspond to earlier values. */\n+uint32_t PolyMod(const data& v)\n+{\n+    // The input is interpreted as a list of coefficients of a polynomial over F = GF(32), with an\n+    // implicit 1 in front. If the input is [v0,v1,v2,v3,v4], that polynomial is v(x) =\n+    // 1*x^5 + v0*x^4 + v1*x^3 + v2*x^2 + v3*x + v4. The implicit 1 guarantees that\n+    // [v0,v1,v2,...] has a distinct checksum from [0,v0,v1,v2,...].\n+\n+    // The output is a 30-bit integer whose 5-bit groups are the coefficients of the remainder of\n+    // v(x) mod g(x), where g(x) is the Bech32 generator,\n+    // x^6 + {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}. g(x) is chosen in such a way\n+    // that the resulting code is a BCH code, guaranteeing detection of up to 3 errors within a\n+    // window of 1023 characters. Among the various possible BCH codes, one was selected to in\n+    // fact guarantee detection of up to 4 errors within a window of 89 characters.\n+\n+    // Note that the coefficients are elements of GF(32), here represented as decimal numbers\n+    // between {}. In this finite field, addition is just XOR of the corresponding numbers. For\n+    // example, {27} + {13} = {27 ^ 13} = {22}. Multiplication is more complicated, and requires\n+    // treating the bits of values themselves as coefficients of a polynomial over a smaller field,\n+    // GF(2), and multiplying those polynomials mod a^5 + a^3 + 1. For example, {5} * {26} =\n+    // (a^2 + 1) * (a^4 + a^3 + a) = (a^4 + a^3 + a) * a^2 + (a^4 + a^3 + a) = a^6 + a^5 + a^4 + a\n+    // = a^3 + 1 (mod a^5 + a^3 + 1) = {9}.\n+\n+    // During the course of the loop below, `c` contains the bitpacked coefficients of the\n+    // polynomial constructed from just the values of v that were processed so far, mod g(x). In\n+    // the above example, `c` initially corresponds to 1 mod (x), and after processing 2 inputs of\n+    // v, it corresponds to x^2 + v0*x + v1 mod g(x). As 1 mod g(x) = 1, that is the starting value\n+    // for `c`.\n+    uint32_t c = 1;\n+    for (size_t i = 0; i < v.size(); ++i) {\n+        // We want to update `c` to correspond to a polynomial with one extra term. If the initial\n+        // value of `c` consists of the coefficients of c(x) = f(x) mod g(x), we modify it to\n+        // correspond to c'(x) = (f(x) * x + v[i]) mod g(x), where v[i] is the next input to\n+        // process. Simplifying:\n+        // c'(x) = (f(x) * x + v[i]) mod g(x)\n+        //         ((f(x) mod g(x)) * x + v[i]) mod g(x)\n+        //         (c(x) * x + v[i]) mod g(x)\n+        // If c(x) = c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5, we want to compute\n+        // c'(x) = (c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5) * x + v[i] mod g(x)\n+        //       = c0*x^6 + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i] mod g(x)\n+        //       = c0*(x^6 mod g(x)) + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]\n+        // If we call (x^6 mod g(x)) = k(x), this can be written as\n+        // c'(x) = (c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]) + c0*k(x)\n+\n+        // First, determine the value of c0:\n+        uint8_t c0 = c >> 25;\n+\n+        // Then compute c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]:\n+        c = ((c & 0x1ffffff) << 5) ^ v[i];\n+\n+        // Finally, for each set bit n in c0, conditionally add {2^n}k(x):\n+        if (c0 & 1)  c ^= 0x3b6a57b2; //     k(x) = {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}\n+        if (c0 & 2)  c ^= 0x26508e6d; //  {2}k(x) = {19}x^5 +  {5}x^4 +     x^3 +  {3}x^2 + {19}x + {13}\n+        if (c0 & 4)  c ^= 0x1ea119fa; //  {4}k(x) = {15}x^5 + {10}x^4 +  {2}x^3 +  {6}x^2 + {15}x + {26}\n+        if (c0 & 8)  c ^= 0x3d4233dd; //  {8}k(x) = {30}x^5 + {20}x^4 +  {4}x^3 + {12}x^2 + {30}x + {29}\n+        if (c0 & 16) c ^= 0x2a1462b3; // {16}k(x) = {21}x^5 +     x^4 +  {8}x^3 + {24}x^2 + {21}x + {19}\n+    }\n+    return c;\n+}\n+\n+/** Convert to lower case. */\n+inline unsigned char LowerCase(unsigned char c)\n+{\n+    return (c >= 'A' && c <= 'Z') ? (c - 'A') + 'a' : c;\n+}\n+\n+/** Expand a HRP for use in checksum computation. */\n+data ExpandHRP(const std::string& hrp)\n+{\n+    data ret;\n+    ret.resize(hrp.size() * 2 + 1);\n+    for (size_t i = 0; i < hrp.size(); ++i) {\n+        unsigned char c = hrp[i];\n+        ret[i] = c >> 5;\n+        ret[i + hrp.size() + 1] = c & 0x1f;\n+    }\n+    ret[hrp.size()] = 0;\n+    return ret;\n+}\n+\n+/** Verify a checksum. */\n+bool VerifyChecksum(const std::string& hrp, const data& values)\n+{\n+    // PolyMod computes what value to xor into the final values to make the checksum 0. However,\n+    // if we required that the checksum was 0, it would be the case that appending a 0 to a valid\n+    // list of values would result in a new valid list. For that reason, Bech32 requires the\n+    // resulting checksum to be 1 instead.\n+    return PolyMod(Cat(ExpandHRP(hrp), values)) == 1;\n+}\n+\n+/** Create a checksum. */\n+data CreateChecksum(const std::string& hrp, const data& values)\n+{\n+    data enc = Cat(ExpandHRP(hrp), values);\n+    enc.resize(enc.size() + 6); // Append 6 zeroes\n+    uint32_t mod = PolyMod(enc) ^ 1; // Determine what to XOR into those 6 zeroes.\n+    data ret;\n+    ret.resize(6);\n+    for (size_t i = 0; i < 6; ++i) {\n+        // Convert the 5-bit groups in mod to checksum values.\n+        ret[i] = (mod >> (5 * (5 - i))) & 31;\n+    }\n+    return ret;\n+}\n+\n+} // namespace\n+\n+namespace bech32\n+{\n+\n+/** Encode a Bech32 string. */\n+std::string Encode(const std::string& hrp, const data& values) {\n+    data checksum = CreateChecksum(hrp, values);\n+    data combined = Cat(values, checksum);\n+    std::string ret = hrp + '1';\n+    ret.reserve(ret.size() + combined.size());\n+    for (size_t i = 0; i < combined.size(); ++i) {\n+        ret += CHARSET[combined[i]];\n+    }\n+    return ret;\n+}\n+\n+/** Decode a Bech32 string. */\n+std::pair<std::string, data> Decode(const std::string& str) {\n+    bool lower = false, upper = false;\n+    for (size_t i = 0; i < str.size(); ++i) {\n+        unsigned char c = str[i];\n+        if (c < 33 || c > 126) return std::make_pair(std::string(), data());\n+        if (c >= 'a' && c <= 'z') lower = true;\n+        if (c >= 'A' && c <= 'Z') upper = true;\n+    }\n+    if (lower && upper) return std::make_pair(std::string(), data());\n+    size_t pos = str.rfind('1');\n+    if (str.size() > 90 || pos == str.npos || pos == 0 || pos + 7 > str.size()) {\n+        return std::make_pair(std::string(), data());\n+    }\n+    data values;\n+    values.resize(str.size() - 1 - pos);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141717000",
+      "id" : 141717000,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 173,
+      "path" : "src/bech32.cpp",
+      "position" : 173,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141717000",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141717549"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141717549"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Here and later, just `return {}`",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T19:45:34Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};\n+\n+/** Concatenate two byte arrays. */\n+data Cat(data x, const data& y)\n+{\n+    x.insert(x.end(), y.begin(), y.end());\n+    return x;\n+}\n+\n+/** This function will compute what 6 5-bit values to XOR into the last 6 input values, in order to\n+ *  make the checksum 0. These 6 values are packed together in a single 30-bit integer. The higher\n+ *  bits correspond to earlier values. */\n+uint32_t PolyMod(const data& v)\n+{\n+    // The input is interpreted as a list of coefficients of a polynomial over F = GF(32), with an\n+    // implicit 1 in front. If the input is [v0,v1,v2,v3,v4], that polynomial is v(x) =\n+    // 1*x^5 + v0*x^4 + v1*x^3 + v2*x^2 + v3*x + v4. The implicit 1 guarantees that\n+    // [v0,v1,v2,...] has a distinct checksum from [0,v0,v1,v2,...].\n+\n+    // The output is a 30-bit integer whose 5-bit groups are the coefficients of the remainder of\n+    // v(x) mod g(x), where g(x) is the Bech32 generator,\n+    // x^6 + {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}. g(x) is chosen in such a way\n+    // that the resulting code is a BCH code, guaranteeing detection of up to 3 errors within a\n+    // window of 1023 characters. Among the various possible BCH codes, one was selected to in\n+    // fact guarantee detection of up to 4 errors within a window of 89 characters.\n+\n+    // Note that the coefficients are elements of GF(32), here represented as decimal numbers\n+    // between {}. In this finite field, addition is just XOR of the corresponding numbers. For\n+    // example, {27} + {13} = {27 ^ 13} = {22}. Multiplication is more complicated, and requires\n+    // treating the bits of values themselves as coefficients of a polynomial over a smaller field,\n+    // GF(2), and multiplying those polynomials mod a^5 + a^3 + 1. For example, {5} * {26} =\n+    // (a^2 + 1) * (a^4 + a^3 + a) = (a^4 + a^3 + a) * a^2 + (a^4 + a^3 + a) = a^6 + a^5 + a^4 + a\n+    // = a^3 + 1 (mod a^5 + a^3 + 1) = {9}.\n+\n+    // During the course of the loop below, `c` contains the bitpacked coefficients of the\n+    // polynomial constructed from just the values of v that were processed so far, mod g(x). In\n+    // the above example, `c` initially corresponds to 1 mod (x), and after processing 2 inputs of\n+    // v, it corresponds to x^2 + v0*x + v1 mod g(x). As 1 mod g(x) = 1, that is the starting value\n+    // for `c`.\n+    uint32_t c = 1;\n+    for (size_t i = 0; i < v.size(); ++i) {\n+        // We want to update `c` to correspond to a polynomial with one extra term. If the initial\n+        // value of `c` consists of the coefficients of c(x) = f(x) mod g(x), we modify it to\n+        // correspond to c'(x) = (f(x) * x + v[i]) mod g(x), where v[i] is the next input to\n+        // process. Simplifying:\n+        // c'(x) = (f(x) * x + v[i]) mod g(x)\n+        //         ((f(x) mod g(x)) * x + v[i]) mod g(x)\n+        //         (c(x) * x + v[i]) mod g(x)\n+        // If c(x) = c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5, we want to compute\n+        // c'(x) = (c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5) * x + v[i] mod g(x)\n+        //       = c0*x^6 + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i] mod g(x)\n+        //       = c0*(x^6 mod g(x)) + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]\n+        // If we call (x^6 mod g(x)) = k(x), this can be written as\n+        // c'(x) = (c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]) + c0*k(x)\n+\n+        // First, determine the value of c0:\n+        uint8_t c0 = c >> 25;\n+\n+        // Then compute c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]:\n+        c = ((c & 0x1ffffff) << 5) ^ v[i];\n+\n+        // Finally, for each set bit n in c0, conditionally add {2^n}k(x):\n+        if (c0 & 1)  c ^= 0x3b6a57b2; //     k(x) = {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}\n+        if (c0 & 2)  c ^= 0x26508e6d; //  {2}k(x) = {19}x^5 +  {5}x^4 +     x^3 +  {3}x^2 + {19}x + {13}\n+        if (c0 & 4)  c ^= 0x1ea119fa; //  {4}k(x) = {15}x^5 + {10}x^4 +  {2}x^3 +  {6}x^2 + {15}x + {26}\n+        if (c0 & 8)  c ^= 0x3d4233dd; //  {8}k(x) = {30}x^5 + {20}x^4 +  {4}x^3 + {12}x^2 + {30}x + {29}\n+        if (c0 & 16) c ^= 0x2a1462b3; // {16}k(x) = {21}x^5 +     x^4 +  {8}x^3 + {24}x^2 + {21}x + {19}\n+    }\n+    return c;\n+}\n+\n+/** Convert to lower case. */\n+inline unsigned char LowerCase(unsigned char c)\n+{\n+    return (c >= 'A' && c <= 'Z') ? (c - 'A') + 'a' : c;\n+}\n+\n+/** Expand a HRP for use in checksum computation. */\n+data ExpandHRP(const std::string& hrp)\n+{\n+    data ret;\n+    ret.resize(hrp.size() * 2 + 1);\n+    for (size_t i = 0; i < hrp.size(); ++i) {\n+        unsigned char c = hrp[i];\n+        ret[i] = c >> 5;\n+        ret[i + hrp.size() + 1] = c & 0x1f;\n+    }\n+    ret[hrp.size()] = 0;\n+    return ret;\n+}\n+\n+/** Verify a checksum. */\n+bool VerifyChecksum(const std::string& hrp, const data& values)\n+{\n+    // PolyMod computes what value to xor into the final values to make the checksum 0. However,\n+    // if we required that the checksum was 0, it would be the case that appending a 0 to a valid\n+    // list of values would result in a new valid list. For that reason, Bech32 requires the\n+    // resulting checksum to be 1 instead.\n+    return PolyMod(Cat(ExpandHRP(hrp), values)) == 1;\n+}\n+\n+/** Create a checksum. */\n+data CreateChecksum(const std::string& hrp, const data& values)\n+{\n+    data enc = Cat(ExpandHRP(hrp), values);\n+    enc.resize(enc.size() + 6); // Append 6 zeroes\n+    uint32_t mod = PolyMod(enc) ^ 1; // Determine what to XOR into those 6 zeroes.\n+    data ret;\n+    ret.resize(6);\n+    for (size_t i = 0; i < 6; ++i) {\n+        // Convert the 5-bit groups in mod to checksum values.\n+        ret[i] = (mod >> (5 * (5 - i))) & 31;\n+    }\n+    return ret;\n+}\n+\n+} // namespace\n+\n+namespace bech32\n+{\n+\n+/** Encode a Bech32 string. */\n+std::string Encode(const std::string& hrp, const data& values) {\n+    data checksum = CreateChecksum(hrp, values);\n+    data combined = Cat(values, checksum);\n+    std::string ret = hrp + '1';\n+    ret.reserve(ret.size() + combined.size());\n+    for (size_t i = 0; i < combined.size(); ++i) {\n+        ret += CHARSET[combined[i]];\n+    }\n+    return ret;\n+}\n+\n+/** Decode a Bech32 string. */\n+std::pair<std::string, data> Decode(const std::string& str) {\n+    bool lower = false, upper = false;\n+    for (size_t i = 0; i < str.size(); ++i) {\n+        unsigned char c = str[i];\n+        if (c < 33 || c > 126) return std::make_pair(std::string(), data());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141717549",
+      "id" : 141717549,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 163,
+      "path" : "src/bech32.cpp",
+      "position" : 163,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:47Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141717549",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141718442"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141718442"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Access `CHARSET_REV` just once, store `const int8_t& val = CHARSET_REV[c]`",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T19:49:39Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};\n+\n+/** Concatenate two byte arrays. */\n+data Cat(data x, const data& y)\n+{\n+    x.insert(x.end(), y.begin(), y.end());\n+    return x;\n+}\n+\n+/** This function will compute what 6 5-bit values to XOR into the last 6 input values, in order to\n+ *  make the checksum 0. These 6 values are packed together in a single 30-bit integer. The higher\n+ *  bits correspond to earlier values. */\n+uint32_t PolyMod(const data& v)\n+{\n+    // The input is interpreted as a list of coefficients of a polynomial over F = GF(32), with an\n+    // implicit 1 in front. If the input is [v0,v1,v2,v3,v4], that polynomial is v(x) =\n+    // 1*x^5 + v0*x^4 + v1*x^3 + v2*x^2 + v3*x + v4. The implicit 1 guarantees that\n+    // [v0,v1,v2,...] has a distinct checksum from [0,v0,v1,v2,...].\n+\n+    // The output is a 30-bit integer whose 5-bit groups are the coefficients of the remainder of\n+    // v(x) mod g(x), where g(x) is the Bech32 generator,\n+    // x^6 + {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}. g(x) is chosen in such a way\n+    // that the resulting code is a BCH code, guaranteeing detection of up to 3 errors within a\n+    // window of 1023 characters. Among the various possible BCH codes, one was selected to in\n+    // fact guarantee detection of up to 4 errors within a window of 89 characters.\n+\n+    // Note that the coefficients are elements of GF(32), here represented as decimal numbers\n+    // between {}. In this finite field, addition is just XOR of the corresponding numbers. For\n+    // example, {27} + {13} = {27 ^ 13} = {22}. Multiplication is more complicated, and requires\n+    // treating the bits of values themselves as coefficients of a polynomial over a smaller field,\n+    // GF(2), and multiplying those polynomials mod a^5 + a^3 + 1. For example, {5} * {26} =\n+    // (a^2 + 1) * (a^4 + a^3 + a) = (a^4 + a^3 + a) * a^2 + (a^4 + a^3 + a) = a^6 + a^5 + a^4 + a\n+    // = a^3 + 1 (mod a^5 + a^3 + 1) = {9}.\n+\n+    // During the course of the loop below, `c` contains the bitpacked coefficients of the\n+    // polynomial constructed from just the values of v that were processed so far, mod g(x). In\n+    // the above example, `c` initially corresponds to 1 mod (x), and after processing 2 inputs of\n+    // v, it corresponds to x^2 + v0*x + v1 mod g(x). As 1 mod g(x) = 1, that is the starting value\n+    // for `c`.\n+    uint32_t c = 1;\n+    for (size_t i = 0; i < v.size(); ++i) {\n+        // We want to update `c` to correspond to a polynomial with one extra term. If the initial\n+        // value of `c` consists of the coefficients of c(x) = f(x) mod g(x), we modify it to\n+        // correspond to c'(x) = (f(x) * x + v[i]) mod g(x), where v[i] is the next input to\n+        // process. Simplifying:\n+        // c'(x) = (f(x) * x + v[i]) mod g(x)\n+        //         ((f(x) mod g(x)) * x + v[i]) mod g(x)\n+        //         (c(x) * x + v[i]) mod g(x)\n+        // If c(x) = c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5, we want to compute\n+        // c'(x) = (c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5) * x + v[i] mod g(x)\n+        //       = c0*x^6 + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i] mod g(x)\n+        //       = c0*(x^6 mod g(x)) + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]\n+        // If we call (x^6 mod g(x)) = k(x), this can be written as\n+        // c'(x) = (c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]) + c0*k(x)\n+\n+        // First, determine the value of c0:\n+        uint8_t c0 = c >> 25;\n+\n+        // Then compute c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]:\n+        c = ((c & 0x1ffffff) << 5) ^ v[i];\n+\n+        // Finally, for each set bit n in c0, conditionally add {2^n}k(x):\n+        if (c0 & 1)  c ^= 0x3b6a57b2; //     k(x) = {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}\n+        if (c0 & 2)  c ^= 0x26508e6d; //  {2}k(x) = {19}x^5 +  {5}x^4 +     x^3 +  {3}x^2 + {19}x + {13}\n+        if (c0 & 4)  c ^= 0x1ea119fa; //  {4}k(x) = {15}x^5 + {10}x^4 +  {2}x^3 +  {6}x^2 + {15}x + {26}\n+        if (c0 & 8)  c ^= 0x3d4233dd; //  {8}k(x) = {30}x^5 + {20}x^4 +  {4}x^3 + {12}x^2 + {30}x + {29}\n+        if (c0 & 16) c ^= 0x2a1462b3; // {16}k(x) = {21}x^5 +     x^4 +  {8}x^3 + {24}x^2 + {21}x + {19}\n+    }\n+    return c;\n+}\n+\n+/** Convert to lower case. */\n+inline unsigned char LowerCase(unsigned char c)\n+{\n+    return (c >= 'A' && c <= 'Z') ? (c - 'A') + 'a' : c;\n+}\n+\n+/** Expand a HRP for use in checksum computation. */\n+data ExpandHRP(const std::string& hrp)\n+{\n+    data ret;\n+    ret.resize(hrp.size() * 2 + 1);\n+    for (size_t i = 0; i < hrp.size(); ++i) {\n+        unsigned char c = hrp[i];\n+        ret[i] = c >> 5;\n+        ret[i + hrp.size() + 1] = c & 0x1f;\n+    }\n+    ret[hrp.size()] = 0;\n+    return ret;\n+}\n+\n+/** Verify a checksum. */\n+bool VerifyChecksum(const std::string& hrp, const data& values)\n+{\n+    // PolyMod computes what value to xor into the final values to make the checksum 0. However,\n+    // if we required that the checksum was 0, it would be the case that appending a 0 to a valid\n+    // list of values would result in a new valid list. For that reason, Bech32 requires the\n+    // resulting checksum to be 1 instead.\n+    return PolyMod(Cat(ExpandHRP(hrp), values)) == 1;\n+}\n+\n+/** Create a checksum. */\n+data CreateChecksum(const std::string& hrp, const data& values)\n+{\n+    data enc = Cat(ExpandHRP(hrp), values);\n+    enc.resize(enc.size() + 6); // Append 6 zeroes\n+    uint32_t mod = PolyMod(enc) ^ 1; // Determine what to XOR into those 6 zeroes.\n+    data ret;\n+    ret.resize(6);\n+    for (size_t i = 0; i < 6; ++i) {\n+        // Convert the 5-bit groups in mod to checksum values.\n+        ret[i] = (mod >> (5 * (5 - i))) & 31;\n+    }\n+    return ret;\n+}\n+\n+} // namespace\n+\n+namespace bech32\n+{\n+\n+/** Encode a Bech32 string. */\n+std::string Encode(const std::string& hrp, const data& values) {\n+    data checksum = CreateChecksum(hrp, values);\n+    data combined = Cat(values, checksum);\n+    std::string ret = hrp + '1';\n+    ret.reserve(ret.size() + combined.size());\n+    for (size_t i = 0; i < combined.size(); ++i) {\n+        ret += CHARSET[combined[i]];\n+    }\n+    return ret;\n+}\n+\n+/** Decode a Bech32 string. */\n+std::pair<std::string, data> Decode(const std::string& str) {\n+    bool lower = false, upper = false;\n+    for (size_t i = 0; i < str.size(); ++i) {\n+        unsigned char c = str[i];\n+        if (c < 33 || c > 126) return std::make_pair(std::string(), data());\n+        if (c >= 'a' && c <= 'z') lower = true;\n+        if (c >= 'A' && c <= 'Z') upper = true;\n+    }\n+    if (lower && upper) return std::make_pair(std::string(), data());\n+    size_t pos = str.rfind('1');\n+    if (str.size() > 90 || pos == str.npos || pos == 0 || pos + 7 > str.size()) {\n+        return std::make_pair(std::string(), data());\n+    }\n+    data values;\n+    values.resize(str.size() - 1 - pos);\n+    for (size_t i = 0; i < str.size() - 1 - pos; ++i) {\n+        unsigned char c = str[i + pos + 1];\n+        if (CHARSET_REV[c] == -1) {\n+            return std::make_pair(std::string(), data());\n+        }\n+        values[i] = CHARSET_REV[c];",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141718442",
+      "id" : 141718442,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 179,
+      "path" : "src/bech32.cpp",
+      "position" : 179,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:47Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141718442",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141720047"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141720047"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Here too `std::make_pair` can be removed in favor of `{}`",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T19:56:11Z",
+      "diff_hunk" : "@@ -0,0 +1,191 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+\n+namespace\n+{\n+\n+typedef std::vector<uint8_t> data;\n+\n+/** The Bech32 character set for encoding. */\n+const char* CHARSET = \"qpzry9x8gf2tvdw0s3jn54khce6mua7l\";\n+\n+/** The Bech32 character set for decoding. */\n+const int8_t CHARSET_REV[128] = {\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,\n+    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,\n+    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,\n+     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1\n+};\n+\n+/** Concatenate two byte arrays. */\n+data Cat(data x, const data& y)\n+{\n+    x.insert(x.end(), y.begin(), y.end());\n+    return x;\n+}\n+\n+/** This function will compute what 6 5-bit values to XOR into the last 6 input values, in order to\n+ *  make the checksum 0. These 6 values are packed together in a single 30-bit integer. The higher\n+ *  bits correspond to earlier values. */\n+uint32_t PolyMod(const data& v)\n+{\n+    // The input is interpreted as a list of coefficients of a polynomial over F = GF(32), with an\n+    // implicit 1 in front. If the input is [v0,v1,v2,v3,v4], that polynomial is v(x) =\n+    // 1*x^5 + v0*x^4 + v1*x^3 + v2*x^2 + v3*x + v4. The implicit 1 guarantees that\n+    // [v0,v1,v2,...] has a distinct checksum from [0,v0,v1,v2,...].\n+\n+    // The output is a 30-bit integer whose 5-bit groups are the coefficients of the remainder of\n+    // v(x) mod g(x), where g(x) is the Bech32 generator,\n+    // x^6 + {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}. g(x) is chosen in such a way\n+    // that the resulting code is a BCH code, guaranteeing detection of up to 3 errors within a\n+    // window of 1023 characters. Among the various possible BCH codes, one was selected to in\n+    // fact guarantee detection of up to 4 errors within a window of 89 characters.\n+\n+    // Note that the coefficients are elements of GF(32), here represented as decimal numbers\n+    // between {}. In this finite field, addition is just XOR of the corresponding numbers. For\n+    // example, {27} + {13} = {27 ^ 13} = {22}. Multiplication is more complicated, and requires\n+    // treating the bits of values themselves as coefficients of a polynomial over a smaller field,\n+    // GF(2), and multiplying those polynomials mod a^5 + a^3 + 1. For example, {5} * {26} =\n+    // (a^2 + 1) * (a^4 + a^3 + a) = (a^4 + a^3 + a) * a^2 + (a^4 + a^3 + a) = a^6 + a^5 + a^4 + a\n+    // = a^3 + 1 (mod a^5 + a^3 + 1) = {9}.\n+\n+    // During the course of the loop below, `c` contains the bitpacked coefficients of the\n+    // polynomial constructed from just the values of v that were processed so far, mod g(x). In\n+    // the above example, `c` initially corresponds to 1 mod (x), and after processing 2 inputs of\n+    // v, it corresponds to x^2 + v0*x + v1 mod g(x). As 1 mod g(x) = 1, that is the starting value\n+    // for `c`.\n+    uint32_t c = 1;\n+    for (size_t i = 0; i < v.size(); ++i) {\n+        // We want to update `c` to correspond to a polynomial with one extra term. If the initial\n+        // value of `c` consists of the coefficients of c(x) = f(x) mod g(x), we modify it to\n+        // correspond to c'(x) = (f(x) * x + v[i]) mod g(x), where v[i] is the next input to\n+        // process. Simplifying:\n+        // c'(x) = (f(x) * x + v[i]) mod g(x)\n+        //         ((f(x) mod g(x)) * x + v[i]) mod g(x)\n+        //         (c(x) * x + v[i]) mod g(x)\n+        // If c(x) = c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5, we want to compute\n+        // c'(x) = (c0*x^5 + c1*x^4 + c2*x^3 + c3*x^2 + c4*x + c5) * x + v[i] mod g(x)\n+        //       = c0*x^6 + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i] mod g(x)\n+        //       = c0*(x^6 mod g(x)) + c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]\n+        // If we call (x^6 mod g(x)) = k(x), this can be written as\n+        // c'(x) = (c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]) + c0*k(x)\n+\n+        // First, determine the value of c0:\n+        uint8_t c0 = c >> 25;\n+\n+        // Then compute c1*x^5 + c2*x^4 + c3*x^3 + c4*x^2 + c5*x + v[i]:\n+        c = ((c & 0x1ffffff) << 5) ^ v[i];\n+\n+        // Finally, for each set bit n in c0, conditionally add {2^n}k(x):\n+        if (c0 & 1)  c ^= 0x3b6a57b2; //     k(x) = {29}x^5 + {22}x^4 + {20}x^3 + {21}x^2 + {29}x + {18}\n+        if (c0 & 2)  c ^= 0x26508e6d; //  {2}k(x) = {19}x^5 +  {5}x^4 +     x^3 +  {3}x^2 + {19}x + {13}\n+        if (c0 & 4)  c ^= 0x1ea119fa; //  {4}k(x) = {15}x^5 + {10}x^4 +  {2}x^3 +  {6}x^2 + {15}x + {26}\n+        if (c0 & 8)  c ^= 0x3d4233dd; //  {8}k(x) = {30}x^5 + {20}x^4 +  {4}x^3 + {12}x^2 + {30}x + {29}\n+        if (c0 & 16) c ^= 0x2a1462b3; // {16}k(x) = {21}x^5 +     x^4 +  {8}x^3 + {24}x^2 + {21}x + {19}\n+    }\n+    return c;\n+}\n+\n+/** Convert to lower case. */\n+inline unsigned char LowerCase(unsigned char c)\n+{\n+    return (c >= 'A' && c <= 'Z') ? (c - 'A') + 'a' : c;\n+}\n+\n+/** Expand a HRP for use in checksum computation. */\n+data ExpandHRP(const std::string& hrp)\n+{\n+    data ret;\n+    ret.resize(hrp.size() * 2 + 1);\n+    for (size_t i = 0; i < hrp.size(); ++i) {\n+        unsigned char c = hrp[i];\n+        ret[i] = c >> 5;\n+        ret[i + hrp.size() + 1] = c & 0x1f;\n+    }\n+    ret[hrp.size()] = 0;\n+    return ret;\n+}\n+\n+/** Verify a checksum. */\n+bool VerifyChecksum(const std::string& hrp, const data& values)\n+{\n+    // PolyMod computes what value to xor into the final values to make the checksum 0. However,\n+    // if we required that the checksum was 0, it would be the case that appending a 0 to a valid\n+    // list of values would result in a new valid list. For that reason, Bech32 requires the\n+    // resulting checksum to be 1 instead.\n+    return PolyMod(Cat(ExpandHRP(hrp), values)) == 1;\n+}\n+\n+/** Create a checksum. */\n+data CreateChecksum(const std::string& hrp, const data& values)\n+{\n+    data enc = Cat(ExpandHRP(hrp), values);\n+    enc.resize(enc.size() + 6); // Append 6 zeroes\n+    uint32_t mod = PolyMod(enc) ^ 1; // Determine what to XOR into those 6 zeroes.\n+    data ret;\n+    ret.resize(6);\n+    for (size_t i = 0; i < 6; ++i) {\n+        // Convert the 5-bit groups in mod to checksum values.\n+        ret[i] = (mod >> (5 * (5 - i))) & 31;\n+    }\n+    return ret;\n+}\n+\n+} // namespace\n+\n+namespace bech32\n+{\n+\n+/** Encode a Bech32 string. */\n+std::string Encode(const std::string& hrp, const data& values) {\n+    data checksum = CreateChecksum(hrp, values);\n+    data combined = Cat(values, checksum);\n+    std::string ret = hrp + '1';\n+    ret.reserve(ret.size() + combined.size());\n+    for (size_t i = 0; i < combined.size(); ++i) {\n+        ret += CHARSET[combined[i]];\n+    }\n+    return ret;\n+}\n+\n+/** Decode a Bech32 string. */\n+std::pair<std::string, data> Decode(const std::string& str) {\n+    bool lower = false, upper = false;\n+    for (size_t i = 0; i < str.size(); ++i) {\n+        unsigned char c = str[i];\n+        if (c < 33 || c > 126) return std::make_pair(std::string(), data());\n+        if (c >= 'a' && c <= 'z') lower = true;\n+        if (c >= 'A' && c <= 'Z') upper = true;\n+    }\n+    if (lower && upper) return std::make_pair(std::string(), data());\n+    size_t pos = str.rfind('1');\n+    if (str.size() > 90 || pos == str.npos || pos == 0 || pos + 7 > str.size()) {\n+        return std::make_pair(std::string(), data());\n+    }\n+    data values;\n+    values.resize(str.size() - 1 - pos);\n+    for (size_t i = 0; i < str.size() - 1 - pos; ++i) {\n+        unsigned char c = str[i + pos + 1];\n+        if (CHARSET_REV[c] == -1) {\n+            return std::make_pair(std::string(), data());\n+        }\n+        values[i] = CHARSET_REV[c];\n+    }\n+    std::string hrp;\n+    for (size_t i = 0; i < pos; ++i) {\n+        hrp += LowerCase(str[i]);\n+    }\n+    if (!VerifyChecksum(hrp, values)) {\n+        return std::make_pair(std::string(), data());\n+    }\n+    return std::make_pair(hrp, data(values.begin(), values.end() - 6));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141720047",
+      "id" : 141720047,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 188,
+      "path" : "src/bech32.cpp",
+      "position" : 188,
+      "pull_request_review_id" : 65957794,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T19:58:47Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141720047",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141733308"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141733308"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Suggest using `std::tolower()` and standard algorithms to simplify the implementation",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T20:53:32Z",
+      "diff_hunk" : "@@ -0,0 +1,61 @@\n+// Copyright (c) 2017 Pieter Wuille\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include \"bech32.h\"\n+#include \"test/test_bitcoin.h\"\n+\n+#include <boost/test/unit_test.hpp>\n+\n+BOOST_FIXTURE_TEST_SUITE(bech32_tests, BasicTestingSetup)\n+\n+bool CaseInsensitiveEqual(const std::string &s1, const std::string &s2)\n+{\n+    if (s1.size() != s2.size()) return false;\n+    for (size_t i = 0; i < s1.size(); ++i) {\n+        char c1 = s1[i];\n+        if (c1 >= 'A' && c1 <= 'Z') c1 -= ('A' - 'a');\n+        char c2 = s2[i];\n+        if (c2 >= 'A' && c2 <= 'Z') c2 -= ('A' - 'a');\n+        if (c1 != c2) return false;\n+    }\n+    return true;\n+}",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141733308",
+      "id" : 141733308,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 23,
+      "path" : "src/test/bech32_tests.cpp",
+      "position" : 23,
+      "pull_request_review_id" : 65996273,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T20:53:32Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141733308",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141734853"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141734853"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`isRegtest` for consistency",
+      "commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "created_at" : "2017-09-28T20:59:53Z",
+      "diff_hunk" : "@@ -127,22 +84,25 @@ BOOST_AUTO_TEST_CASE(base58_keys_valid_parse)\n     for (unsigned int idx = 0; idx < tests.size(); idx++) {\n         UniValue test = tests[idx];\n         std::string strTest = test.write();\n-        if (test.size() < 3) // Allow for extra stuff (useful for comments)\n-        {\n+        if (test.size() < 3) { // Allow for extra stuff (useful for comments)\n             BOOST_ERROR(\"Bad test: \" << strTest);\n             continue;\n         }\n         std::string exp_base58string = test[0].get_str();\n         std::vector<unsigned char> exp_payload = ParseHex(test[1].get_str());\n         const UniValue &metadata = test[2].get_obj();\n         bool isPrivkey = find_value(metadata, \"isPrivkey\").get_bool();\n-        bool isTestnet = find_value(metadata, \"isTestnet\").get_bool();\n-        if (isTestnet)\n+        bool isTestnet = find_value(metadata, \"chain\").get_str() == \"testnet\";\n+        bool regtest = find_value(metadata, \"chain\").get_str() == \"regtest\";",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11167#discussion_r141734853",
+      "id" : 141734853,
+      "original_commit_id" : "86d42998b8534201848da207a6545390e1189ae1",
+      "original_position" : 86,
+      "path" : "src/test/base58_tests.cpp",
+      "position" : 86,
+      "pull_request_review_id" : 65998144,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11167",
+      "updated_at" : "2017-09-28T20:59:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/141734853",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/84245?v=4",
+         "events_url" : "https://api.github.com/users/danra/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/danra/followers",
+         "following_url" : "https://api.github.com/users/danra/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/danra/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/danra",
+         "id" : 84245,
+         "login" : "danra",
+         "organizations_url" : "https://api.github.com/users/danra/orgs",
+         "received_events_url" : "https://api.github.com/users/danra/received_events",
+         "repos_url" : "https://api.github.com/users/danra/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/danra/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/danra/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/danra"
+      }
    }
 ]
