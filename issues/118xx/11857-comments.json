@@ -13,7 +13,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "Instead of blocking, give 503?",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2017-12-09T01:32:57Z",
       "diff_hunk" : "@@ -350,6 +351,10 @@ static bool rest_tx(HTTPRequest* req, const std::string& strURIPart)\n     if (!ParseHashStr(hashStr, hash))\n         return RESTERR(req, HTTP_BAD_REQUEST, \"Invalid hash: \" + hashStr);\n \n+    if (g_txindex) {\n+        g_txindex->BlockUntilSyncedToCurrentChain();",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r155908730",
@@ -24,7 +24,7 @@
       "position" : 13,
       "pull_request_review_id" : 82311538,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-04T18:53:38Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/155908730",
       "user" : {
          "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
@@ -60,7 +60,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "Comment incomplete or outdated?",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2017-12-09T06:51:20Z",
       "diff_hunk" : "@@ -1426,9 +1433,9 @@ bool AppInitMain(boost::thread_group& threadGroup, CScheduler& scheduler)\n \n                 if (fRequestShutdown) break;\n \n-                // LoadBlockIndex will load fTxIndex from the db, or set it if\n+                // LoadBlockIndex will load fHavePruned if we've ever removed a",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r155915071",
@@ -71,7 +71,7 @@
       "position" : null,
       "pull_request_review_id" : 82318411,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-04T18:53:38Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/155915071",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/73197?v=4",
@@ -136,7 +136,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "Move after Init?",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2017-12-10T01:58:23Z",
       "diff_hunk" : "@@ -0,0 +1,242 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <future>\n+\n+#include <chainparams.h>\n+#include <index/txindex.h>\n+#include <init.h>\n+#include <tinyformat.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <warnings.h>\n+\n+std::unique_ptr<TxIndex> g_txindex;\n+\n+template<typename... Args>\n+static void FatalError(const char* fmt, const Args&... args)\n+{\n+    std::string strMessage = tfm::format(fmt, args...);\n+    SetMiscWarning(strMessage);\n+    LogPrintf(\"*** %s\\n\", strMessage);\n+    uiInterface.ThreadSafeMessageBox(\n+        \"Error: A fatal internal error occurred, see debug.log for details\",\n+        \"\", CClientUIInterface::MSG_ERROR);\n+    StartShutdown();\n+}\n+\n+TxIndex::TxIndex(const std::shared_ptr<CBlockTreeDB>& db) :\n+    m_db(db), m_synced(false), m_best_block_index(nullptr)\n+{}\n+\n+TxIndex::~TxIndex()\n+{\n+    Interrupt();\n+    Stop();\n+}\n+\n+bool TxIndex::Init()\n+{\n+    LOCK(cs_main);\n+\n+    uint256 best_block_hash;\n+    if (!m_db->ReadTxIndexBestBlockHash(best_block_hash)) {\n+        FatalError(\"%s: Failed to read from tx index database\", __func__);\n+        return false;\n+    }\n+\n+    if (!best_block_hash.IsNull()) {\n+        auto it = mapBlockIndex.find(best_block_hash);\n+        if (it == mapBlockIndex.end()) {\n+            FatalError(\"%s: Last block synced by txindex is unknown\", __func__);\n+            return false;\n+        }\n+\n+        const auto pindex = it->second;\n+        m_best_block_index = pindex;\n+\n+        auto chain_tip = chainActive.Tip();\n+        if (pindex->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+            m_synced = true;\n+        }\n+\n+        return true;\n+    }\n+\n+    auto chain_tip = chainActive.Tip();\n+    if (!chain_tip) {\n+        m_synced = true;\n+        return true;\n+    }\n+\n+    // The prior implementation of txindex was always in sync with block index\n+    // and presence was indicated with a boolean DB flag.\n+    bool f_migrate_index;\n+    m_db->ReadFlag(\"txindex\", f_migrate_index);\n+    if (f_migrate_index) {\n+        m_best_block_index = chain_tip;\n+        m_synced = true;\n+    }\n+\n+    return true;\n+}\n+\n+static const CBlockIndex* NextSyncBlock(const CBlockIndex* pindex_prev)\n+{\n+    AssertLockHeld(cs_main);\n+\n+    if (!pindex_prev) {\n+        return chainActive.Genesis();\n+    }\n+\n+    auto pindex = chainActive.Next(pindex_prev);\n+    if (pindex) {\n+        return pindex;\n+    }\n+\n+    return chainActive.Next(chainActive.FindFork(pindex_prev));\n+}\n+\n+void TxIndex::ThreadSync()\n+{\n+    auto pindex = m_best_block_index.load();\n+    if (!m_synced) {\n+        auto& consensus_params = Params().GetConsensus();\n+\n+        LogPrintf(\"Syncing txindex with block chain from height %d\\n\",\n+                  pindex ? pindex->nHeight + 1 : 0);\n+\n+        while (true) {\n+            if (m_interrupt) {\n+                return;\n+            }\n+\n+            {\n+                LOCK(cs_main);\n+                auto pindex_next = NextSyncBlock(pindex);\n+                if (!pindex_next) {\n+                    m_best_block_index = pindex;\n+                    m_synced = true;\n+                    break;\n+                }\n+                pindex = pindex_next;\n+            }\n+            CBlock block;\n+            if (!ReadBlockFromDisk(block, pindex, consensus_params)) {\n+                FatalError(\"%s: Failed to read block %s from disk\",\n+                           __func__, pindex->GetBlockHash().ToString());\n+                return;\n+            }\n+            if (!WriteBlock(block, pindex)) {\n+                FatalError(\"%s: Failed to write block %s to tx index database\",\n+                           __func__, pindex->GetBlockHash().ToString());\n+                return;\n+            }\n+        }\n+    }\n+\n+    LogPrintf(\"txindex is enabled at height %d\\n\", pindex->nHeight);\n+}\n+\n+bool TxIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)\n+{\n+    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));\n+    std::vector<std::pair<uint256, CDiskTxPos>> vPos;\n+    vPos.reserve(block.vtx.size());\n+    for (auto tx : block.vtx) {\n+        vPos.push_back(std::make_pair(tx->GetHash(), pos));\n+        pos.nTxOffset += ::GetSerializeSize(*tx, SER_DISK, CLIENT_VERSION);\n+    }\n+    return m_db->WriteTxIndex(vPos, pindex->GetBlockHash());\n+}\n+\n+void TxIndex::BlockConnected(const std::shared_ptr<const CBlock>& block, const CBlockIndex* pindex,\n+                    const std::vector<CTransactionRef>& txn_conflicted)\n+{\n+    if (!m_synced) {\n+        return;\n+    }\n+\n+    // Ensure block connects to an ancestor of the current best block.\n+    {\n+        LOCK(cs_main);\n+        auto best_block_index = m_best_block_index.load();\n+        if (best_block_index->GetAncestor(pindex->nHeight - 1) != pindex->pprev) {\n+            FatalError(\"%s: Block %s does not connect to an ancestor of known best chain (tip=%s)\",\n+                       __func__, pindex->GetBlockHash().ToString(),\n+                       best_block_index->GetBlockHash().ToString());\n+            return;\n+        }\n+    }\n+\n+    if (WriteBlock(*block, pindex)) {\n+        m_best_block_index = pindex;\n+    } else {\n+        FatalError(\"%s: Failed to write block %s to txindex\",\n+                   __func__, pindex->GetBlockHash().ToString());\n+        return;\n+    }\n+}\n+\n+bool TxIndex::BlockUntilSyncedToCurrentChain()\n+{\n+    AssertLockNotHeld(cs_main);\n+\n+    if (!m_synced) {\n+        return false;\n+    }\n+\n+    {\n+        // Skip the queue-draining stuff if we know we're caught up with\n+        // chainActive.Tip()...\n+        LOCK(cs_main);\n+        auto chain_tip = chainActive.Tip();\n+        auto best_block_index = m_best_block_index.load();\n+        if (best_block_index->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+            return true;\n+        }\n+    }\n+\n+    // ...otherwise put a callback in the validation interface queue and wait\n+    // for the queue to drain enough to execute it (indicating we are caught up\n+    // at least with the time we entered this function).\n+    std::promise<void> promise;\n+    CallFunctionInValidationInterfaceQueue([&promise] {\n+        promise.set_value();\n+    });\n+    promise.get_future().wait();\n+\n+    return true;\n+}\n+\n+bool TxIndex::FindTx(const uint256& txid, CDiskTxPos& pos) const\n+{\n+    return m_db->ReadTxIndex(txid, pos);\n+}\n+\n+void TxIndex::Interrupt()\n+{\n+    m_interrupt();\n+}\n+\n+void TxIndex::Start()\n+{\n+    RegisterValidationInterface(this);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r155936523",
@@ -144,10 +144,10 @@
       "original_commit_id" : "41022ec2770d328c55191f8b1bc36b750e46f9a0",
       "original_position" : 226,
       "path" : "src/index/txindex.cpp",
-      "position" : 218,
+      "position" : null,
       "pull_request_review_id" : 82339759,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-04T18:53:38Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/155936523",
       "user" : {
          "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
@@ -183,7 +183,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "No, this has to be registered before `m_synced` is set to true in Init.",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2017-12-12T00:11:43Z",
       "diff_hunk" : "@@ -0,0 +1,242 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <future>\n+\n+#include <chainparams.h>\n+#include <index/txindex.h>\n+#include <init.h>\n+#include <tinyformat.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <warnings.h>\n+\n+std::unique_ptr<TxIndex> g_txindex;\n+\n+template<typename... Args>\n+static void FatalError(const char* fmt, const Args&... args)\n+{\n+    std::string strMessage = tfm::format(fmt, args...);\n+    SetMiscWarning(strMessage);\n+    LogPrintf(\"*** %s\\n\", strMessage);\n+    uiInterface.ThreadSafeMessageBox(\n+        \"Error: A fatal internal error occurred, see debug.log for details\",\n+        \"\", CClientUIInterface::MSG_ERROR);\n+    StartShutdown();\n+}\n+\n+TxIndex::TxIndex(const std::shared_ptr<CBlockTreeDB>& db) :\n+    m_db(db), m_synced(false), m_best_block_index(nullptr)\n+{}\n+\n+TxIndex::~TxIndex()\n+{\n+    Interrupt();\n+    Stop();\n+}\n+\n+bool TxIndex::Init()\n+{\n+    LOCK(cs_main);\n+\n+    uint256 best_block_hash;\n+    if (!m_db->ReadTxIndexBestBlockHash(best_block_hash)) {\n+        FatalError(\"%s: Failed to read from tx index database\", __func__);\n+        return false;\n+    }\n+\n+    if (!best_block_hash.IsNull()) {\n+        auto it = mapBlockIndex.find(best_block_hash);\n+        if (it == mapBlockIndex.end()) {\n+            FatalError(\"%s: Last block synced by txindex is unknown\", __func__);\n+            return false;\n+        }\n+\n+        const auto pindex = it->second;\n+        m_best_block_index = pindex;\n+\n+        auto chain_tip = chainActive.Tip();\n+        if (pindex->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+            m_synced = true;\n+        }\n+\n+        return true;\n+    }\n+\n+    auto chain_tip = chainActive.Tip();\n+    if (!chain_tip) {\n+        m_synced = true;\n+        return true;\n+    }\n+\n+    // The prior implementation of txindex was always in sync with block index\n+    // and presence was indicated with a boolean DB flag.\n+    bool f_migrate_index;\n+    m_db->ReadFlag(\"txindex\", f_migrate_index);\n+    if (f_migrate_index) {\n+        m_best_block_index = chain_tip;\n+        m_synced = true;\n+    }\n+\n+    return true;\n+}\n+\n+static const CBlockIndex* NextSyncBlock(const CBlockIndex* pindex_prev)\n+{\n+    AssertLockHeld(cs_main);\n+\n+    if (!pindex_prev) {\n+        return chainActive.Genesis();\n+    }\n+\n+    auto pindex = chainActive.Next(pindex_prev);\n+    if (pindex) {\n+        return pindex;\n+    }\n+\n+    return chainActive.Next(chainActive.FindFork(pindex_prev));\n+}\n+\n+void TxIndex::ThreadSync()\n+{\n+    auto pindex = m_best_block_index.load();\n+    if (!m_synced) {\n+        auto& consensus_params = Params().GetConsensus();\n+\n+        LogPrintf(\"Syncing txindex with block chain from height %d\\n\",\n+                  pindex ? pindex->nHeight + 1 : 0);\n+\n+        while (true) {\n+            if (m_interrupt) {\n+                return;\n+            }\n+\n+            {\n+                LOCK(cs_main);\n+                auto pindex_next = NextSyncBlock(pindex);\n+                if (!pindex_next) {\n+                    m_best_block_index = pindex;\n+                    m_synced = true;\n+                    break;\n+                }\n+                pindex = pindex_next;\n+            }\n+            CBlock block;\n+            if (!ReadBlockFromDisk(block, pindex, consensus_params)) {\n+                FatalError(\"%s: Failed to read block %s from disk\",\n+                           __func__, pindex->GetBlockHash().ToString());\n+                return;\n+            }\n+            if (!WriteBlock(block, pindex)) {\n+                FatalError(\"%s: Failed to write block %s to tx index database\",\n+                           __func__, pindex->GetBlockHash().ToString());\n+                return;\n+            }\n+        }\n+    }\n+\n+    LogPrintf(\"txindex is enabled at height %d\\n\", pindex->nHeight);\n+}\n+\n+bool TxIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)\n+{\n+    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));\n+    std::vector<std::pair<uint256, CDiskTxPos>> vPos;\n+    vPos.reserve(block.vtx.size());\n+    for (auto tx : block.vtx) {\n+        vPos.push_back(std::make_pair(tx->GetHash(), pos));\n+        pos.nTxOffset += ::GetSerializeSize(*tx, SER_DISK, CLIENT_VERSION);\n+    }\n+    return m_db->WriteTxIndex(vPos, pindex->GetBlockHash());\n+}\n+\n+void TxIndex::BlockConnected(const std::shared_ptr<const CBlock>& block, const CBlockIndex* pindex,\n+                    const std::vector<CTransactionRef>& txn_conflicted)\n+{\n+    if (!m_synced) {\n+        return;\n+    }\n+\n+    // Ensure block connects to an ancestor of the current best block.\n+    {\n+        LOCK(cs_main);\n+        auto best_block_index = m_best_block_index.load();\n+        if (best_block_index->GetAncestor(pindex->nHeight - 1) != pindex->pprev) {\n+            FatalError(\"%s: Block %s does not connect to an ancestor of known best chain (tip=%s)\",\n+                       __func__, pindex->GetBlockHash().ToString(),\n+                       best_block_index->GetBlockHash().ToString());\n+            return;\n+        }\n+    }\n+\n+    if (WriteBlock(*block, pindex)) {\n+        m_best_block_index = pindex;\n+    } else {\n+        FatalError(\"%s: Failed to write block %s to txindex\",\n+                   __func__, pindex->GetBlockHash().ToString());\n+        return;\n+    }\n+}\n+\n+bool TxIndex::BlockUntilSyncedToCurrentChain()\n+{\n+    AssertLockNotHeld(cs_main);\n+\n+    if (!m_synced) {\n+        return false;\n+    }\n+\n+    {\n+        // Skip the queue-draining stuff if we know we're caught up with\n+        // chainActive.Tip()...\n+        LOCK(cs_main);\n+        auto chain_tip = chainActive.Tip();\n+        auto best_block_index = m_best_block_index.load();\n+        if (best_block_index->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+            return true;\n+        }\n+    }\n+\n+    // ...otherwise put a callback in the validation interface queue and wait\n+    // for the queue to drain enough to execute it (indicating we are caught up\n+    // at least with the time we entered this function).\n+    std::promise<void> promise;\n+    CallFunctionInValidationInterfaceQueue([&promise] {\n+        promise.set_value();\n+    });\n+    promise.get_future().wait();\n+\n+    return true;\n+}\n+\n+bool TxIndex::FindTx(const uint256& txid, CDiskTxPos& pos) const\n+{\n+    return m_db->ReadTxIndex(txid, pos);\n+}\n+\n+void TxIndex::Interrupt()\n+{\n+    m_interrupt();\n+}\n+\n+void TxIndex::Start()\n+{\n+    RegisterValidationInterface(this);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r156239136",
@@ -192,10 +192,10 @@
       "original_commit_id" : "41022ec2770d328c55191f8b1bc36b750e46f9a0",
       "original_position" : 226,
       "path" : "src/index/txindex.cpp",
-      "position" : 218,
+      "position" : null,
       "pull_request_review_id" : 82684125,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-04T18:53:38Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/156239136",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
@@ -231,7 +231,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "It's not really unavailable, just that the background process needs to catch up, which should happen quickly.",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2017-12-12T00:12:34Z",
       "diff_hunk" : "@@ -350,6 +351,10 @@ static bool rest_tx(HTTPRequest* req, const std::string& strURIPart)\n     if (!ParseHashStr(hashStr, hash))\n         return RESTERR(req, HTTP_BAD_REQUEST, \"Invalid hash: \" + hashStr);\n \n+    if (g_txindex) {\n+        g_txindex->BlockUntilSyncedToCurrentChain();",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r156239250",
@@ -243,7 +243,7 @@
       "position" : 13,
       "pull_request_review_id" : 82684252,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-04T18:53:38Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/156239250",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
@@ -279,7 +279,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "Thanks, fixed.",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2017-12-13T01:14:22Z",
       "diff_hunk" : "@@ -1426,9 +1433,9 @@ bool AppInitMain(boost::thread_group& threadGroup, CScheduler& scheduler)\n \n                 if (fRequestShutdown) break;\n \n-                // LoadBlockIndex will load fTxIndex from the db, or set it if\n+                // LoadBlockIndex will load fHavePruned if we've ever removed a",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r156541766",
@@ -291,7 +291,7 @@
       "position" : null,
       "pull_request_review_id" : 83036066,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-04T18:53:38Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/156541766",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
@@ -472,7 +472,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "Separating these if statements loses coherency - if we crash we may have a bogus txindex and no way to detect it. Should likely instead do if (batch_newdb.SizeEstimate() + batch_olddb.SizeEstimate() > batch_size)........",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2017-12-13T20:16:59Z",
       "diff_hunk" : "@@ -424,3 +425,129 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {\n+        batch.Write(std::make_pair(DB_TXINDEX, tuple.first), tuple.second);\n+    }\n+    return WriteBatch(batch);\n+}\n+\n+bool TxIndexDB::ReadBestBlockHash(uint256& hash) const {\n+    if (Read(DB_BEST_BLOCK, hash)) {\n+        return true;\n+    }\n+\n+    // Read might have failed either because key does not exist or due to an error.\n+    // If the former, return value should still be true.\n+    if (!Exists(DB_BEST_BLOCK)) {\n+        hash.SetNull();\n+        return true;\n+    }\n+    return false;\n+}\n+\n+bool TxIndexDB::WriteBestBlockHash(const uint256& hash) {\n+    return Write(DB_BEST_BLOCK, hash);\n+}\n+\n+bool TxIndexDB::MigrateData(CBlockTreeDB& block_tree_db, const uint256& block_hash)\n+{\n+    // The prior implementation of txindex was always in sync with block index\n+    // and presence was indicated with a boolean DB flag.\n+    bool f_migrate_index;\n+    block_tree_db.ReadFlag(\"txindex\", f_migrate_index);\n+    if (!f_migrate_index) {\n+        return true;\n+    }\n+\n+    int64_t count = 0;\n+    LogPrintf(\"Upgrading txindex database...\\n\");\n+    LogPrintf(\"[0%%]...\");\n+    int report_done = 0;\n+    size_t batch_size = 1 << 24;\n+\n+    CDBBatch batch_newdb(*this);\n+    CDBBatch batch_olddb(block_tree_db);\n+\n+    std::pair<unsigned char, uint256> key;\n+    std::pair<unsigned char, uint256> begin_key{DB_TXINDEX, uint256()};\n+    std::pair<unsigned char, uint256> prev_key_newdb = begin_key;\n+    std::pair<unsigned char, uint256> prev_key_olddb = begin_key;\n+\n+    std::unique_ptr<CDBIterator> pcursor(block_tree_db.NewIterator());\n+    for (pcursor->Seek(begin_key); pcursor->Valid(); pcursor->Next()) {\n+        boost::this_thread::interruption_point();\n+        if (ShutdownRequested()) {\n+            break;\n+        }\n+\n+        if (!pcursor->GetKey(key)) {\n+            break;\n+        }\n+        if (key.first != DB_TXINDEX) {\n+            break;\n+        }\n+\n+        // Log progress every 10%.\n+        if (++count % 256 == 0) {\n+            uint32_t high = 0x100 * *key.second.begin() + *(key.second.begin() + 1);\n+            int percentage_done = (int)(high * 100.0 / 65536.0 + 0.5);\n+            if (report_done < percentage_done/10) {\n+                LogPrintf(\"[%d%%]...\", percentage_done);\n+                report_done = percentage_done/10;\n+            }\n+        }\n+\n+        CDiskTxPos value;\n+        if (!pcursor->GetValue(value)) {\n+            return error(\"%s: cannot parse txindex record\", __func__);\n+        }\n+        batch_newdb.Write(key, value);\n+        batch_olddb.Erase(key);\n+\n+        if (batch_newdb.SizeEstimate() > batch_size) {\n+            WriteBatch(batch_newdb);\n+            batch_newdb.Clear();\n+            CompactRange(prev_key_newdb, key);\n+            prev_key_newdb = key;\n+        }\n+        if (batch_olddb.SizeEstimate() > batch_size) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r156770888",
@@ -483,7 +483,7 @@
       "position" : null,
       "pull_request_review_id" : 83303997,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-04T18:53:38Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/156770888",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/649246?v=4",
@@ -519,7 +519,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "Good catch.",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2017-12-13T22:26:59Z",
       "diff_hunk" : "@@ -424,3 +425,129 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {\n+        batch.Write(std::make_pair(DB_TXINDEX, tuple.first), tuple.second);\n+    }\n+    return WriteBatch(batch);\n+}\n+\n+bool TxIndexDB::ReadBestBlockHash(uint256& hash) const {\n+    if (Read(DB_BEST_BLOCK, hash)) {\n+        return true;\n+    }\n+\n+    // Read might have failed either because key does not exist or due to an error.\n+    // If the former, return value should still be true.\n+    if (!Exists(DB_BEST_BLOCK)) {\n+        hash.SetNull();\n+        return true;\n+    }\n+    return false;\n+}\n+\n+bool TxIndexDB::WriteBestBlockHash(const uint256& hash) {\n+    return Write(DB_BEST_BLOCK, hash);\n+}\n+\n+bool TxIndexDB::MigrateData(CBlockTreeDB& block_tree_db, const uint256& block_hash)\n+{\n+    // The prior implementation of txindex was always in sync with block index\n+    // and presence was indicated with a boolean DB flag.\n+    bool f_migrate_index;\n+    block_tree_db.ReadFlag(\"txindex\", f_migrate_index);\n+    if (!f_migrate_index) {\n+        return true;\n+    }\n+\n+    int64_t count = 0;\n+    LogPrintf(\"Upgrading txindex database...\\n\");\n+    LogPrintf(\"[0%%]...\");\n+    int report_done = 0;\n+    size_t batch_size = 1 << 24;\n+\n+    CDBBatch batch_newdb(*this);\n+    CDBBatch batch_olddb(block_tree_db);\n+\n+    std::pair<unsigned char, uint256> key;\n+    std::pair<unsigned char, uint256> begin_key{DB_TXINDEX, uint256()};\n+    std::pair<unsigned char, uint256> prev_key_newdb = begin_key;\n+    std::pair<unsigned char, uint256> prev_key_olddb = begin_key;\n+\n+    std::unique_ptr<CDBIterator> pcursor(block_tree_db.NewIterator());\n+    for (pcursor->Seek(begin_key); pcursor->Valid(); pcursor->Next()) {\n+        boost::this_thread::interruption_point();\n+        if (ShutdownRequested()) {\n+            break;\n+        }\n+\n+        if (!pcursor->GetKey(key)) {\n+            break;\n+        }\n+        if (key.first != DB_TXINDEX) {\n+            break;\n+        }\n+\n+        // Log progress every 10%.\n+        if (++count % 256 == 0) {\n+            uint32_t high = 0x100 * *key.second.begin() + *(key.second.begin() + 1);\n+            int percentage_done = (int)(high * 100.0 / 65536.0 + 0.5);\n+            if (report_done < percentage_done/10) {\n+                LogPrintf(\"[%d%%]...\", percentage_done);\n+                report_done = percentage_done/10;\n+            }\n+        }\n+\n+        CDiskTxPos value;\n+        if (!pcursor->GetValue(value)) {\n+            return error(\"%s: cannot parse txindex record\", __func__);\n+        }\n+        batch_newdb.Write(key, value);\n+        batch_olddb.Erase(key);\n+\n+        if (batch_newdb.SizeEstimate() > batch_size) {\n+            WriteBatch(batch_newdb);\n+            batch_newdb.Clear();\n+            CompactRange(prev_key_newdb, key);\n+            prev_key_newdb = key;\n+        }\n+        if (batch_olddb.SizeEstimate() > batch_size) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r156804378",
@@ -531,7 +531,7 @@
       "position" : null,
       "pull_request_review_id" : 83341524,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-04T18:53:38Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/156804378",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
@@ -567,7 +567,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[db] Create separate database for txindex.\"\r\n\r\nMaybe change to `const auto& tuple` to avoid a copy while iterating.\r\n  ",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T15:01:03Z",
       "diff_hunk" : "@@ -424,3 +424,107 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159895945",
@@ -575,10 +575,10 @@
       "original_commit_id" : "1ae2904ea5e333c28a33af8c6ce6526d8554f9f6",
       "original_position" : 17,
       "path" : "src/txdb.cpp",
-      "position" : 25,
+      "position" : null,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:46Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159895945",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -614,7 +614,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[db] Create separate database for txindex.\"\r\n\r\nMaybe declare const and add comment (16MiB).",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T15:06:43Z",
       "diff_hunk" : "@@ -424,3 +424,107 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {\n+        batch.Write(std::make_pair(DB_TXINDEX, tuple.first), tuple.second);\n+    }\n+    return WriteBatch(batch);\n+}\n+\n+bool TxIndexDB::MigrateData(CBlockTreeDB& block_tree_db)\n+{\n+    // The prior implementation of txindex was always in sync with block index\n+    // and presence was indicated with a boolean DB flag.\n+    bool f_migrate_index = false;\n+    block_tree_db.ReadFlag(\"txindex\", f_migrate_index);\n+    if (!f_migrate_index) {\n+        return true;\n+    }\n+\n+    int64_t count = 0;\n+    LogPrintf(\"Upgrading txindex database...\\n\");\n+    LogPrintf(\"[0%%]...\");\n+    int report_done = 0;\n+    size_t batch_size = 1 << 24;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159897305",
@@ -622,10 +622,10 @@
       "original_commit_id" : "1ae2904ea5e333c28a33af8c6ce6526d8554f9f6",
       "original_position" : 37,
       "path" : "src/txdb.cpp",
-      "position" : 63,
+      "position" : null,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:46Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159897305",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -661,7 +661,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[db] Create separate database for txindex.\"\r\n\r\nMaybe log an error in this case. I don't think it would be expected for pcursor->Valid() to return true but pcursor->GetKey to fail.",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T15:09:28Z",
       "diff_hunk" : "@@ -424,3 +424,107 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {\n+        batch.Write(std::make_pair(DB_TXINDEX, tuple.first), tuple.second);\n+    }\n+    return WriteBatch(batch);\n+}\n+\n+bool TxIndexDB::MigrateData(CBlockTreeDB& block_tree_db)\n+{\n+    // The prior implementation of txindex was always in sync with block index\n+    // and presence was indicated with a boolean DB flag.\n+    bool f_migrate_index = false;\n+    block_tree_db.ReadFlag(\"txindex\", f_migrate_index);\n+    if (!f_migrate_index) {\n+        return true;\n+    }\n+\n+    int64_t count = 0;\n+    LogPrintf(\"Upgrading txindex database...\\n\");\n+    LogPrintf(\"[0%%]...\");\n+    int report_done = 0;\n+    size_t batch_size = 1 << 24;\n+\n+    CDBBatch batch_newdb(*this);\n+    CDBBatch batch_olddb(block_tree_db);\n+\n+    std::pair<unsigned char, uint256> key;\n+    std::pair<unsigned char, uint256> begin_key{DB_TXINDEX, uint256()};\n+    std::pair<unsigned char, uint256> prev_key_newdb = begin_key;\n+    std::pair<unsigned char, uint256> prev_key_olddb = begin_key;\n+\n+    std::unique_ptr<CDBIterator> pcursor(block_tree_db.NewIterator());\n+    for (pcursor->Seek(begin_key); pcursor->Valid(); pcursor->Next()) {\n+        boost::this_thread::interruption_point();\n+        if (ShutdownRequested()) {\n+            break;\n+        }\n+\n+        if (!pcursor->GetKey(key)) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159897839",
@@ -669,10 +669,10 @@
       "original_commit_id" : "1ae2904ea5e333c28a33af8c6ce6526d8554f9f6",
       "original_position" : 54,
       "path" : "src/txdb.cpp",
-      "position" : 80,
+      "position" : 74,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:46Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159897839",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -708,7 +708,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[db] Create separate database for txindex.\"\r\n\r\nThis is duplicating code inside the for loop, and also skipping the last compact range on the old db. Maybe just flush and compact once at the top of the loop:\r\n\r\n```c++\r\nfor (pcursor->Seek(begin_key);; pcursor->Next()) {\r\n    if (!pcursor->Valid() || batch_newdb.SizeEstimate()...) {\r\n        ...flush and compact...\r\n    }\r\n    if (!pcursor->Valid()) break;\r\n    ...move entry at cursor...\r\n}\r\n```\r\n  ",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T15:20:13Z",
       "diff_hunk" : "@@ -424,3 +424,107 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {\n+        batch.Write(std::make_pair(DB_TXINDEX, tuple.first), tuple.second);\n+    }\n+    return WriteBatch(batch);\n+}\n+\n+bool TxIndexDB::MigrateData(CBlockTreeDB& block_tree_db)\n+{\n+    // The prior implementation of txindex was always in sync with block index\n+    // and presence was indicated with a boolean DB flag.\n+    bool f_migrate_index = false;\n+    block_tree_db.ReadFlag(\"txindex\", f_migrate_index);\n+    if (!f_migrate_index) {\n+        return true;\n+    }\n+\n+    int64_t count = 0;\n+    LogPrintf(\"Upgrading txindex database...\\n\");\n+    LogPrintf(\"[0%%]...\");\n+    int report_done = 0;\n+    size_t batch_size = 1 << 24;\n+\n+    CDBBatch batch_newdb(*this);\n+    CDBBatch batch_olddb(block_tree_db);\n+\n+    std::pair<unsigned char, uint256> key;\n+    std::pair<unsigned char, uint256> begin_key{DB_TXINDEX, uint256()};\n+    std::pair<unsigned char, uint256> prev_key_newdb = begin_key;\n+    std::pair<unsigned char, uint256> prev_key_olddb = begin_key;\n+\n+    std::unique_ptr<CDBIterator> pcursor(block_tree_db.NewIterator());\n+    for (pcursor->Seek(begin_key); pcursor->Valid(); pcursor->Next()) {\n+        boost::this_thread::interruption_point();\n+        if (ShutdownRequested()) {\n+            break;\n+        }\n+\n+        if (!pcursor->GetKey(key)) {\n+            break;\n+        }\n+        if (key.first != DB_TXINDEX) {\n+            break;\n+        }\n+\n+        // Log progress every 10%.\n+        if (++count % 256 == 0) {\n+            uint32_t high = 0x100 * *key.second.begin() + *(key.second.begin() + 1);\n+            int percentage_done = (int)(high * 100.0 / 65536.0 + 0.5);\n+            if (report_done < percentage_done/10) {\n+                LogPrintf(\"[%d%%]...\", percentage_done);\n+                report_done = percentage_done/10;\n+            }\n+        }\n+\n+        CDiskTxPos value;\n+        if (!pcursor->GetValue(value)) {\n+            return error(\"%s: cannot parse txindex record\", __func__);\n+        }\n+        batch_newdb.Write(key, value);\n+        batch_olddb.Erase(key);\n+\n+        if (batch_newdb.SizeEstimate() > batch_size || batch_olddb.SizeEstimate() > batch_size) {\n+            WriteBatch(batch_newdb);\n+            batch_newdb.Clear();\n+            CompactRange(prev_key_newdb, key);\n+            prev_key_newdb = key;\n+\n+            block_tree_db.WriteBatch(batch_olddb);\n+            batch_olddb.Clear();\n+            block_tree_db.CompactRange(prev_key_olddb, key);\n+            prev_key_olddb = key;\n+        }\n+    }\n+\n+    WriteBatch(batch_newdb);\n+    CompactRange(begin_key, key);\n+    block_tree_db.WriteBatch(batch_olddb);\n+    block_tree_db.CompactRange(begin_key, key);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159900328",
@@ -716,10 +716,10 @@
       "original_commit_id" : "1ae2904ea5e333c28a33af8c6ce6526d8554f9f6",
       "original_position" : 94,
       "path" : "src/txdb.cpp",
-      "position" : 120,
+      "position" : 115,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:46Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159900328",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -755,7 +755,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[db] Create separate database for txindex.\"\r\n\r\nUnclear why migration should be tied to txindex flag. At first glance, it would seem simpler to reason about possible states and also more robust if the code just always moved DB_TXINDEX entries from the old location to the new location independent of the flag. Maybe add a code comment here to clarify rationale.\r\n  ",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T15:26:46Z",
       "diff_hunk" : "@@ -424,3 +424,107 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {\n+        batch.Write(std::make_pair(DB_TXINDEX, tuple.first), tuple.second);\n+    }\n+    return WriteBatch(batch);\n+}\n+\n+bool TxIndexDB::MigrateData(CBlockTreeDB& block_tree_db)\n+{\n+    // The prior implementation of txindex was always in sync with block index",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159901942",
@@ -766,7 +766,7 @@
       "position" : null,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:46Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159901942",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -802,7 +802,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[db] Methods on TxIndexDB to persist best block hash. \"\r\n\r\nIs this a mistake? Probably shouldn't be adding an unused parameter to an unrelated method in this commit.\r\n  \r\n  ",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T15:34:31Z",
       "diff_hunk" : "@@ -142,9 +142,15 @@ class TxIndexDB : public CDBWrapper\n     /// Write a batch of transaction positions to the DB.\n     bool WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos);\n \n+    /// Read the best block hash of the chain that the txindex is in sync with.\n+    bool ReadBestBlockHash(uint256& hash) const;\n+\n+    /// Write the best block hash of the chain that the txindex is in sync with.\n+    bool WriteBestBlockHash(const uint256& block_hash);\n+\n     /// Migrate txindex data from the block tree DB, where it may be for older nodes that have not\n     /// been upgraded yet to the new database.\n-    bool MigrateData(CBlockTreeDB& block_tree_db);\n+    bool MigrateData(CBlockTreeDB& block_tree_db, const uint256& block_hash);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159904033",
@@ -813,7 +813,7 @@
       "position" : null,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:46Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159904033",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -849,7 +849,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[index] Create new TxIndex class.\"\r\n\r\nMaybe restructure the code to get rid of this early successful return. It's a little confusing, and also not clear if it's 100% correct. For example I would think that if best_block_hash and chain_tip are both null, m_synced should still be set to true below.\r\n  ",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T16:07:29Z",
       "diff_hunk" : "@@ -0,0 +1,129 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <index/txindex.h>\n+#include <init.h>\n+#include <tinyformat.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <warnings.h>\n+\n+template<typename... Args>\n+static void FatalError(const char* fmt, const Args&... args)\n+{\n+    std::string strMessage = tfm::format(fmt, args...);\n+    SetMiscWarning(strMessage);\n+    LogPrintf(\"*** %s\\n\", strMessage);\n+    uiInterface.ThreadSafeMessageBox(\n+        \"Error: A fatal internal error occurred, see debug.log for details\",\n+        \"\", CClientUIInterface::MSG_ERROR);\n+    StartShutdown();\n+}\n+\n+TxIndex::TxIndex(std::unique_ptr<TxIndexDB> db) :\n+    m_db(std::move(db)), m_synced(false), m_best_block_index(nullptr)\n+{}\n+\n+bool TxIndex::Init()\n+{\n+    LOCK(cs_main);\n+\n+    auto chain_tip = chainActive.Tip();\n+    uint256 tip_hash;\n+    if (chain_tip) {\n+        tip_hash = chain_tip->GetBlockHash();\n+    }\n+\n+    if (!m_db->MigrateData(*pblocktree, tip_hash)) {\n+        return false;\n+    }\n+\n+    uint256 best_block_hash;\n+    if (!m_db->ReadBestBlockHash(best_block_hash)) {\n+        FatalError(\"%s: Failed to read from tx index database\", __func__);\n+        return false;\n+    }\n+\n+    if (best_block_hash.IsNull()) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159912603",
@@ -857,10 +857,10 @@
       "original_commit_id" : "669d39e0df5b74fcac11a5055567eefd2f46ce8c",
       "original_position" : 49,
       "path" : "src/index/txindex.cpp",
-      "position" : 58,
+      "position" : 66,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:46Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159912603",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -896,7 +896,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[index] Create new TxIndex class.\"\r\n\r\nCould `const auto&` to avoid a copy.",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T16:09:29Z",
       "diff_hunk" : "@@ -0,0 +1,129 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <index/txindex.h>\n+#include <init.h>\n+#include <tinyformat.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <warnings.h>\n+\n+template<typename... Args>\n+static void FatalError(const char* fmt, const Args&... args)\n+{\n+    std::string strMessage = tfm::format(fmt, args...);\n+    SetMiscWarning(strMessage);\n+    LogPrintf(\"*** %s\\n\", strMessage);\n+    uiInterface.ThreadSafeMessageBox(\n+        \"Error: A fatal internal error occurred, see debug.log for details\",\n+        \"\", CClientUIInterface::MSG_ERROR);\n+    StartShutdown();\n+}\n+\n+TxIndex::TxIndex(std::unique_ptr<TxIndexDB> db) :\n+    m_db(std::move(db)), m_synced(false), m_best_block_index(nullptr)\n+{}\n+\n+bool TxIndex::Init()\n+{\n+    LOCK(cs_main);\n+\n+    auto chain_tip = chainActive.Tip();\n+    uint256 tip_hash;\n+    if (chain_tip) {\n+        tip_hash = chain_tip->GetBlockHash();\n+    }\n+\n+    if (!m_db->MigrateData(*pblocktree, tip_hash)) {\n+        return false;\n+    }\n+\n+    uint256 best_block_hash;\n+    if (!m_db->ReadBestBlockHash(best_block_hash)) {\n+        FatalError(\"%s: Failed to read from tx index database\", __func__);\n+        return false;\n+    }\n+\n+    if (best_block_hash.IsNull()) {\n+        return true;\n+    }\n+\n+    auto it = mapBlockIndex.find(best_block_hash);\n+    if (it == mapBlockIndex.end()) {\n+        FatalError(\"%s: Last block synced by txindex is unknown\", __func__);\n+        return false;\n+    }\n+\n+    const auto pindex = it->second;\n+    m_best_block_index = pindex;\n+    if (!chain_tip || pindex->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+        m_synced = true;\n+    }\n+\n+    return true;\n+}\n+\n+bool TxIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)\n+{\n+    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));\n+    std::vector<std::pair<uint256, CDiskTxPos>> vPos;\n+    vPos.reserve(block.vtx.size());\n+    for (auto tx : block.vtx) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159913072",
@@ -904,10 +904,10 @@
       "original_commit_id" : "669d39e0df5b74fcac11a5055567eefd2f46ce8c",
       "original_position" : 73,
       "path" : "src/index/txindex.cpp",
-      "position" : 143,
+      "position" : null,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:47Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159913072",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -943,7 +943,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[index] Create new TxIndex class.\"\r\n\r\nConsider moving WriteBestBlockHash call out to caller so the stored best block and m_best_block_index get updated together. It's a little unexpected to see one value written without the other. Might want to rename this method to `WriteBlockTxns` if you do this.\r\n  ",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T16:19:07Z",
       "diff_hunk" : "@@ -0,0 +1,129 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <index/txindex.h>\n+#include <init.h>\n+#include <tinyformat.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <warnings.h>\n+\n+template<typename... Args>\n+static void FatalError(const char* fmt, const Args&... args)\n+{\n+    std::string strMessage = tfm::format(fmt, args...);\n+    SetMiscWarning(strMessage);\n+    LogPrintf(\"*** %s\\n\", strMessage);\n+    uiInterface.ThreadSafeMessageBox(\n+        \"Error: A fatal internal error occurred, see debug.log for details\",\n+        \"\", CClientUIInterface::MSG_ERROR);\n+    StartShutdown();\n+}\n+\n+TxIndex::TxIndex(std::unique_ptr<TxIndexDB> db) :\n+    m_db(std::move(db)), m_synced(false), m_best_block_index(nullptr)\n+{}\n+\n+bool TxIndex::Init()\n+{\n+    LOCK(cs_main);\n+\n+    auto chain_tip = chainActive.Tip();\n+    uint256 tip_hash;\n+    if (chain_tip) {\n+        tip_hash = chain_tip->GetBlockHash();\n+    }\n+\n+    if (!m_db->MigrateData(*pblocktree, tip_hash)) {\n+        return false;\n+    }\n+\n+    uint256 best_block_hash;\n+    if (!m_db->ReadBestBlockHash(best_block_hash)) {\n+        FatalError(\"%s: Failed to read from tx index database\", __func__);\n+        return false;\n+    }\n+\n+    if (best_block_hash.IsNull()) {\n+        return true;\n+    }\n+\n+    auto it = mapBlockIndex.find(best_block_hash);\n+    if (it == mapBlockIndex.end()) {\n+        FatalError(\"%s: Last block synced by txindex is unknown\", __func__);\n+        return false;\n+    }\n+\n+    const auto pindex = it->second;\n+    m_best_block_index = pindex;\n+    if (!chain_tip || pindex->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+        m_synced = true;\n+    }\n+\n+    return true;\n+}\n+\n+bool TxIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)\n+{\n+    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));\n+    std::vector<std::pair<uint256, CDiskTxPos>> vPos;\n+    vPos.reserve(block.vtx.size());\n+    for (auto tx : block.vtx) {\n+        vPos.push_back(std::make_pair(tx->GetHash(), pos));\n+        pos.nTxOffset += ::GetSerializeSize(*tx, SER_DISK, CLIENT_VERSION);\n+    }\n+    return m_db->WriteTxns(vPos) && m_db->WriteBestBlockHash(pindex->GetBlockHash());",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159915333",
@@ -951,10 +951,10 @@
       "original_commit_id" : "669d39e0df5b74fcac11a5055567eefd2f46ce8c",
       "original_position" : 77,
       "path" : "src/index/txindex.cpp",
-      "position" : 147,
+      "position" : null,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:47Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159915333",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -990,7 +990,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[index] Create new TxIndex class.\"\r\n\r\n>No, this has to be registered before m_synced is set to true in Init.\r\n\r\nDefinitely worth noting this in a code comment. Also maybe m_synced should be called m_initialized or m_started to be clearer that it changes from false to true just once on startup, and isn't updated in an ongoing way.\r\n\r\n  \r\n  ",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T16:20:16Z",
       "diff_hunk" : "@@ -0,0 +1,242 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <future>\n+\n+#include <chainparams.h>\n+#include <index/txindex.h>\n+#include <init.h>\n+#include <tinyformat.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <warnings.h>\n+\n+std::unique_ptr<TxIndex> g_txindex;\n+\n+template<typename... Args>\n+static void FatalError(const char* fmt, const Args&... args)\n+{\n+    std::string strMessage = tfm::format(fmt, args...);\n+    SetMiscWarning(strMessage);\n+    LogPrintf(\"*** %s\\n\", strMessage);\n+    uiInterface.ThreadSafeMessageBox(\n+        \"Error: A fatal internal error occurred, see debug.log for details\",\n+        \"\", CClientUIInterface::MSG_ERROR);\n+    StartShutdown();\n+}\n+\n+TxIndex::TxIndex(const std::shared_ptr<CBlockTreeDB>& db) :\n+    m_db(db), m_synced(false), m_best_block_index(nullptr)\n+{}\n+\n+TxIndex::~TxIndex()\n+{\n+    Interrupt();\n+    Stop();\n+}\n+\n+bool TxIndex::Init()\n+{\n+    LOCK(cs_main);\n+\n+    uint256 best_block_hash;\n+    if (!m_db->ReadTxIndexBestBlockHash(best_block_hash)) {\n+        FatalError(\"%s: Failed to read from tx index database\", __func__);\n+        return false;\n+    }\n+\n+    if (!best_block_hash.IsNull()) {\n+        auto it = mapBlockIndex.find(best_block_hash);\n+        if (it == mapBlockIndex.end()) {\n+            FatalError(\"%s: Last block synced by txindex is unknown\", __func__);\n+            return false;\n+        }\n+\n+        const auto pindex = it->second;\n+        m_best_block_index = pindex;\n+\n+        auto chain_tip = chainActive.Tip();\n+        if (pindex->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+            m_synced = true;\n+        }\n+\n+        return true;\n+    }\n+\n+    auto chain_tip = chainActive.Tip();\n+    if (!chain_tip) {\n+        m_synced = true;\n+        return true;\n+    }\n+\n+    // The prior implementation of txindex was always in sync with block index\n+    // and presence was indicated with a boolean DB flag.\n+    bool f_migrate_index;\n+    m_db->ReadFlag(\"txindex\", f_migrate_index);\n+    if (f_migrate_index) {\n+        m_best_block_index = chain_tip;\n+        m_synced = true;\n+    }\n+\n+    return true;\n+}\n+\n+static const CBlockIndex* NextSyncBlock(const CBlockIndex* pindex_prev)\n+{\n+    AssertLockHeld(cs_main);\n+\n+    if (!pindex_prev) {\n+        return chainActive.Genesis();\n+    }\n+\n+    auto pindex = chainActive.Next(pindex_prev);\n+    if (pindex) {\n+        return pindex;\n+    }\n+\n+    return chainActive.Next(chainActive.FindFork(pindex_prev));\n+}\n+\n+void TxIndex::ThreadSync()\n+{\n+    auto pindex = m_best_block_index.load();\n+    if (!m_synced) {\n+        auto& consensus_params = Params().GetConsensus();\n+\n+        LogPrintf(\"Syncing txindex with block chain from height %d\\n\",\n+                  pindex ? pindex->nHeight + 1 : 0);\n+\n+        while (true) {\n+            if (m_interrupt) {\n+                return;\n+            }\n+\n+            {\n+                LOCK(cs_main);\n+                auto pindex_next = NextSyncBlock(pindex);\n+                if (!pindex_next) {\n+                    m_best_block_index = pindex;\n+                    m_synced = true;\n+                    break;\n+                }\n+                pindex = pindex_next;\n+            }\n+            CBlock block;\n+            if (!ReadBlockFromDisk(block, pindex, consensus_params)) {\n+                FatalError(\"%s: Failed to read block %s from disk\",\n+                           __func__, pindex->GetBlockHash().ToString());\n+                return;\n+            }\n+            if (!WriteBlock(block, pindex)) {\n+                FatalError(\"%s: Failed to write block %s to tx index database\",\n+                           __func__, pindex->GetBlockHash().ToString());\n+                return;\n+            }\n+        }\n+    }\n+\n+    LogPrintf(\"txindex is enabled at height %d\\n\", pindex->nHeight);\n+}\n+\n+bool TxIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)\n+{\n+    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));\n+    std::vector<std::pair<uint256, CDiskTxPos>> vPos;\n+    vPos.reserve(block.vtx.size());\n+    for (auto tx : block.vtx) {\n+        vPos.push_back(std::make_pair(tx->GetHash(), pos));\n+        pos.nTxOffset += ::GetSerializeSize(*tx, SER_DISK, CLIENT_VERSION);\n+    }\n+    return m_db->WriteTxIndex(vPos, pindex->GetBlockHash());\n+}\n+\n+void TxIndex::BlockConnected(const std::shared_ptr<const CBlock>& block, const CBlockIndex* pindex,\n+                    const std::vector<CTransactionRef>& txn_conflicted)\n+{\n+    if (!m_synced) {\n+        return;\n+    }\n+\n+    // Ensure block connects to an ancestor of the current best block.\n+    {\n+        LOCK(cs_main);\n+        auto best_block_index = m_best_block_index.load();\n+        if (best_block_index->GetAncestor(pindex->nHeight - 1) != pindex->pprev) {\n+            FatalError(\"%s: Block %s does not connect to an ancestor of known best chain (tip=%s)\",\n+                       __func__, pindex->GetBlockHash().ToString(),\n+                       best_block_index->GetBlockHash().ToString());\n+            return;\n+        }\n+    }\n+\n+    if (WriteBlock(*block, pindex)) {\n+        m_best_block_index = pindex;\n+    } else {\n+        FatalError(\"%s: Failed to write block %s to txindex\",\n+                   __func__, pindex->GetBlockHash().ToString());\n+        return;\n+    }\n+}\n+\n+bool TxIndex::BlockUntilSyncedToCurrentChain()\n+{\n+    AssertLockNotHeld(cs_main);\n+\n+    if (!m_synced) {\n+        return false;\n+    }\n+\n+    {\n+        // Skip the queue-draining stuff if we know we're caught up with\n+        // chainActive.Tip()...\n+        LOCK(cs_main);\n+        auto chain_tip = chainActive.Tip();\n+        auto best_block_index = m_best_block_index.load();\n+        if (best_block_index->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+            return true;\n+        }\n+    }\n+\n+    // ...otherwise put a callback in the validation interface queue and wait\n+    // for the queue to drain enough to execute it (indicating we are caught up\n+    // at least with the time we entered this function).\n+    std::promise<void> promise;\n+    CallFunctionInValidationInterfaceQueue([&promise] {\n+        promise.set_value();\n+    });\n+    promise.get_future().wait();\n+\n+    return true;\n+}\n+\n+bool TxIndex::FindTx(const uint256& txid, CDiskTxPos& pos) const\n+{\n+    return m_db->ReadTxIndex(txid, pos);\n+}\n+\n+void TxIndex::Interrupt()\n+{\n+    m_interrupt();\n+}\n+\n+void TxIndex::Start()\n+{\n+    RegisterValidationInterface(this);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159915638",
@@ -999,10 +999,10 @@
       "original_commit_id" : "41022ec2770d328c55191f8b1bc36b750e46f9a0",
       "original_position" : 226,
       "path" : "src/index/txindex.cpp",
-      "position" : 218,
+      "position" : null,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:47Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159915638",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -1038,7 +1038,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[index] Create new TxIndex class.\"\r\n\r\nWhy use a different code for DB_TXINDEX_BEST_BLOCK than DB_BEST_BLOCK? Why even define a new constant at all? It seems strange that the new txindex format would diverge unnecessarily from the old format here when it isn't doing do that in other places. Should add a code comment explaining if there is a reason.",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T16:27:02Z",
       "diff_hunk" : "@@ -29,6 +29,7 @@ static const char DB_HEAD_BLOCKS = 'H';\n static const char DB_FLAG = 'F';\n static const char DB_REINDEX_FLAG = 'R';\n static const char DB_LAST_BLOCK = 'l';\n+static const char DB_TXINDEX_BEST_BLOCK = 'T';",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159917226",
@@ -1046,10 +1046,10 @@
       "original_commit_id" : "669d39e0df5b74fcac11a5055567eefd2f46ce8c",
       "original_position" : 4,
       "path" : "src/txdb.cpp",
-      "position" : 4,
+      "position" : null,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:47Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159917226",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -1085,7 +1085,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "In commit \"[index] Create new TxIndex class.\"\r\n\r\nI'm not sure this case and the one above should be errors given that BlockConnected calls are queued up in the notification thread and may not be up to date with chainActive (which is what ThreadSync syncs toward). Seems like it would be right (and simpler) to just call WriteBlock unconditionally here.\r\n  \r\n  ",
-      "commit_id" : "48fffcfa462f18acc0128906c82c8454f15d124a",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
       "created_at" : "2018-01-05T16:50:18Z",
       "diff_hunk" : "@@ -0,0 +1,129 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <index/txindex.h>\n+#include <init.h>\n+#include <tinyformat.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <warnings.h>\n+\n+template<typename... Args>\n+static void FatalError(const char* fmt, const Args&... args)\n+{\n+    std::string strMessage = tfm::format(fmt, args...);\n+    SetMiscWarning(strMessage);\n+    LogPrintf(\"*** %s\\n\", strMessage);\n+    uiInterface.ThreadSafeMessageBox(\n+        \"Error: A fatal internal error occurred, see debug.log for details\",\n+        \"\", CClientUIInterface::MSG_ERROR);\n+    StartShutdown();\n+}\n+\n+TxIndex::TxIndex(std::unique_ptr<TxIndexDB> db) :\n+    m_db(std::move(db)), m_synced(false), m_best_block_index(nullptr)\n+{}\n+\n+bool TxIndex::Init()\n+{\n+    LOCK(cs_main);\n+\n+    auto chain_tip = chainActive.Tip();\n+    uint256 tip_hash;\n+    if (chain_tip) {\n+        tip_hash = chain_tip->GetBlockHash();\n+    }\n+\n+    if (!m_db->MigrateData(*pblocktree, tip_hash)) {\n+        return false;\n+    }\n+\n+    uint256 best_block_hash;\n+    if (!m_db->ReadBestBlockHash(best_block_hash)) {\n+        FatalError(\"%s: Failed to read from tx index database\", __func__);\n+        return false;\n+    }\n+\n+    if (best_block_hash.IsNull()) {\n+        return true;\n+    }\n+\n+    auto it = mapBlockIndex.find(best_block_hash);\n+    if (it == mapBlockIndex.end()) {\n+        FatalError(\"%s: Last block synced by txindex is unknown\", __func__);\n+        return false;\n+    }\n+\n+    const auto pindex = it->second;\n+    m_best_block_index = pindex;\n+    if (!chain_tip || pindex->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+        m_synced = true;\n+    }\n+\n+    return true;\n+}\n+\n+bool TxIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)\n+{\n+    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));\n+    std::vector<std::pair<uint256, CDiskTxPos>> vPos;\n+    vPos.reserve(block.vtx.size());\n+    for (auto tx : block.vtx) {\n+        vPos.push_back(std::make_pair(tx->GetHash(), pos));\n+        pos.nTxOffset += ::GetSerializeSize(*tx, SER_DISK, CLIENT_VERSION);\n+    }\n+    return m_db->WriteTxns(vPos) && m_db->WriteBestBlockHash(pindex->GetBlockHash());\n+}\n+\n+void TxIndex::BlockConnected(const std::shared_ptr<const CBlock>& block, const CBlockIndex* pindex,\n+                    const std::vector<CTransactionRef>& txn_conflicted)\n+{\n+    if (!m_synced) {\n+        return;\n+    }\n+\n+    // Ensure block connects to an ancestor of the current best block.\n+    auto best_block_index = m_best_block_index.load();\n+    if (!best_block_index) {\n+        if (pindex->nHeight != 0) {\n+            FatalError(\"%s: First block connected is not the genesis block (height=%d)\",\n+                       __func__, pindex->nHeight);\n+            return;\n+        }\n+    } else {\n+        if (best_block_index->GetAncestor(pindex->nHeight - 1) != pindex->pprev) {\n+            FatalError(\"%s: Block %s does not connect to an ancestor of known best chain (tip=%s)\",",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r159923255",
@@ -1093,10 +1093,10 @@
       "original_commit_id" : "669d39e0df5b74fcac11a5055567eefd2f46ce8c",
       "original_position" : 97,
       "path" : "src/index/txindex.cpp",
-      "position" : 167,
+      "position" : 175,
       "pull_request_review_id" : 86924561,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
-      "updated_at" : "2018-01-05T17:14:47Z",
+      "updated_at" : "2018-01-08T23:49:06Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/159923255",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/7133040?v=4",
@@ -1116,6 +1116,390 @@
          "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160286747"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160286747"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Thanks, I moved the check for null `chain_tip` up to fix that case. However, I still think the early return here is necessary.",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
+      "created_at" : "2018-01-08T23:50:25Z",
+      "diff_hunk" : "@@ -0,0 +1,129 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <index/txindex.h>\n+#include <init.h>\n+#include <tinyformat.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <warnings.h>\n+\n+template<typename... Args>\n+static void FatalError(const char* fmt, const Args&... args)\n+{\n+    std::string strMessage = tfm::format(fmt, args...);\n+    SetMiscWarning(strMessage);\n+    LogPrintf(\"*** %s\\n\", strMessage);\n+    uiInterface.ThreadSafeMessageBox(\n+        \"Error: A fatal internal error occurred, see debug.log for details\",\n+        \"\", CClientUIInterface::MSG_ERROR);\n+    StartShutdown();\n+}\n+\n+TxIndex::TxIndex(std::unique_ptr<TxIndexDB> db) :\n+    m_db(std::move(db)), m_synced(false), m_best_block_index(nullptr)\n+{}\n+\n+bool TxIndex::Init()\n+{\n+    LOCK(cs_main);\n+\n+    auto chain_tip = chainActive.Tip();\n+    uint256 tip_hash;\n+    if (chain_tip) {\n+        tip_hash = chain_tip->GetBlockHash();\n+    }\n+\n+    if (!m_db->MigrateData(*pblocktree, tip_hash)) {\n+        return false;\n+    }\n+\n+    uint256 best_block_hash;\n+    if (!m_db->ReadBestBlockHash(best_block_hash)) {\n+        FatalError(\"%s: Failed to read from tx index database\", __func__);\n+        return false;\n+    }\n+\n+    if (best_block_hash.IsNull()) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160286747",
+      "id" : 160286747,
+      "in_reply_to_id" : 159912603,
+      "original_commit_id" : "669d39e0df5b74fcac11a5055567eefd2f46ce8c",
+      "original_position" : 49,
+      "path" : "src/index/txindex.cpp",
+      "position" : 66,
+      "pull_request_review_id" : 87376715,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
+      "updated_at" : "2018-01-08T23:50:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160286747",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
+         "events_url" : "https://api.github.com/users/jimpo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jimpo/followers",
+         "following_url" : "https://api.github.com/users/jimpo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jimpo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jimpo",
+         "id" : 881253,
+         "login" : "jimpo",
+         "organizations_url" : "https://api.github.com/users/jimpo/orgs",
+         "received_events_url" : "https://api.github.com/users/jimpo/received_events",
+         "repos_url" : "https://api.github.com/users/jimpo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jimpo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jimpo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jimpo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160286762"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160286762"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Done",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
+      "created_at" : "2018-01-08T23:50:32Z",
+      "diff_hunk" : "@@ -0,0 +1,129 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <index/txindex.h>\n+#include <init.h>\n+#include <tinyformat.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <warnings.h>\n+\n+template<typename... Args>\n+static void FatalError(const char* fmt, const Args&... args)\n+{\n+    std::string strMessage = tfm::format(fmt, args...);\n+    SetMiscWarning(strMessage);\n+    LogPrintf(\"*** %s\\n\", strMessage);\n+    uiInterface.ThreadSafeMessageBox(\n+        \"Error: A fatal internal error occurred, see debug.log for details\",\n+        \"\", CClientUIInterface::MSG_ERROR);\n+    StartShutdown();\n+}\n+\n+TxIndex::TxIndex(std::unique_ptr<TxIndexDB> db) :\n+    m_db(std::move(db)), m_synced(false), m_best_block_index(nullptr)\n+{}\n+\n+bool TxIndex::Init()\n+{\n+    LOCK(cs_main);\n+\n+    auto chain_tip = chainActive.Tip();\n+    uint256 tip_hash;\n+    if (chain_tip) {\n+        tip_hash = chain_tip->GetBlockHash();\n+    }\n+\n+    if (!m_db->MigrateData(*pblocktree, tip_hash)) {\n+        return false;\n+    }\n+\n+    uint256 best_block_hash;\n+    if (!m_db->ReadBestBlockHash(best_block_hash)) {\n+        FatalError(\"%s: Failed to read from tx index database\", __func__);\n+        return false;\n+    }\n+\n+    if (best_block_hash.IsNull()) {\n+        return true;\n+    }\n+\n+    auto it = mapBlockIndex.find(best_block_hash);\n+    if (it == mapBlockIndex.end()) {\n+        FatalError(\"%s: Last block synced by txindex is unknown\", __func__);\n+        return false;\n+    }\n+\n+    const auto pindex = it->second;\n+    m_best_block_index = pindex;\n+    if (!chain_tip || pindex->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+        m_synced = true;\n+    }\n+\n+    return true;\n+}\n+\n+bool TxIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)\n+{\n+    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));\n+    std::vector<std::pair<uint256, CDiskTxPos>> vPos;\n+    vPos.reserve(block.vtx.size());\n+    for (auto tx : block.vtx) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160286762",
+      "id" : 160286762,
+      "in_reply_to_id" : 159913072,
+      "original_commit_id" : "669d39e0df5b74fcac11a5055567eefd2f46ce8c",
+      "original_position" : 73,
+      "path" : "src/index/txindex.cpp",
+      "position" : null,
+      "pull_request_review_id" : 87376736,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
+      "updated_at" : "2018-01-08T23:50:33Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160286762",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
+         "events_url" : "https://api.github.com/users/jimpo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jimpo/followers",
+         "following_url" : "https://api.github.com/users/jimpo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jimpo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jimpo",
+         "id" : 881253,
+         "login" : "jimpo",
+         "organizations_url" : "https://api.github.com/users/jimpo/orgs",
+         "received_events_url" : "https://api.github.com/users/jimpo/received_events",
+         "repos_url" : "https://api.github.com/users/jimpo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jimpo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jimpo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jimpo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287005"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287005"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "This isn't checking against chainActive, it is just asserting that BlockConnected gets called with blocks in order (even if chainActive is ahead). It's important to note that if the BlockConnected callbacks are running, then `m_synced` is true an `ThreadSync` has exited. I added more comments to these fields/methods in the header file to hopefully make that more clear.",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
+      "created_at" : "2018-01-08T23:52:05Z",
+      "diff_hunk" : "@@ -0,0 +1,129 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <index/txindex.h>\n+#include <init.h>\n+#include <tinyformat.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <warnings.h>\n+\n+template<typename... Args>\n+static void FatalError(const char* fmt, const Args&... args)\n+{\n+    std::string strMessage = tfm::format(fmt, args...);\n+    SetMiscWarning(strMessage);\n+    LogPrintf(\"*** %s\\n\", strMessage);\n+    uiInterface.ThreadSafeMessageBox(\n+        \"Error: A fatal internal error occurred, see debug.log for details\",\n+        \"\", CClientUIInterface::MSG_ERROR);\n+    StartShutdown();\n+}\n+\n+TxIndex::TxIndex(std::unique_ptr<TxIndexDB> db) :\n+    m_db(std::move(db)), m_synced(false), m_best_block_index(nullptr)\n+{}\n+\n+bool TxIndex::Init()\n+{\n+    LOCK(cs_main);\n+\n+    auto chain_tip = chainActive.Tip();\n+    uint256 tip_hash;\n+    if (chain_tip) {\n+        tip_hash = chain_tip->GetBlockHash();\n+    }\n+\n+    if (!m_db->MigrateData(*pblocktree, tip_hash)) {\n+        return false;\n+    }\n+\n+    uint256 best_block_hash;\n+    if (!m_db->ReadBestBlockHash(best_block_hash)) {\n+        FatalError(\"%s: Failed to read from tx index database\", __func__);\n+        return false;\n+    }\n+\n+    if (best_block_hash.IsNull()) {\n+        return true;\n+    }\n+\n+    auto it = mapBlockIndex.find(best_block_hash);\n+    if (it == mapBlockIndex.end()) {\n+        FatalError(\"%s: Last block synced by txindex is unknown\", __func__);\n+        return false;\n+    }\n+\n+    const auto pindex = it->second;\n+    m_best_block_index = pindex;\n+    if (!chain_tip || pindex->GetAncestor(chain_tip->nHeight) == chain_tip) {\n+        m_synced = true;\n+    }\n+\n+    return true;\n+}\n+\n+bool TxIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)\n+{\n+    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));\n+    std::vector<std::pair<uint256, CDiskTxPos>> vPos;\n+    vPos.reserve(block.vtx.size());\n+    for (auto tx : block.vtx) {\n+        vPos.push_back(std::make_pair(tx->GetHash(), pos));\n+        pos.nTxOffset += ::GetSerializeSize(*tx, SER_DISK, CLIENT_VERSION);\n+    }\n+    return m_db->WriteTxns(vPos) && m_db->WriteBestBlockHash(pindex->GetBlockHash());\n+}\n+\n+void TxIndex::BlockConnected(const std::shared_ptr<const CBlock>& block, const CBlockIndex* pindex,\n+                    const std::vector<CTransactionRef>& txn_conflicted)\n+{\n+    if (!m_synced) {\n+        return;\n+    }\n+\n+    // Ensure block connects to an ancestor of the current best block.\n+    auto best_block_index = m_best_block_index.load();\n+    if (!best_block_index) {\n+        if (pindex->nHeight != 0) {\n+            FatalError(\"%s: First block connected is not the genesis block (height=%d)\",\n+                       __func__, pindex->nHeight);\n+            return;\n+        }\n+    } else {\n+        if (best_block_index->GetAncestor(pindex->nHeight - 1) != pindex->pprev) {\n+            FatalError(\"%s: Block %s does not connect to an ancestor of known best chain (tip=%s)\",",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287005",
+      "id" : 160287005,
+      "in_reply_to_id" : 159923255,
+      "original_commit_id" : "669d39e0df5b74fcac11a5055567eefd2f46ce8c",
+      "original_position" : 97,
+      "path" : "src/index/txindex.cpp",
+      "position" : 175,
+      "pull_request_review_id" : 87376999,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
+      "updated_at" : "2018-01-08T23:52:05Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287005",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
+         "events_url" : "https://api.github.com/users/jimpo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jimpo/followers",
+         "following_url" : "https://api.github.com/users/jimpo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jimpo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jimpo",
+         "id" : 881253,
+         "login" : "jimpo",
+         "organizations_url" : "https://api.github.com/users/jimpo/orgs",
+         "received_events_url" : "https://api.github.com/users/jimpo/received_events",
+         "repos_url" : "https://api.github.com/users/jimpo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jimpo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jimpo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jimpo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287130"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287130"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Yeah, that wasn't even used. Left over from a previous version where the database wasn't split out.",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
+      "created_at" : "2018-01-08T23:52:59Z",
+      "diff_hunk" : "@@ -29,6 +29,7 @@ static const char DB_HEAD_BLOCKS = 'H';\n static const char DB_FLAG = 'F';\n static const char DB_REINDEX_FLAG = 'R';\n static const char DB_LAST_BLOCK = 'l';\n+static const char DB_TXINDEX_BEST_BLOCK = 'T';",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287130",
+      "id" : 160287130,
+      "in_reply_to_id" : 159917226,
+      "original_commit_id" : "669d39e0df5b74fcac11a5055567eefd2f46ce8c",
+      "original_position" : 4,
+      "path" : "src/txdb.cpp",
+      "position" : null,
+      "pull_request_review_id" : 87377151,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
+      "updated_at" : "2018-01-08T23:52:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287130",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
+         "events_url" : "https://api.github.com/users/jimpo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jimpo/followers",
+         "following_url" : "https://api.github.com/users/jimpo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jimpo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jimpo",
+         "id" : 881253,
+         "login" : "jimpo",
+         "organizations_url" : "https://api.github.com/users/jimpo/orgs",
+         "received_events_url" : "https://api.github.com/users/jimpo/received_events",
+         "repos_url" : "https://api.github.com/users/jimpo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jimpo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jimpo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jimpo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287161"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287161"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Done.",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
+      "created_at" : "2018-01-08T23:53:09Z",
+      "diff_hunk" : "@@ -424,3 +424,107 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287161",
+      "id" : 160287161,
+      "in_reply_to_id" : 159895945,
+      "original_commit_id" : "1ae2904ea5e333c28a33af8c6ce6526d8554f9f6",
+      "original_position" : 17,
+      "path" : "src/txdb.cpp",
+      "position" : null,
+      "pull_request_review_id" : 87377189,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
+      "updated_at" : "2018-01-08T23:53:10Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287161",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
+         "events_url" : "https://api.github.com/users/jimpo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jimpo/followers",
+         "following_url" : "https://api.github.com/users/jimpo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jimpo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jimpo",
+         "id" : 881253,
+         "login" : "jimpo",
+         "organizations_url" : "https://api.github.com/users/jimpo/orgs",
+         "received_events_url" : "https://api.github.com/users/jimpo/received_events",
+         "repos_url" : "https://api.github.com/users/jimpo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jimpo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jimpo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jimpo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287269"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287269"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I elaborated on the comment. I think this is the best way to determine whether a migration is necessary. LMK if you think it needs further explanation.",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
+      "created_at" : "2018-01-08T23:54:02Z",
+      "diff_hunk" : "@@ -424,3 +424,107 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {\n+        batch.Write(std::make_pair(DB_TXINDEX, tuple.first), tuple.second);\n+    }\n+    return WriteBatch(batch);\n+}\n+\n+bool TxIndexDB::MigrateData(CBlockTreeDB& block_tree_db)\n+{\n+    // The prior implementation of txindex was always in sync with block index",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287269",
+      "id" : 160287269,
+      "in_reply_to_id" : 159901942,
+      "original_commit_id" : "1ae2904ea5e333c28a33af8c6ce6526d8554f9f6",
+      "original_position" : 25,
+      "path" : "src/txdb.cpp",
+      "position" : null,
+      "pull_request_review_id" : 87377320,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
+      "updated_at" : "2018-01-08T23:54:02Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287269",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
+         "events_url" : "https://api.github.com/users/jimpo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jimpo/followers",
+         "following_url" : "https://api.github.com/users/jimpo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jimpo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jimpo",
+         "id" : 881253,
+         "login" : "jimpo",
+         "organizations_url" : "https://api.github.com/users/jimpo/orgs",
+         "received_events_url" : "https://api.github.com/users/jimpo/received_events",
+         "repos_url" : "https://api.github.com/users/jimpo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jimpo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jimpo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jimpo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287498"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287498"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Done.",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
+      "created_at" : "2018-01-08T23:55:47Z",
+      "diff_hunk" : "@@ -424,3 +424,107 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {\n+        batch.Write(std::make_pair(DB_TXINDEX, tuple.first), tuple.second);\n+    }\n+    return WriteBatch(batch);\n+}\n+\n+bool TxIndexDB::MigrateData(CBlockTreeDB& block_tree_db)\n+{\n+    // The prior implementation of txindex was always in sync with block index\n+    // and presence was indicated with a boolean DB flag.\n+    bool f_migrate_index = false;\n+    block_tree_db.ReadFlag(\"txindex\", f_migrate_index);\n+    if (!f_migrate_index) {\n+        return true;\n+    }\n+\n+    int64_t count = 0;\n+    LogPrintf(\"Upgrading txindex database...\\n\");\n+    LogPrintf(\"[0%%]...\");\n+    int report_done = 0;\n+    size_t batch_size = 1 << 24;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287498",
+      "id" : 160287498,
+      "in_reply_to_id" : 159897305,
+      "original_commit_id" : "1ae2904ea5e333c28a33af8c6ce6526d8554f9f6",
+      "original_position" : 37,
+      "path" : "src/txdb.cpp",
+      "position" : null,
+      "pull_request_review_id" : 87377606,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
+      "updated_at" : "2018-01-08T23:55:47Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287498",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
+         "events_url" : "https://api.github.com/users/jimpo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jimpo/followers",
+         "following_url" : "https://api.github.com/users/jimpo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jimpo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jimpo",
+         "id" : 881253,
+         "login" : "jimpo",
+         "organizations_url" : "https://api.github.com/users/jimpo/orgs",
+         "received_events_url" : "https://api.github.com/users/jimpo/received_events",
+         "repos_url" : "https://api.github.com/users/jimpo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jimpo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jimpo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jimpo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287605"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287605"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I think you are right that this should never happen, so I opted to return an error instead of logging and completing the migration.",
+      "commit_id" : "1d2c76afa297905904ae50cbaa1eb88b426ed856",
+      "created_at" : "2018-01-08T23:56:38Z",
+      "diff_hunk" : "@@ -424,3 +424,107 @@ bool CCoinsViewDB::Upgrade() {\n     LogPrintf(\"[%s].\\n\", ShutdownRequested() ? \"CANCELLED\" : \"DONE\");\n     return !ShutdownRequested();\n }\n+\n+TxIndexDB::TxIndexDB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    CDBWrapper(GetDataDir() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+bool TxIndexDB::ReadTxPos(const uint256 &txid, CDiskTxPos& pos) const\n+{\n+    return Read(std::make_pair(DB_TXINDEX, txid), pos);\n+}\n+\n+bool TxIndexDB::WriteTxns(const std::vector<std::pair<uint256, CDiskTxPos>>& v_pos)\n+{\n+    CDBBatch batch(*this);\n+    for (auto tuple : v_pos) {\n+        batch.Write(std::make_pair(DB_TXINDEX, tuple.first), tuple.second);\n+    }\n+    return WriteBatch(batch);\n+}\n+\n+bool TxIndexDB::MigrateData(CBlockTreeDB& block_tree_db)\n+{\n+    // The prior implementation of txindex was always in sync with block index\n+    // and presence was indicated with a boolean DB flag.\n+    bool f_migrate_index = false;\n+    block_tree_db.ReadFlag(\"txindex\", f_migrate_index);\n+    if (!f_migrate_index) {\n+        return true;\n+    }\n+\n+    int64_t count = 0;\n+    LogPrintf(\"Upgrading txindex database...\\n\");\n+    LogPrintf(\"[0%%]...\");\n+    int report_done = 0;\n+    size_t batch_size = 1 << 24;\n+\n+    CDBBatch batch_newdb(*this);\n+    CDBBatch batch_olddb(block_tree_db);\n+\n+    std::pair<unsigned char, uint256> key;\n+    std::pair<unsigned char, uint256> begin_key{DB_TXINDEX, uint256()};\n+    std::pair<unsigned char, uint256> prev_key_newdb = begin_key;\n+    std::pair<unsigned char, uint256> prev_key_olddb = begin_key;\n+\n+    std::unique_ptr<CDBIterator> pcursor(block_tree_db.NewIterator());\n+    for (pcursor->Seek(begin_key); pcursor->Valid(); pcursor->Next()) {\n+        boost::this_thread::interruption_point();\n+        if (ShutdownRequested()) {\n+            break;\n+        }\n+\n+        if (!pcursor->GetKey(key)) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/11857#discussion_r160287605",
+      "id" : 160287605,
+      "in_reply_to_id" : 159897839,
+      "original_commit_id" : "1ae2904ea5e333c28a33af8c6ce6526d8554f9f6",
+      "original_position" : 54,
+      "path" : "src/txdb.cpp",
+      "position" : 74,
+      "pull_request_review_id" : 87377744,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/11857",
+      "updated_at" : "2018-01-08T23:56:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160287605",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
+         "events_url" : "https://api.github.com/users/jimpo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jimpo/followers",
+         "following_url" : "https://api.github.com/users/jimpo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jimpo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jimpo",
+         "id" : 881253,
+         "login" : "jimpo",
+         "organizations_url" : "https://api.github.com/users/jimpo/orgs",
+         "received_events_url" : "https://api.github.com/users/jimpo/received_events",
+         "repos_url" : "https://api.github.com/users/jimpo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jimpo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jimpo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jimpo"
       }
    }
 ]
