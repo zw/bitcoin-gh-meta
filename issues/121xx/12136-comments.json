@@ -13,7 +13,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "`SignPartialTransaction` sounds after we have partial transactions. Suggest `SignPartialSignedTransaction`.",
-      "commit_id" : "55a72233626bec231d79d38440000a5cb7dd8a28",
+      "commit_id" : "7aca9a0501c8c6d8ebce9bb1b46d3f2762acc38a",
       "created_at" : "2018-01-10T07:47:17Z",
       "diff_hunk" : "@@ -302,6 +381,218 @@ struct Stacks\n };\n }\n \n+// Iterates through all inputs of the partially signed transaction and just produces signatures for what it can and adds them to the psbt partial sigs\n+bool SignPartialTransaction(PartiallySignedTransaction& psbt, const CKeyStore* keystore, int nHashType)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r160607899",
@@ -24,7 +24,7 @@
       "position" : 126,
       "pull_request_review_id" : 87753024,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-02-02T01:28:42Z",
+      "updated_at" : "2018-02-15T03:10:52Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160607899",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/178464?v=4",
@@ -205,7 +205,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "this may segfault when there is no corresponding `partial_sig`, I believe this is the cause of your test failure.",
-      "commit_id" : "55a72233626bec231d79d38440000a5cb7dd8a28",
+      "commit_id" : "7aca9a0501c8c6d8ebce9bb1b46d3f2762acc38a",
       "created_at" : "2018-02-14T19:29:47Z",
       "diff_hunk" : "@@ -302,6 +381,218 @@ struct Stacks\n };\n }\n \n+// Iterates through all inputs of the partially signed transaction and just produces signatures for what it can and adds them to the psbt partial sigs\n+bool SignPartialTransaction(PartiallySignedTransaction& psbt, const CKeyStore* keystore, int nHashType)\n+{\n+    CMutableTransaction mtx = psbt.tx;\n+    bool solved = true;\n+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {\n+        CTxIn& txin = mtx.vin[i];\n+        PartiallySignedInput psbt_in = psbt.inputs[i];\n+\n+        // Find the non witness utxo first\n+        CTxOut utxo;\n+        if (psbt_in.non_witness_utxo) {\n+            utxo = psbt_in.non_witness_utxo->vout[txin.prevout.n];\n+        }\n+        // Now find the witness utxo if the non witness doesn't exist\n+        else if (!psbt_in.witness_utxo.IsNull()) {\n+            utxo = psbt_in.witness_utxo;\n+        }\n+        // If there is no nonwitness or witness utxo, then this input is fully signed and we are done here\n+        else {\n+            continue;\n+        }\n+\n+        CScript script = utxo.scriptPubKey;\n+        const CAmount& amount = utxo.nValue;\n+\n+        MutableTransactionSignatureCreator creator(keystore, &mtx, i, amount, nHashType);\n+\n+        std::vector<valtype> sig_ret;\n+        std::vector<valtype> script_ret; // Only for the signer to put redemscripts to be used later.\n+        std::vector<CPubKey> key_ret;\n+        txnouttype whichType;\n+        solved = SignSigsOnly(creator, script, sig_ret, whichType, SIGVERSION_BASE, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts);\n+\n+        if (solved && whichType == TX_SCRIPTHASH)\n+        {\n+            script = CScript(script_ret[0].begin(), script_ret[0].end());\n+            solved = solved && SignSigsOnly(creator, script, sig_ret, whichType, SIGVERSION_BASE, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts) && whichType != TX_SCRIPTHASH;\n+        }\n+\n+        if (solved && whichType == TX_WITNESS_V0_KEYHASH)\n+        {\n+            CScript witnessscript;\n+            witnessscript << OP_DUP << OP_HASH160 << ToByteVector(script_ret[0]) << OP_EQUALVERIFY << OP_CHECKSIG;\n+            txnouttype subType;\n+            solved = solved && SignSigsOnly(creator, witnessscript, sig_ret, subType, SIGVERSION_WITNESS_V0, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts);\n+        }\n+        else if (solved && whichType == TX_WITNESS_V0_SCRIPTHASH)\n+        {\n+            CScript witnessscript(script_ret[0].begin(), script_ret[0].end());\n+            txnouttype subType;\n+            solved = solved && SignSigsOnly(creator, witnessscript, sig_ret, subType, SIGVERSION_WITNESS_V0, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts) && subType != TX_SCRIPTHASH && subType != TX_WITNESS_V0_SCRIPTHASH && subType != TX_WITNESS_V0_KEYHASH;\n+        }\n+\n+        // Add to partial sigs\n+        if (solved) {\n+            for (unsigned int j = 0; j < key_ret.size(); ++j) {\n+                psbt.inputs[i].partial_sigs.emplace(key_ret[j], sig_ret[j]);\n+            }\n+        }\n+    }\n+\n+    return solved;\n+}\n+\n+// Finalizes the inputs that can be finalized\n+// Returns true for final tx, false for non final\n+bool FinalizePartialTransaction(PartiallySignedTransaction& psbt)\n+{\n+    CMutableTransaction mtx = psbt.tx;\n+    bool complete = true;\n+    const CTransaction const_tx(mtx);\n+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {\n+        CTxIn& txin = mtx.vin[i];\n+        PartiallySignedInput psbt_in = psbt.inputs[i];\n+\n+        // Find the non witness utxo first\n+        CTxOut utxo;\n+        if (psbt_in.non_witness_utxo) {\n+            utxo = psbt_in.non_witness_utxo->vout[txin.prevout.n];\n+        }\n+        // Now find the witness utxo if the non witness doesn't exist\n+        else if (!psbt_in.witness_utxo.IsNull()) {\n+            utxo = psbt_in.witness_utxo;\n+        }\n+        // If there is no nonwitness or witness utxo, then this input is fully signed and we are done here\n+        else {\n+            continue;\n+        }\n+\n+        // Combine partial sigs and create full scriptsig\n+        std::vector<valtype> vSolutions;\n+        CScript spk = utxo.scriptPubKey;\n+        bool loop = true;\n+        bool P2SH = false;\n+        bool witness = false;\n+        bool WSH = false;\n+        CScript redeemscript;\n+        CScript witnessscript;\n+        SignatureData sigdata;\n+        std::vector<valtype> script_ret; // Only for the signer to put redemscripts to be used later.\n+        txnouttype whichType;\n+        while (loop) {\n+            loop = false;\n+            uint160 h160;\n+            CScript script_ret2;\n+            CKeyID keyID;\n+            bool found_pk = false;\n+            if (Solver(spk, whichType, vSolutions)) {\n+                switch (whichType)\n+                {\n+                case TX_PUBKEY:\n+                    script_ret.push_back(psbt.inputs[i].partial_sigs.find(CPubKey(vSolutions[0]))->second);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r168284628",
@@ -213,10 +213,10 @@
       "original_commit_id" : "55a72233626bec231d79d38440000a5cb7dd8a28",
       "original_position" : 237,
       "path" : "src/script/sign.cpp",
-      "position" : 237,
+      "position" : null,
       "pull_request_review_id" : 96627328,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-02-14T19:29:47Z",
+      "updated_at" : "2018-02-15T03:10:52Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/168284628",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/5767891?v=4",
@@ -236,6 +236,54 @@
          "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r168372462"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/168372462"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed",
+      "commit_id" : "7aca9a0501c8c6d8ebce9bb1b46d3f2762acc38a",
+      "created_at" : "2018-02-15T03:11:06Z",
+      "diff_hunk" : "@@ -302,6 +381,218 @@ struct Stacks\n };\n }\n \n+// Iterates through all inputs of the partially signed transaction and just produces signatures for what it can and adds them to the psbt partial sigs\n+bool SignPartialTransaction(PartiallySignedTransaction& psbt, const CKeyStore* keystore, int nHashType)\n+{\n+    CMutableTransaction mtx = psbt.tx;\n+    bool solved = true;\n+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {\n+        CTxIn& txin = mtx.vin[i];\n+        PartiallySignedInput psbt_in = psbt.inputs[i];\n+\n+        // Find the non witness utxo first\n+        CTxOut utxo;\n+        if (psbt_in.non_witness_utxo) {\n+            utxo = psbt_in.non_witness_utxo->vout[txin.prevout.n];\n+        }\n+        // Now find the witness utxo if the non witness doesn't exist\n+        else if (!psbt_in.witness_utxo.IsNull()) {\n+            utxo = psbt_in.witness_utxo;\n+        }\n+        // If there is no nonwitness or witness utxo, then this input is fully signed and we are done here\n+        else {\n+            continue;\n+        }\n+\n+        CScript script = utxo.scriptPubKey;\n+        const CAmount& amount = utxo.nValue;\n+\n+        MutableTransactionSignatureCreator creator(keystore, &mtx, i, amount, nHashType);\n+\n+        std::vector<valtype> sig_ret;\n+        std::vector<valtype> script_ret; // Only for the signer to put redemscripts to be used later.\n+        std::vector<CPubKey> key_ret;\n+        txnouttype whichType;\n+        solved = SignSigsOnly(creator, script, sig_ret, whichType, SIGVERSION_BASE, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts);\n+\n+        if (solved && whichType == TX_SCRIPTHASH)\n+        {\n+            script = CScript(script_ret[0].begin(), script_ret[0].end());\n+            solved = solved && SignSigsOnly(creator, script, sig_ret, whichType, SIGVERSION_BASE, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts) && whichType != TX_SCRIPTHASH;\n+        }\n+\n+        if (solved && whichType == TX_WITNESS_V0_KEYHASH)\n+        {\n+            CScript witnessscript;\n+            witnessscript << OP_DUP << OP_HASH160 << ToByteVector(script_ret[0]) << OP_EQUALVERIFY << OP_CHECKSIG;\n+            txnouttype subType;\n+            solved = solved && SignSigsOnly(creator, witnessscript, sig_ret, subType, SIGVERSION_WITNESS_V0, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts);\n+        }\n+        else if (solved && whichType == TX_WITNESS_V0_SCRIPTHASH)\n+        {\n+            CScript witnessscript(script_ret[0].begin(), script_ret[0].end());\n+            txnouttype subType;\n+            solved = solved && SignSigsOnly(creator, witnessscript, sig_ret, subType, SIGVERSION_WITNESS_V0, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts) && subType != TX_SCRIPTHASH && subType != TX_WITNESS_V0_SCRIPTHASH && subType != TX_WITNESS_V0_KEYHASH;\n+        }\n+\n+        // Add to partial sigs\n+        if (solved) {\n+            for (unsigned int j = 0; j < key_ret.size(); ++j) {\n+                psbt.inputs[i].partial_sigs.emplace(key_ret[j], sig_ret[j]);\n+            }\n+        }\n+    }\n+\n+    return solved;\n+}\n+\n+// Finalizes the inputs that can be finalized\n+// Returns true for final tx, false for non final\n+bool FinalizePartialTransaction(PartiallySignedTransaction& psbt)\n+{\n+    CMutableTransaction mtx = psbt.tx;\n+    bool complete = true;\n+    const CTransaction const_tx(mtx);\n+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {\n+        CTxIn& txin = mtx.vin[i];\n+        PartiallySignedInput psbt_in = psbt.inputs[i];\n+\n+        // Find the non witness utxo first\n+        CTxOut utxo;\n+        if (psbt_in.non_witness_utxo) {\n+            utxo = psbt_in.non_witness_utxo->vout[txin.prevout.n];\n+        }\n+        // Now find the witness utxo if the non witness doesn't exist\n+        else if (!psbt_in.witness_utxo.IsNull()) {\n+            utxo = psbt_in.witness_utxo;\n+        }\n+        // If there is no nonwitness or witness utxo, then this input is fully signed and we are done here\n+        else {\n+            continue;\n+        }\n+\n+        // Combine partial sigs and create full scriptsig\n+        std::vector<valtype> vSolutions;\n+        CScript spk = utxo.scriptPubKey;\n+        bool loop = true;\n+        bool P2SH = false;\n+        bool witness = false;\n+        bool WSH = false;\n+        CScript redeemscript;\n+        CScript witnessscript;\n+        SignatureData sigdata;\n+        std::vector<valtype> script_ret; // Only for the signer to put redemscripts to be used later.\n+        txnouttype whichType;\n+        while (loop) {\n+            loop = false;\n+            uint160 h160;\n+            CScript script_ret2;\n+            CKeyID keyID;\n+            bool found_pk = false;\n+            if (Solver(spk, whichType, vSolutions)) {\n+                switch (whichType)\n+                {\n+                case TX_PUBKEY:\n+                    script_ret.push_back(psbt.inputs[i].partial_sigs.find(CPubKey(vSolutions[0]))->second);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r168372462",
+      "id" : 168372462,
+      "in_reply_to_id" : 168284628,
+      "original_commit_id" : "55a72233626bec231d79d38440000a5cb7dd8a28",
+      "original_position" : 237,
+      "path" : "src/script/sign.cpp",
+      "position" : null,
+      "pull_request_review_id" : 96727423,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-02-15T03:11:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/168372462",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
       }
    }
 ]
