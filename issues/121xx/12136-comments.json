@@ -13,7 +13,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "`SignPartialTransaction` sounds after we have partial transactions. Suggest `SignPartialSignedTransaction`.",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-01-10T07:47:17Z",
       "diff_hunk" : "@@ -302,6 +381,218 @@ struct Stacks\n };\n }\n \n+// Iterates through all inputs of the partially signed transaction and just produces signatures for what it can and adds them to the psbt partial sigs\n+bool SignPartialTransaction(PartiallySignedTransaction& psbt, const CKeyStore* keystore, int nHashType)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r160607899",
@@ -24,7 +24,7 @@
       "position" : null,
       "pull_request_review_id" : 87753024,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/160607899",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/178464?v=4",
@@ -205,7 +205,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "this may segfault when there is no corresponding `partial_sig`, I believe this is the cause of your test failure.",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-14T19:29:47Z",
       "diff_hunk" : "@@ -302,6 +381,218 @@ struct Stacks\n };\n }\n \n+// Iterates through all inputs of the partially signed transaction and just produces signatures for what it can and adds them to the psbt partial sigs\n+bool SignPartialTransaction(PartiallySignedTransaction& psbt, const CKeyStore* keystore, int nHashType)\n+{\n+    CMutableTransaction mtx = psbt.tx;\n+    bool solved = true;\n+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {\n+        CTxIn& txin = mtx.vin[i];\n+        PartiallySignedInput psbt_in = psbt.inputs[i];\n+\n+        // Find the non witness utxo first\n+        CTxOut utxo;\n+        if (psbt_in.non_witness_utxo) {\n+            utxo = psbt_in.non_witness_utxo->vout[txin.prevout.n];\n+        }\n+        // Now find the witness utxo if the non witness doesn't exist\n+        else if (!psbt_in.witness_utxo.IsNull()) {\n+            utxo = psbt_in.witness_utxo;\n+        }\n+        // If there is no nonwitness or witness utxo, then this input is fully signed and we are done here\n+        else {\n+            continue;\n+        }\n+\n+        CScript script = utxo.scriptPubKey;\n+        const CAmount& amount = utxo.nValue;\n+\n+        MutableTransactionSignatureCreator creator(keystore, &mtx, i, amount, nHashType);\n+\n+        std::vector<valtype> sig_ret;\n+        std::vector<valtype> script_ret; // Only for the signer to put redemscripts to be used later.\n+        std::vector<CPubKey> key_ret;\n+        txnouttype whichType;\n+        solved = SignSigsOnly(creator, script, sig_ret, whichType, SIGVERSION_BASE, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts);\n+\n+        if (solved && whichType == TX_SCRIPTHASH)\n+        {\n+            script = CScript(script_ret[0].begin(), script_ret[0].end());\n+            solved = solved && SignSigsOnly(creator, script, sig_ret, whichType, SIGVERSION_BASE, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts) && whichType != TX_SCRIPTHASH;\n+        }\n+\n+        if (solved && whichType == TX_WITNESS_V0_KEYHASH)\n+        {\n+            CScript witnessscript;\n+            witnessscript << OP_DUP << OP_HASH160 << ToByteVector(script_ret[0]) << OP_EQUALVERIFY << OP_CHECKSIG;\n+            txnouttype subType;\n+            solved = solved && SignSigsOnly(creator, witnessscript, sig_ret, subType, SIGVERSION_WITNESS_V0, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts);\n+        }\n+        else if (solved && whichType == TX_WITNESS_V0_SCRIPTHASH)\n+        {\n+            CScript witnessscript(script_ret[0].begin(), script_ret[0].end());\n+            txnouttype subType;\n+            solved = solved && SignSigsOnly(creator, witnessscript, sig_ret, subType, SIGVERSION_WITNESS_V0, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts) && subType != TX_SCRIPTHASH && subType != TX_WITNESS_V0_SCRIPTHASH && subType != TX_WITNESS_V0_KEYHASH;\n+        }\n+\n+        // Add to partial sigs\n+        if (solved) {\n+            for (unsigned int j = 0; j < key_ret.size(); ++j) {\n+                psbt.inputs[i].partial_sigs.emplace(key_ret[j], sig_ret[j]);\n+            }\n+        }\n+    }\n+\n+    return solved;\n+}\n+\n+// Finalizes the inputs that can be finalized\n+// Returns true for final tx, false for non final\n+bool FinalizePartialTransaction(PartiallySignedTransaction& psbt)\n+{\n+    CMutableTransaction mtx = psbt.tx;\n+    bool complete = true;\n+    const CTransaction const_tx(mtx);\n+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {\n+        CTxIn& txin = mtx.vin[i];\n+        PartiallySignedInput psbt_in = psbt.inputs[i];\n+\n+        // Find the non witness utxo first\n+        CTxOut utxo;\n+        if (psbt_in.non_witness_utxo) {\n+            utxo = psbt_in.non_witness_utxo->vout[txin.prevout.n];\n+        }\n+        // Now find the witness utxo if the non witness doesn't exist\n+        else if (!psbt_in.witness_utxo.IsNull()) {\n+            utxo = psbt_in.witness_utxo;\n+        }\n+        // If there is no nonwitness or witness utxo, then this input is fully signed and we are done here\n+        else {\n+            continue;\n+        }\n+\n+        // Combine partial sigs and create full scriptsig\n+        std::vector<valtype> vSolutions;\n+        CScript spk = utxo.scriptPubKey;\n+        bool loop = true;\n+        bool P2SH = false;\n+        bool witness = false;\n+        bool WSH = false;\n+        CScript redeemscript;\n+        CScript witnessscript;\n+        SignatureData sigdata;\n+        std::vector<valtype> script_ret; // Only for the signer to put redemscripts to be used later.\n+        txnouttype whichType;\n+        while (loop) {\n+            loop = false;\n+            uint160 h160;\n+            CScript script_ret2;\n+            CKeyID keyID;\n+            bool found_pk = false;\n+            if (Solver(spk, whichType, vSolutions)) {\n+                switch (whichType)\n+                {\n+                case TX_PUBKEY:\n+                    script_ret.push_back(psbt.inputs[i].partial_sigs.find(CPubKey(vSolutions[0]))->second);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r168284628",
@@ -216,7 +216,7 @@
       "position" : null,
       "pull_request_review_id" : 96627328,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/168284628",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/5767891?v=4",
@@ -252,7 +252,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "Fixed",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-15T03:11:06Z",
       "diff_hunk" : "@@ -302,6 +381,218 @@ struct Stacks\n };\n }\n \n+// Iterates through all inputs of the partially signed transaction and just produces signatures for what it can and adds them to the psbt partial sigs\n+bool SignPartialTransaction(PartiallySignedTransaction& psbt, const CKeyStore* keystore, int nHashType)\n+{\n+    CMutableTransaction mtx = psbt.tx;\n+    bool solved = true;\n+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {\n+        CTxIn& txin = mtx.vin[i];\n+        PartiallySignedInput psbt_in = psbt.inputs[i];\n+\n+        // Find the non witness utxo first\n+        CTxOut utxo;\n+        if (psbt_in.non_witness_utxo) {\n+            utxo = psbt_in.non_witness_utxo->vout[txin.prevout.n];\n+        }\n+        // Now find the witness utxo if the non witness doesn't exist\n+        else if (!psbt_in.witness_utxo.IsNull()) {\n+            utxo = psbt_in.witness_utxo;\n+        }\n+        // If there is no nonwitness or witness utxo, then this input is fully signed and we are done here\n+        else {\n+            continue;\n+        }\n+\n+        CScript script = utxo.scriptPubKey;\n+        const CAmount& amount = utxo.nValue;\n+\n+        MutableTransactionSignatureCreator creator(keystore, &mtx, i, amount, nHashType);\n+\n+        std::vector<valtype> sig_ret;\n+        std::vector<valtype> script_ret; // Only for the signer to put redemscripts to be used later.\n+        std::vector<CPubKey> key_ret;\n+        txnouttype whichType;\n+        solved = SignSigsOnly(creator, script, sig_ret, whichType, SIGVERSION_BASE, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts);\n+\n+        if (solved && whichType == TX_SCRIPTHASH)\n+        {\n+            script = CScript(script_ret[0].begin(), script_ret[0].end());\n+            solved = solved && SignSigsOnly(creator, script, sig_ret, whichType, SIGVERSION_BASE, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts) && whichType != TX_SCRIPTHASH;\n+        }\n+\n+        if (solved && whichType == TX_WITNESS_V0_KEYHASH)\n+        {\n+            CScript witnessscript;\n+            witnessscript << OP_DUP << OP_HASH160 << ToByteVector(script_ret[0]) << OP_EQUALVERIFY << OP_CHECKSIG;\n+            txnouttype subType;\n+            solved = solved && SignSigsOnly(creator, witnessscript, sig_ret, subType, SIGVERSION_WITNESS_V0, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts);\n+        }\n+        else if (solved && whichType == TX_WITNESS_V0_SCRIPTHASH)\n+        {\n+            CScript witnessscript(script_ret[0].begin(), script_ret[0].end());\n+            txnouttype subType;\n+            solved = solved && SignSigsOnly(creator, witnessscript, sig_ret, subType, SIGVERSION_WITNESS_V0, key_ret, script_ret, psbt.redeem_scripts, psbt.witness_scripts) && subType != TX_SCRIPTHASH && subType != TX_WITNESS_V0_SCRIPTHASH && subType != TX_WITNESS_V0_KEYHASH;\n+        }\n+\n+        // Add to partial sigs\n+        if (solved) {\n+            for (unsigned int j = 0; j < key_ret.size(); ++j) {\n+                psbt.inputs[i].partial_sigs.emplace(key_ret[j], sig_ret[j]);\n+            }\n+        }\n+    }\n+\n+    return solved;\n+}\n+\n+// Finalizes the inputs that can be finalized\n+// Returns true for final tx, false for non final\n+bool FinalizePartialTransaction(PartiallySignedTransaction& psbt)\n+{\n+    CMutableTransaction mtx = psbt.tx;\n+    bool complete = true;\n+    const CTransaction const_tx(mtx);\n+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {\n+        CTxIn& txin = mtx.vin[i];\n+        PartiallySignedInput psbt_in = psbt.inputs[i];\n+\n+        // Find the non witness utxo first\n+        CTxOut utxo;\n+        if (psbt_in.non_witness_utxo) {\n+            utxo = psbt_in.non_witness_utxo->vout[txin.prevout.n];\n+        }\n+        // Now find the witness utxo if the non witness doesn't exist\n+        else if (!psbt_in.witness_utxo.IsNull()) {\n+            utxo = psbt_in.witness_utxo;\n+        }\n+        // If there is no nonwitness or witness utxo, then this input is fully signed and we are done here\n+        else {\n+            continue;\n+        }\n+\n+        // Combine partial sigs and create full scriptsig\n+        std::vector<valtype> vSolutions;\n+        CScript spk = utxo.scriptPubKey;\n+        bool loop = true;\n+        bool P2SH = false;\n+        bool witness = false;\n+        bool WSH = false;\n+        CScript redeemscript;\n+        CScript witnessscript;\n+        SignatureData sigdata;\n+        std::vector<valtype> script_ret; // Only for the signer to put redemscripts to be used later.\n+        txnouttype whichType;\n+        while (loop) {\n+            loop = false;\n+            uint160 h160;\n+            CScript script_ret2;\n+            CKeyID keyID;\n+            bool found_pk = false;\n+            if (Solver(spk, whichType, vSolutions)) {\n+                switch (whichType)\n+                {\n+                case TX_PUBKEY:\n+                    script_ret.push_back(psbt.inputs[i].partial_sigs.find(CPubKey(vSolutions[0]))->second);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r168372462",
@@ -264,7 +264,7 @@
       "position" : null,
       "pull_request_review_id" : 96727423,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/168372462",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
@@ -300,7 +300,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "should be:\r\n\r\n`if (type == TX_PUBKEYHASH || type == TX_WITNESS_V0_KEYHASH) {`",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-20T16:49:46Z",
       "diff_hunk" : "@@ -3520,6 +3520,336 @@ UniValue rescanblockchain(const JSONRPCRequest& request)\n     return response;\n }\n \n+bool parse_hd_keypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            } else {\n+                return false;\n+            }\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= BIP32_HARDENED_KEY_LIMIT;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        for (auto& c : item) {\n+            if (!std::isdigit(c)) {\n+                return false;\n+            }\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void add_keypath_to_map(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    pwallet->GetPubKey(keyID, vchPubKey);\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    if (!meta.hdKeypath.empty()) {\n+        std::vector<uint32_t> keypath;\n+        if (!parse_hd_keypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hdMasterKeyID, key);\n+        CExtKey masterKey;\n+        masterKey.SetMaster(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), masterKey.key.GetPubKey().GetID().GetUint32(0));\n+        hd_keypaths.emplace(vchPubKey, keypath);\n+    }\n+}\n+\n+void fill_psbt(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst)\n+{\n+    // Get all of the previous transactions\n+    bool psbtx_blank = psbtx.IsNull();\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        CTxIn txin = txConst->vin[i];\n+        PartiallySignedInput input;\n+        if (!psbtx_blank) {\n+            input = psbtx.inputs.at(i);\n+        }\n+\n+        // If this input is not empty, skip it\n+        if (!psbtx_blank && (!input.IsNull() || txin.scriptSig.empty() || txin.scriptWitness.IsNull())) {\n+            continue;\n+        }\n+\n+        uint256 txhash = txin.prevout.hash;\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        if (!pwallet->mapWallet.count(txhash)) {\n+            if (psbtx_blank) {\n+                psbtx.inputs.push_back(input);\n+            }\n+            continue;\n+        }\n+        const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+        const CTransaction& ctx = *wtx.tx;\n+\n+        // Get scriptpubkey and check for redeemScript or witnessscript\n+        CTxOut prevout = ctx.vout[txin.prevout.n];\n+        txnouttype type;\n+        std::vector<std::vector<unsigned char>> solns;\n+        Solver(prevout.scriptPubKey, type, solns);\n+        // Get script hashes\n+        if (type == TX_SCRIPTHASH) {\n+            // get the hash and find it in the wallet.\n+            CScript redeem_script;\n+            uint160 hash(solns[0]);\n+            pwallet->GetCScript(CScriptID(hash), redeem_script);\n+\n+            // put redeem_script in map\n+            psbtx.redeem_scripts.emplace(hash, redeem_script);\n+\n+            // Now check whether the redeem_script is a witness script\n+            solns.clear();\n+            Solver(redeem_script, type, solns);\n+        }\n+        // Get witness scripts\n+        bool witness = false;\n+        if (type == TX_WITNESS_V0_SCRIPTHASH) {\n+            witness = true;\n+            // Get the hash from the solver return\n+            uint160 hash;\n+            CRIPEMD160().Write(&solns[0][0], solns[0].size()).Finalize(hash.begin());\n+\n+            // Lookup hash from wallet\n+            CScript witness_script;\n+            pwallet->GetCScript(CScriptID(hash), witness_script);\n+\n+            // Put witness script in map\n+            uint256 hash256(solns[0]);\n+            psbtx.witness_scripts.emplace(hash256, witness_script);\n+\n+            // Decode the witness script\n+            solns.clear();\n+            Solver(witness_script, type, solns);\n+        }\n+        // Get public keys if hd is enabled\n+        if (pwallet->IsHDEnabled()) {\n+            if (type == TX_PUBKEYHASH) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169384651",
@@ -311,7 +311,7 @@
       "position" : null,
       "pull_request_review_id" : 97902598,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169384651",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/5767891?v=4",
@@ -347,7 +347,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "this isn't mentioned in the spec anywhere, but passing along the the change output's pubkey(s)/hdpath(s)/redeemscript allows hww to understand change outputs.",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-20T16:56:54Z",
       "diff_hunk" : "@@ -3520,6 +3520,336 @@ UniValue rescanblockchain(const JSONRPCRequest& request)\n     return response;\n }\n \n+bool parse_hd_keypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            } else {\n+                return false;\n+            }\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= BIP32_HARDENED_KEY_LIMIT;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        for (auto& c : item) {\n+            if (!std::isdigit(c)) {\n+                return false;\n+            }\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void add_keypath_to_map(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    pwallet->GetPubKey(keyID, vchPubKey);\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    if (!meta.hdKeypath.empty()) {\n+        std::vector<uint32_t> keypath;\n+        if (!parse_hd_keypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hdMasterKeyID, key);\n+        CExtKey masterKey;\n+        masterKey.SetMaster(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), masterKey.key.GetPubKey().GetID().GetUint32(0));\n+        hd_keypaths.emplace(vchPubKey, keypath);\n+    }\n+}\n+\n+void fill_psbt(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst)\n+{\n+    // Get all of the previous transactions\n+    bool psbtx_blank = psbtx.IsNull();\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        CTxIn txin = txConst->vin[i];\n+        PartiallySignedInput input;\n+        if (!psbtx_blank) {\n+            input = psbtx.inputs.at(i);\n+        }\n+\n+        // If this input is not empty, skip it\n+        if (!psbtx_blank && (!input.IsNull() || txin.scriptSig.empty() || txin.scriptWitness.IsNull())) {\n+            continue;\n+        }\n+\n+        uint256 txhash = txin.prevout.hash;\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        if (!pwallet->mapWallet.count(txhash)) {\n+            if (psbtx_blank) {\n+                psbtx.inputs.push_back(input);\n+            }\n+            continue;\n+        }\n+        const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+        const CTransaction& ctx = *wtx.tx;\n+\n+        // Get scriptpubkey and check for redeemScript or witnessscript\n+        CTxOut prevout = ctx.vout[txin.prevout.n];\n+        txnouttype type;\n+        std::vector<std::vector<unsigned char>> solns;\n+        Solver(prevout.scriptPubKey, type, solns);\n+        // Get script hashes\n+        if (type == TX_SCRIPTHASH) {\n+            // get the hash and find it in the wallet.\n+            CScript redeem_script;\n+            uint160 hash(solns[0]);\n+            pwallet->GetCScript(CScriptID(hash), redeem_script);\n+\n+            // put redeem_script in map\n+            psbtx.redeem_scripts.emplace(hash, redeem_script);\n+\n+            // Now check whether the redeem_script is a witness script\n+            solns.clear();\n+            Solver(redeem_script, type, solns);\n+        }\n+        // Get witness scripts\n+        bool witness = false;\n+        if (type == TX_WITNESS_V0_SCRIPTHASH) {\n+            witness = true;\n+            // Get the hash from the solver return\n+            uint160 hash;\n+            CRIPEMD160().Write(&solns[0][0], solns[0].size()).Finalize(hash.begin());\n+\n+            // Lookup hash from wallet\n+            CScript witness_script;\n+            pwallet->GetCScript(CScriptID(hash), witness_script);\n+\n+            // Put witness script in map\n+            uint256 hash256(solns[0]);\n+            psbtx.witness_scripts.emplace(hash256, witness_script);\n+\n+            // Decode the witness script\n+            solns.clear();\n+            Solver(witness_script, type, solns);\n+        }\n+        // Get public keys if hd is enabled\n+        if (pwallet->IsHDEnabled()) {\n+            if (type == TX_PUBKEYHASH) {\n+                uint160 hash(solns[0]);\n+                CKeyID keyID(hash);\n+                add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+            } else if (type == TX_PUBKEY) {\n+                CPubKey vchPubKey(solns[0]);\n+                CKeyID keyID = vchPubKey.GetID();\n+                add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+            } else if (type == TX_MULTISIG) {\n+                for (auto& soln : solns) {\n+                    CPubKey vchPubKey(soln);\n+                    CKeyID keyID = vchPubKey.GetID();\n+                    add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+                }\n+            }\n+        }\n+\n+        // Put the witness utxo for witness outputs\n+        if (witness || type == TX_WITNESS_V0_KEYHASH || type == TX_WITNESS_V0_SCRIPTHASH || type == TX_WITNESS_UNKNOWN) {\n+            // Put the witness CTxOut in the input\n+            input.witness_utxo = prevout;\n+        }\n+        // Not witness, put non witness utxo\n+        else {\n+            input.non_witness_utxo = wtx.tx;\n+        }\n+\n+        if (psbtx_blank) {\n+            // Add to inputs\n+            psbtx.inputs.push_back(input);\n+        }\n+    }",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169386999",
@@ -358,7 +358,7 @@
       "position" : 171,
       "pull_request_review_id" : 97902598,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169386999",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/5767891?v=4",
@@ -394,7 +394,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "Done.",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-20T23:08:12Z",
       "diff_hunk" : "@@ -3520,6 +3520,336 @@ UniValue rescanblockchain(const JSONRPCRequest& request)\n     return response;\n }\n \n+bool parse_hd_keypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            } else {\n+                return false;\n+            }\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= BIP32_HARDENED_KEY_LIMIT;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        for (auto& c : item) {\n+            if (!std::isdigit(c)) {\n+                return false;\n+            }\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void add_keypath_to_map(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    pwallet->GetPubKey(keyID, vchPubKey);\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    if (!meta.hdKeypath.empty()) {\n+        std::vector<uint32_t> keypath;\n+        if (!parse_hd_keypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hdMasterKeyID, key);\n+        CExtKey masterKey;\n+        masterKey.SetMaster(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), masterKey.key.GetPubKey().GetID().GetUint32(0));\n+        hd_keypaths.emplace(vchPubKey, keypath);\n+    }\n+}\n+\n+void fill_psbt(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst)\n+{\n+    // Get all of the previous transactions\n+    bool psbtx_blank = psbtx.IsNull();\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        CTxIn txin = txConst->vin[i];\n+        PartiallySignedInput input;\n+        if (!psbtx_blank) {\n+            input = psbtx.inputs.at(i);\n+        }\n+\n+        // If this input is not empty, skip it\n+        if (!psbtx_blank && (!input.IsNull() || txin.scriptSig.empty() || txin.scriptWitness.IsNull())) {\n+            continue;\n+        }\n+\n+        uint256 txhash = txin.prevout.hash;\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        if (!pwallet->mapWallet.count(txhash)) {\n+            if (psbtx_blank) {\n+                psbtx.inputs.push_back(input);\n+            }\n+            continue;\n+        }\n+        const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+        const CTransaction& ctx = *wtx.tx;\n+\n+        // Get scriptpubkey and check for redeemScript or witnessscript\n+        CTxOut prevout = ctx.vout[txin.prevout.n];\n+        txnouttype type;\n+        std::vector<std::vector<unsigned char>> solns;\n+        Solver(prevout.scriptPubKey, type, solns);\n+        // Get script hashes\n+        if (type == TX_SCRIPTHASH) {\n+            // get the hash and find it in the wallet.\n+            CScript redeem_script;\n+            uint160 hash(solns[0]);\n+            pwallet->GetCScript(CScriptID(hash), redeem_script);\n+\n+            // put redeem_script in map\n+            psbtx.redeem_scripts.emplace(hash, redeem_script);\n+\n+            // Now check whether the redeem_script is a witness script\n+            solns.clear();\n+            Solver(redeem_script, type, solns);\n+        }\n+        // Get witness scripts\n+        bool witness = false;\n+        if (type == TX_WITNESS_V0_SCRIPTHASH) {\n+            witness = true;\n+            // Get the hash from the solver return\n+            uint160 hash;\n+            CRIPEMD160().Write(&solns[0][0], solns[0].size()).Finalize(hash.begin());\n+\n+            // Lookup hash from wallet\n+            CScript witness_script;\n+            pwallet->GetCScript(CScriptID(hash), witness_script);\n+\n+            // Put witness script in map\n+            uint256 hash256(solns[0]);\n+            psbtx.witness_scripts.emplace(hash256, witness_script);\n+\n+            // Decode the witness script\n+            solns.clear();\n+            Solver(witness_script, type, solns);\n+        }\n+        // Get public keys if hd is enabled\n+        if (pwallet->IsHDEnabled()) {\n+            if (type == TX_PUBKEYHASH) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169490318",
@@ -406,7 +406,7 @@
       "position" : null,
       "pull_request_review_id" : 98024923,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169490318",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
@@ -471,7 +471,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "Done",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-20T23:49:08Z",
       "diff_hunk" : "@@ -3520,6 +3520,336 @@ UniValue rescanblockchain(const JSONRPCRequest& request)\n     return response;\n }\n \n+bool parse_hd_keypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            } else {\n+                return false;\n+            }\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= BIP32_HARDENED_KEY_LIMIT;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        for (auto& c : item) {\n+            if (!std::isdigit(c)) {\n+                return false;\n+            }\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void add_keypath_to_map(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    pwallet->GetPubKey(keyID, vchPubKey);\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    if (!meta.hdKeypath.empty()) {\n+        std::vector<uint32_t> keypath;\n+        if (!parse_hd_keypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hdMasterKeyID, key);\n+        CExtKey masterKey;\n+        masterKey.SetMaster(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), masterKey.key.GetPubKey().GetID().GetUint32(0));\n+        hd_keypaths.emplace(vchPubKey, keypath);\n+    }\n+}\n+\n+void fill_psbt(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst)\n+{\n+    // Get all of the previous transactions\n+    bool psbtx_blank = psbtx.IsNull();\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        CTxIn txin = txConst->vin[i];\n+        PartiallySignedInput input;\n+        if (!psbtx_blank) {\n+            input = psbtx.inputs.at(i);\n+        }\n+\n+        // If this input is not empty, skip it\n+        if (!psbtx_blank && (!input.IsNull() || txin.scriptSig.empty() || txin.scriptWitness.IsNull())) {\n+            continue;\n+        }\n+\n+        uint256 txhash = txin.prevout.hash;\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        if (!pwallet->mapWallet.count(txhash)) {\n+            if (psbtx_blank) {\n+                psbtx.inputs.push_back(input);\n+            }\n+            continue;\n+        }\n+        const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+        const CTransaction& ctx = *wtx.tx;\n+\n+        // Get scriptpubkey and check for redeemScript or witnessscript\n+        CTxOut prevout = ctx.vout[txin.prevout.n];\n+        txnouttype type;\n+        std::vector<std::vector<unsigned char>> solns;\n+        Solver(prevout.scriptPubKey, type, solns);\n+        // Get script hashes\n+        if (type == TX_SCRIPTHASH) {\n+            // get the hash and find it in the wallet.\n+            CScript redeem_script;\n+            uint160 hash(solns[0]);\n+            pwallet->GetCScript(CScriptID(hash), redeem_script);\n+\n+            // put redeem_script in map\n+            psbtx.redeem_scripts.emplace(hash, redeem_script);\n+\n+            // Now check whether the redeem_script is a witness script\n+            solns.clear();\n+            Solver(redeem_script, type, solns);\n+        }\n+        // Get witness scripts\n+        bool witness = false;\n+        if (type == TX_WITNESS_V0_SCRIPTHASH) {\n+            witness = true;\n+            // Get the hash from the solver return\n+            uint160 hash;\n+            CRIPEMD160().Write(&solns[0][0], solns[0].size()).Finalize(hash.begin());\n+\n+            // Lookup hash from wallet\n+            CScript witness_script;\n+            pwallet->GetCScript(CScriptID(hash), witness_script);\n+\n+            // Put witness script in map\n+            uint256 hash256(solns[0]);\n+            psbtx.witness_scripts.emplace(hash256, witness_script);\n+\n+            // Decode the witness script\n+            solns.clear();\n+            Solver(witness_script, type, solns);\n+        }\n+        // Get public keys if hd is enabled\n+        if (pwallet->IsHDEnabled()) {\n+            if (type == TX_PUBKEYHASH) {\n+                uint160 hash(solns[0]);\n+                CKeyID keyID(hash);\n+                add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+            } else if (type == TX_PUBKEY) {\n+                CPubKey vchPubKey(solns[0]);\n+                CKeyID keyID = vchPubKey.GetID();\n+                add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+            } else if (type == TX_MULTISIG) {\n+                for (auto& soln : solns) {\n+                    CPubKey vchPubKey(soln);\n+                    CKeyID keyID = vchPubKey.GetID();\n+                    add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+                }\n+            }\n+        }\n+\n+        // Put the witness utxo for witness outputs\n+        if (witness || type == TX_WITNESS_V0_KEYHASH || type == TX_WITNESS_V0_SCRIPTHASH || type == TX_WITNESS_UNKNOWN) {\n+            // Put the witness CTxOut in the input\n+            input.witness_utxo = prevout;\n+        }\n+        // Not witness, put non witness utxo\n+        else {\n+            input.non_witness_utxo = wtx.tx;\n+        }\n+\n+        if (psbtx_blank) {\n+            // Add to inputs\n+            psbtx.inputs.push_back(input);\n+        }\n+    }",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169497726",
@@ -483,7 +483,7 @@
       "position" : 171,
       "pull_request_review_id" : 98033441,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169497726",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
@@ -519,7 +519,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "I decided to make this an option instead of the default. I'll add tests for it later.",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-21T00:07:48Z",
       "diff_hunk" : "@@ -3520,6 +3520,336 @@ UniValue rescanblockchain(const JSONRPCRequest& request)\n     return response;\n }\n \n+bool parse_hd_keypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            } else {\n+                return false;\n+            }\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= BIP32_HARDENED_KEY_LIMIT;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        for (auto& c : item) {\n+            if (!std::isdigit(c)) {\n+                return false;\n+            }\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void add_keypath_to_map(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    pwallet->GetPubKey(keyID, vchPubKey);\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    if (!meta.hdKeypath.empty()) {\n+        std::vector<uint32_t> keypath;\n+        if (!parse_hd_keypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hdMasterKeyID, key);\n+        CExtKey masterKey;\n+        masterKey.SetMaster(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), masterKey.key.GetPubKey().GetID().GetUint32(0));\n+        hd_keypaths.emplace(vchPubKey, keypath);\n+    }\n+}\n+\n+void fill_psbt(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst)\n+{\n+    // Get all of the previous transactions\n+    bool psbtx_blank = psbtx.IsNull();\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        CTxIn txin = txConst->vin[i];\n+        PartiallySignedInput input;\n+        if (!psbtx_blank) {\n+            input = psbtx.inputs.at(i);\n+        }\n+\n+        // If this input is not empty, skip it\n+        if (!psbtx_blank && (!input.IsNull() || txin.scriptSig.empty() || txin.scriptWitness.IsNull())) {\n+            continue;\n+        }\n+\n+        uint256 txhash = txin.prevout.hash;\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        if (!pwallet->mapWallet.count(txhash)) {\n+            if (psbtx_blank) {\n+                psbtx.inputs.push_back(input);\n+            }\n+            continue;\n+        }\n+        const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+        const CTransaction& ctx = *wtx.tx;\n+\n+        // Get scriptpubkey and check for redeemScript or witnessscript\n+        CTxOut prevout = ctx.vout[txin.prevout.n];\n+        txnouttype type;\n+        std::vector<std::vector<unsigned char>> solns;\n+        Solver(prevout.scriptPubKey, type, solns);\n+        // Get script hashes\n+        if (type == TX_SCRIPTHASH) {\n+            // get the hash and find it in the wallet.\n+            CScript redeem_script;\n+            uint160 hash(solns[0]);\n+            pwallet->GetCScript(CScriptID(hash), redeem_script);\n+\n+            // put redeem_script in map\n+            psbtx.redeem_scripts.emplace(hash, redeem_script);\n+\n+            // Now check whether the redeem_script is a witness script\n+            solns.clear();\n+            Solver(redeem_script, type, solns);\n+        }\n+        // Get witness scripts\n+        bool witness = false;\n+        if (type == TX_WITNESS_V0_SCRIPTHASH) {\n+            witness = true;\n+            // Get the hash from the solver return\n+            uint160 hash;\n+            CRIPEMD160().Write(&solns[0][0], solns[0].size()).Finalize(hash.begin());\n+\n+            // Lookup hash from wallet\n+            CScript witness_script;\n+            pwallet->GetCScript(CScriptID(hash), witness_script);\n+\n+            // Put witness script in map\n+            uint256 hash256(solns[0]);\n+            psbtx.witness_scripts.emplace(hash256, witness_script);\n+\n+            // Decode the witness script\n+            solns.clear();\n+            Solver(witness_script, type, solns);\n+        }\n+        // Get public keys if hd is enabled\n+        if (pwallet->IsHDEnabled()) {\n+            if (type == TX_PUBKEYHASH) {\n+                uint160 hash(solns[0]);\n+                CKeyID keyID(hash);\n+                add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+            } else if (type == TX_PUBKEY) {\n+                CPubKey vchPubKey(solns[0]);\n+                CKeyID keyID = vchPubKey.GetID();\n+                add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+            } else if (type == TX_MULTISIG) {\n+                for (auto& soln : solns) {\n+                    CPubKey vchPubKey(soln);\n+                    CKeyID keyID = vchPubKey.GetID();\n+                    add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+                }\n+            }\n+        }\n+\n+        // Put the witness utxo for witness outputs\n+        if (witness || type == TX_WITNESS_V0_KEYHASH || type == TX_WITNESS_V0_SCRIPTHASH || type == TX_WITNESS_UNKNOWN) {\n+            // Put the witness CTxOut in the input\n+            input.witness_utxo = prevout;\n+        }\n+        // Not witness, put non witness utxo\n+        else {\n+            input.non_witness_utxo = wtx.tx;\n+        }\n+\n+        if (psbtx_blank) {\n+            // Add to inputs\n+            psbtx.inputs.push_back(input);\n+        }\n+    }",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169500813",
@@ -531,7 +531,7 @@
       "position" : 171,
       "pull_request_review_id" : 98037043,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169500813",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
@@ -567,7 +567,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "you need to edit number of allowed args, and include the optional one in parens above.",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-21T16:15:40Z",
       "diff_hunk" : "@@ -4082,6 +4163,8 @@ UniValue walletcreatepsbt(const JSONRPCRequest& request)\n                             \"using fundrawtransaction.\\n\"\n                             \"\\nArguments:\\n\"\n                             \"1. \\\"hexstring\\\"            (string, required) The hex string of the raw transaction\\n\"\n+                            \"2. \\\"include_output_info\\\"  (boolean, optional, default=false) If true, returns the PSBT with the redeem scripts, witness\\n\"",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169691012",
@@ -578,7 +578,7 @@
       "position" : null,
       "pull_request_review_id" : 98258245,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169691012",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/5767891?v=4",
@@ -614,7 +614,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "you also need to add it to the list of arguments that will be parsed as json rather than strings in `rpc/client.cpp`",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-21T16:18:33Z",
       "diff_hunk" : "@@ -4082,6 +4163,8 @@ UniValue walletcreatepsbt(const JSONRPCRequest& request)\n                             \"using fundrawtransaction.\\n\"\n                             \"\\nArguments:\\n\"\n                             \"1. \\\"hexstring\\\"            (string, required) The hex string of the raw transaction\\n\"\n+                            \"2. \\\"include_output_info\\\"  (boolean, optional, default=false) If true, returns the PSBT with the redeem scripts, witness\\n\"",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169692049",
@@ -626,7 +626,7 @@
       "position" : null,
       "pull_request_review_id" : 98258245,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169692049",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/5767891?v=4",
@@ -662,7 +662,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "What we really care about is that we have the hdkeypath, not particularly that the key is present or not. I don't think these `HaveKey` checks are necessary since `add_keypath_to_map` will deal with that case specifically.",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-21T16:25:29Z",
       "diff_hunk" : "@@ -3956,6 +3956,84 @@ void fill_psbt(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const\n             psbtx.inputs.push_back(input);\n         }\n     }\n+\n+    // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change\n+    if (include_output_info) {\n+        for (const CTxOut& out : txConst->vout) {\n+            // Get scriptpubkey and check for redeemScript or witnessscript\n+            txnouttype type;\n+            std::vector<std::vector<unsigned char>> solns;\n+            Solver(out.scriptPubKey, type, solns);\n+            // Get script hashes\n+            if (type == TX_SCRIPTHASH) {\n+                // get the hash and find it in the wallet.\n+                CScript redeem_script;\n+                uint160 hash(solns[0]);\n+                if (!pwallet->GetCScript(CScriptID(hash), redeem_script)) {\n+                    // We don't have this script, skip it\n+                    continue;\n+                }\n+\n+                // put redeem_script in map\n+                psbtx.redeem_scripts.emplace(hash, redeem_script);\n+\n+                // Now check whether the redeem_script is a witness script\n+                solns.clear();\n+                Solver(redeem_script, type, solns);\n+            }\n+            // Get witness scripts\n+            if (type == TX_WITNESS_V0_SCRIPTHASH) {\n+                // Get the hash from the solver return\n+                uint160 hash;\n+                CRIPEMD160().Write(&solns[0][0], solns[0].size()).Finalize(hash.begin());\n+\n+                // Lookup hash from wallet\n+                CScript witness_script;\n+                if (!pwallet->GetCScript(CScriptID(hash), witness_script)) {\n+                    // We don't have this script, skip it\n+                    continue;\n+                }\n+\n+                // Put witness script in map\n+                uint256 hash256(solns[0]);\n+                psbtx.witness_scripts.emplace(hash256, witness_script);\n+\n+                // Decode the witness script\n+                solns.clear();\n+                Solver(witness_script, type, solns);\n+            }\n+            // Get public keys if hd is enabled\n+            if (pwallet->IsHDEnabled()) {\n+                if (type == TX_PUBKEYHASH || type == TX_WITNESS_V0_KEYHASH) {\n+                    uint160 hash(solns[0]);\n+                    CKeyID keyID(hash);\n+                    if (!pwallet->HaveKey(keyID)) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169694684",
@@ -673,7 +673,7 @@
       "position" : null,
       "pull_request_review_id" : 98258245,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169694684",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/5767891?v=4",
@@ -709,7 +709,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "Right, fixed.",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-22T05:47:27Z",
       "diff_hunk" : "@@ -3956,6 +3956,84 @@ void fill_psbt(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const\n             psbtx.inputs.push_back(input);\n         }\n     }\n+\n+    // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change\n+    if (include_output_info) {\n+        for (const CTxOut& out : txConst->vout) {\n+            // Get scriptpubkey and check for redeemScript or witnessscript\n+            txnouttype type;\n+            std::vector<std::vector<unsigned char>> solns;\n+            Solver(out.scriptPubKey, type, solns);\n+            // Get script hashes\n+            if (type == TX_SCRIPTHASH) {\n+                // get the hash and find it in the wallet.\n+                CScript redeem_script;\n+                uint160 hash(solns[0]);\n+                if (!pwallet->GetCScript(CScriptID(hash), redeem_script)) {\n+                    // We don't have this script, skip it\n+                    continue;\n+                }\n+\n+                // put redeem_script in map\n+                psbtx.redeem_scripts.emplace(hash, redeem_script);\n+\n+                // Now check whether the redeem_script is a witness script\n+                solns.clear();\n+                Solver(redeem_script, type, solns);\n+            }\n+            // Get witness scripts\n+            if (type == TX_WITNESS_V0_SCRIPTHASH) {\n+                // Get the hash from the solver return\n+                uint160 hash;\n+                CRIPEMD160().Write(&solns[0][0], solns[0].size()).Finalize(hash.begin());\n+\n+                // Lookup hash from wallet\n+                CScript witness_script;\n+                if (!pwallet->GetCScript(CScriptID(hash), witness_script)) {\n+                    // We don't have this script, skip it\n+                    continue;\n+                }\n+\n+                // Put witness script in map\n+                uint256 hash256(solns[0]);\n+                psbtx.witness_scripts.emplace(hash256, witness_script);\n+\n+                // Decode the witness script\n+                solns.clear();\n+                Solver(witness_script, type, solns);\n+            }\n+            // Get public keys if hd is enabled\n+            if (pwallet->IsHDEnabled()) {\n+                if (type == TX_PUBKEYHASH || type == TX_WITNESS_V0_KEYHASH) {\n+                    uint160 hash(solns[0]);\n+                    CKeyID keyID(hash);\n+                    if (!pwallet->HaveKey(keyID)) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169860061",
@@ -721,7 +721,7 @@
       "position" : null,
       "pull_request_review_id" : 98453809,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169860061",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
@@ -757,7 +757,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "Dang, I knew I forgot something. Fixed.",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-22T05:47:35Z",
       "diff_hunk" : "@@ -4082,6 +4163,8 @@ UniValue walletcreatepsbt(const JSONRPCRequest& request)\n                             \"using fundrawtransaction.\\n\"\n                             \"\\nArguments:\\n\"\n                             \"1. \\\"hexstring\\\"            (string, required) The hex string of the raw transaction\\n\"\n+                            \"2. \\\"include_output_info\\\"  (boolean, optional, default=false) If true, returns the PSBT with the redeem scripts, witness\\n\"",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169860070",
@@ -769,7 +769,7 @@
       "position" : null,
       "pull_request_review_id" : 98453823,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169860070",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
@@ -805,7 +805,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "should be `1`",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-22T15:13:48Z",
       "diff_hunk" : "@@ -102,6 +102,8 @@ static const CRPCConvertParam vRPCConvertParams[] =\n     { \"fundrawtransaction\", 1, \"options\" },\n     { \"fundrawtransaction\", 2, \"iswitness\" },\n     { \"walletupdatepsbt\", 2, \"psbtformat\"},\n+    { \"walletupdatepsbt\", 3, \"include_output_info\"},\n+    { \"walletcreatepsbt\", 2, \"include_output_info\"},",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r169988690",
@@ -816,7 +816,7 @@
       "position" : null,
       "pull_request_review_id" : 98600585,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/169988690",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/5767891?v=4",
@@ -852,7 +852,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "fixed",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-02-22T15:58:29Z",
       "diff_hunk" : "@@ -102,6 +102,8 @@ static const CRPCConvertParam vRPCConvertParams[] =\n     { \"fundrawtransaction\", 1, \"options\" },\n     { \"fundrawtransaction\", 2, \"iswitness\" },\n     { \"walletupdatepsbt\", 2, \"psbtformat\"},\n+    { \"walletupdatepsbt\", 3, \"include_output_info\"},\n+    { \"walletcreatepsbt\", 2, \"include_output_info\"},",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r170004555",
@@ -864,7 +864,7 @@
       "position" : null,
       "pull_request_review_id" : 98620692,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:35Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/170004555",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
@@ -958,7 +958,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "Changed to `SignPartiallySignedTransaction`",
-      "commit_id" : "6f16068d9e0c1d5b7ce9ba5f7e4f605ac0b94c33",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
       "created_at" : "2018-04-05T20:37:55Z",
       "diff_hunk" : "@@ -302,6 +381,218 @@ struct Stacks\n };\n }\n \n+// Iterates through all inputs of the partially signed transaction and just produces signatures for what it can and adds them to the psbt partial sigs\n+bool SignPartialTransaction(PartiallySignedTransaction& psbt, const CKeyStore* keystore, int nHashType)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r179593431",
@@ -970,7 +970,7 @@
       "position" : null,
       "pull_request_review_id" : 109868427,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
-      "updated_at" : "2018-04-05T20:37:55Z",
+      "updated_at" : "2018-04-26T23:16:37Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/179593431",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
@@ -1048,6 +1048,899 @@
          "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184557822"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184557822"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nThis constructor can take const reference arguments.",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-26T23:25:07Z",
+      "diff_hunk" : "@@ -441,3 +441,60 @@ bool IsSolvable(const SigningProvider& provider, const CScript& script)\n     }\n     return false;\n }\n+\n+PartiallySignedTransaction::PartiallySignedTransaction() : tx(), redeem_scripts(), witness_scripts(), inputs() {}\n+PartiallySignedTransaction::PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184557822",
+      "id" : 184557822,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 6,
+      "path" : "src/script/sign.cpp",
+      "position" : null,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184557822",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184557916"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184557916"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nNit: method naming convention",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-26T23:25:30Z",
+      "diff_hunk" : "@@ -441,3 +441,60 @@ bool IsSolvable(const SigningProvider& provider, const CScript& script)\n     }\n     return false;\n }\n+\n+PartiallySignedTransaction::PartiallySignedTransaction() : tx(), redeem_scripts(), witness_scripts(), inputs() {}\n+PartiallySignedTransaction::PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs)\n+{\n+    this->tx = tx;\n+    this->redeem_scripts = redeem_scripts;\n+    this->witness_scripts = witness_scripts;\n+    this->inputs = inputs;\n+\n+    sanitize_for_serialization();\n+}\n+\n+void PartiallySignedTransaction::sanitize_for_serialization()",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184557916",
+      "id" : 184557916,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 16,
+      "path" : "src/script/sign.cpp",
+      "position" : 363,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184557916",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184558052"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184558052"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nNit: `else` on the same line as `}` (and elsewhere).",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-26T23:26:27Z",
+      "diff_hunk" : "@@ -441,3 +441,60 @@ bool IsSolvable(const SigningProvider& provider, const CScript& script)\n     }\n     return false;\n }\n+\n+PartiallySignedTransaction::PartiallySignedTransaction() : tx(), redeem_scripts(), witness_scripts(), inputs() {}\n+PartiallySignedTransaction::PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs)\n+{\n+    this->tx = tx;\n+    this->redeem_scripts = redeem_scripts;\n+    this->witness_scripts = witness_scripts;\n+    this->inputs = inputs;\n+\n+    sanitize_for_serialization();\n+}\n+\n+void PartiallySignedTransaction::sanitize_for_serialization()\n+{\n+    // Remove sigs from inputs\n+    for (unsigned int i = 0; i < tx.vin.size(); i++) {\n+        CTxIn& in = tx.vin[i];\n+        PartiallySignedInput psbt_in = inputs[i];\n+        CTxOut vout;\n+        if (psbt_in.non_witness_utxo) {\n+            vout = psbt_in.non_witness_utxo->vout[in.prevout.n];\n+        }\n+        else if (!psbt_in.witness_utxo.IsNull()) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184558052",
+      "id" : 184558052,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 26,
+      "path" : "src/script/sign.cpp",
+      "position" : 373,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184558052",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184558399"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184558399"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nYou can avoid making a copy here (use a const reference instead).",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-26T23:28:53Z",
+      "diff_hunk" : "@@ -441,3 +441,60 @@ bool IsSolvable(const SigningProvider& provider, const CScript& script)\n     }\n     return false;\n }\n+\n+PartiallySignedTransaction::PartiallySignedTransaction() : tx(), redeem_scripts(), witness_scripts(), inputs() {}\n+PartiallySignedTransaction::PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs)\n+{\n+    this->tx = tx;\n+    this->redeem_scripts = redeem_scripts;\n+    this->witness_scripts = witness_scripts;\n+    this->inputs = inputs;\n+\n+    sanitize_for_serialization();\n+}\n+\n+void PartiallySignedTransaction::sanitize_for_serialization()\n+{\n+    // Remove sigs from inputs\n+    for (unsigned int i = 0; i < tx.vin.size(); i++) {\n+        CTxIn& in = tx.vin[i];\n+        PartiallySignedInput psbt_in = inputs[i];",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184558399",
+      "id" : 184558399,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 21,
+      "path" : "src/script/sign.cpp",
+      "position" : 368,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184558399",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184558613"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184558613"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nThese can be marked `constexpr` instead.",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-26T23:30:15Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184558613",
+      "id" : 184558613,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 7,
+      "path" : "src/script/sign.h",
+      "position" : 18,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184558613",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184559298"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184559298"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "Using `std::move(key)` and `std::move(val_bytes)` here and below will avoid copies.",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-26T23:34:59Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}\n+    void SetNull();\n+    bool IsNull();\n+};\n+\n+/** A version of CTransaction with the PSBT format*/\n+struct PartiallySignedTransaction\n+{\n+    CMutableTransaction tx;\n+    std::map<uint160, CScript> redeem_scripts;\n+    std::map<uint256, CScript> witness_scripts;\n+    std::vector<PartiallySignedInput> inputs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    std::map<CPubKey, std::vector<uint32_t>> hd_keypaths;\n+    uint64_t num_ins = 0;\n+    bool use_in_index = false;\n+\n+    PartiallySignedTransaction();\n+    PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs);\n+\n+    template <typename Stream>\n+    inline void Serialize(Stream& s) const {\n+\n+        // magic bytes\n+        s << PSBT_MAGIC_BYTES << (char)0xff; // psbt 0xff\n+\n+        // Write transaction if it exists\n+        if (!CTransaction(tx).IsNull()) {\n+            // unsigned tx flag\n+            WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+            s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+\n+            // Write serialized tx to a stream\n+            WriteCompactSize(s, ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION));\n+            s << tx;\n+        }\n+\n+        // Write redeem scripts and witness scripts\n+        for (auto& entry : redeem_scripts) {\n+            s << SerializeToVector(PSBT_REDEEMSCRIPT_WITNESS_UTXO, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        for (auto& entry : witness_scripts) {\n+            s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        // Write any hd keypaths\n+        for (auto keypath_pair : hd_keypaths) {\n+            s << SerializeToVector(PSBT_BIP32_KEYPATH_SIGHASH, Span<const unsigned char>(keypath_pair.first.begin(), keypath_pair.first.size()));\n+            WriteCompactSize(s, keypath_pair.second.size() * sizeof(uint32_t));\n+            for (auto& key : keypath_pair.second) {\n+                s << key;\n+            }\n+        }\n+\n+        // Write the number of inputs\n+        if (num_ins > 0) {\n+            s << PSBT_NUM_IN_VIN;\n+            WriteCompactSize(s, num_ins);\n+        }\n+\n+        // Write the unknown things\n+        for(auto& entry : unknown) {\n+            s << entry.first;\n+            s << entry.second;\n+        }\n+\n+        // Separator\n+        s << PSBT_SEPARATOR;\n+\n+        for (unsigned int i = 0; i < tx.vin.size(); i++) {\n+            CTxIn in = tx.vin[i];\n+            PartiallySignedInput psbt_in = inputs[i];\n+            if (in.scriptSig.empty() && in.scriptWitness.IsNull()) {\n+                // Write the utxo\n+                // If there is a non-witness utxo, then don't add the witness one.\n+                if (psbt_in.non_witness_utxo) {\n+                    WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+                    s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+                    WriteCompactSize(s, ::GetSerializeSize(psbt_in.non_witness_utxo, SER_NETWORK, PROTOCOL_VERSION));\n+                    s << psbt_in.non_witness_utxo;\n+                } else if (!psbt_in.witness_utxo.IsNull()) {\n+                    WriteCompactSize(s, sizeof(PSBT_REDEEMSCRIPT_WITNESS_UTXO));\n+                    s << PSBT_REDEEMSCRIPT_WITNESS_UTXO;\n+                    WriteCompactSize(s, ::GetSerializeSize(psbt_in.witness_utxo, SER_NETWORK, PROTOCOL_VERSION));\n+                    s << psbt_in.witness_utxo;\n+                }\n+\n+                // Write any partial signatures\n+                for (auto sig_pair : psbt_in.partial_sigs) {\n+                    s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, Span<const unsigned char>(sig_pair.first.begin(), sig_pair.first.size()));\n+                    WriteCompactSize(s, sig_pair.second.size());\n+                    s << MakeSpan(sig_pair.second);\n+                }\n+\n+                // Write the sighash type\n+                if (psbt_in.sighash_type > 0) {\n+                    WriteCompactSize(s, sizeof(PSBT_BIP32_KEYPATH_SIGHASH));\n+                    s << PSBT_BIP32_KEYPATH_SIGHASH;\n+                    WriteCompactSize(s, sizeof(psbt_in.sighash_type));\n+                    s << psbt_in.sighash_type;\n+                }\n+\n+                // Write the index\n+                if (use_in_index) {\n+                    WriteCompactSize(s, sizeof(PSBT_NUM_IN_VIN));\n+                    s << PSBT_NUM_IN_VIN;\n+                    WriteCompactSize(s, sizeof(psbt_in.index));\n+                    s << psbt_in.index;\n+                }\n+            }\n+\n+            // Write unknown things\n+            for(auto& entry : psbt_in.unknown) {\n+                s << entry.first;\n+                s << entry.second;\n+            }\n+\n+            s << PSBT_SEPARATOR;\n+        }\n+    }\n+\n+\n+    template <typename Stream>\n+    inline void Unserialize(Stream& s) {\n+        // Read the magic bytes\n+        int magic;\n+        s >> magic;\n+        if (magic != PSBT_MAGIC_BYTES) {\n+            throw std::ios_base::failure(\"Invalid PSBT magic bytes\");\n+        }\n+        unsigned char magic_sep;\n+        s >> magic_sep;\n+\n+        // hashers\n+        CHash160 hash160_hasher;\n+        CSHA256 sha256_hasher;\n+\n+        // Read loop\n+        uint32_t separators = 0;\n+        PartiallySignedInput input;\n+        input.index = 0; // Make the first input at index 0\n+        bool in_globals = true;\n+        while(!s.empty()) {\n+            // Reset hashers\n+            hash160_hasher.Reset();\n+            sha256_hasher.Reset();\n+\n+            // read size of key\n+            uint64_t key_len = ReadCompactSize(s);\n+\n+            // the key length is 0 if that was actually a separator byte\n+            // This is a special case for key lengths 0 as those are not allowed (except for separator)\n+            if (key_len == 0) {\n+\n+                // If we ever hit a separator, we are no longer in globals\n+                in_globals = false;\n+\n+                if (separators > 0) {\n+                    // Make sure this input has an index of indexes are being used\n+                    if (!use_in_index && !input.use_in_index) {\n+                        throw std::ios_base::failure(\"Input indexes being used but an input was provided without an index\");\n+                    }\n+\n+                    // Add input to vector\n+                    inputs.push_back(input);\n+                    input.SetNull();\n+                    input.index = separators - 1; // Set the inputs index. This will be overwritten if an index is provided.\n+                }\n+\n+                ++separators;\n+\n+                // Make sure that the number of separators - 1 matches the number of inputs if the stream is going to be empty\n+                if (s.empty() && separators - 1 == num_ins) {\n+                    throw std::ios_base::failure(\"Inputs provided does not match the number of inputs stated.\");\n+                }\n+\n+                continue;\n+            }\n+\n+            // Read key\n+            std::vector<unsigned char> key;\n+            key.resize(key_len);\n+            Span<unsigned char> key_data = MakeSpan(key);\n+            s >> key_data;\n+\n+            // First byte of key is the type\n+            unsigned char type = key[0];\n+\n+            // Read in value length\n+            uint64_t value_len = ReadCompactSize(s);\n+\n+            // Do stuff based on type\n+            switch(type)\n+            {\n+                // Raw transaction or a non witness utxo\n+                case PSBT_UNSIGNED_TX_NON_WITNESS_UTXO:\n+                    if (in_globals) {\n+                        s >> tx;\n+                    } else {\n+                        // Read in the transaction\n+                        CMutableTransaction mtx;\n+                        s >> mtx;\n+                        CTransaction prev_tx(mtx);\n+\n+                        // Check that this utxo matches this input\n+                        if (tx.vin[input.index].prevout.hash.Compare(prev_tx.GetHash()) != 0) {\n+                            throw std::ios_base::failure(\"Provided non witness utxo does not match the required utxo for input\");\n+                        }\n+\n+                        // Add to input\n+                        input.non_witness_utxo = MakeTransactionRef(prev_tx);\n+                    }\n+                    break;\n+                // redeemscript or a witness utxo\n+                case PSBT_REDEEMSCRIPT_WITNESS_UTXO:\n+                    if (in_globals) {\n+                        // Retrieve hash160 from key\n+                        uint160 hash160(std::vector<unsigned char>(key.begin() + 1, key.end()));\n+\n+                        // Read in the redeemscript\n+                        std::vector<unsigned char> redeemscript_bytes;\n+                        redeemscript_bytes.resize(value_len);\n+                        Span<unsigned char> redeemscript_data = MakeSpan(redeemscript_bytes);\n+                        s >> redeemscript_data;\n+                        CScript redeemscript(redeemscript_bytes.begin(), redeemscript_bytes.end());\n+\n+                        // Check that the redeemscript hash160 matches the one provided\n+                        hash160_hasher.Write(&redeemscript_bytes[0], redeemscript_bytes.size());\n+                        unsigned char rs_hash160_data[hash160_hasher.OUTPUT_SIZE];\n+                        hash160_hasher.Finalize(rs_hash160_data);\n+                        uint160 rs_hash160(std::vector<unsigned char>(rs_hash160_data, rs_hash160_data + hash160_hasher.OUTPUT_SIZE));\n+                        if (hash160.Compare(rs_hash160) != 0) {\n+                            throw std::ios_base::failure(\"Provided hash160 does not match the redeemscript's hash160\");\n+                        }\n+\n+                        // Add to map\n+                        redeem_scripts.emplace(hash160, redeemscript);\n+                    } else {\n+                        // Read in the utxo\n+                        CTxOut vout;\n+                        s >> vout;\n+\n+                        // Add to map\n+                        input.witness_utxo = vout;\n+                    }\n+                    break;\n+                // witnessscript or a partial signature\n+                case PSBT_WITNESSSCRIPT_PARTIAL_SIG:\n+                    if (in_globals) {\n+                        // Retrieve sha256 from key\n+                        uint256 hash(std::vector<unsigned char>(key.begin() + 1, key.end()));\n+\n+                        // Read in the redeemscript\n+                        std::vector<unsigned char> witnessscript_bytes;\n+                        witnessscript_bytes.resize(value_len);\n+                        Span<unsigned char> witnessscript_data = MakeSpan(witnessscript_bytes);\n+                        s >> witnessscript_data;\n+                        CScript witnessscript(witnessscript_bytes.begin(), witnessscript_bytes.end());\n+\n+                        // Check that the witnessscript sha256 matches the one provided\n+                        sha256_hasher.Write(&witnessscript_bytes[0], witnessscript_bytes.size());\n+                        unsigned char ws_sha256_data[sha256_hasher.OUTPUT_SIZE];\n+                        sha256_hasher.Finalize(ws_sha256_data);\n+                        uint256 ws_sha256(std::vector<unsigned char>(ws_sha256_data, ws_sha256_data + sha256_hasher.OUTPUT_SIZE));\n+                        if (hash.Compare(ws_sha256) != 0) {\n+                            throw std::ios_base::failure(\"Provided sha256 does not match the witnessscript's sha256\");\n+                        }\n+\n+                        // Add to map\n+                        witness_scripts.emplace(hash, witnessscript);\n+                    } else {\n+                        // Read in the pubkey from key\n+                        CPubKey pubkey(key.begin() + 1, key.end());\n+\n+                        // Read in the signature from value\n+                        std::vector<unsigned char> sig;\n+                        sig.resize(value_len);\n+                        Span<unsigned char> sig_data = MakeSpan(sig);\n+                        s >> sig_data;\n+\n+                        // Add to list\n+                        input.partial_sigs.emplace(pubkey, sig);\n+                    }\n+                    break;\n+                // BIP 32 HD Keypaths and sighash types\n+                case PSBT_BIP32_KEYPATH_SIGHASH:\n+                {\n+                    if (in_globals) {\n+                        // Read in the pubkey from key\n+                        CPubKey pubkey(key.begin() + 1, key.end());\n+\n+                        // Read in key path\n+                        std::vector<uint32_t> keypath;\n+                        for (unsigned int i = 0; i < value_len; i += sizeof(uint32_t)) {\n+                            uint32_t index;\n+                            s >> index;\n+                            keypath.push_back(index);\n+                        }\n+\n+                        // Add to map\n+                        hd_keypaths.emplace(pubkey, keypath);\n+                    } else {\n+                        // Read in the sighash type\n+                        s >> input.sighash_type;\n+                    }\n+                    break;\n+                }\n+                // Number of inputs and input index\n+                case PSBT_NUM_IN_VIN:\n+                {\n+                    if (in_globals) {\n+                        num_ins = ReadCompactSize(s);\n+                    } else {\n+                        // Make sure that we are using inout indexes or this is the first input\n+                        if (!use_in_index && separators != 1) {\n+                            throw std::ios_base::failure(\"Input indexes being used but an input does not provide its index\");\n+                        }\n+\n+                        s >> input.index;\n+                        use_in_index = true;\n+                        input.use_in_index = true;\n+                    }\n+                }\n+                // Unknown stuff\n+                default:\n+                    // Read in the value\n+                    std::vector<unsigned char> val_bytes;\n+                    val_bytes.resize(value_len);\n+                    Span<unsigned char> value = MakeSpan(val_bytes);\n+                    s >> value;\n+\n+                    // global data\n+                    if (in_globals) {\n+                        unknown.emplace(key, val_bytes);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184559298",
+      "id" : 184559298,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 374,
+      "path" : "src/script/sign.h",
+      "position" : 415,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184559298",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184782824"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184782824"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nI don't think any of these constructor initializers are necessary (the default constructor will do the same).",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:16:10Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184782824",
+      "id" : 184782824,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 38,
+      "path" : "src/script/sign.h",
+      "position" : 49,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184782824",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184782858"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184782858"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nSpecify an initializer for index?",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:16:21Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184782858",
+      "id" : 184782858,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 35,
+      "path" : "src/script/sign.h",
+      "position" : 46,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184782858",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184783148"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184783148"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nThese initializers are not necessary (they just invoke the default constructor).",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:17:47Z",
+      "diff_hunk" : "@@ -441,3 +441,60 @@ bool IsSolvable(const SigningProvider& provider, const CScript& script)\n     }\n     return false;\n }\n+\n+PartiallySignedTransaction::PartiallySignedTransaction() : tx(), redeem_scripts(), witness_scripts(), inputs() {}",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184783148",
+      "id" : 184783148,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 5,
+      "path" : "src/script/sign.cpp",
+      "position" : null,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184783148",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184783552"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184783552"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nYou can use `non_witness_utxo.reset();` here.",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:19:44Z",
+      "diff_hunk" : "@@ -441,3 +441,60 @@ bool IsSolvable(const SigningProvider& provider, const CScript& script)\n     }\n     return false;\n }\n+\n+PartiallySignedTransaction::PartiallySignedTransaction() : tx(), redeem_scripts(), witness_scripts(), inputs() {}\n+PartiallySignedTransaction::PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs)\n+{\n+    this->tx = tx;\n+    this->redeem_scripts = redeem_scripts;\n+    this->witness_scripts = witness_scripts;\n+    this->inputs = inputs;\n+\n+    sanitize_for_serialization();\n+}\n+\n+void PartiallySignedTransaction::sanitize_for_serialization()\n+{\n+    // Remove sigs from inputs\n+    for (unsigned int i = 0; i < tx.vin.size(); i++) {\n+        CTxIn& in = tx.vin[i];\n+        PartiallySignedInput psbt_in = inputs[i];\n+        CTxOut vout;\n+        if (psbt_in.non_witness_utxo) {\n+            vout = psbt_in.non_witness_utxo->vout[in.prevout.n];\n+        }\n+        else if (!psbt_in.witness_utxo.IsNull()) {\n+            vout = psbt_in.witness_utxo;\n+        }\n+        else {\n+            // There is no input here, skip\n+            continue;\n+        }\n+\n+        // Check the input for sigs. Remove partial sigs. Assume that they are already in partial_sigs\n+        ScriptError serror = SCRIPT_ERR_OK;\n+        const CAmount& amount = vout.nValue;\n+        const CTransaction const_tx(tx);\n+        if (!VerifyScript(in.scriptSig, vout.scriptPubKey, &in.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&const_tx, i, amount), &serror)) {\n+            in.scriptSig.clear();\n+            in.scriptWitness.SetNull();\n+        }\n+        // If this passes, then remove all input data for this input\n+        else {\n+            inputs[i].SetNull();\n+        }\n+    }\n+}\n+\n+void PartiallySignedInput::SetNull()\n+{\n+    non_witness_utxo = CTransactionRef();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184783552",
+      "id" : 184783552,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 51,
+      "path" : "src/script/sign.cpp",
+      "position" : 412,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184783552",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184784166"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184784166"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nYou can replace this line + the next with `s << entry.second` (the default serializer for `CScript` uses length prefixing).",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:22:00Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}\n+    void SetNull();\n+    bool IsNull();\n+};\n+\n+/** A version of CTransaction with the PSBT format*/\n+struct PartiallySignedTransaction\n+{\n+    CMutableTransaction tx;\n+    std::map<uint160, CScript> redeem_scripts;\n+    std::map<uint256, CScript> witness_scripts;\n+    std::vector<PartiallySignedInput> inputs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    std::map<CPubKey, std::vector<uint32_t>> hd_keypaths;\n+    uint64_t num_ins = 0;\n+    bool use_in_index = false;\n+\n+    PartiallySignedTransaction();\n+    PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs);\n+\n+    template <typename Stream>\n+    inline void Serialize(Stream& s) const {\n+\n+        // magic bytes\n+        s << PSBT_MAGIC_BYTES << (char)0xff; // psbt 0xff\n+\n+        // Write transaction if it exists\n+        if (!CTransaction(tx).IsNull()) {\n+            // unsigned tx flag\n+            WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+            s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+\n+            // Write serialized tx to a stream\n+            WriteCompactSize(s, ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION));\n+            s << tx;\n+        }\n+\n+        // Write redeem scripts and witness scripts\n+        for (auto& entry : redeem_scripts) {\n+            s << SerializeToVector(PSBT_REDEEMSCRIPT_WITNESS_UTXO, entry.first);\n+            WriteCompactSize(s, entry.second.size());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184784166",
+      "id" : 184784166,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 78,
+      "path" : "src/script/sign.h",
+      "position" : 116,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184784166",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184784273"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184784273"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nLikewise, replace this line and the next with `s << entry.second`.",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:22:32Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}\n+    void SetNull();\n+    bool IsNull();\n+};\n+\n+/** A version of CTransaction with the PSBT format*/\n+struct PartiallySignedTransaction\n+{\n+    CMutableTransaction tx;\n+    std::map<uint160, CScript> redeem_scripts;\n+    std::map<uint256, CScript> witness_scripts;\n+    std::vector<PartiallySignedInput> inputs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    std::map<CPubKey, std::vector<uint32_t>> hd_keypaths;\n+    uint64_t num_ins = 0;\n+    bool use_in_index = false;\n+\n+    PartiallySignedTransaction();\n+    PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs);\n+\n+    template <typename Stream>\n+    inline void Serialize(Stream& s) const {\n+\n+        // magic bytes\n+        s << PSBT_MAGIC_BYTES << (char)0xff; // psbt 0xff\n+\n+        // Write transaction if it exists\n+        if (!CTransaction(tx).IsNull()) {\n+            // unsigned tx flag\n+            WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+            s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+\n+            // Write serialized tx to a stream\n+            WriteCompactSize(s, ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION));\n+            s << tx;\n+        }\n+\n+        // Write redeem scripts and witness scripts\n+        for (auto& entry : redeem_scripts) {\n+            s << SerializeToVector(PSBT_REDEEMSCRIPT_WITNESS_UTXO, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        for (auto& entry : witness_scripts) {\n+            s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, entry.first);\n+            WriteCompactSize(s, entry.second.size());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184784273",
+      "id" : 184784273,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 83,
+      "path" : "src/script/sign.h",
+      "position" : 121,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184784273",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184784933"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184784933"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nReplace this line and the line below with `s << keypath_pair.second;`.",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:25:33Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}\n+    void SetNull();\n+    bool IsNull();\n+};\n+\n+/** A version of CTransaction with the PSBT format*/\n+struct PartiallySignedTransaction\n+{\n+    CMutableTransaction tx;\n+    std::map<uint160, CScript> redeem_scripts;\n+    std::map<uint256, CScript> witness_scripts;\n+    std::vector<PartiallySignedInput> inputs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    std::map<CPubKey, std::vector<uint32_t>> hd_keypaths;\n+    uint64_t num_ins = 0;\n+    bool use_in_index = false;\n+\n+    PartiallySignedTransaction();\n+    PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs);\n+\n+    template <typename Stream>\n+    inline void Serialize(Stream& s) const {\n+\n+        // magic bytes\n+        s << PSBT_MAGIC_BYTES << (char)0xff; // psbt 0xff\n+\n+        // Write transaction if it exists\n+        if (!CTransaction(tx).IsNull()) {\n+            // unsigned tx flag\n+            WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+            s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+\n+            // Write serialized tx to a stream\n+            WriteCompactSize(s, ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION));\n+            s << tx;\n+        }\n+\n+        // Write redeem scripts and witness scripts\n+        for (auto& entry : redeem_scripts) {\n+            s << SerializeToVector(PSBT_REDEEMSCRIPT_WITNESS_UTXO, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        for (auto& entry : witness_scripts) {\n+            s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        // Write any hd keypaths\n+        for (auto keypath_pair : hd_keypaths) {\n+            s << SerializeToVector(PSBT_BIP32_KEYPATH_SIGHASH, Span<const unsigned char>(keypath_pair.first.begin(), keypath_pair.first.size()));\n+            WriteCompactSize(s, keypath_pair.second.size() * sizeof(uint32_t));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184784933",
+      "id" : 184784933,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 89,
+      "path" : "src/script/sign.h",
+      "position" : 127,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184784933",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184786509"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184786509"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nThis record does not follow the keylen-key-valuelen-value format, and thus wouldn't be parseable by software that doesn't know about it.\r\n\r\nAlso, BIP174 question - why is this record necessary? It should be implied by `tx.vin.size()`.",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:32:51Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}\n+    void SetNull();\n+    bool IsNull();\n+};\n+\n+/** A version of CTransaction with the PSBT format*/\n+struct PartiallySignedTransaction\n+{\n+    CMutableTransaction tx;\n+    std::map<uint160, CScript> redeem_scripts;\n+    std::map<uint256, CScript> witness_scripts;\n+    std::vector<PartiallySignedInput> inputs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    std::map<CPubKey, std::vector<uint32_t>> hd_keypaths;\n+    uint64_t num_ins = 0;\n+    bool use_in_index = false;\n+\n+    PartiallySignedTransaction();\n+    PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs);\n+\n+    template <typename Stream>\n+    inline void Serialize(Stream& s) const {\n+\n+        // magic bytes\n+        s << PSBT_MAGIC_BYTES << (char)0xff; // psbt 0xff\n+\n+        // Write transaction if it exists\n+        if (!CTransaction(tx).IsNull()) {\n+            // unsigned tx flag\n+            WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+            s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+\n+            // Write serialized tx to a stream\n+            WriteCompactSize(s, ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION));\n+            s << tx;\n+        }\n+\n+        // Write redeem scripts and witness scripts\n+        for (auto& entry : redeem_scripts) {\n+            s << SerializeToVector(PSBT_REDEEMSCRIPT_WITNESS_UTXO, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        for (auto& entry : witness_scripts) {\n+            s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        // Write any hd keypaths\n+        for (auto keypath_pair : hd_keypaths) {\n+            s << SerializeToVector(PSBT_BIP32_KEYPATH_SIGHASH, Span<const unsigned char>(keypath_pair.first.begin(), keypath_pair.first.size()));\n+            WriteCompactSize(s, keypath_pair.second.size() * sizeof(uint32_t));\n+            for (auto& key : keypath_pair.second) {\n+                s << key;\n+            }\n+        }\n+\n+        // Write the number of inputs\n+        if (num_ins > 0) {\n+            s << PSBT_NUM_IN_VIN;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184786509",
+      "id" : 184786509,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 97,
+      "path" : "src/script/sign.h",
+      "position" : 135,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184786509",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184789102"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184789102"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nThis line and the next write the index as a 4-byte uint32, not a compact size as described by BIP174.\r\n\r\nThe correct way to follow the BIP would be to first write the size of the compactsize-encoded input index in compactsize encoding, and then the compactsize encoding of the input. This is a lot easier if you'd have a single-argument `SerializeToVector` first (see above).\r\n\r\nAlso, this record requires 4 bytes (for smallish transactions), while a separator is only 1. It's only advantageous to write it everywhere (as opposed to having separators for already-signed inputs) if over 75% of the inputs are already signed. Perhaps it's generally better to use the separator approach instead?\r\n",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:45:13Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}\n+    void SetNull();\n+    bool IsNull();\n+};\n+\n+/** A version of CTransaction with the PSBT format*/\n+struct PartiallySignedTransaction\n+{\n+    CMutableTransaction tx;\n+    std::map<uint160, CScript> redeem_scripts;\n+    std::map<uint256, CScript> witness_scripts;\n+    std::vector<PartiallySignedInput> inputs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    std::map<CPubKey, std::vector<uint32_t>> hd_keypaths;\n+    uint64_t num_ins = 0;\n+    bool use_in_index = false;\n+\n+    PartiallySignedTransaction();\n+    PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs);\n+\n+    template <typename Stream>\n+    inline void Serialize(Stream& s) const {\n+\n+        // magic bytes\n+        s << PSBT_MAGIC_BYTES << (char)0xff; // psbt 0xff\n+\n+        // Write transaction if it exists\n+        if (!CTransaction(tx).IsNull()) {\n+            // unsigned tx flag\n+            WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+            s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+\n+            // Write serialized tx to a stream\n+            WriteCompactSize(s, ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION));\n+            s << tx;\n+        }\n+\n+        // Write redeem scripts and witness scripts\n+        for (auto& entry : redeem_scripts) {\n+            s << SerializeToVector(PSBT_REDEEMSCRIPT_WITNESS_UTXO, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        for (auto& entry : witness_scripts) {\n+            s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        // Write any hd keypaths\n+        for (auto keypath_pair : hd_keypaths) {\n+            s << SerializeToVector(PSBT_BIP32_KEYPATH_SIGHASH, Span<const unsigned char>(keypath_pair.first.begin(), keypath_pair.first.size()));\n+            WriteCompactSize(s, keypath_pair.second.size() * sizeof(uint32_t));\n+            for (auto& key : keypath_pair.second) {\n+                s << key;\n+            }\n+        }\n+\n+        // Write the number of inputs\n+        if (num_ins > 0) {\n+            s << PSBT_NUM_IN_VIN;\n+            WriteCompactSize(s, num_ins);\n+        }\n+\n+        // Write the unknown things\n+        for(auto& entry : unknown) {\n+            s << entry.first;\n+            s << entry.second;\n+        }\n+\n+        // Separator\n+        s << PSBT_SEPARATOR;\n+\n+        for (unsigned int i = 0; i < tx.vin.size(); i++) {\n+            CTxIn in = tx.vin[i];\n+            PartiallySignedInput psbt_in = inputs[i];\n+            if (in.scriptSig.empty() && in.scriptWitness.IsNull()) {\n+                // Write the utxo\n+                // If there is a non-witness utxo, then don't add the witness one.\n+                if (psbt_in.non_witness_utxo) {\n+                    WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+                    s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+                    WriteCompactSize(s, ::GetSerializeSize(psbt_in.non_witness_utxo, SER_NETWORK, PROTOCOL_VERSION));\n+                    s << psbt_in.non_witness_utxo;\n+                } else if (!psbt_in.witness_utxo.IsNull()) {\n+                    WriteCompactSize(s, sizeof(PSBT_REDEEMSCRIPT_WITNESS_UTXO));\n+                    s << PSBT_REDEEMSCRIPT_WITNESS_UTXO;\n+                    WriteCompactSize(s, ::GetSerializeSize(psbt_in.witness_utxo, SER_NETWORK, PROTOCOL_VERSION));\n+                    s << psbt_in.witness_utxo;\n+                }\n+\n+                // Write any partial signatures\n+                for (auto sig_pair : psbt_in.partial_sigs) {\n+                    s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, Span<const unsigned char>(sig_pair.first.begin(), sig_pair.first.size()));\n+                    WriteCompactSize(s, sig_pair.second.size());\n+                    s << MakeSpan(sig_pair.second);\n+                }\n+\n+                // Write the sighash type\n+                if (psbt_in.sighash_type > 0) {\n+                    WriteCompactSize(s, sizeof(PSBT_BIP32_KEYPATH_SIGHASH));\n+                    s << PSBT_BIP32_KEYPATH_SIGHASH;\n+                    WriteCompactSize(s, sizeof(psbt_in.sighash_type));\n+                    s << psbt_in.sighash_type;\n+                }\n+\n+                // Write the index\n+                if (use_in_index) {\n+                    WriteCompactSize(s, sizeof(PSBT_NUM_IN_VIN));\n+                    s << PSBT_NUM_IN_VIN;\n+                    WriteCompactSize(s, sizeof(psbt_in.index));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184789102",
+      "id" : 184789102,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 147,
+      "path" : "src/script/sign.h",
+      "position" : 185,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184789102",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184789407"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184789407"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nNit: `{` on the same line as `switch`.",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:46:38Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}\n+    void SetNull();\n+    bool IsNull();\n+};\n+\n+/** A version of CTransaction with the PSBT format*/\n+struct PartiallySignedTransaction\n+{\n+    CMutableTransaction tx;\n+    std::map<uint160, CScript> redeem_scripts;\n+    std::map<uint256, CScript> witness_scripts;\n+    std::vector<PartiallySignedInput> inputs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    std::map<CPubKey, std::vector<uint32_t>> hd_keypaths;\n+    uint64_t num_ins = 0;\n+    bool use_in_index = false;\n+\n+    PartiallySignedTransaction();\n+    PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs);\n+\n+    template <typename Stream>\n+    inline void Serialize(Stream& s) const {\n+\n+        // magic bytes\n+        s << PSBT_MAGIC_BYTES << (char)0xff; // psbt 0xff\n+\n+        // Write transaction if it exists\n+        if (!CTransaction(tx).IsNull()) {\n+            // unsigned tx flag\n+            WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+            s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+\n+            // Write serialized tx to a stream\n+            WriteCompactSize(s, ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION));\n+            s << tx;\n+        }\n+\n+        // Write redeem scripts and witness scripts\n+        for (auto& entry : redeem_scripts) {\n+            s << SerializeToVector(PSBT_REDEEMSCRIPT_WITNESS_UTXO, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        for (auto& entry : witness_scripts) {\n+            s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        // Write any hd keypaths\n+        for (auto keypath_pair : hd_keypaths) {\n+            s << SerializeToVector(PSBT_BIP32_KEYPATH_SIGHASH, Span<const unsigned char>(keypath_pair.first.begin(), keypath_pair.first.size()));\n+            WriteCompactSize(s, keypath_pair.second.size() * sizeof(uint32_t));\n+            for (auto& key : keypath_pair.second) {\n+                s << key;\n+            }\n+        }\n+\n+        // Write the number of inputs\n+        if (num_ins > 0) {\n+            s << PSBT_NUM_IN_VIN;\n+            WriteCompactSize(s, num_ins);\n+        }\n+\n+        // Write the unknown things\n+        for(auto& entry : unknown) {\n+            s << entry.first;\n+            s << entry.second;\n+        }\n+\n+        // Separator\n+        s << PSBT_SEPARATOR;\n+\n+        for (unsigned int i = 0; i < tx.vin.size(); i++) {\n+            CTxIn in = tx.vin[i];\n+            PartiallySignedInput psbt_in = inputs[i];\n+            if (in.scriptSig.empty() && in.scriptWitness.IsNull()) {\n+                // Write the utxo\n+                // If there is a non-witness utxo, then don't add the witness one.\n+                if (psbt_in.non_witness_utxo) {\n+                    WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+                    s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+                    WriteCompactSize(s, ::GetSerializeSize(psbt_in.non_witness_utxo, SER_NETWORK, PROTOCOL_VERSION));\n+                    s << psbt_in.non_witness_utxo;\n+                } else if (!psbt_in.witness_utxo.IsNull()) {\n+                    WriteCompactSize(s, sizeof(PSBT_REDEEMSCRIPT_WITNESS_UTXO));\n+                    s << PSBT_REDEEMSCRIPT_WITNESS_UTXO;\n+                    WriteCompactSize(s, ::GetSerializeSize(psbt_in.witness_utxo, SER_NETWORK, PROTOCOL_VERSION));\n+                    s << psbt_in.witness_utxo;\n+                }\n+\n+                // Write any partial signatures\n+                for (auto sig_pair : psbt_in.partial_sigs) {\n+                    s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, Span<const unsigned char>(sig_pair.first.begin(), sig_pair.first.size()));\n+                    WriteCompactSize(s, sig_pair.second.size());\n+                    s << MakeSpan(sig_pair.second);\n+                }\n+\n+                // Write the sighash type\n+                if (psbt_in.sighash_type > 0) {\n+                    WriteCompactSize(s, sizeof(PSBT_BIP32_KEYPATH_SIGHASH));\n+                    s << PSBT_BIP32_KEYPATH_SIGHASH;\n+                    WriteCompactSize(s, sizeof(psbt_in.sighash_type));\n+                    s << psbt_in.sighash_type;\n+                }\n+\n+                // Write the index\n+                if (use_in_index) {\n+                    WriteCompactSize(s, sizeof(PSBT_NUM_IN_VIN));\n+                    s << PSBT_NUM_IN_VIN;\n+                    WriteCompactSize(s, sizeof(psbt_in.index));\n+                    s << psbt_in.index;\n+                }\n+            }\n+\n+            // Write unknown things\n+            for(auto& entry : psbt_in.unknown) {\n+                s << entry.first;\n+                s << entry.second;\n+            }\n+\n+            s << PSBT_SEPARATOR;\n+        }\n+    }\n+\n+\n+    template <typename Stream>\n+    inline void Unserialize(Stream& s) {\n+        // Read the magic bytes\n+        int magic;\n+        s >> magic;\n+        if (magic != PSBT_MAGIC_BYTES) {\n+            throw std::ios_base::failure(\"Invalid PSBT magic bytes\");\n+        }\n+        unsigned char magic_sep;\n+        s >> magic_sep;\n+\n+        // hashers\n+        CHash160 hash160_hasher;\n+        CSHA256 sha256_hasher;\n+\n+        // Read loop\n+        uint32_t separators = 0;\n+        PartiallySignedInput input;\n+        input.index = 0; // Make the first input at index 0\n+        bool in_globals = true;\n+        while(!s.empty()) {\n+            // Reset hashers\n+            hash160_hasher.Reset();\n+            sha256_hasher.Reset();\n+\n+            // read size of key\n+            uint64_t key_len = ReadCompactSize(s);\n+\n+            // the key length is 0 if that was actually a separator byte\n+            // This is a special case for key lengths 0 as those are not allowed (except for separator)\n+            if (key_len == 0) {\n+\n+                // If we ever hit a separator, we are no longer in globals\n+                in_globals = false;\n+\n+                if (separators > 0) {\n+                    // Make sure this input has an index of indexes are being used\n+                    if (!use_in_index && !input.use_in_index) {\n+                        throw std::ios_base::failure(\"Input indexes being used but an input was provided without an index\");\n+                    }\n+\n+                    // Add input to vector\n+                    inputs.push_back(input);\n+                    input.SetNull();\n+                    input.index = separators - 1; // Set the inputs index. This will be overwritten if an index is provided.\n+                }\n+\n+                ++separators;\n+\n+                // Make sure that the number of separators - 1 matches the number of inputs if the stream is going to be empty\n+                if (s.empty() && separators - 1 == num_ins) {\n+                    throw std::ios_base::failure(\"Inputs provided does not match the number of inputs stated.\");\n+                }\n+\n+                continue;\n+            }\n+\n+            // Read key\n+            std::vector<unsigned char> key;\n+            key.resize(key_len);\n+            Span<unsigned char> key_data = MakeSpan(key);\n+            s >> key_data;\n+\n+            // First byte of key is the type\n+            unsigned char type = key[0];\n+\n+            // Read in value length\n+            uint64_t value_len = ReadCompactSize(s);\n+\n+            // Do stuff based on type\n+            switch(type)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184789407",
+      "id" : 184789407,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 233,
+      "path" : "src/script/sign.h",
+      "position" : 273,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184789407",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184790215"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184790215"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nOverall comment on the serialization code: you could simplify things a lot by also having a single-argument `SerializeToVector` (which takes an object but no header byte).\r\n\r\nAll instances of `WriteCompactSize(s, ::GetSerializeSize(foo)); s << foo;` could then turn into `s << SerializeToVector(foo);`. There are dozens of cases of this.",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T19:50:39Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}\n+    void SetNull();\n+    bool IsNull();\n+};\n+\n+/** A version of CTransaction with the PSBT format*/\n+struct PartiallySignedTransaction\n+{\n+    CMutableTransaction tx;\n+    std::map<uint160, CScript> redeem_scripts;\n+    std::map<uint256, CScript> witness_scripts;\n+    std::vector<PartiallySignedInput> inputs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    std::map<CPubKey, std::vector<uint32_t>> hd_keypaths;\n+    uint64_t num_ins = 0;\n+    bool use_in_index = false;\n+\n+    PartiallySignedTransaction();\n+    PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs);\n+\n+    template <typename Stream>\n+    inline void Serialize(Stream& s) const {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184790215",
+      "id" : 184790215,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 59,
+      "path" : "src/script/sign.h",
+      "position" : null,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184790215",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184797335"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184797335"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nYou can use `CTransactionRef prev_tx; s >> prev_tx;` instead here (and `input.non_witness_utxo = std::move(prev_tx);` below).",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T20:21:37Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}\n+    void SetNull();\n+    bool IsNull();\n+};\n+\n+/** A version of CTransaction with the PSBT format*/\n+struct PartiallySignedTransaction\n+{\n+    CMutableTransaction tx;\n+    std::map<uint160, CScript> redeem_scripts;\n+    std::map<uint256, CScript> witness_scripts;\n+    std::vector<PartiallySignedInput> inputs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    std::map<CPubKey, std::vector<uint32_t>> hd_keypaths;\n+    uint64_t num_ins = 0;\n+    bool use_in_index = false;\n+\n+    PartiallySignedTransaction();\n+    PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs);\n+\n+    template <typename Stream>\n+    inline void Serialize(Stream& s) const {\n+\n+        // magic bytes\n+        s << PSBT_MAGIC_BYTES << (char)0xff; // psbt 0xff\n+\n+        // Write transaction if it exists\n+        if (!CTransaction(tx).IsNull()) {\n+            // unsigned tx flag\n+            WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+            s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+\n+            // Write serialized tx to a stream\n+            WriteCompactSize(s, ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION));\n+            s << tx;\n+        }\n+\n+        // Write redeem scripts and witness scripts\n+        for (auto& entry : redeem_scripts) {\n+            s << SerializeToVector(PSBT_REDEEMSCRIPT_WITNESS_UTXO, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        for (auto& entry : witness_scripts) {\n+            s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        // Write any hd keypaths\n+        for (auto keypath_pair : hd_keypaths) {\n+            s << SerializeToVector(PSBT_BIP32_KEYPATH_SIGHASH, Span<const unsigned char>(keypath_pair.first.begin(), keypath_pair.first.size()));\n+            WriteCompactSize(s, keypath_pair.second.size() * sizeof(uint32_t));\n+            for (auto& key : keypath_pair.second) {\n+                s << key;\n+            }\n+        }\n+\n+        // Write the number of inputs\n+        if (num_ins > 0) {\n+            s << PSBT_NUM_IN_VIN;\n+            WriteCompactSize(s, num_ins);\n+        }\n+\n+        // Write the unknown things\n+        for(auto& entry : unknown) {\n+            s << entry.first;\n+            s << entry.second;\n+        }\n+\n+        // Separator\n+        s << PSBT_SEPARATOR;\n+\n+        for (unsigned int i = 0; i < tx.vin.size(); i++) {\n+            CTxIn in = tx.vin[i];\n+            PartiallySignedInput psbt_in = inputs[i];\n+            if (in.scriptSig.empty() && in.scriptWitness.IsNull()) {\n+                // Write the utxo\n+                // If there is a non-witness utxo, then don't add the witness one.\n+                if (psbt_in.non_witness_utxo) {\n+                    WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+                    s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+                    WriteCompactSize(s, ::GetSerializeSize(psbt_in.non_witness_utxo, SER_NETWORK, PROTOCOL_VERSION));\n+                    s << psbt_in.non_witness_utxo;\n+                } else if (!psbt_in.witness_utxo.IsNull()) {\n+                    WriteCompactSize(s, sizeof(PSBT_REDEEMSCRIPT_WITNESS_UTXO));\n+                    s << PSBT_REDEEMSCRIPT_WITNESS_UTXO;\n+                    WriteCompactSize(s, ::GetSerializeSize(psbt_in.witness_utxo, SER_NETWORK, PROTOCOL_VERSION));\n+                    s << psbt_in.witness_utxo;\n+                }\n+\n+                // Write any partial signatures\n+                for (auto sig_pair : psbt_in.partial_sigs) {\n+                    s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, Span<const unsigned char>(sig_pair.first.begin(), sig_pair.first.size()));\n+                    WriteCompactSize(s, sig_pair.second.size());\n+                    s << MakeSpan(sig_pair.second);\n+                }\n+\n+                // Write the sighash type\n+                if (psbt_in.sighash_type > 0) {\n+                    WriteCompactSize(s, sizeof(PSBT_BIP32_KEYPATH_SIGHASH));\n+                    s << PSBT_BIP32_KEYPATH_SIGHASH;\n+                    WriteCompactSize(s, sizeof(psbt_in.sighash_type));\n+                    s << psbt_in.sighash_type;\n+                }\n+\n+                // Write the index\n+                if (use_in_index) {\n+                    WriteCompactSize(s, sizeof(PSBT_NUM_IN_VIN));\n+                    s << PSBT_NUM_IN_VIN;\n+                    WriteCompactSize(s, sizeof(psbt_in.index));\n+                    s << psbt_in.index;\n+                }\n+            }\n+\n+            // Write unknown things\n+            for(auto& entry : psbt_in.unknown) {\n+                s << entry.first;\n+                s << entry.second;\n+            }\n+\n+            s << PSBT_SEPARATOR;\n+        }\n+    }\n+\n+\n+    template <typename Stream>\n+    inline void Unserialize(Stream& s) {\n+        // Read the magic bytes\n+        int magic;\n+        s >> magic;\n+        if (magic != PSBT_MAGIC_BYTES) {\n+            throw std::ios_base::failure(\"Invalid PSBT magic bytes\");\n+        }\n+        unsigned char magic_sep;\n+        s >> magic_sep;\n+\n+        // hashers\n+        CHash160 hash160_hasher;\n+        CSHA256 sha256_hasher;\n+\n+        // Read loop\n+        uint32_t separators = 0;\n+        PartiallySignedInput input;\n+        input.index = 0; // Make the first input at index 0\n+        bool in_globals = true;\n+        while(!s.empty()) {\n+            // Reset hashers\n+            hash160_hasher.Reset();\n+            sha256_hasher.Reset();\n+\n+            // read size of key\n+            uint64_t key_len = ReadCompactSize(s);\n+\n+            // the key length is 0 if that was actually a separator byte\n+            // This is a special case for key lengths 0 as those are not allowed (except for separator)\n+            if (key_len == 0) {\n+\n+                // If we ever hit a separator, we are no longer in globals\n+                in_globals = false;\n+\n+                if (separators > 0) {\n+                    // Make sure this input has an index of indexes are being used\n+                    if (!use_in_index && !input.use_in_index) {\n+                        throw std::ios_base::failure(\"Input indexes being used but an input was provided without an index\");\n+                    }\n+\n+                    // Add input to vector\n+                    inputs.push_back(input);\n+                    input.SetNull();\n+                    input.index = separators - 1; // Set the inputs index. This will be overwritten if an index is provided.\n+                }\n+\n+                ++separators;\n+\n+                // Make sure that the number of separators - 1 matches the number of inputs if the stream is going to be empty\n+                if (s.empty() && separators - 1 == num_ins) {\n+                    throw std::ios_base::failure(\"Inputs provided does not match the number of inputs stated.\");\n+                }\n+\n+                continue;\n+            }\n+\n+            // Read key\n+            std::vector<unsigned char> key;\n+            key.resize(key_len);\n+            Span<unsigned char> key_data = MakeSpan(key);\n+            s >> key_data;\n+\n+            // First byte of key is the type\n+            unsigned char type = key[0];\n+\n+            // Read in value length\n+            uint64_t value_len = ReadCompactSize(s);\n+\n+            // Do stuff based on type\n+            switch(type)\n+            {\n+                // Raw transaction or a non witness utxo\n+                case PSBT_UNSIGNED_TX_NON_WITNESS_UTXO:\n+                    if (in_globals) {\n+                        s >> tx;\n+                    } else {\n+                        // Read in the transaction\n+                        CMutableTransaction mtx;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184797335",
+      "id" : 184797335,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 241,
+      "path" : "src/script/sign.h",
+      "position" : 281,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184797335",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184800129"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184800129"
+         }
+      },
+      "author_association" : "OWNER",
+      "body" : "In commit \"Implement PSBT structures and un/serliazation methods per BIP 174\":\r\n\r\nGeneral comment on deserialization code: check that keys and values (where relevant) have the expected length. Things like `uint160(key.begin() + 1, key.end())` will assertion fail if the length is wrong.",
+      "commit_id" : "81de58466499f6c5f1aa3364f823bc3a2be1301d",
+      "created_at" : "2018-04-27T20:33:55Z",
+      "diff_hunk" : "@@ -68,6 +68,392 @@ struct SignatureData {\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n };\n \n+\n+\n+// Note: These constants are in reverse byte order because serialization uses LSB\n+static const uint32_t PSBT_MAGIC_BYTES = 0x74627370;\n+static const uint8_t PSBT_UNSIGNED_TX_NON_WITNESS_UTXO = 0x00;\n+static const uint8_t PSBT_REDEEMSCRIPT_WITNESS_UTXO = 0x01;\n+static const uint8_t PSBT_WITNESSSCRIPT_PARTIAL_SIG = 0x02;\n+static const uint8_t PSBT_BIP32_KEYPATH_SIGHASH = 0x03;\n+static const uint8_t PSBT_NUM_IN_VIN = 0x04;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static const uint8_t PSBT_SEPARATOR = 0x00;\n+\n+template<typename X>\n+std::vector<unsigned char> SerializeToVector(uint8_t header, const X& x)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    ss << header << x;\n+    return ret;\n+}\n+\n+/** An structure for PSBTs which contain per input information */\n+struct PartiallySignedInput\n+{\n+    CTransactionRef non_witness_utxo;\n+    CTxOut witness_utxo;\n+    std::map<CPubKey, std::vector<unsigned char>> partial_sigs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    int sighash_type = 0;\n+    uint64_t index;\n+    bool use_in_index = false;\n+\n+    PartiallySignedInput(): non_witness_utxo(), witness_utxo(), partial_sigs(), unknown() {}\n+    void SetNull();\n+    bool IsNull();\n+};\n+\n+/** A version of CTransaction with the PSBT format*/\n+struct PartiallySignedTransaction\n+{\n+    CMutableTransaction tx;\n+    std::map<uint160, CScript> redeem_scripts;\n+    std::map<uint256, CScript> witness_scripts;\n+    std::vector<PartiallySignedInput> inputs;\n+    std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;\n+    std::map<CPubKey, std::vector<uint32_t>> hd_keypaths;\n+    uint64_t num_ins = 0;\n+    bool use_in_index = false;\n+\n+    PartiallySignedTransaction();\n+    PartiallySignedTransaction(CMutableTransaction& tx, std::map<uint160, CScript>& redeem_scripts, std::map<uint256, CScript>& witness_scripts, std::vector<PartiallySignedInput>& inputs);\n+\n+    template <typename Stream>\n+    inline void Serialize(Stream& s) const {\n+\n+        // magic bytes\n+        s << PSBT_MAGIC_BYTES << (char)0xff; // psbt 0xff\n+\n+        // Write transaction if it exists\n+        if (!CTransaction(tx).IsNull()) {\n+            // unsigned tx flag\n+            WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+            s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+\n+            // Write serialized tx to a stream\n+            WriteCompactSize(s, ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION));\n+            s << tx;\n+        }\n+\n+        // Write redeem scripts and witness scripts\n+        for (auto& entry : redeem_scripts) {\n+            s << SerializeToVector(PSBT_REDEEMSCRIPT_WITNESS_UTXO, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        for (auto& entry : witness_scripts) {\n+            s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, entry.first);\n+            WriteCompactSize(s, entry.second.size());\n+            s << MakeSpan(entry.second);\n+        }\n+        // Write any hd keypaths\n+        for (auto keypath_pair : hd_keypaths) {\n+            s << SerializeToVector(PSBT_BIP32_KEYPATH_SIGHASH, Span<const unsigned char>(keypath_pair.first.begin(), keypath_pair.first.size()));\n+            WriteCompactSize(s, keypath_pair.second.size() * sizeof(uint32_t));\n+            for (auto& key : keypath_pair.second) {\n+                s << key;\n+            }\n+        }\n+\n+        // Write the number of inputs\n+        if (num_ins > 0) {\n+            s << PSBT_NUM_IN_VIN;\n+            WriteCompactSize(s, num_ins);\n+        }\n+\n+        // Write the unknown things\n+        for(auto& entry : unknown) {\n+            s << entry.first;\n+            s << entry.second;\n+        }\n+\n+        // Separator\n+        s << PSBT_SEPARATOR;\n+\n+        for (unsigned int i = 0; i < tx.vin.size(); i++) {\n+            CTxIn in = tx.vin[i];\n+            PartiallySignedInput psbt_in = inputs[i];\n+            if (in.scriptSig.empty() && in.scriptWitness.IsNull()) {\n+                // Write the utxo\n+                // If there is a non-witness utxo, then don't add the witness one.\n+                if (psbt_in.non_witness_utxo) {\n+                    WriteCompactSize(s, sizeof(PSBT_UNSIGNED_TX_NON_WITNESS_UTXO));\n+                    s << PSBT_UNSIGNED_TX_NON_WITNESS_UTXO;\n+                    WriteCompactSize(s, ::GetSerializeSize(psbt_in.non_witness_utxo, SER_NETWORK, PROTOCOL_VERSION));\n+                    s << psbt_in.non_witness_utxo;\n+                } else if (!psbt_in.witness_utxo.IsNull()) {\n+                    WriteCompactSize(s, sizeof(PSBT_REDEEMSCRIPT_WITNESS_UTXO));\n+                    s << PSBT_REDEEMSCRIPT_WITNESS_UTXO;\n+                    WriteCompactSize(s, ::GetSerializeSize(psbt_in.witness_utxo, SER_NETWORK, PROTOCOL_VERSION));\n+                    s << psbt_in.witness_utxo;\n+                }\n+\n+                // Write any partial signatures\n+                for (auto sig_pair : psbt_in.partial_sigs) {\n+                    s << SerializeToVector(PSBT_WITNESSSCRIPT_PARTIAL_SIG, Span<const unsigned char>(sig_pair.first.begin(), sig_pair.first.size()));\n+                    WriteCompactSize(s, sig_pair.second.size());\n+                    s << MakeSpan(sig_pair.second);\n+                }\n+\n+                // Write the sighash type\n+                if (psbt_in.sighash_type > 0) {\n+                    WriteCompactSize(s, sizeof(PSBT_BIP32_KEYPATH_SIGHASH));\n+                    s << PSBT_BIP32_KEYPATH_SIGHASH;\n+                    WriteCompactSize(s, sizeof(psbt_in.sighash_type));\n+                    s << psbt_in.sighash_type;\n+                }\n+\n+                // Write the index\n+                if (use_in_index) {\n+                    WriteCompactSize(s, sizeof(PSBT_NUM_IN_VIN));\n+                    s << PSBT_NUM_IN_VIN;\n+                    WriteCompactSize(s, sizeof(psbt_in.index));\n+                    s << psbt_in.index;\n+                }\n+            }\n+\n+            // Write unknown things\n+            for(auto& entry : psbt_in.unknown) {\n+                s << entry.first;\n+                s << entry.second;\n+            }\n+\n+            s << PSBT_SEPARATOR;\n+        }\n+    }\n+\n+\n+    template <typename Stream>\n+    inline void Unserialize(Stream& s) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r184800129",
+      "id" : 184800129,
+      "original_commit_id" : "15840187f587e29cbef57a896265f31d32d87dc0",
+      "original_position" : 164,
+      "path" : "src/script/sign.h",
+      "position" : 202,
+      "pull_request_review_id" : 115780552,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-04-27T20:34:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/184800129",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
       }
    }
 ]
