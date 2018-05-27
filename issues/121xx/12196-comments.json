@@ -2825,5 +2825,193 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jonasschnelli"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12196#discussion_r191063217"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/191063217"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I think we should avoid doing this step for uncompressed pubkeys as such outputs would be unspendable.",
+      "commit_id" : "1945f5fd3f14d7d485fc00444cc0e8c4bdc98220",
+      "created_at" : "2018-05-27T02:57:50Z",
+      "diff_hunk" : "@@ -1926,6 +1929,251 @@ static UniValue savemempool(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+/** RAII object to prevent concurrency issue when scanning the txout set */\n+static std::mutex g_utxosetscan;\n+static std::atomic<int> g_scan_progress;\n+static std::atomic<bool> g_scan_in_progress;\n+static std::atomic<bool> g_should_abort_scan;\n+class CoinsViewScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit CoinsViewScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        assert (!m_could_reserve);\n+        std::lock_guard<std::mutex> lock(g_utxosetscan);\n+        if (g_scan_in_progress) {\n+            return false;\n+        }\n+        g_scan_in_progress = true;\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~CoinsViewScanReserver() {\n+        if (m_could_reserve) {\n+            std::lock_guard<std::mutex> lock(g_utxosetscan);\n+            g_scan_in_progress = false;\n+        }\n+    }\n+};\n+\n+UniValue scantxoutset(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)\n+        throw std::runtime_error(\n+            \"scantxoutset <action> {\\\"pubkeys\\\": [\\\"pubkey\\\",...], \\\"xpubs\\\":[{\\\"xpub\\\": \\\"<xpub>\\\"}]}\\n\"\n+            \"\\nScans the unspent transaction output set for possible entries that matches common scripts of given public keys.\\n\"\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"action\\\"                       (string, required) The action to execute\\n\"\n+            \"                                          \\\"start\\\" for starting a scan\\n\"\n+            \"                                          \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                          \\\"status\\\" for progress report (in %) of the current scan\\n\"\n+            \"2. \\\"options\\\"                      (object, optional)\\n\"\n+            \"      \\\"pubkeys\\\":[\\\"pubkey\\\",...]    (array of strings, optional) An array of HEX encoded public keys\\n\"\n+            \"      \\\"addresses\\\":[\\\"address\\\",...] (array of strings, optional) An array of bitcoin addresses\\n\"\n+            \"      \\\"xpubs\\\":                    (array of xpub objects that will be used to derive child keys with the given lookup window after m/0/k and m/1/k scheme)\\n\"\n+            \"           [\\n\"\n+            \"               {\\n\"\n+            \"                \\\"xpub\\\":\\\"<xpub>\\\",  (base58check encoded extended public key (xpub)\\n\"\n+            \"                \\\"lookupwindow\\\":   [<startindex>, <stopindex>] (An array with two integers that does define the range of keys that will be deriven for the given xpubs, default is 0 to 1000)\\n\"\n+            \"                }\\n\"\n+            \"           ]\\n\"\n+            \"\\nResult:\\n\"\n+            \"{\\n\"\n+            \"  \\\"unspents\\\": [\\n\"\n+            \"    {\\n\"\n+            \"    \\\"txid\\\" : \\\"transactionid\\\",     (string) The transaction id\\n\"\n+            \"    \\\"vout\\\": n,                    (numeric) the vout value\\n\"\n+            \"    \\\"scriptPubKey\\\" : \\\"script\\\",    (string) the script key\\n\"\n+            \"    \\\"amount\\\" : x.xxx,             (numeric) The total amount in \" + CURRENCY_UNIT + \" received by the address\\n\"\n+            \"    \\\"height\\\" : n,                 (numeric) Height of the unspent transaction output\\n\"\n+            \"   }\\n\"\n+            \"   ,...], \\n\"\n+            \" \\\"total_amount\\\" : x.xxx,          (numeric) The total amount of all found unspent outputs in \" + CURRENCY_UNIT + \"\\n\"\n+            \"]\\n\"\n+        );\n+\n+    RPCTypeCheck(request.params, {UniValue::VSTR, UniValue::VOBJ});\n+\n+    UniValue result(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        CoinsViewScanReserver reserver;\n+        if (reserver.reserve()) {\n+            //no scan in progress\n+            return NullUniValue;\n+        }\n+        result.pushKV(\"progress\", g_scan_progress);\n+        return result;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        CoinsViewScanReserver reserver;\n+        if (reserver.reserve()) {\n+            return false;\n+        }\n+        g_should_abort_scan = true;\n+        return true;\n+    } else if (request.params[0].get_str() == \"start\") {\n+        CoinsViewScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        std::set<CScript> needles;\n+        CBasicKeyStore temp_keystore;\n+        CAmount total_in = 0;\n+\n+        // look for posssible pubkeys\n+        std::vector<CPubKey> pubkeys;\n+        UniValue pubkeys_uni = find_value(request.params[1], \"pubkeys\");\n+        if (pubkeys_uni.isArray()) {\n+            for (const UniValue& pubkey_uni : pubkeys_uni.get_array().getValues()) {\n+                if (!pubkey_uni.isStr() || !IsHex(pubkey_uni.get_str())) {\n+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"public key must be hex encoded\");\n+                }\n+                std::vector<unsigned char> data(ParseHex(pubkey_uni.get_str()));\n+                CPubKey pub_key(data.begin(), data.end());\n+                if (!pub_key.IsFullyValid()) {\n+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Invalid public key\");\n+                }\n+                pubkeys.push_back(pub_key);\n+            }\n+        }\n+\n+        // check for xpubs and derive a lookup window\n+        UniValue xpubs_uni = find_value(request.params[1], \"xpubs\");\n+        if (xpubs_uni.isArray()) {\n+            for (const UniValue& xpub_uni : xpubs_uni.get_array().getValues()) {\n+                if (!xpub_uni.isObject()) {\n+                    throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid xpub object\");\n+                }\n+\n+                UniValue xpubkey_uni = find_value(xpub_uni, \"xpub\");\n+                UniValue lookup_window_uni = find_value(xpub_uni, \"lookupwindow\");\n+                //default lookup window\n+                unsigned int window_start = 0;\n+                unsigned int window_end = 1000;\n+                if (!lookup_window_uni.isNull()) {\n+                    if (lookup_window_uni.isArray() && lookup_window_uni.get_array().size() != 2) {\n+                        throw JSONRPCError(RPC_INVALID_PARAMETER, \"xpub lookupwindow must be an array with two elements (range)\");\n+                    }\n+                    else {\n+                        window_start = (unsigned int)lookup_window_uni.get_array().getValues()[0].get_int();\n+                        window_end = (unsigned int)lookup_window_uni.get_array().getValues()[1].get_int();\n+                    }\n+                }\n+                // Derive internal- and external-chain keys\n+                CExtPubKey xpub = DecodeExtPubKey(xpubkey_uni.get_str());\n+                if (!xpub.pubkey.IsValid()) {\n+                    throw JSONRPCError(RPC_INVALID_PARAMETER, \"invalid xpub\");\n+                }\n+                CExtPubKey c0;\n+                CExtPubKey c1;\n+                xpub.Derive(c0, 0);\n+                xpub.Derive(c1, 1);\n+\n+                for (unsigned int i = window_start; i <= window_end; i++) {\n+                    // derive both (internal and external chain) child keys\n+                    CExtPubKey k;\n+                    c0.Derive(k, i);\n+                    pubkeys.push_back(k.pubkey);\n+                    c1.Derive(k, i);\n+                    pubkeys.push_back(k.pubkey);\n+                }\n+            }\n+        }\n+\n+        // add all common scripts for the given and derived pubkeys\n+        for (const CPubKey& pubKey : pubkeys) {\n+            // add legacy P2PKH script\n+            CKeyID address = pubKey.GetID();\n+            CScript script = GetScriptForDestination(address);\n+            if (!script.empty()) {\n+                needles.insert(script);\n+                temp_keystore.AddWatchOnly(script);\n+            }\n+            // add P2SH-P2WPKH script",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12196#discussion_r191063217",
+      "id" : 191063217,
+      "original_commit_id" : "e6b1a46eb8f82c39f490e1e6c2592cfd12fece7f",
+      "original_position" : 184,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 216,
+      "pull_request_review_id" : 123571013,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12196",
+      "updated_at" : "2018-05-27T03:07:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/191063217",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12196#discussion_r191063259"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/191063259"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit: `searchItems` should be `search_items` to match the `.h` file.",
+      "commit_id" : "1945f5fd3f14d7d485fc00444cc0e8c4bdc98220",
+      "created_at" : "2018-05-27T03:01:25Z",
+      "diff_hunk" : "@@ -19,6 +23,41 @@ bool CCoinsView::HaveCoin(const COutPoint &outpoint) const\n     return GetCoin(outpoint, coin);\n }\n \n+bool CCoinsView::FindScriptPubKey(std::atomic<int>& scan_progress, std::atomic<bool>& should_abort, int64_t& count, CCoinsViewCursor& cursor, const std::set<CScript>& needles, std::map<COutPoint, Coin>& out_results) {\n+    scan_progress = 0;\n+    while (cursor.Valid()) {\n+        COutPoint key;\n+        Coin coin;\n+        if (cursor.GetKey(key) && cursor.GetValue(coin)) {\n+            if (count++ % 8192 == 0) {\n+                boost::this_thread::interruption_point();\n+                if (should_abort) {\n+                    // allow to abort the scan via the abort reference\n+                    return false;\n+                }\n+            }\n+            if (count % 256 == 0) {\n+                // update progress reference every 256 item\n+                uint32_t high = 0x100 * *key.hash.begin() + *(key.hash.begin() + 1);\n+                scan_progress = (int)(high * 100.0 / 65536.0 + 0.5);\n+            }\n+            if (needles.count(coin.out.scriptPubKey)) {\n+                out_results.emplace(key, coin);\n+            }\n+        } else {\n+            return false;\n+        }\n+        cursor.Next();\n+    }\n+    scan_progress = 100;\n+    return true;\n+}\n+\n+bool CCoinsView::FindScriptPubKey(std::atomic<int>& scan_progress, std::atomic<bool>& should_abort, int64_t& searchItems, const std::set<CScript>& needles, std::map<COutPoint, Coin>& out_results) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12196#discussion_r191063259",
+      "id" : 191063259,
+      "original_commit_id" : "468b034a64a33146fcc2a0faddb4484fa5899d87",
+      "original_position" : 45,
+      "path" : "src/coins.cpp",
+      "position" : 45,
+      "pull_request_review_id" : 123571013,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12196",
+      "updated_at" : "2018-05-27T03:07:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/191063259",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12196#discussion_r191063262"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/191063262"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit: should have `,...` after this.",
+      "commit_id" : "1945f5fd3f14d7d485fc00444cc0e8c4bdc98220",
+      "created_at" : "2018-05-27T03:01:59Z",
+      "diff_hunk" : "@@ -1926,6 +1929,251 @@ static UniValue savemempool(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+/** RAII object to prevent concurrency issue when scanning the txout set */\n+static std::mutex g_utxosetscan;\n+static std::atomic<int> g_scan_progress;\n+static std::atomic<bool> g_scan_in_progress;\n+static std::atomic<bool> g_should_abort_scan;\n+class CoinsViewScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit CoinsViewScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        assert (!m_could_reserve);\n+        std::lock_guard<std::mutex> lock(g_utxosetscan);\n+        if (g_scan_in_progress) {\n+            return false;\n+        }\n+        g_scan_in_progress = true;\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~CoinsViewScanReserver() {\n+        if (m_could_reserve) {\n+            std::lock_guard<std::mutex> lock(g_utxosetscan);\n+            g_scan_in_progress = false;\n+        }\n+    }\n+};\n+\n+UniValue scantxoutset(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)\n+        throw std::runtime_error(\n+            \"scantxoutset <action> {\\\"pubkeys\\\": [\\\"pubkey\\\",...], \\\"xpubs\\\":[{\\\"xpub\\\": \\\"<xpub>\\\"}]}\\n\"\n+            \"\\nScans the unspent transaction output set for possible entries that matches common scripts of given public keys.\\n\"\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"action\\\"                       (string, required) The action to execute\\n\"\n+            \"                                          \\\"start\\\" for starting a scan\\n\"\n+            \"                                          \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                          \\\"status\\\" for progress report (in %) of the current scan\\n\"\n+            \"2. \\\"options\\\"                      (object, optional)\\n\"\n+            \"      \\\"pubkeys\\\":[\\\"pubkey\\\",...]    (array of strings, optional) An array of HEX encoded public keys\\n\"\n+            \"      \\\"addresses\\\":[\\\"address\\\",...] (array of strings, optional) An array of bitcoin addresses\\n\"\n+            \"      \\\"xpubs\\\":                    (array of xpub objects that will be used to derive child keys with the given lookup window after m/0/k and m/1/k scheme)\\n\"\n+            \"           [\\n\"\n+            \"               {\\n\"\n+            \"                \\\"xpub\\\":\\\"<xpub>\\\",  (base58check encoded extended public key (xpub)\\n\"\n+            \"                \\\"lookupwindow\\\":   [<startindex>, <stopindex>] (An array with two integers that does define the range of keys that will be deriven for the given xpubs, default is 0 to 1000)\\n\"\n+            \"                }\\n\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12196#discussion_r191063262",
+      "id" : 191063262,
+      "original_commit_id" : "e6b1a46eb8f82c39f490e1e6c2592cfd12fece7f",
+      "original_position" : 71,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 95,
+      "pull_request_review_id" : 123571013,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12196",
+      "updated_at" : "2018-05-27T03:07:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/191063262",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12196#discussion_r191063268"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/191063268"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit: the spacing of this block looks a bit funny. I think the text should be indented more and the braces for the object should be aligned.",
+      "commit_id" : "1945f5fd3f14d7d485fc00444cc0e8c4bdc98220",
+      "created_at" : "2018-05-27T03:02:59Z",
+      "diff_hunk" : "@@ -1926,6 +1929,251 @@ static UniValue savemempool(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+/** RAII object to prevent concurrency issue when scanning the txout set */\n+static std::mutex g_utxosetscan;\n+static std::atomic<int> g_scan_progress;\n+static std::atomic<bool> g_scan_in_progress;\n+static std::atomic<bool> g_should_abort_scan;\n+class CoinsViewScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit CoinsViewScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        assert (!m_could_reserve);\n+        std::lock_guard<std::mutex> lock(g_utxosetscan);\n+        if (g_scan_in_progress) {\n+            return false;\n+        }\n+        g_scan_in_progress = true;\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~CoinsViewScanReserver() {\n+        if (m_could_reserve) {\n+            std::lock_guard<std::mutex> lock(g_utxosetscan);\n+            g_scan_in_progress = false;\n+        }\n+    }\n+};\n+\n+UniValue scantxoutset(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)\n+        throw std::runtime_error(\n+            \"scantxoutset <action> {\\\"pubkeys\\\": [\\\"pubkey\\\",...], \\\"xpubs\\\":[{\\\"xpub\\\": \\\"<xpub>\\\"}]}\\n\"\n+            \"\\nScans the unspent transaction output set for possible entries that matches common scripts of given public keys.\\n\"\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"action\\\"                       (string, required) The action to execute\\n\"\n+            \"                                          \\\"start\\\" for starting a scan\\n\"\n+            \"                                          \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                          \\\"status\\\" for progress report (in %) of the current scan\\n\"\n+            \"2. \\\"options\\\"                      (object, optional)\\n\"\n+            \"      \\\"pubkeys\\\":[\\\"pubkey\\\",...]    (array of strings, optional) An array of HEX encoded public keys\\n\"\n+            \"      \\\"addresses\\\":[\\\"address\\\",...] (array of strings, optional) An array of bitcoin addresses\\n\"\n+            \"      \\\"xpubs\\\":                    (array of xpub objects that will be used to derive child keys with the given lookup window after m/0/k and m/1/k scheme)\\n\"\n+            \"           [\\n\"\n+            \"               {\\n\"\n+            \"                \\\"xpub\\\":\\\"<xpub>\\\",  (base58check encoded extended public key (xpub)\\n\"\n+            \"                \\\"lookupwindow\\\":   [<startindex>, <stopindex>] (An array with two integers that does define the range of keys that will be deriven for the given xpubs, default is 0 to 1000)\\n\"\n+            \"                }\\n\"\n+            \"           ]\\n\"\n+            \"\\nResult:\\n\"\n+            \"{\\n\"\n+            \"  \\\"unspents\\\": [\\n\"\n+            \"    {\\n\"\n+            \"    \\\"txid\\\" : \\\"transactionid\\\",     (string) The transaction id\\n\"\n+            \"    \\\"vout\\\": n,                    (numeric) the vout value\\n\"\n+            \"    \\\"scriptPubKey\\\" : \\\"script\\\",    (string) the script key\\n\"\n+            \"    \\\"amount\\\" : x.xxx,             (numeric) The total amount in \" + CURRENCY_UNIT + \" received by the address\\n\"\n+            \"    \\\"height\\\" : n,                 (numeric) Height of the unspent transaction output\\n\"\n+            \"   }\\n\"\n+            \"   ,...], \\n\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12196#discussion_r191063268",
+      "id" : 191063268,
+      "original_commit_id" : "e6b1a46eb8f82c39f490e1e6c2592cfd12fece7f",
+      "original_position" : 83,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 112,
+      "pull_request_review_id" : 123571013,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12196",
+      "updated_at" : "2018-05-27T03:07:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/191063268",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
    }
 ]
