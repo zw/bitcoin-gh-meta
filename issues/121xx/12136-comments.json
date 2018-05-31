@@ -5199,5 +5199,55 @@
          "type" : "User",
          "url" : "https://api.github.com/users/kallewoof"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r192105577"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/192105577"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Should that be mentioned in the spec, then?",
+      "commit_id" : "30c0cf203e8c82798e047ab4b8805638612421a5",
+      "created_at" : "2018-05-31T13:50:31Z",
+      "diff_hunk" : "@@ -3520,6 +3520,336 @@ UniValue rescanblockchain(const JSONRPCRequest& request)\n     return response;\n }\n \n+bool parse_hd_keypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            } else {\n+                return false;\n+            }\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= BIP32_HARDENED_KEY_LIMIT;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        for (auto& c : item) {\n+            if (!std::isdigit(c)) {\n+                return false;\n+            }\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void add_keypath_to_map(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    pwallet->GetPubKey(keyID, vchPubKey);\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    if (!meta.hdKeypath.empty()) {\n+        std::vector<uint32_t> keypath;\n+        if (!parse_hd_keypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hdMasterKeyID, key);\n+        CExtKey masterKey;\n+        masterKey.SetMaster(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), masterKey.key.GetPubKey().GetID().GetUint32(0));\n+        hd_keypaths.emplace(vchPubKey, keypath);\n+    }\n+}\n+\n+void fill_psbt(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst)\n+{\n+    // Get all of the previous transactions\n+    bool psbtx_blank = psbtx.IsNull();\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        CTxIn txin = txConst->vin[i];\n+        PartiallySignedInput input;\n+        if (!psbtx_blank) {\n+            input = psbtx.inputs.at(i);\n+        }\n+\n+        // If this input is not empty, skip it\n+        if (!psbtx_blank && (!input.IsNull() || txin.scriptSig.empty() || txin.scriptWitness.IsNull())) {\n+            continue;\n+        }\n+\n+        uint256 txhash = txin.prevout.hash;\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        if (!pwallet->mapWallet.count(txhash)) {\n+            if (psbtx_blank) {\n+                psbtx.inputs.push_back(input);\n+            }\n+            continue;\n+        }\n+        const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+        const CTransaction& ctx = *wtx.tx;\n+\n+        // Get scriptpubkey and check for redeemScript or witnessscript\n+        CTxOut prevout = ctx.vout[txin.prevout.n];\n+        txnouttype type;\n+        std::vector<std::vector<unsigned char>> solns;\n+        Solver(prevout.scriptPubKey, type, solns);\n+        // Get script hashes\n+        if (type == TX_SCRIPTHASH) {\n+            // get the hash and find it in the wallet.\n+            CScript redeem_script;\n+            uint160 hash(solns[0]);\n+            pwallet->GetCScript(CScriptID(hash), redeem_script);\n+\n+            // put redeem_script in map\n+            psbtx.redeem_scripts.emplace(hash, redeem_script);\n+\n+            // Now check whether the redeem_script is a witness script\n+            solns.clear();\n+            Solver(redeem_script, type, solns);\n+        }\n+        // Get witness scripts\n+        bool witness = false;\n+        if (type == TX_WITNESS_V0_SCRIPTHASH) {\n+            witness = true;\n+            // Get the hash from the solver return\n+            uint160 hash;\n+            CRIPEMD160().Write(&solns[0][0], solns[0].size()).Finalize(hash.begin());\n+\n+            // Lookup hash from wallet\n+            CScript witness_script;\n+            pwallet->GetCScript(CScriptID(hash), witness_script);\n+\n+            // Put witness script in map\n+            uint256 hash256(solns[0]);\n+            psbtx.witness_scripts.emplace(hash256, witness_script);\n+\n+            // Decode the witness script\n+            solns.clear();\n+            Solver(witness_script, type, solns);\n+        }\n+        // Get public keys if hd is enabled\n+        if (pwallet->IsHDEnabled()) {\n+            if (type == TX_PUBKEYHASH) {\n+                uint160 hash(solns[0]);\n+                CKeyID keyID(hash);\n+                add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+            } else if (type == TX_PUBKEY) {\n+                CPubKey vchPubKey(solns[0]);\n+                CKeyID keyID = vchPubKey.GetID();\n+                add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+            } else if (type == TX_MULTISIG) {\n+                for (auto& soln : solns) {\n+                    CPubKey vchPubKey(soln);\n+                    CKeyID keyID = vchPubKey.GetID();\n+                    add_keypath_to_map(pwallet, keyID, psbtx.hd_keypaths);\n+                }\n+            }\n+        }\n+\n+        // Put the witness utxo for witness outputs\n+        if (witness || type == TX_WITNESS_V0_KEYHASH || type == TX_WITNESS_V0_SCRIPTHASH || type == TX_WITNESS_UNKNOWN) {\n+            // Put the witness CTxOut in the input\n+            input.witness_utxo = prevout;\n+        }\n+        // Not witness, put non witness utxo\n+        else {\n+            input.non_witness_utxo = wtx.tx;\n+        }\n+\n+        if (psbtx_blank) {\n+            // Add to inputs\n+            psbtx.inputs.push_back(input);\n+        }\n+    }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12136#discussion_r192105577",
+      "id" : 192105577,
+      "in_reply_to_id" : 169386999,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDE5MjEwNTU3Nw==",
+      "original_commit_id" : "03145519c72cd0a737f7fbd3a7b85473a45a8b46",
+      "original_position" : 171,
+      "path" : "src/wallet/rpcwallet.cpp",
+      "position" : 170,
+      "pull_request_review_id" : 124813244,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12136",
+      "updated_at" : "2018-05-31T13:50:31Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/192105577",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/126646?v=4",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "node_id" : "MDQ6VXNlcjEyNjY0Ng==",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
    }
 ]
