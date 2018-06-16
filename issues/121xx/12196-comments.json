@@ -4378,5 +4378,54 @@
          "type" : "User",
          "url" : "https://api.github.com/users/luke-jr"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/12196#discussion_r195908302"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/195908302"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "s/received by the address/of the UTXO/",
+      "commit_id" : "12cb70c0caec282fad5d7dc97a409d025c092481",
+      "created_at" : "2018-06-16T17:41:23Z",
+      "diff_hunk" : "@@ -1916,6 +1923,435 @@ static UniValue savemempool(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+/** RAII object to prevent concurrency issue when scanning the txout set */\n+static std::mutex g_utxosetscan;\n+static std::atomic<int> g_scan_progress;\n+static std::atomic<bool> g_scan_in_progress;\n+static std::atomic<bool> g_should_abort_scan;\n+class CoinsViewScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit CoinsViewScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        assert (!m_could_reserve);\n+        std::lock_guard<std::mutex> lock(g_utxosetscan);\n+        if (g_scan_in_progress) {\n+            return false;\n+        }\n+        g_scan_in_progress = true;\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~CoinsViewScanReserver() {\n+        if (m_could_reserve) {\n+            std::lock_guard<std::mutex> lock(g_utxosetscan);\n+            g_scan_in_progress = false;\n+        }\n+    }\n+};\n+\n+const char *g_default_scantxoutset_script_types[] = { \"P2PKH\", \"P2SH_P2WPKH\", \"P2WPKH\" };\n+\n+enum class OutputScriptType {\n+    UNKNOWN,\n+    P2PK,\n+    P2PKH,\n+    P2SH_P2WPKH,\n+    P2WPKH\n+};\n+\n+static inline OutputScriptType GetOutputScriptTypeFromString(const std::string& outputtype)\n+{\n+    if (outputtype == \"P2PK\") return OutputScriptType::P2PK;\n+    else if (outputtype == \"P2PKH\") return OutputScriptType::P2PKH;\n+    else if (outputtype == \"P2SH_P2WPKH\") return OutputScriptType::P2SH_P2WPKH;\n+    else if (outputtype == \"P2WPKH\") return OutputScriptType::P2WPKH;\n+    else return OutputScriptType::UNKNOWN;\n+}\n+\n+CTxDestination GetDestinationForKey(const CPubKey& key, OutputScriptType type)\n+{\n+    switch (type) {\n+    case OutputScriptType::P2PKH: return key.GetID();\n+    case OutputScriptType::P2SH_P2WPKH:\n+    case OutputScriptType::P2WPKH: {\n+        if (!key.IsCompressed()) return key.GetID();\n+        CTxDestination witdest = WitnessV0KeyHash(key.GetID());\n+        CScript witprog = GetScriptForDestination(witdest);\n+        if (type == OutputScriptType::P2SH_P2WPKH) {\n+            return CScriptID(witprog);\n+        } else {\n+            return witdest;\n+        }\n+    }\n+    default: assert(false);\n+    }\n+}\n+\n+/** A dummy keystore for the txout-set scan in order to calculate the right fees for the sweep transaction */\n+static CPubKey pub_key(std::vector<unsigned char>(33)); // always use a compress pubkey\n+class CCoinsViewScanDummySignKeyStore : public CBasicKeyStore\n+{\n+public:\n+    bool GetPubKey(const CKeyID &address, CPubKey& vchPubKeyOut) const override {\n+        // return dummy pubkey\n+        vchPubKeyOut = pub_key;\n+        return true;\n+    }\n+    bool GetCScript(const CScriptID &hash, CScript& redeemScriptOut) const override {\n+        // return a dummy TX_WITNESS_V0_KEYHASH script\n+        redeemScriptOut = CScript() << OP_0 << std::vector<unsigned char>(20);\n+        return true;\n+    }\n+};\n+\n+UniValue scantxoutset(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 3)\n+        throw std::runtime_error(\n+            \"scantxoutset <action> <scanobjects> ( <options> )\\n\"\n+            \"\\nScans the unspent transaction output set for possible entries that matches common scripts of given public keys.\\n\"\n+            \"Using addresses as scanobjects will _not_ detect unspent P2PK txouts\\n\"\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"action\\\"                       (string, required) The action to execute\\n\"\n+            \"                                      \\\"start\\\" for starting a scan\\n\"\n+            \"                                      \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                      \\\"status\\\" for progress report (in %) of the current scan\\n\"\n+            \"2. \\\"scanobjects\\\"                  (array, required) Array of scan objects (only one object type per scan object allowed)\\n\"\n+            \"      [\\n\"\n+            \"        { \\\"address\\\" : \\\"<address>\\\" },       (string, optional) Bitcoin address\\n\"\n+            \"        { \\\"script\\\"  : \\\"<scriptPubKey>\\\" },  (string, optional) HEX encoded script (scriptPubKey)\\n\"\n+            \"        { \\\"pubkey\\\"  :                      (object, optional) Public key\\n\"\n+            \"          {\\n\"\n+            \"            \\\"pubkey\\\" : \\\"<pubkey\\\">,         (string, required) HEX encoded public key\\n\"\n+            \"            \\\"script_types\\\" : [ ... ],      (array, optional) Array of script-types to derive from the pubkey (possible values: \\\"P2PK\\\", \\\"P2PKH\\\", \\\"P2SH-P2WPKH\\\", \\\"P2WPKH\\\")\\n\"\n+            \"          }\\n\"\n+            \"        },\\n\"\n+            \"        { \\\"xpub\\\"  :                        (object, optional) Use an extended public key child key range (m/0/k & m/1/k) to derive scripts from\\n\"\n+            \"          { \\n\"\n+            \"            \\\"xpub\\\" : \\\"<xpub\\\">,             (string, required) Base58check encoded extended public key (xpub)\\n\"\n+            \"            \\\"range\\\" : [ <s>, <e> ],        (array, optional) Range of keys that will be deriven from the given xpubs (default is 0 to 1000)\\n\"\n+            \"            \\\"script_types\\\" : [ ... ],      (array, optional) Array of derivation type (possible values: \\\"P2PK\\\", \\\"P2PKH\\\", \\\"P2SH-P2WPKH\\\", \\\"P2WPKH\\\")\\n\"\n+            \"          }\\n\"\n+            \"        },\\n\"\n+            \"      ]\\n\"\n+            \"3. \\\"options\\\"                               (object, optional)\\n\"\n+            \"      \\\"rawsweep\\\": {                        (object, optional) Optionally creates a raw sweep transaction\\n\"\n+            \"          \\\"address\\\": \\\"address\\\",            (string, optional) Address where the funds should be sent to\\n\"\n+            \"          \\\"feerate\\\": n,                    (numeric, optional, default not set: makes wallet determine the fee) Set a specific fee rate in \" + CURRENCY_UNIT + \"/kB\\n\"\n+            \"          \\\"conf_target\\\": n,                (numeric, optional) Confirmation target (in blocks), has no effect if feerate is provided\\n\"\n+            \"       }\\n\"\n+            \"\\nResult:\\n\"\n+            \"{\\n\"\n+            \"  \\\"unspents\\\": [\\n\"\n+            \"    {\\n\"\n+            \"    \\\"txid\\\" : \\\"transactionid\\\",     (string) The transaction id\\n\"\n+            \"    \\\"vout\\\": n,                    (numeric) the vout value\\n\"\n+            \"    \\\"scriptPubKey\\\" : \\\"script\\\",    (string) the script key\\n\"\n+            \"    \\\"amount\\\" : x.xxx,             (numeric) The total amount in \" + CURRENCY_UNIT + \" received by the address\\n\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/12196#discussion_r195908302",
+      "id" : 195908302,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDE5NTkwODMwMg==",
+      "original_commit_id" : "12cb70c0caec282fad5d7dc97a409d025c092481",
+      "original_position" : 158,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 158,
+      "pull_request_review_id" : 129368754,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/12196",
+      "updated_at" : "2018-06-16T17:41:23Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/195908302",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
    }
 ]
