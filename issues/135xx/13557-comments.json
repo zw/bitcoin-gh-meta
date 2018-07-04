@@ -8338,5 +8338,447 @@
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200201430"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200201430"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "`> 3`",
+      "commit_id" : "dbd6d74ec6057af9afd97973d138ed44e49411dd",
+      "created_at" : "2018-07-04T21:08:36Z",
+      "diff_hunk" : "@@ -4391,6 +4391,339 @@ UniValue sethdseed(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+bool ParseHDKeypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            }\n+            return false;\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= 0x80000000;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        if (item.find_first_not_of( \"0123456789\" ) != std::string::npos) {\n+            return false;\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void AddKeypathToMap(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    if (!pwallet->GetPubKey(keyID, vchPubKey)) {\n+        return;\n+    }\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    std::vector<uint32_t> keypath;\n+    if (!meta.hdKeypath.empty()) {\n+        if (!ParseHDKeypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hd_seed_id, key);\n+        CExtKey masterKey;\n+        masterKey.SetSeed(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), ReadLE32(masterKey.key.GetPubKey().GetID().begin()));\n+    } else { // Single pubkeys get the master fingerprint of themselves\n+        keypath.insert(keypath.begin(), ReadLE32(vchPubKey.GetID().begin()));\n+    }\n+    hd_keypaths.emplace(vchPubKey, keypath);\n+}\n+\n+bool FillPSBT(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst, int sighash_type, bool sign)\n+{\n+    // Get all of the previous transactions\n+    bool complete = true;\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        const CTxIn& txin = txConst->vin[i];\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        const uint256& txhash = txin.prevout.hash;\n+        if (pwallet->mapWallet.count(txhash)) {\n+            const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+            CTxOut utxo = wtx.tx->vout[txin.prevout.n];\n+            input.non_witness_utxo = wtx.tx;\n+            input.witness_utxo = utxo;\n+        }\n+\n+        // Get the Sighash type\n+        if (sign && input.sighash_type > 0 && input.sighash_type != sighash_type) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"Specified Sighash and sighash in PSBT do not match.\");\n+        }\n+\n+        SignatureData sigdata;\n+        if (sign) {\n+            complete &= SignPSBTInput(*pwallet, *psbtx.tx, input, sigdata, i, sighash_type);\n+        } else {\n+            complete &= SignPSBTInput(PublicOnlySigningProvider(pwallet), *psbtx.tx, input, sigdata, i, sighash_type);\n+        }\n+\n+        // Drop the unnecessary UTXO\n+        if (sigdata.witness) {\n+            input.non_witness_utxo = nullptr;\n+        } else {\n+            input.witness_utxo.SetNull();\n+        }\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, input.hd_keypaths);\n+        }\n+    }\n+\n+    // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change\n+    for (unsigned int i = 0; i < txConst->vout.size(); ++i) {\n+        const CTxOut& out = txConst->vout.at(i);\n+        PSBTOutput& psbt_out = psbtx.outputs.at(i);\n+\n+        // Dummy tx so we can use ProduceSignature to get stuff out\n+        CMutableTransaction dummy_tx;\n+        dummy_tx.vin.push_back(CTxIn());\n+        dummy_tx.vout.push_back(CTxOut());\n+\n+        // Fill a SignatureData with output info\n+        SignatureData sigdata;\n+        psbt_out.FillSignatureData(sigdata);\n+\n+        MutableTransactionSignatureCreator creator(psbtx.tx.get_ptr(), 0, out.nValue, 1);\n+        ProduceSignature(*pwallet, creator, out.scriptPubKey, sigdata);\n+        psbt_out.FromSignatureData(sigdata);\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, psbt_out.hd_keypaths);\n+        }\n+    }\n+    return complete;\n+}\n+\n+UniValue walletprocesspsbt(const JSONRPCRequest& request)\n+{\n+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);\n+    CWallet* const pwallet = wallet.get();\n+\n+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {\n+        return NullUniValue;\n+    }\n+\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200201430",
+      "id" : 200201430,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIwMDIwMTQzMA==",
+      "original_commit_id" : "9e4077a992bc647f36f724c74ba6c595afe12419",
+      "original_position" : 149,
+      "path" : "src/wallet/rpcwallet.cpp",
+      "position" : 383,
+      "pull_request_review_id" : 134470768,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557",
+      "updated_at" : "2018-07-04T21:37:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200201430",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200201761"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200201761"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "`[2]`?",
+      "commit_id" : "dbd6d74ec6057af9afd97973d138ed44e49411dd",
+      "created_at" : "2018-07-04T21:13:01Z",
+      "diff_hunk" : "@@ -4391,6 +4391,339 @@ UniValue sethdseed(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+bool ParseHDKeypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            }\n+            return false;\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= 0x80000000;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        if (item.find_first_not_of( \"0123456789\" ) != std::string::npos) {\n+            return false;\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void AddKeypathToMap(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    if (!pwallet->GetPubKey(keyID, vchPubKey)) {\n+        return;\n+    }\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    std::vector<uint32_t> keypath;\n+    if (!meta.hdKeypath.empty()) {\n+        if (!ParseHDKeypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hd_seed_id, key);\n+        CExtKey masterKey;\n+        masterKey.SetSeed(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), ReadLE32(masterKey.key.GetPubKey().GetID().begin()));\n+    } else { // Single pubkeys get the master fingerprint of themselves\n+        keypath.insert(keypath.begin(), ReadLE32(vchPubKey.GetID().begin()));\n+    }\n+    hd_keypaths.emplace(vchPubKey, keypath);\n+}\n+\n+bool FillPSBT(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst, int sighash_type, bool sign)\n+{\n+    // Get all of the previous transactions\n+    bool complete = true;\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        const CTxIn& txin = txConst->vin[i];\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        const uint256& txhash = txin.prevout.hash;\n+        if (pwallet->mapWallet.count(txhash)) {\n+            const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+            CTxOut utxo = wtx.tx->vout[txin.prevout.n];\n+            input.non_witness_utxo = wtx.tx;\n+            input.witness_utxo = utxo;\n+        }\n+\n+        // Get the Sighash type\n+        if (sign && input.sighash_type > 0 && input.sighash_type != sighash_type) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"Specified Sighash and sighash in PSBT do not match.\");\n+        }\n+\n+        SignatureData sigdata;\n+        if (sign) {\n+            complete &= SignPSBTInput(*pwallet, *psbtx.tx, input, sigdata, i, sighash_type);\n+        } else {\n+            complete &= SignPSBTInput(PublicOnlySigningProvider(pwallet), *psbtx.tx, input, sigdata, i, sighash_type);\n+        }\n+\n+        // Drop the unnecessary UTXO\n+        if (sigdata.witness) {\n+            input.non_witness_utxo = nullptr;\n+        } else {\n+            input.witness_utxo.SetNull();\n+        }\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, input.hd_keypaths);\n+        }\n+    }\n+\n+    // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change\n+    for (unsigned int i = 0; i < txConst->vout.size(); ++i) {\n+        const CTxOut& out = txConst->vout.at(i);\n+        PSBTOutput& psbt_out = psbtx.outputs.at(i);\n+\n+        // Dummy tx so we can use ProduceSignature to get stuff out\n+        CMutableTransaction dummy_tx;\n+        dummy_tx.vin.push_back(CTxIn());\n+        dummy_tx.vout.push_back(CTxOut());\n+\n+        // Fill a SignatureData with output info\n+        SignatureData sigdata;\n+        psbt_out.FillSignatureData(sigdata);\n+\n+        MutableTransactionSignatureCreator creator(psbtx.tx.get_ptr(), 0, out.nValue, 1);\n+        ProduceSignature(*pwallet, creator, out.scriptPubKey, sigdata);\n+        psbt_out.FromSignatureData(sigdata);\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, psbt_out.hd_keypaths);\n+        }\n+    }\n+    return complete;\n+}\n+\n+UniValue walletprocesspsbt(const JSONRPCRequest& request)\n+{\n+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);\n+    CWallet* const pwallet = wallet.get();\n+\n+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {\n+        return NullUniValue;\n+    }\n+\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)\n+        throw std::runtime_error(\n+            \"walletprocesspsbt \\\"psbt\\\" ( sign sighashtype )\\n\"\n+            \"\\nUpdate a PSBT with input information from our wallet and then sign inputs\\n\"\n+            \"that we can sign for.\\n\"\n+            + HelpRequiringPassphrase(pwallet) + \"\\n\"\n+\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"psbt\\\"                      (string, required) The transaction base64 string\\n\"\n+            \"2. \\\"sign\\\",                     (string, optional, default=true) Also sign the transaction when updating\\n\"\n+            \"3. \\\"sighashtype\\\"            (string, optional, default=ALL) The signature hash type to sign with if not specified by the PSBT. Must be one of\\n\"\n+            \"       \\\"ALL\\\"\\n\"\n+            \"       \\\"NONE\\\"\\n\"\n+            \"       \\\"SINGLE\\\"\\n\"\n+            \"       \\\"ALL|ANYONECANPAY\\\"\\n\"\n+            \"       \\\"NONE|ANYONECANPAY\\\"\\n\"\n+            \"       \\\"SINGLE|ANYONECANPAY\\\"\\n\"\n+\n+            \"\\nResult:\\n\"\n+            \"{\\n\"\n+            \"  \\\"psbt\\\" : \\\"value\\\",          (string) The base64-encoded partially signed transaction\\n\"\n+            \"  \\\"complete\\\" : true|false,   (boolean) If the transaction has a complete set of signatures\\n\"\n+            \"  ]\\n\"\n+            \"}\\n\"\n+\n+            \"\\nExamples:\\n\"\n+            + HelpExampleCli(\"walletprocesspsbt\", \"\\\"psbt\\\"\")\n+        );\n+\n+    LOCK2(cs_main, pwallet->cs_wallet);\n+    RPCTypeCheck(request.params, {UniValue::VSTR, UniValue::VBOOL, UniValue::VSTR});\n+\n+    // Unserialize the transaction\n+    PartiallySignedTransaction psbtx;\n+    std::string error;\n+    if (!DecodePSBT(psbtx, request.params[0].get_str(), error)) {\n+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf(\"TX decode failed %s\", error));\n+    }\n+\n+    // Get the sighash type\n+    int nHashType = SIGHASH_ALL;\n+    if (!request.params[2].isNull()) {\n+        static std::map<std::string, int> mapSigHashValues = {\n+            {std::string(\"ALL\"), int(SIGHASH_ALL)},\n+            {std::string(\"ALL|ANYONECANPAY\"), int(SIGHASH_ALL|SIGHASH_ANYONECANPAY)},\n+            {std::string(\"NONE\"), int(SIGHASH_NONE)},\n+            {std::string(\"NONE|ANYONECANPAY\"), int(SIGHASH_NONE|SIGHASH_ANYONECANPAY)},\n+            {std::string(\"SINGLE\"), int(SIGHASH_SINGLE)},\n+            {std::string(\"SINGLE|ANYONECANPAY\"), int(SIGHASH_SINGLE|SIGHASH_ANYONECANPAY)},\n+        };\n+        std::string strHashType = request.params[1].get_str();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200201761",
+      "id" : 200201761,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIwMDIwMTc2MQ==",
+      "original_commit_id" : "9e4077a992bc647f36f724c74ba6c595afe12419",
+      "original_position" : 199,
+      "path" : "src/wallet/rpcwallet.cpp",
+      "position" : 433,
+      "pull_request_review_id" : 134470768,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557",
+      "updated_at" : "2018-07-04T21:37:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200201761",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202027"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202027"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Nit, could move this to a `ParseSigHashType()`? Like `ParseOutputType` and `ParseConfirmTarget`.",
+      "commit_id" : "dbd6d74ec6057af9afd97973d138ed44e49411dd",
+      "created_at" : "2018-07-04T21:16:39Z",
+      "diff_hunk" : "@@ -4391,6 +4391,339 @@ UniValue sethdseed(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+bool ParseHDKeypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            }\n+            return false;\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= 0x80000000;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        if (item.find_first_not_of( \"0123456789\" ) != std::string::npos) {\n+            return false;\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void AddKeypathToMap(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    if (!pwallet->GetPubKey(keyID, vchPubKey)) {\n+        return;\n+    }\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    std::vector<uint32_t> keypath;\n+    if (!meta.hdKeypath.empty()) {\n+        if (!ParseHDKeypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hd_seed_id, key);\n+        CExtKey masterKey;\n+        masterKey.SetSeed(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), ReadLE32(masterKey.key.GetPubKey().GetID().begin()));\n+    } else { // Single pubkeys get the master fingerprint of themselves\n+        keypath.insert(keypath.begin(), ReadLE32(vchPubKey.GetID().begin()));\n+    }\n+    hd_keypaths.emplace(vchPubKey, keypath);\n+}\n+\n+bool FillPSBT(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst, int sighash_type, bool sign)\n+{\n+    // Get all of the previous transactions\n+    bool complete = true;\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        const CTxIn& txin = txConst->vin[i];\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        const uint256& txhash = txin.prevout.hash;\n+        if (pwallet->mapWallet.count(txhash)) {\n+            const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+            CTxOut utxo = wtx.tx->vout[txin.prevout.n];\n+            input.non_witness_utxo = wtx.tx;\n+            input.witness_utxo = utxo;\n+        }\n+\n+        // Get the Sighash type\n+        if (sign && input.sighash_type > 0 && input.sighash_type != sighash_type) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"Specified Sighash and sighash in PSBT do not match.\");\n+        }\n+\n+        SignatureData sigdata;\n+        if (sign) {\n+            complete &= SignPSBTInput(*pwallet, *psbtx.tx, input, sigdata, i, sighash_type);\n+        } else {\n+            complete &= SignPSBTInput(PublicOnlySigningProvider(pwallet), *psbtx.tx, input, sigdata, i, sighash_type);\n+        }\n+\n+        // Drop the unnecessary UTXO\n+        if (sigdata.witness) {\n+            input.non_witness_utxo = nullptr;\n+        } else {\n+            input.witness_utxo.SetNull();\n+        }\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, input.hd_keypaths);\n+        }\n+    }\n+\n+    // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change\n+    for (unsigned int i = 0; i < txConst->vout.size(); ++i) {\n+        const CTxOut& out = txConst->vout.at(i);\n+        PSBTOutput& psbt_out = psbtx.outputs.at(i);\n+\n+        // Dummy tx so we can use ProduceSignature to get stuff out\n+        CMutableTransaction dummy_tx;\n+        dummy_tx.vin.push_back(CTxIn());\n+        dummy_tx.vout.push_back(CTxOut());\n+\n+        // Fill a SignatureData with output info\n+        SignatureData sigdata;\n+        psbt_out.FillSignatureData(sigdata);\n+\n+        MutableTransactionSignatureCreator creator(psbtx.tx.get_ptr(), 0, out.nValue, 1);\n+        ProduceSignature(*pwallet, creator, out.scriptPubKey, sigdata);\n+        psbt_out.FromSignatureData(sigdata);\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, psbt_out.hd_keypaths);\n+        }\n+    }\n+    return complete;\n+}\n+\n+UniValue walletprocesspsbt(const JSONRPCRequest& request)\n+{\n+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);\n+    CWallet* const pwallet = wallet.get();\n+\n+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {\n+        return NullUniValue;\n+    }\n+\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)\n+        throw std::runtime_error(\n+            \"walletprocesspsbt \\\"psbt\\\" ( sign sighashtype )\\n\"\n+            \"\\nUpdate a PSBT with input information from our wallet and then sign inputs\\n\"\n+            \"that we can sign for.\\n\"\n+            + HelpRequiringPassphrase(pwallet) + \"\\n\"\n+\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"psbt\\\"                      (string, required) The transaction base64 string\\n\"\n+            \"2. \\\"sign\\\",                     (string, optional, default=true) Also sign the transaction when updating\\n\"\n+            \"3. \\\"sighashtype\\\"            (string, optional, default=ALL) The signature hash type to sign with if not specified by the PSBT. Must be one of\\n\"\n+            \"       \\\"ALL\\\"\\n\"\n+            \"       \\\"NONE\\\"\\n\"\n+            \"       \\\"SINGLE\\\"\\n\"\n+            \"       \\\"ALL|ANYONECANPAY\\\"\\n\"\n+            \"       \\\"NONE|ANYONECANPAY\\\"\\n\"\n+            \"       \\\"SINGLE|ANYONECANPAY\\\"\\n\"\n+\n+            \"\\nResult:\\n\"\n+            \"{\\n\"\n+            \"  \\\"psbt\\\" : \\\"value\\\",          (string) The base64-encoded partially signed transaction\\n\"\n+            \"  \\\"complete\\\" : true|false,   (boolean) If the transaction has a complete set of signatures\\n\"\n+            \"  ]\\n\"\n+            \"}\\n\"\n+\n+            \"\\nExamples:\\n\"\n+            + HelpExampleCli(\"walletprocesspsbt\", \"\\\"psbt\\\"\")\n+        );\n+\n+    LOCK2(cs_main, pwallet->cs_wallet);\n+    RPCTypeCheck(request.params, {UniValue::VSTR, UniValue::VBOOL, UniValue::VSTR});\n+\n+    // Unserialize the transaction\n+    PartiallySignedTransaction psbtx;\n+    std::string error;\n+    if (!DecodePSBT(psbtx, request.params[0].get_str(), error)) {\n+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf(\"TX decode failed %s\", error));\n+    }\n+\n+    // Get the sighash type\n+    int nHashType = SIGHASH_ALL;\n+    if (!request.params[2].isNull()) {\n+        static std::map<std::string, int> mapSigHashValues = {\n+            {std::string(\"ALL\"), int(SIGHASH_ALL)},\n+            {std::string(\"ALL|ANYONECANPAY\"), int(SIGHASH_ALL|SIGHASH_ANYONECANPAY)},\n+            {std::string(\"NONE\"), int(SIGHASH_NONE)},\n+            {std::string(\"NONE|ANYONECANPAY\"), int(SIGHASH_NONE|SIGHASH_ANYONECANPAY)},\n+            {std::string(\"SINGLE\"), int(SIGHASH_SINGLE)},\n+            {std::string(\"SINGLE|ANYONECANPAY\"), int(SIGHASH_SINGLE|SIGHASH_ANYONECANPAY)},\n+        };\n+        std::string strHashType = request.params[1].get_str();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202027",
+      "id" : 200202027,
+      "in_reply_to_id" : 200201761,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIwMDIwMjAyNw==",
+      "original_commit_id" : "9e4077a992bc647f36f724c74ba6c595afe12419",
+      "original_position" : 199,
+      "path" : "src/wallet/rpcwallet.cpp",
+      "position" : 433,
+      "pull_request_review_id" : 134470768,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557",
+      "updated_at" : "2018-07-04T21:37:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202027",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202117"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202117"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit, just `complete`.",
+      "commit_id" : "dbd6d74ec6057af9afd97973d138ed44e49411dd",
+      "created_at" : "2018-07-04T21:17:51Z",
+      "diff_hunk" : "@@ -4391,6 +4391,339 @@ UniValue sethdseed(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+bool ParseHDKeypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            }\n+            return false;\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= 0x80000000;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        if (item.find_first_not_of( \"0123456789\" ) != std::string::npos) {\n+            return false;\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void AddKeypathToMap(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    if (!pwallet->GetPubKey(keyID, vchPubKey)) {\n+        return;\n+    }\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    std::vector<uint32_t> keypath;\n+    if (!meta.hdKeypath.empty()) {\n+        if (!ParseHDKeypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hd_seed_id, key);\n+        CExtKey masterKey;\n+        masterKey.SetSeed(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), ReadLE32(masterKey.key.GetPubKey().GetID().begin()));\n+    } else { // Single pubkeys get the master fingerprint of themselves\n+        keypath.insert(keypath.begin(), ReadLE32(vchPubKey.GetID().begin()));\n+    }\n+    hd_keypaths.emplace(vchPubKey, keypath);\n+}\n+\n+bool FillPSBT(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst, int sighash_type, bool sign)\n+{\n+    // Get all of the previous transactions\n+    bool complete = true;\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        const CTxIn& txin = txConst->vin[i];\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        const uint256& txhash = txin.prevout.hash;\n+        if (pwallet->mapWallet.count(txhash)) {\n+            const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+            CTxOut utxo = wtx.tx->vout[txin.prevout.n];\n+            input.non_witness_utxo = wtx.tx;\n+            input.witness_utxo = utxo;\n+        }\n+\n+        // Get the Sighash type\n+        if (sign && input.sighash_type > 0 && input.sighash_type != sighash_type) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"Specified Sighash and sighash in PSBT do not match.\");\n+        }\n+\n+        SignatureData sigdata;\n+        if (sign) {\n+            complete &= SignPSBTInput(*pwallet, *psbtx.tx, input, sigdata, i, sighash_type);\n+        } else {\n+            complete &= SignPSBTInput(PublicOnlySigningProvider(pwallet), *psbtx.tx, input, sigdata, i, sighash_type);\n+        }\n+\n+        // Drop the unnecessary UTXO\n+        if (sigdata.witness) {\n+            input.non_witness_utxo = nullptr;\n+        } else {\n+            input.witness_utxo.SetNull();\n+        }\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, input.hd_keypaths);\n+        }\n+    }\n+\n+    // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change\n+    for (unsigned int i = 0; i < txConst->vout.size(); ++i) {\n+        const CTxOut& out = txConst->vout.at(i);\n+        PSBTOutput& psbt_out = psbtx.outputs.at(i);\n+\n+        // Dummy tx so we can use ProduceSignature to get stuff out\n+        CMutableTransaction dummy_tx;\n+        dummy_tx.vin.push_back(CTxIn());\n+        dummy_tx.vout.push_back(CTxOut());\n+\n+        // Fill a SignatureData with output info\n+        SignatureData sigdata;\n+        psbt_out.FillSignatureData(sigdata);\n+\n+        MutableTransactionSignatureCreator creator(psbtx.tx.get_ptr(), 0, out.nValue, 1);\n+        ProduceSignature(*pwallet, creator, out.scriptPubKey, sigdata);\n+        psbt_out.FromSignatureData(sigdata);\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, psbt_out.hd_keypaths);\n+        }\n+    }\n+    return complete;\n+}\n+\n+UniValue walletprocesspsbt(const JSONRPCRequest& request)\n+{\n+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);\n+    CWallet* const pwallet = wallet.get();\n+\n+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {\n+        return NullUniValue;\n+    }\n+\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)\n+        throw std::runtime_error(\n+            \"walletprocesspsbt \\\"psbt\\\" ( sign sighashtype )\\n\"\n+            \"\\nUpdate a PSBT with input information from our wallet and then sign inputs\\n\"\n+            \"that we can sign for.\\n\"\n+            + HelpRequiringPassphrase(pwallet) + \"\\n\"\n+\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"psbt\\\"                      (string, required) The transaction base64 string\\n\"\n+            \"2. \\\"sign\\\",                     (string, optional, default=true) Also sign the transaction when updating\\n\"\n+            \"3. \\\"sighashtype\\\"            (string, optional, default=ALL) The signature hash type to sign with if not specified by the PSBT. Must be one of\\n\"\n+            \"       \\\"ALL\\\"\\n\"\n+            \"       \\\"NONE\\\"\\n\"\n+            \"       \\\"SINGLE\\\"\\n\"\n+            \"       \\\"ALL|ANYONECANPAY\\\"\\n\"\n+            \"       \\\"NONE|ANYONECANPAY\\\"\\n\"\n+            \"       \\\"SINGLE|ANYONECANPAY\\\"\\n\"\n+\n+            \"\\nResult:\\n\"\n+            \"{\\n\"\n+            \"  \\\"psbt\\\" : \\\"value\\\",          (string) The base64-encoded partially signed transaction\\n\"\n+            \"  \\\"complete\\\" : true|false,   (boolean) If the transaction has a complete set of signatures\\n\"\n+            \"  ]\\n\"\n+            \"}\\n\"\n+\n+            \"\\nExamples:\\n\"\n+            + HelpExampleCli(\"walletprocesspsbt\", \"\\\"psbt\\\"\")\n+        );\n+\n+    LOCK2(cs_main, pwallet->cs_wallet);\n+    RPCTypeCheck(request.params, {UniValue::VSTR, UniValue::VBOOL, UniValue::VSTR});\n+\n+    // Unserialize the transaction\n+    PartiallySignedTransaction psbtx;\n+    std::string error;\n+    if (!DecodePSBT(psbtx, request.params[0].get_str(), error)) {\n+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf(\"TX decode failed %s\", error));\n+    }\n+\n+    // Get the sighash type\n+    int nHashType = SIGHASH_ALL;\n+    if (!request.params[2].isNull()) {\n+        static std::map<std::string, int> mapSigHashValues = {\n+            {std::string(\"ALL\"), int(SIGHASH_ALL)},\n+            {std::string(\"ALL|ANYONECANPAY\"), int(SIGHASH_ALL|SIGHASH_ANYONECANPAY)},\n+            {std::string(\"NONE\"), int(SIGHASH_NONE)},\n+            {std::string(\"NONE|ANYONECANPAY\"), int(SIGHASH_NONE|SIGHASH_ANYONECANPAY)},\n+            {std::string(\"SINGLE\"), int(SIGHASH_SINGLE)},\n+            {std::string(\"SINGLE|ANYONECANPAY\"), int(SIGHASH_SINGLE|SIGHASH_ANYONECANPAY)},\n+        };\n+        std::string strHashType = request.params[1].get_str();\n+        if (mapSigHashValues.count(strHashType)) {\n+            nHashType = mapSigHashValues[strHashType];\n+        } else {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid sighash param\");\n+        }\n+    }\n+\n+    // Use CTransaction for the constant parts of the\n+    // transaction to avoid rehashing.\n+    const CTransaction txConst(*psbtx.tx);\n+\n+    // Fill transaction with our data and also sign\n+    bool sign = request.params[1].isNull() ? true : request.params[1].get_bool();\n+    bool fComplete = FillPSBT(pwallet, psbtx, &txConst, nHashType, sign);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202117",
+      "id" : 200202117,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIwMDIwMjExNw==",
+      "original_commit_id" : "9e4077a992bc647f36f724c74ba6c595afe12419",
+      "original_position" : 213,
+      "path" : "src/wallet/rpcwallet.cpp",
+      "position" : 447,
+      "pull_request_review_id" : 134470768,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557",
+      "updated_at" : "2018-07-04T21:37:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202117",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202478"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202478"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Why lock `cs_main`? Locking could be in `FillPSBT`?",
+      "commit_id" : "dbd6d74ec6057af9afd97973d138ed44e49411dd",
+      "created_at" : "2018-07-04T21:22:09Z",
+      "diff_hunk" : "@@ -4391,6 +4391,339 @@ UniValue sethdseed(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+bool ParseHDKeypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            }\n+            return false;\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= 0x80000000;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        if (item.find_first_not_of( \"0123456789\" ) != std::string::npos) {\n+            return false;\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void AddKeypathToMap(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    if (!pwallet->GetPubKey(keyID, vchPubKey)) {\n+        return;\n+    }\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    std::vector<uint32_t> keypath;\n+    if (!meta.hdKeypath.empty()) {\n+        if (!ParseHDKeypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hd_seed_id, key);\n+        CExtKey masterKey;\n+        masterKey.SetSeed(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), ReadLE32(masterKey.key.GetPubKey().GetID().begin()));\n+    } else { // Single pubkeys get the master fingerprint of themselves\n+        keypath.insert(keypath.begin(), ReadLE32(vchPubKey.GetID().begin()));\n+    }\n+    hd_keypaths.emplace(vchPubKey, keypath);\n+}\n+\n+bool FillPSBT(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst, int sighash_type, bool sign)\n+{\n+    // Get all of the previous transactions\n+    bool complete = true;\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        const CTxIn& txin = txConst->vin[i];\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        const uint256& txhash = txin.prevout.hash;\n+        if (pwallet->mapWallet.count(txhash)) {\n+            const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+            CTxOut utxo = wtx.tx->vout[txin.prevout.n];\n+            input.non_witness_utxo = wtx.tx;\n+            input.witness_utxo = utxo;\n+        }\n+\n+        // Get the Sighash type\n+        if (sign && input.sighash_type > 0 && input.sighash_type != sighash_type) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"Specified Sighash and sighash in PSBT do not match.\");\n+        }\n+\n+        SignatureData sigdata;\n+        if (sign) {\n+            complete &= SignPSBTInput(*pwallet, *psbtx.tx, input, sigdata, i, sighash_type);\n+        } else {\n+            complete &= SignPSBTInput(PublicOnlySigningProvider(pwallet), *psbtx.tx, input, sigdata, i, sighash_type);\n+        }\n+\n+        // Drop the unnecessary UTXO\n+        if (sigdata.witness) {\n+            input.non_witness_utxo = nullptr;\n+        } else {\n+            input.witness_utxo.SetNull();\n+        }\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, input.hd_keypaths);\n+        }\n+    }\n+\n+    // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change\n+    for (unsigned int i = 0; i < txConst->vout.size(); ++i) {\n+        const CTxOut& out = txConst->vout.at(i);\n+        PSBTOutput& psbt_out = psbtx.outputs.at(i);\n+\n+        // Dummy tx so we can use ProduceSignature to get stuff out\n+        CMutableTransaction dummy_tx;\n+        dummy_tx.vin.push_back(CTxIn());\n+        dummy_tx.vout.push_back(CTxOut());\n+\n+        // Fill a SignatureData with output info\n+        SignatureData sigdata;\n+        psbt_out.FillSignatureData(sigdata);\n+\n+        MutableTransactionSignatureCreator creator(psbtx.tx.get_ptr(), 0, out.nValue, 1);\n+        ProduceSignature(*pwallet, creator, out.scriptPubKey, sigdata);\n+        psbt_out.FromSignatureData(sigdata);\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, psbt_out.hd_keypaths);\n+        }\n+    }\n+    return complete;\n+}\n+\n+UniValue walletprocesspsbt(const JSONRPCRequest& request)\n+{\n+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);\n+    CWallet* const pwallet = wallet.get();\n+\n+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {\n+        return NullUniValue;\n+    }\n+\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)\n+        throw std::runtime_error(\n+            \"walletprocesspsbt \\\"psbt\\\" ( sign sighashtype )\\n\"\n+            \"\\nUpdate a PSBT with input information from our wallet and then sign inputs\\n\"\n+            \"that we can sign for.\\n\"\n+            + HelpRequiringPassphrase(pwallet) + \"\\n\"\n+\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"psbt\\\"                      (string, required) The transaction base64 string\\n\"\n+            \"2. \\\"sign\\\",                     (string, optional, default=true) Also sign the transaction when updating\\n\"\n+            \"3. \\\"sighashtype\\\"            (string, optional, default=ALL) The signature hash type to sign with if not specified by the PSBT. Must be one of\\n\"\n+            \"       \\\"ALL\\\"\\n\"\n+            \"       \\\"NONE\\\"\\n\"\n+            \"       \\\"SINGLE\\\"\\n\"\n+            \"       \\\"ALL|ANYONECANPAY\\\"\\n\"\n+            \"       \\\"NONE|ANYONECANPAY\\\"\\n\"\n+            \"       \\\"SINGLE|ANYONECANPAY\\\"\\n\"\n+\n+            \"\\nResult:\\n\"\n+            \"{\\n\"\n+            \"  \\\"psbt\\\" : \\\"value\\\",          (string) The base64-encoded partially signed transaction\\n\"\n+            \"  \\\"complete\\\" : true|false,   (boolean) If the transaction has a complete set of signatures\\n\"\n+            \"  ]\\n\"\n+            \"}\\n\"\n+\n+            \"\\nExamples:\\n\"\n+            + HelpExampleCli(\"walletprocesspsbt\", \"\\\"psbt\\\"\")\n+        );\n+\n+    LOCK2(cs_main, pwallet->cs_wallet);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202478",
+      "id" : 200202478,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIwMDIwMjQ3OA==",
+      "original_commit_id" : "9e4077a992bc647f36f724c74ba6c595afe12419",
+      "original_position" : 178,
+      "path" : "src/wallet/rpcwallet.cpp",
+      "position" : 412,
+      "pull_request_review_id" : 134470768,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557",
+      "updated_at" : "2018-07-04T21:37:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202478",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202562"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202562"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "boolean? Drop `\\\"` in `sign`.",
+      "commit_id" : "dbd6d74ec6057af9afd97973d138ed44e49411dd",
+      "created_at" : "2018-07-04T21:23:33Z",
+      "diff_hunk" : "@@ -4391,6 +4391,339 @@ UniValue sethdseed(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+bool ParseHDKeypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            }\n+            return false;\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= 0x80000000;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        if (item.find_first_not_of( \"0123456789\" ) != std::string::npos) {\n+            return false;\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void AddKeypathToMap(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    if (!pwallet->GetPubKey(keyID, vchPubKey)) {\n+        return;\n+    }\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    std::vector<uint32_t> keypath;\n+    if (!meta.hdKeypath.empty()) {\n+        if (!ParseHDKeypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hd_seed_id, key);\n+        CExtKey masterKey;\n+        masterKey.SetSeed(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), ReadLE32(masterKey.key.GetPubKey().GetID().begin()));\n+    } else { // Single pubkeys get the master fingerprint of themselves\n+        keypath.insert(keypath.begin(), ReadLE32(vchPubKey.GetID().begin()));\n+    }\n+    hd_keypaths.emplace(vchPubKey, keypath);\n+}\n+\n+bool FillPSBT(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst, int sighash_type, bool sign)\n+{\n+    // Get all of the previous transactions\n+    bool complete = true;\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        const CTxIn& txin = txConst->vin[i];\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        const uint256& txhash = txin.prevout.hash;\n+        if (pwallet->mapWallet.count(txhash)) {\n+            const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+            CTxOut utxo = wtx.tx->vout[txin.prevout.n];\n+            input.non_witness_utxo = wtx.tx;\n+            input.witness_utxo = utxo;\n+        }\n+\n+        // Get the Sighash type\n+        if (sign && input.sighash_type > 0 && input.sighash_type != sighash_type) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"Specified Sighash and sighash in PSBT do not match.\");\n+        }\n+\n+        SignatureData sigdata;\n+        if (sign) {\n+            complete &= SignPSBTInput(*pwallet, *psbtx.tx, input, sigdata, i, sighash_type);\n+        } else {\n+            complete &= SignPSBTInput(PublicOnlySigningProvider(pwallet), *psbtx.tx, input, sigdata, i, sighash_type);\n+        }\n+\n+        // Drop the unnecessary UTXO\n+        if (sigdata.witness) {\n+            input.non_witness_utxo = nullptr;\n+        } else {\n+            input.witness_utxo.SetNull();\n+        }\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, input.hd_keypaths);\n+        }\n+    }\n+\n+    // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change\n+    for (unsigned int i = 0; i < txConst->vout.size(); ++i) {\n+        const CTxOut& out = txConst->vout.at(i);\n+        PSBTOutput& psbt_out = psbtx.outputs.at(i);\n+\n+        // Dummy tx so we can use ProduceSignature to get stuff out\n+        CMutableTransaction dummy_tx;\n+        dummy_tx.vin.push_back(CTxIn());\n+        dummy_tx.vout.push_back(CTxOut());\n+\n+        // Fill a SignatureData with output info\n+        SignatureData sigdata;\n+        psbt_out.FillSignatureData(sigdata);\n+\n+        MutableTransactionSignatureCreator creator(psbtx.tx.get_ptr(), 0, out.nValue, 1);\n+        ProduceSignature(*pwallet, creator, out.scriptPubKey, sigdata);\n+        psbt_out.FromSignatureData(sigdata);\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, psbt_out.hd_keypaths);\n+        }\n+    }\n+    return complete;\n+}\n+\n+UniValue walletprocesspsbt(const JSONRPCRequest& request)\n+{\n+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);\n+    CWallet* const pwallet = wallet.get();\n+\n+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {\n+        return NullUniValue;\n+    }\n+\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)\n+        throw std::runtime_error(\n+            \"walletprocesspsbt \\\"psbt\\\" ( sign sighashtype )\\n\"\n+            \"\\nUpdate a PSBT with input information from our wallet and then sign inputs\\n\"\n+            \"that we can sign for.\\n\"\n+            + HelpRequiringPassphrase(pwallet) + \"\\n\"\n+\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"psbt\\\"                      (string, required) The transaction base64 string\\n\"\n+            \"2. \\\"sign\\\",                     (string, optional, default=true) Also sign the transaction when updating\\n\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202562",
+      "id" : 200202562,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIwMDIwMjU2Mg==",
+      "original_commit_id" : "9e4077a992bc647f36f724c74ba6c595afe12419",
+      "original_position" : 158,
+      "path" : "src/wallet/rpcwallet.cpp",
+      "position" : 392,
+      "pull_request_review_id" : 134470768,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557",
+      "updated_at" : "2018-07-04T21:37:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202562",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202663"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202663"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "`\"sighashtype\"`?",
+      "commit_id" : "dbd6d74ec6057af9afd97973d138ed44e49411dd",
+      "created_at" : "2018-07-04T21:25:03Z",
+      "diff_hunk" : "@@ -4391,6 +4391,339 @@ UniValue sethdseed(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+bool ParseHDKeypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            }\n+            return false;\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= 0x80000000;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        if (item.find_first_not_of( \"0123456789\" ) != std::string::npos) {\n+            return false;\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void AddKeypathToMap(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    if (!pwallet->GetPubKey(keyID, vchPubKey)) {\n+        return;\n+    }\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    std::vector<uint32_t> keypath;\n+    if (!meta.hdKeypath.empty()) {\n+        if (!ParseHDKeypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hd_seed_id, key);\n+        CExtKey masterKey;\n+        masterKey.SetSeed(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), ReadLE32(masterKey.key.GetPubKey().GetID().begin()));\n+    } else { // Single pubkeys get the master fingerprint of themselves\n+        keypath.insert(keypath.begin(), ReadLE32(vchPubKey.GetID().begin()));\n+    }\n+    hd_keypaths.emplace(vchPubKey, keypath);\n+}\n+\n+bool FillPSBT(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst, int sighash_type, bool sign)\n+{\n+    // Get all of the previous transactions\n+    bool complete = true;\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        const CTxIn& txin = txConst->vin[i];\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        const uint256& txhash = txin.prevout.hash;\n+        if (pwallet->mapWallet.count(txhash)) {\n+            const CWalletTx& wtx = pwallet->mapWallet.at(txhash);\n+            CTxOut utxo = wtx.tx->vout[txin.prevout.n];\n+            input.non_witness_utxo = wtx.tx;\n+            input.witness_utxo = utxo;\n+        }\n+\n+        // Get the Sighash type\n+        if (sign && input.sighash_type > 0 && input.sighash_type != sighash_type) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"Specified Sighash and sighash in PSBT do not match.\");\n+        }\n+\n+        SignatureData sigdata;\n+        if (sign) {\n+            complete &= SignPSBTInput(*pwallet, *psbtx.tx, input, sigdata, i, sighash_type);\n+        } else {\n+            complete &= SignPSBTInput(PublicOnlySigningProvider(pwallet), *psbtx.tx, input, sigdata, i, sighash_type);\n+        }\n+\n+        // Drop the unnecessary UTXO\n+        if (sigdata.witness) {\n+            input.non_witness_utxo = nullptr;\n+        } else {\n+            input.witness_utxo.SetNull();\n+        }\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, input.hd_keypaths);\n+        }\n+    }\n+\n+    // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change\n+    for (unsigned int i = 0; i < txConst->vout.size(); ++i) {\n+        const CTxOut& out = txConst->vout.at(i);\n+        PSBTOutput& psbt_out = psbtx.outputs.at(i);\n+\n+        // Dummy tx so we can use ProduceSignature to get stuff out\n+        CMutableTransaction dummy_tx;\n+        dummy_tx.vin.push_back(CTxIn());\n+        dummy_tx.vout.push_back(CTxOut());\n+\n+        // Fill a SignatureData with output info\n+        SignatureData sigdata;\n+        psbt_out.FillSignatureData(sigdata);\n+\n+        MutableTransactionSignatureCreator creator(psbtx.tx.get_ptr(), 0, out.nValue, 1);\n+        ProduceSignature(*pwallet, creator, out.scriptPubKey, sigdata);\n+        psbt_out.FromSignatureData(sigdata);\n+\n+        // Get public key paths\n+        for (const auto& pubkey_it : sigdata.misc_pubkeys) {\n+            AddKeypathToMap(pwallet, pubkey_it.first, psbt_out.hd_keypaths);\n+        }\n+    }\n+    return complete;\n+}\n+\n+UniValue walletprocesspsbt(const JSONRPCRequest& request)\n+{\n+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);\n+    CWallet* const pwallet = wallet.get();\n+\n+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {\n+        return NullUniValue;\n+    }\n+\n+    if (request.fHelp || request.params.size() < 1 || request.params.size() > 4)\n+        throw std::runtime_error(\n+            \"walletprocesspsbt \\\"psbt\\\" ( sign sighashtype )\\n\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202663",
+      "id" : 200202663,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIwMDIwMjY2Mw==",
+      "original_commit_id" : "9e4077a992bc647f36f724c74ba6c595afe12419",
+      "original_position" : 151,
+      "path" : "src/wallet/rpcwallet.cpp",
+      "position" : 385,
+      "pull_request_review_id" : 134470768,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557",
+      "updated_at" : "2018-07-04T21:37:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202663",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202834"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202834"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Missing `{ \"walletprocesspsbt\", 1, \"sign\" }`?",
+      "commit_id" : "dbd6d74ec6057af9afd97973d138ed44e49411dd",
+      "created_at" : "2018-07-04T21:27:27Z",
+      "diff_hunk" : "@@ -109,6 +109,11 @@ static const CRPCConvertParam vRPCConvertParams[] =\n     { \"combinerawtransaction\", 0, \"txs\" },\n     { \"fundrawtransaction\", 1, \"options\" },\n     { \"fundrawtransaction\", 2, \"iswitness\" },\n+    { \"walletcreatefundedpsbt\", 0, \"inputs\" },\n+    { \"walletcreatefundedpsbt\", 1, \"outputs\" },\n+    { \"walletcreatefundedpsbt\", 2, \"locktime\" },\n+    { \"walletcreatefundedpsbt\", 3, \"replaceable\" },\n+    { \"walletcreatefundedpsbt\", 4, \"options\" },\n     { \"createpsbt\", 0, \"inputs\" },",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202834",
+      "id" : 200202834,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIwMDIwMjgzNA==",
+      "original_commit_id" : "9e4077a992bc647f36f724c74ba6c595afe12419",
+      "original_position" : 9,
+      "path" : "src/rpc/client.cpp",
+      "position" : null,
+      "pull_request_review_id" : 134470768,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557",
+      "updated_at" : "2018-07-04T21:37:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202834",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202931"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202931"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Use find to avoid 2nd lookup below.",
+      "commit_id" : "dbd6d74ec6057af9afd97973d138ed44e49411dd",
+      "created_at" : "2018-07-04T21:28:45Z",
+      "diff_hunk" : "@@ -4391,6 +4391,339 @@ UniValue sethdseed(const JSONRPCRequest& request)\n     return NullUniValue;\n }\n \n+bool ParseHDKeypath(std::string keypath_str, std::vector<uint32_t>& keypath)\n+{\n+    std::stringstream ss(keypath_str);\n+    std::string item;\n+    bool first = true;\n+    while (std::getline(ss, item, '/')) {\n+        if (item.compare(\"m\") == 0) {\n+            if (first) {\n+                first = false;\n+                continue;\n+            }\n+            return false;\n+        }\n+        // Finds whether it is hardened\n+        uint32_t path = 0;\n+        size_t pos = item.find(\"'\");\n+        if (pos != std::string::npos) {\n+            // The hardened tick can only be in the last index of the string\n+            if (pos != item.size() - 1) {\n+                return false;\n+            }\n+            path |= 0x80000000;\n+            item = item.substr(0, item.size() - 1); // Drop the last character which is the hardened tick\n+        }\n+\n+        // Ensure this is only numbers\n+        if (item.find_first_not_of( \"0123456789\" ) != std::string::npos) {\n+            return false;\n+        }\n+        uint32_t number;\n+        ParseUInt32(item, &number);\n+        path |= number;\n+\n+        keypath.push_back(path);\n+        first = false;\n+    }\n+    return true;\n+}\n+\n+void AddKeypathToMap(const CWallet* pwallet, const CKeyID& keyID, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    CPubKey vchPubKey;\n+    if (!pwallet->GetPubKey(keyID, vchPubKey)) {\n+        return;\n+    }\n+    CKeyMetadata meta;\n+    auto it = pwallet->mapKeyMetadata.find(keyID);\n+    if (it != pwallet->mapKeyMetadata.end()) {\n+        meta = it->second;\n+    }\n+    std::vector<uint32_t> keypath;\n+    if (!meta.hdKeypath.empty()) {\n+        if (!ParseHDKeypath(meta.hdKeypath, keypath)) {\n+            throw JSONRPCError(RPC_INTERNAL_ERROR, \"Internal keypath is broken\");\n+        }\n+        // Get the proper master key id\n+        CKey key;\n+        pwallet->GetKey(meta.hd_seed_id, key);\n+        CExtKey masterKey;\n+        masterKey.SetSeed(key.begin(), key.size());\n+        // Add to map\n+        keypath.insert(keypath.begin(), ReadLE32(masterKey.key.GetPubKey().GetID().begin()));\n+    } else { // Single pubkeys get the master fingerprint of themselves\n+        keypath.insert(keypath.begin(), ReadLE32(vchPubKey.GetID().begin()));\n+    }\n+    hd_keypaths.emplace(vchPubKey, keypath);\n+}\n+\n+bool FillPSBT(const CWallet* pwallet, PartiallySignedTransaction& psbtx, const CTransaction* txConst, int sighash_type, bool sign)\n+{\n+    // Get all of the previous transactions\n+    bool complete = true;\n+    for (unsigned int i = 0; i < txConst->vin.size(); ++i) {\n+        const CTxIn& txin = txConst->vin[i];\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        // If we don't know about this input, skip it and let someone else deal with it\n+        const uint256& txhash = txin.prevout.hash;\n+        if (pwallet->mapWallet.count(txhash)) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200202931",
+      "id" : 200202931,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIwMDIwMjkzMQ==",
+      "original_commit_id" : "9e4077a992bc647f36f724c74ba6c595afe12419",
+      "original_position" : 82,
+      "path" : "src/wallet/rpcwallet.cpp",
+      "position" : 316,
+      "pull_request_review_id" : 134470768,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557",
+      "updated_at" : "2018-07-04T21:37:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200202931",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
    }
 ]
