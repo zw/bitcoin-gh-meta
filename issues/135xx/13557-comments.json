@@ -9372,5 +9372,54 @@
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200617738"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200617738"
+         }
+      },
+      "author_association" : "NONE",
+      "body" : "I'm having some trouble matching this code to the spec, with the HD keypaths shouldn't we prefix the \"value\" (as in the key/value entry) with the fingerprint of the public key? I don't see where it's done here (and neither in 'DeserializeHDKeypaths').",
+      "commit_id" : "8415956f703b950308e3fc1b955b84977fd9e66a",
+      "created_at" : "2018-07-06T10:47:20Z",
+      "diff_hunk" : "@@ -62,24 +77,579 @@ typedef std::pair<CPubKey, std::vector<unsigned char>> SigPair;\n // in order to construct final scriptSigs and scriptWitnesses.\n struct SignatureData {\n     bool complete = false; ///< Stores whether the scriptSig and scriptWitness are complete\n+    bool witness = false; ///< Stores whether the input this SigData corresponds to is a witness input\n     CScript scriptSig; ///< The scriptSig of an input. Contains complete signatures or the traditional partial signatures format\n     CScript redeem_script; ///< The redeemScript (if any) for the input\n     CScript witness_script; ///< The witnessScript (if any) for the input. witnessScripts are used in P2WSH outputs.\n     CScriptWitness scriptWitness; ///< The scriptWitness of an input. Contains complete signatures or the traditional partial signatures format. scriptWitness is part of a transaction input per BIP 144.\n     std::map<CKeyID, SigPair> signatures; ///< BIP 174 style partial signatures for the input. May contain all signatures necessary for producing a final scriptSig or scriptWitness.\n+    std::map<CKeyID, CPubKey> misc_pubkeys;\n \n     SignatureData() {}\n     explicit SignatureData(const CScript& script) : scriptSig(script) {}\n     void MergeSignatureData(SignatureData sigdata);\n };\n \n+// Magic bytes\n+static constexpr uint8_t PSBT_MAGIC_BYTES[4] = {'p', 's', 'b', 't'};\n+\n+// Global types\n+static constexpr uint8_t PSBT_GLOBAL_UNSIGNED_TX = 0x00;\n+\n+// Input types\n+static constexpr uint8_t PSBT_IN_NON_WITNESS_UTXO = 0x00;\n+static constexpr uint8_t PSBT_IN_WITNESS_UTXO = 0x01;\n+static constexpr uint8_t PSBT_IN_PARTIAL_SIG = 0x02;\n+static constexpr uint8_t PSBT_IN_SIGHASH = 0x03;\n+static constexpr uint8_t PSBT_IN_REDEEMSCRIPT = 0x04;\n+static constexpr uint8_t PSBT_IN_WITNESSSCRIPT = 0x05;\n+static constexpr uint8_t PSBT_IN_BIP32_DERIVATION = 0x06;\n+static constexpr uint8_t PSBT_IN_SCRIPTSIG = 0x07;\n+static constexpr uint8_t PSBT_IN_SCRIPTWITNESS = 0x08;\n+\n+// Output types\n+static constexpr uint8_t PSBT_OUT_REDEEMSCRIPT = 0x00;\n+static constexpr uint8_t PSBT_OUT_WITNESSSCRIPT = 0x01;\n+static constexpr uint8_t PSBT_OUT_BIP32_DERIVATION = 0x02;\n+\n+// The separator is 0x00. Reading this in means that the unserializer can interpret it\n+// as a 0 length key. which indicates that this is the separator. The separator has no value.\n+static constexpr uint8_t PSBT_SEPARATOR = 0x00;\n+\n+// Takes a stream and multiple arguments and serializes them into a vector and then into the stream\n+// The resulting output into the stream has the total serialized length of all of the objects followed by all objects concatenated with each other.\n+template<typename Stream, typename... X>\n+void SerializeToVector(Stream& s, const X&... args)\n+{\n+    std::vector<unsigned char> ret;\n+    CVectorWriter ss(SER_NETWORK, PROTOCOL_VERSION, ret, 0);\n+    SerializeMany(ss, args...);\n+    s << ret;\n+}\n+\n+// Takes a stream and multiple arguments and unserializes them first as a vector then each object individually in the order provided in the arguments\n+template<typename Stream, typename... X>\n+void UnserializeFromVector(Stream& s, X&... args)\n+{\n+    std::vector<unsigned char> data;\n+    s >> data;\n+    CDataStream ss(data, SER_NETWORK, PROTOCOL_VERSION);\n+    UnserializeMany(ss, args...);\n+    if (!ss.eof()) {\n+        throw std::ios_base::failure(\"Size of value was not the stated size\");\n+    }\n+}\n+\n+// Deserialize HD keypaths into a map\n+template<typename Stream>\n+void DeserializeHDKeypaths(Stream& s, const std::vector<unsigned char>& key, std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths)\n+{\n+    // Make sure that the key is the size of pubkey + 1\n+    if (key.size() != CPubKey::PUBLIC_KEY_SIZE + 1 && key.size() != CPubKey::COMPRESSED_PUBLIC_KEY_SIZE + 1) {\n+        throw std::ios_base::failure(\"Size of key was not the expected size for the type BIP32 keypath\");\n+    }\n+    // Read in the pubkey from key\n+    CPubKey pubkey(key.begin() + 1, key.end());\n+    if (!pubkey.IsFullyValid()) {\n+       throw std::ios_base::failure(\"Invalid pubkey\");\n+    }\n+    if (hd_keypaths.count(pubkey) > 0) {\n+        throw std::ios_base::failure(\"Duplicate Key, pubkey derivation path already provided\");\n+    }\n+\n+    // Read in key path\n+    uint64_t value_len = ReadCompactSize(s);\n+    std::vector<uint32_t> keypath;\n+    for (unsigned int i = 0; i < value_len; i += sizeof(uint32_t)) {\n+        uint32_t index;\n+        s >> index;\n+        keypath.push_back(index);\n+    }\n+\n+    // Add to map\n+    hd_keypaths.emplace(pubkey, keypath);\n+}\n+\n+// Serialize HD keypaths to a stream from a map\n+template<typename Stream>\n+void SerializeHDKeypaths(Stream& s, const std::map<CPubKey, std::vector<uint32_t>>& hd_keypaths, uint8_t type)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13557#discussion_r200617738",
+      "id" : 200617738,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIwMDYxNzczOA==",
+      "original_commit_id" : "8415956f703b950308e3fc1b955b84977fd9e66a",
+      "original_position" : 129,
+      "path" : "src/script/sign.h",
+      "position" : 129,
+      "pull_request_review_id" : 134969494,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13557",
+      "updated_at" : "2018-07-06T10:47:21Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/200617738",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/2931875?v=4",
+         "events_url" : "https://api.github.com/users/araspitzu/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/araspitzu/followers",
+         "following_url" : "https://api.github.com/users/araspitzu/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/araspitzu/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/araspitzu",
+         "id" : 2931875,
+         "login" : "araspitzu",
+         "node_id" : "MDQ6VXNlcjI5MzE4NzU=",
+         "organizations_url" : "https://api.github.com/users/araspitzu/orgs",
+         "received_events_url" : "https://api.github.com/users/araspitzu/received_events",
+         "repos_url" : "https://api.github.com/users/araspitzu/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/araspitzu/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/araspitzu/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/araspitzu"
+      }
    }
 ]
