@@ -277,5 +277,54 @@
          "type" : "User",
          "url" : "https://api.github.com/users/practicalswift"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/10443#discussion_r217878986"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/10443"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/217878986"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Mod by zero here.",
+      "commit_id" : "8cd1bb684bfec22fc54e091dc96c782a26847393",
+      "created_at" : "2018-09-15T07:58:24Z",
+      "diff_hunk" : "@@ -0,0 +1,332 @@\n+#include <policy/fees.h>\n+#include <policy/fees_input.h>\n+#include <txmempool.h>\n+#include <util.h>\n+\n+#include <univalue.h>\n+\n+#include <fstream>\n+#include <stdio.h>\n+\n+const std::function<std::string(const char*)> G_TRANSLATION_FUN = nullptr;\n+\n+std::string Usage()\n+{\n+    std::string usage = \"Usage: fee_est [options] <estlog.txt>\\n\";\n+    usage += HelpMessageGroup(\"Options:\");\n+    usage += HelpMessageOpt(\"-?, -help\", \"This help message\");\n+    usage += HelpMessageOpt(\"-ograph=<graph.html>\", \"Generate target vs feerate graph output after replaying transaction log.\");\n+    usage += HelpMessageOpt(\"-odat=<fee_estimates.dat>\", \"Save fee estimator state after after replaying transaction log.\");\n+    usage += HelpMessageOpt(\"-idat=<fee_estimates.dat>\", \"Load fee estimator state after before replaying transaction log.\");\n+    usage += HelpMessageOpt(\"-dat=<fee_estimates.dat>\", \"Shortcut for -idat=<fee_estimates.dat> -odat=<fee_estimates.dat>\");\n+    usage += HelpMessageOpt(\"-cross\", \"Treat half the transactions from the log as test data and print cross-validation statistics.\");\n+    return usage;\n+}\n+\n+struct Options\n+{\n+    std::string logFileIn;\n+    std::string dataFileIn;\n+    std::string dataFileOut;\n+    std::string graphFileOut;\n+    bool cross = false;\n+    bool help = false;\n+    bool error = false;\n+};\n+\n+Options ParseCommandLine(int argc, char** argv)\n+{\n+    auto match = [&](const char* arg, const char* name, const char** value = nullptr) {\n+        if (arg[0] != '-') return false;\n+        size_t n = strlen(name);\n+        if (strncmp(arg + 1, name, n) != 0) return false;\n+        if (value) return (*value = arg[n + 1] == '=' ? arg + n + 2 : nullptr) != nullptr;\n+        return arg[n + 1] == '\\0';\n+    };\n+\n+    Options options;\n+    for (int i = 1; i < argc; ++i) {\n+        const char* arg = argv[i];\n+        const char* value;\n+        if (match(arg, \"ograph\", &value)) {\n+            options.graphFileOut = value;\n+        } else if (match(arg, \"odat\", &value)) {\n+            options.dataFileOut = value;\n+        } else if (match(arg, \"idat\", &value)) {\n+            options.dataFileIn = value;\n+        } else if (match(arg, \"dat\", &value)) {\n+            options.dataFileIn = options.dataFileOut = value;\n+        } else if (match(arg, \"cross\")) {\n+            options.cross = true;\n+        } else if (match(arg, \"help\") || match(arg, \"h\") || match(arg, \"?\")) {\n+            options.help = true;\n+        } else if (arg[0] != '-' && options.logFileIn.empty()) {\n+            options.logFileIn = arg;\n+        } else {\n+            fprintf(stderr, \"Error: unexpected argument: '%s'\\n\", arg);\n+            options.error = true;\n+        }\n+    }\n+\n+    if (options.logFileIn.empty() && !options.help) {\n+        fprintf(stderr, \"Error: missing required log file argument.\\n\");\n+        options.error = true;\n+    }\n+\n+    return options;\n+}\n+\n+struct TxData\n+{\n+    TxData(CAmount fee, int size, int height) : fee(fee), size(size), height(height) {}\n+    CAmount fee;\n+    int size;\n+    int height;\n+    int expectedBlocks = -1;\n+    int actualBlocks = -1;\n+};\n+\n+using TxMap = std::map<uint256, TxData>;\n+\n+const char* const GRAPH_HTML = R\"(<!DOCTYPE html>\n+<meta charset=\"utf-8\">\n+<title>Fee Graph</title>\n+<script src=\"https://d3js.org/d3.v3.min.js\"></script>\n+<script src=\"https://cdnjs.cloudflare.com/ajax/libs/vega/3.0.0-beta.30/vega.js\"></script>\n+<script src=\"https://cdnjs.cloudflare.com/ajax/libs/vega-lite/2.0.0-beta.2/vega-lite.js\"></script>\n+<script src=\"https://cdnjs.cloudflare.com/ajax/libs/vega-embed/3.0.0-beta.14/vega-embed.js\"></script>\n+<style media=\"screen\">\n+.vega-actions a {\n+    margin-right: 5px;\n+}\n+</style>\n+<div id=vis></div>\n+<script>\n+var spec = {\n+  \"$schema\": \"https://vega.github.io/schema/vega-lite/v2.json\",\n+  \"width\": 800,\n+  \"height\": 600,\n+  \"layer\": [\n+    {\n+        \"data\": {\n+            \"values\": %s\n+        },\n+        \"mark\": \"tick\",\n+        \"encoding\": {\n+            \"x\": {\"field\": \"blocks\", \"type\": \"quantitative\"},\n+            \"y\": {\"field\": \"feeRate\", \"type\": \"quantitative\"},\n+            \"color\": {\"field\": \"height\", \"type\": \"quantitative\"}\n+        }\n+    },\n+    {\n+      \"data\": {\n+        \"values\": %s\n+      },\n+      \"encoding\": {\n+        \"x\": {\"field\": \"blocks\", \"type\": \"quantitative\"},\n+        \"y\": {\"field\": \"feeRate\", \"type\": \"quantitative\"},\n+        \"color\": {\"field\": \"mode\", \"type\": \"nominal\"}\n+      },\n+      \"mark\": \"line\",\n+    }\n+  ]\n+}\n+vega.embed(\"#vis\", spec);\n+</script>\n+)\";\n+\n+// Maximum number of randomly sampled transactions to show on graph.\n+const int SAMPLE_TXS = 50000;\n+\n+// Drop 1/20th of sampled transactions with highest feerates if they are\n+// outliers that would change the scale of the graph.\n+const int DROP_FRAC = 20;\n+\n+void WriteGraph(const std::string& filename,\n+    const TxMap& txMap,\n+    const std::vector<unsigned int>& targets,\n+    CBlockPolicyEstimator& estimator,\n+    CTxMemPool& pool)\n+{\n+    UniValue fees(UniValue::VARR);\n+\n+    int64_t maxFeeRate = 0;\n+    const unsigned int maxTarget = estimator.getMaxTarget();\n+    for (bool conservative : {false, true}) {\n+        for (unsigned int target : targets) {\n+            if (target > maxTarget) continue;\n+            UniValue fee(UniValue::VOBJ);\n+            fee.pushKV(\"mode\", conservative ? \"conservative\" : \"default\");\n+            fee.pushKV(\"blocks\", int(target));\n+            int64_t feeRate = estimator.estimateSmartFee(target, nullptr /* confTarget */, conservative).GetFeePerK();\n+            fee.pushKV(\"feeRate\", feeRate);\n+            fees.push_back(std::move(fee));\n+            maxFeeRate = std::max(maxFeeRate, feeRate);\n+        }\n+    }\n+\n+    std::vector<const TxMap::value_type*> sample;\n+    sample.reserve(SAMPLE_TXS);\n+    int i = 0;\n+    for (const auto& entry : txMap) {\n+        if (entry.second.actualBlocks > int(maxTarget)) {\n+            continue;\n+        } else if (sample.size() < SAMPLE_TXS) {\n+            sample.emplace_back(&entry);\n+        } else {\n+            int j = rand() % i;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/10443#discussion_r217878986",
+      "id" : 217878986,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIxNzg3ODk4Ng==",
+      "original_commit_id" : "8cd1bb684bfec22fc54e091dc96c782a26847393",
+      "original_position" : 177,
+      "path" : "src/test/fee_est/fee_est.cpp",
+      "position" : 177,
+      "pull_request_review_id" : 155707084,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/10443",
+      "updated_at" : "2018-09-15T07:58:24Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/217878986",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/7826565?v=4",
+         "events_url" : "https://api.github.com/users/practicalswift/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/practicalswift/followers",
+         "following_url" : "https://api.github.com/users/practicalswift/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/practicalswift/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/practicalswift",
+         "id" : 7826565,
+         "login" : "practicalswift",
+         "node_id" : "MDQ6VXNlcjc4MjY1NjU=",
+         "organizations_url" : "https://api.github.com/users/practicalswift/orgs",
+         "received_events_url" : "https://api.github.com/users/practicalswift/received_events",
+         "repos_url" : "https://api.github.com/users/practicalswift/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/practicalswift/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/practicalswift/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/practicalswift"
+      }
    }
 ]
