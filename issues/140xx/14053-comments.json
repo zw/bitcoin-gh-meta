@@ -2124,5 +2124,103 @@
          "type" : "User",
          "url" : "https://api.github.com/users/Sjors"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/14053#discussion_r219691269"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14053"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/219691269"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "```\r\n2018-09-22 21:20:09 cpplint(pr=14053): src/index/addrindex.cpp:124:  Should have a space between // and comment  [whitespace/comments] [4]\r\n```",
+      "commit_id" : "4865275573a56abb9e079d8a4ff5957c3694c583",
+      "created_at" : "2018-09-23T07:59:31Z",
+      "diff_hunk" : "@@ -0,0 +1,225 @@\n+// Copyright (c) 2017-2018 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <hash.h>\n+#include <index/addrindex.h>\n+#include <index/txindex.h>\n+#include <shutdown.h>\n+#include <primitives/transaction.h>\n+#include <script/standard.h>\n+#include <ui_interface.h>\n+#include <util.h>\n+#include <validation.h>\n+#include <vector>\n+#include <uint256.h>\n+\n+#include <boost/thread.hpp>\n+\n+constexpr char DB_ADDRINDEX = 'a';\n+std::unique_ptr<AddrIndex> g_addrindex;\n+\n+/**\n+ * Access to the addrindex database (indexes/addrindex/)\n+ *\n+ * The database stores a block locator of the chain the database is synced to\n+ * so that the AddrIndex can efficiently determine the point it last stopped at.\n+ * A locator is used instead of a simple hash of the chain tip because blocks\n+ * and block index entries may not be flushed to disk until after this database\n+ * is updated.\n+ */\n+class AddrIndex::DB : public BaseIndex::DB\n+{\n+public:\n+    explicit DB(size_t n_cache_size, bool f_memory = false, bool f_wipe = false);\n+\n+    // Find all entries in the index for addr_id.\n+    // If filter_by_value is true, only returns keys with values equal to value_wanted.\n+    bool ReadAddrIndex(const uint64_t addr_id,\n+                       std::vector<std::pair<std::pair<char, uint64_t>, CDiskTxPos>> &keys_found,\n+                       const bool filter_by_value = false,\n+                       const uint64_t value_wanted = 0);\n+\n+    bool WriteToIndex(const std::vector<std::pair<uint64_t, CDiskTxPos>> &positions, const uint256 block_hash);\n+\n+    void RemoveKeys(const std::vector<std::pair<std::pair<char, uint64_t>, CDiskTxPos>> &keys_to_remove);\n+};\n+\n+AddrIndex::DB::DB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n+    BaseIndex::DB(GetDataDir() / \"indexes\" / \"addrindex\", n_cache_size, f_memory, f_wipe)\n+{}\n+\n+BaseIndex::DB& AddrIndex::GetDB() const { return *m_db; }\n+\n+bool AddrIndex::DB::ReadAddrIndex(const uint64_t addr_id,\n+                                  std::vector<std::pair<std::pair<char, uint64_t>, CDiskTxPos>> &keys_found,\n+                                  const bool filter_by_value,\n+                                  const uint64_t value_wanted){\n+    bool found_tx = false; // return true only if at least one transaction was found\n+    const std::pair<char, uint64_t> key_prefix = std::make_pair(DB_ADDRINDEX, addr_id);\n+    std::unique_ptr<CDBIterator> iter(NewIterator());\n+\n+    iter->Seek(key_prefix);\n+    while (iter->Valid()) {\n+        std::pair<std::pair<char, uint64_t>, CDiskTxPos> key;\n+        uint64_t value;\n+        if (!iter->GetKey(key) || !iter->GetValue(value) || key.first != key_prefix) break;\n+\n+        if  (!filter_by_value || (filter_by_value && value == value_wanted)) {\n+            found_tx = true;\n+            keys_found.emplace_back(key);\n+        }\n+\n+        iter->Next();\n+    }\n+\n+    return found_tx;\n+}\n+\n+void AddrIndex::DB::RemoveKeys(const std::vector<std::pair<std::pair<char, uint64_t>, CDiskTxPos>> &keys_to_remove) {\n+    CDBBatch batch(*this);\n+    for (const auto& key : keys_to_remove) {\n+        batch.Erase(key);\n+    }\n+    WriteBatch(batch);\n+}\n+\n+AddrIndex::AddrIndex(size_t n_cache_size, bool f_memory, bool f_wipe)\n+    : m_db(MakeUnique<AddrIndex::DB>(n_cache_size, f_memory, f_wipe)){}\n+\n+AddrIndex::~AddrIndex() {}\n+\n+uint64_t AddrIndex::GetAddrID(const CScript& script) {\n+    uint256 hashed_script;\n+\n+    CSHA256 hasher;\n+    hasher.Write((unsigned char*)&(*script.begin()), script.end() - script.begin());\n+    hasher.Finalize(hashed_script.begin());\n+\n+    return hashed_script.GetUint64(0);\n+}\n+\n+bool AddrIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)\n+{\n+    CDiskTxPos pos(pindex->GetBlockPos(), GetSizeOfCompactSize(block.vtx.size()));\n+    std::vector<std::pair<uint64_t, CDiskTxPos>> positions;\n+    positions.reserve(2 * block.vtx.size());  // Most transactions have at least 1 input and 1 output.\n+\n+    // Index addresses of spent outputs if txindex is enabled,\n+    for (const auto& tx : block.vtx) {\n+        for (const auto tx_out : tx->vout){\n+            positions.emplace_back(GetAddrID(tx_out.scriptPubKey), pos);\n+        }\n+\n+        if (g_txindex && !tx->IsCoinBase()) {\n+            for (const auto tx_in : tx->vin) {\n+                CTransactionRef tx;\n+                uint256 block_hash;\n+\n+                if (!g_txindex->FindTx(tx_in.prevout.hash, block_hash, tx)) {\n+                    // Both addrindex and txindex may be syncing in parallel, and addrindex might\n+                    // be ahead of txindex. We let txindex sync first so that addrindex can continue\n+                    // after it.\n+                    while (!g_txindex->IsInSyncWithMainChain()) {\n+                        MilliSleep(1000); //TODO: find a less arbitrary sleep time.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/14053#discussion_r219691269",
+      "id" : 219691269,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIxOTY5MTI2OQ==",
+      "original_commit_id" : "4865275573a56abb9e079d8a4ff5957c3694c583",
+      "original_position" : 124,
+      "path" : "src/index/addrindex.cpp",
+      "position" : 124,
+      "pull_request_review_id" : 157931834,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14053",
+      "updated_at" : "2018-09-23T07:59:31Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/219691269",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/7826565?v=4",
+         "events_url" : "https://api.github.com/users/practicalswift/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/practicalswift/followers",
+         "following_url" : "https://api.github.com/users/practicalswift/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/practicalswift/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/practicalswift",
+         "id" : 7826565,
+         "login" : "practicalswift",
+         "node_id" : "MDQ6VXNlcjc4MjY1NjU=",
+         "organizations_url" : "https://api.github.com/users/practicalswift/orgs",
+         "received_events_url" : "https://api.github.com/users/practicalswift/received_events",
+         "repos_url" : "https://api.github.com/users/practicalswift/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/practicalswift/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/practicalswift/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/practicalswift"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/14053#discussion_r219691273"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14053"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/219691273"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "```\r\n2018-09-22 21:20:09 cpplint(pr=14053): src/index/addrindex.h:44:  \"virtual\" is redundant since function is already declared as \"override\"  [readability/inheritance] [4]\r\n```",
+      "commit_id" : "4865275573a56abb9e079d8a4ff5957c3694c583",
+      "created_at" : "2018-09-23T07:59:48Z",
+      "diff_hunk" : "@@ -0,0 +1,56 @@\n+// Copyright (c) 2017-2018 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_INDEX_ADDRINDEX_H\n+#define BITCOIN_INDEX_ADDRINDEX_H\n+\n+#include <chain.h>\n+#include <index/base.h>\n+#include <vector>\n+#include <txdb.h>\n+#include <uint256.h>\n+#include <primitives/transaction.h>\n+#include <script/standard.h>\n+#include <script/script.h>\n+\n+/**\n+ * AddrIndex is used to look up transactions included in the blockchain by script.\n+ * The index is written to a LevelDB database and records the filesystem\n+ * location of transactions by script.\n+ */\n+class AddrIndex final : public BaseIndex\n+{\n+protected:\n+    class DB;\n+\n+private:\n+    const std::unique_ptr<DB> m_db;\n+\n+protected:\n+    bool WriteBlock(const CBlock& block, const CBlockIndex* pindex) override;\n+\n+    BaseIndex::DB& GetDB() const override;\n+\n+    void BlockDisconnected(const std::shared_ptr<const CBlock> &block) override;\n+\n+    const char* GetName() const override { return \"addrindex\"; }\n+\n+public:\n+    /// Constructs the index, which becomes available to be queried.\n+    explicit AddrIndex(size_t n_cache_size, bool f_memory = false, bool f_wipe = false);\n+\n+    // Destructor is declared because this class contains a unique_ptr to an incomplete type.\n+    virtual ~AddrIndex() override;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/14053#discussion_r219691273",
+      "id" : 219691273,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIxOTY5MTI3Mw==",
+      "original_commit_id" : "4865275573a56abb9e079d8a4ff5957c3694c583",
+      "original_position" : 44,
+      "path" : "src/index/addrindex.h",
+      "position" : 44,
+      "pull_request_review_id" : 157931838,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14053",
+      "updated_at" : "2018-09-23T07:59:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/219691273",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/7826565?v=4",
+         "events_url" : "https://api.github.com/users/practicalswift/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/practicalswift/followers",
+         "following_url" : "https://api.github.com/users/practicalswift/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/practicalswift/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/practicalswift",
+         "id" : 7826565,
+         "login" : "practicalswift",
+         "node_id" : "MDQ6VXNlcjc4MjY1NjU=",
+         "organizations_url" : "https://api.github.com/users/practicalswift/orgs",
+         "received_events_url" : "https://api.github.com/users/practicalswift/received_events",
+         "repos_url" : "https://api.github.com/users/practicalswift/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/practicalswift/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/practicalswift/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/practicalswift"
+      }
    }
 ]
