@@ -2018,5 +2018,86 @@
          "type" : "User",
          "url" : "https://api.github.com/users/practicalswift"
       }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "I've been trying to figure out why [an earlier iteration of this PR](https://github.com/pstratem/bitcoin/commit/15b9b4ddc9998400f6e2025a9956956c15435187) fails on macOS (Darwin). The earlier version passes in a separate `pollfd` struct for each (fd, event type) pair, potentially having duplicate entries for file descriptors listed in multiple `*_select_set` sets. The current version deduplicates pollfd structs across file descriptors, passing a single struct per fd which consolidates all events we're interested in.\r\n\r\nI did a little reading yesterday to try and figure out why the first approach works on some BSD platforms (per @sdaftuar's testing on FreeBSD), but not macOS. Bear with me while we briefly venture into the weeds.\r\n\r\nDarwin's poll() implementation basically wraps kqueue use; for each `pollfd` struct passed into Darwin's poll(), [3 separate `kevent_register()` calls are made](https://github.com/apple/darwin-xnu/blob/0a798f6738bc1db01281fc08ae024145e84df927/bsd/kern/sys_generic.c#L1740-L1777) and then waited upon using `kqueue_scan()` up to the timeout.\r\n\r\nI found an apparent bug in Darwin's kqueue implementation: for each kevent registered, a knote is created and [enqueued on a per-fd list on the process' file descriptor table](https://github.com/apple/darwin-xnu/blob/0a798f6738bc1db01281fc08ae024145e84df927/bsd/kern/kern_event.c#L8141-L8143).  These knotes track which events we're waiting on and are supposed to be unique per `(fd, kevent filter)` pair, where the kevent filter is either `EVFILT_READ` (for `POLLIN`) or `EVFILT_WRITE` (for `POLLOUT`), per the kqueue API. However, `knote_fdfind()` looks to be improperly implemented so that [the first knote per fd is always returned](https://github.com/apple/darwin-xnu/blob/0a798f6738bc1db01281fc08ae024145e84df927/bsd/kern/kern_event.c#L8025-L8045), effectively ignoring the difference in filter. As far as I can tell, this could result in a situation where output events are ignored for an fd also being polled for input events (because the `POLLIN` `kevent_register()` call comes before the `POLLOUT` one in `poll_nocancel()`). \r\n\r\nUnfortunately, this doesn't explain why `POLLIN` events are ignored in the previous version of this change - in @sdaftuar's logs above and in my own testing on macOS, we always disconnect peers because we think there's nothing to read on their sockets. This isn't explained by the supposed bug I note above, though my confidence in macOS' implementation of `poll()` isn't very high given the complexity of the kqueue implementation backing it.\r\n\r\nOther versions of BSD implement poll in a much simpler way, iterating through all the pollfd structs passed in and [calling a filetype-specific poll function](https://github.com/freebsd/freebsd/blob/7ee56b76a87d24a5ff8586ff8f5d888a3898dc46/sys/kern/sys_generic.c#L1539-L1540) which returns `revents` immediately without having to deal with kevents, kqueues, or callbacks. This delegation eventually reduces to a [socket-specific poll function](https://github.com/freebsd/freebsd/blob/7ee56b76a87d24a5ff8586ff8f5d888a3898dc46/sys/kern/uipc_socket.c#L3281-L3337).\r\n\r\nAnyway, this is a longwinded way of saying that macOS's poll() doesn't inspire confidence and that we should consider disabling its use on that platform. The other BSDs look okay to me.\r\n",
+      "created_at" : "2018-11-09T14:58:04Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/14336#issuecomment-437384408",
+      "id" : 437384408,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/14336",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDQzNzM4NDQwOA==",
+      "updated_at" : "2018-11-09T14:58:04Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/437384408",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/14336#discussion_r232289036"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14336"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/232289036"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Transform looks overly complicated for this: https://stackoverflow.com/a/771482",
+      "commit_id" : "44f9c1ab13487c6ecf1a2bc038720e4b1de07098",
+      "created_at" : "2018-11-09T15:21:06Z",
+      "diff_hunk" : "@@ -1312,46 +1298,149 @@ void CConnman::SocketHandler()\n             if (pnode->hSocket == INVALID_SOCKET)\n                 continue;\n \n-            FD_SET(pnode->hSocket, &fdsetError);\n-            hSocketMax = std::max(hSocketMax, pnode->hSocket);\n-            have_fds = true;\n-\n+            error_set.insert(pnode->hSocket);\n             if (select_send) {\n-                FD_SET(pnode->hSocket, &fdsetSend);\n+                send_set.insert(pnode->hSocket);\n                 continue;\n             }\n             if (select_recv) {\n-                FD_SET(pnode->hSocket, &fdsetRecv);\n+                recv_set.insert(pnode->hSocket);\n             }\n         }\n     }\n \n-    int nSelect = select(have_fds ? hSocketMax + 1 : 0,\n-                         &fdsetRecv, &fdsetSend, &fdsetError, &timeout);\n+    return !recv_set.empty() || !send_set.empty() || !error_set.empty();\n+}\n+\n+#ifdef USE_POLL\n+void CConnman::SocketEvents(std::set<SOCKET> &recv_set, std::set<SOCKET> &send_set, std::set<SOCKET> &error_set)\n+{\n+    std::set<SOCKET> recv_select_set, send_select_set, error_select_set;\n+    if (!GenerateSelectSet(recv_select_set, send_select_set, error_select_set)) {\n+        interruptNet.sleep_for(std::chrono::milliseconds(SELECT_TIMEOUT_MILLISECONDS));\n+        return;\n+    }\n+\n+    std::map<SOCKET, struct pollfd> pollfds;\n+    for (SOCKET hSocket : recv_select_set) {\n+        pollfds[hSocket].fd = hSocket;\n+        pollfds[hSocket].events |= POLLIN;\n+    }\n+\n+    for (SOCKET hSocket : send_select_set) {\n+        pollfds[hSocket].fd = hSocket;\n+        pollfds[hSocket].events |= POLLOUT;\n+    }\n+\n+    for (SOCKET hSocket : error_select_set) {\n+        pollfds[hSocket].fd = hSocket;\n+        // These flags are ignored, but we set them for clarity\n+        pollfds[hSocket].events |= POLLERR|POLLHUP;\n+    }\n+\n+    std::vector<struct pollfd> vpollfds;\n+    for(auto it : pollfds)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/14336#discussion_r232289036",
+      "id" : 232289036,
+      "in_reply_to_id" : 232173803,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIzMjI4OTAzNg==",
+      "original_commit_id" : "44f9c1ab13487c6ecf1a2bc038720e4b1de07098",
+      "original_position" : 95,
+      "path" : "src/net.cpp",
+      "position" : 95,
+      "pull_request_review_id" : 173456510,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14336",
+      "updated_at" : "2018-11-09T15:21:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/232289036",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
    }
 ]
