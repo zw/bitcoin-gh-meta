@@ -1147,5 +1147,252 @@
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r234827979"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/234827979"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Like the conflicting input index?",
+      "commit_id" : "afdec9a0ef6c2d77e0a92650d8800e6be56d8950",
+      "created_at" : "2018-11-20T00:06:37Z",
+      "diff_hunk" : "@@ -1791,6 +1792,320 @@ UniValue converttopsbt(const JSONRPCRequest& request)\n     return EncodeBase64((unsigned char*)ssTx.data(), ssTx.size());\n }\n \n+UniValue utxoupdatepsbt(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() != 1)\n+        throw std::runtime_error(\n+                            \"utxoupdatepsbt \\\"psbt\\\"\\n\"\n+                            \"\\nUpdates a PSBT with witness UTXOs retrieved from the UTXO set or the mempool.\\n\"\n+                            \"\\nArguments:\\n\"\n+                            \"1. \\\"psbt\\\"                 (string) A base64 string of a PSBT\\n\"\n+                            \"\\nResult:\\n\"\n+                            \"  \\\"psbt\\\"          (string) The base64-encoded partially signed transaction with inputs updated\\n\"\n+                            \"\\nExamples:\\n\"\n+                            + HelpExampleCli(\"utxoupdatepsbt\", \"\\\"psbt\\\"\")\n+                            );\n+\n+    RPCTypeCheck(request.params, {UniValue::VSTR}, true);\n+\n+    // Unserialize the transactions\n+    PartiallySignedTransaction psbtx;\n+    std::string error;\n+    if (!DecodePSBT(psbtx, request.params[0].get_str(), error)) {\n+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf(\"TX decode failed %s\", error));\n+    }\n+\n+    // Fetch previous transactions (inputs):\n+    CCoinsView viewDummy;\n+    CCoinsViewCache view(&viewDummy);\n+    {\n+        LOCK2(cs_main, mempool.cs);\n+        CCoinsViewCache &viewChain = *pcoinsTip;\n+        CCoinsViewMemPool viewMempool(&viewChain, mempool);\n+        view.SetBackend(viewMempool); // temporarily switch cache backend to db+mempool view\n+\n+        for (const CTxIn& txin : psbtx.tx->vin) {\n+            view.AccessCoin(txin.prevout); // Load entries from viewChain into view; can fail.\n+        }\n+\n+        view.SetBackend(viewDummy); // switch back to avoid locking mempool for too long\n+    }\n+\n+    // Fill the inputs\n+    for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        if (input.non_witness_utxo || !input.witness_utxo.IsNull()) {\n+            continue;\n+        }\n+\n+        const Coin& coin = view.AccessCoin(psbtx.tx->vin[i].prevout);\n+\n+        std::vector<std::vector<unsigned char>> solutions_data;\n+        txnouttype which_type = Solver(coin.out.scriptPubKey, solutions_data);\n+        if (which_type == TX_WITNESS_V0_SCRIPTHASH || which_type == TX_WITNESS_V0_KEYHASH || which_type == TX_WITNESS_UNKNOWN) {\n+            input.witness_utxo = coin.out;\n+        }\n+    }\n+\n+    CDataStream ssTx(SER_NETWORK, PROTOCOL_VERSION);\n+    ssTx << psbtx;\n+    return EncodeBase64((unsigned char*)ssTx.data(), ssTx.size());\n+}\n+\n+UniValue joinpsbts(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() != 1)\n+        throw std::runtime_error(\n+                            \"joinpsbts [\\\"psbt\\\",...]\\n\"\n+                            \"\\nJoins multiple distinct PSBTs with different inputs and outputs into one PSBT with inputs and outputs from all of the PSBTs\\n\"\n+                            \"No input in any of the PSBTs can be in more than one of the PSBTs.\\n\"\n+                            \"\\nArguments:\\n\"\n+                            \"1. \\\"txs\\\"                   (string) A json array of base64 strings of partially signed transactions\\n\"\n+                            \"    [\\n\"\n+                            \"      \\\"psbt\\\"             (string) A base64 string of a PSBT\\n\"\n+                            \"      ,...\\n\"\n+                            \"    ]\\n\"\n+\n+                            \"\\nResult:\\n\"\n+                            \"  \\\"psbt\\\"          (string) The base64-encoded partially signed transaction\\n\"\n+                            \"\\nExamples:\\n\"\n+                            + HelpExampleCli(\"joinpsbts\", \"\\\"psbt\\\"\")\n+                            );\n+\n+    RPCTypeCheck(request.params, {UniValue::VARR}, true);\n+\n+    // Unserialize the transactions\n+    std::vector<PartiallySignedTransaction> psbtxs;\n+    UniValue txs = request.params[0].get_array();\n+    for (unsigned int i = 0; i < txs.size(); ++i) {\n+        PartiallySignedTransaction psbtx;\n+        std::string error;\n+        if (!DecodePSBT(psbtx, txs[i].get_str(), error)) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf(\"TX decode failed %s\", error));\n+        }\n+        psbtxs.push_back(psbtx);\n+    }\n+\n+    PartiallySignedTransaction merged_psbt(psbtxs[0]); // Copy the first one\n+\n+    // Clear signatures from all inputs\n+    for (auto& input : merged_psbt.inputs) {\n+        input.partial_sigs.clear();\n+    }\n+\n+    // Merge\n+    for (auto it = std::next(psbtxs.begin()); it != psbtxs.end(); ++it) {\n+        for (unsigned int i = 0; i < it->tx->vin.size(); ++i) {\n+            if (!merged_psbt.AddInput(it->tx->vin[i], it->inputs[i])) {\n+                throw JSONRPCError(RPC_INVALID_PARAMETER, \"An input exists in multiple PSBTs\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r234827979",
+      "id" : 234827979,
+      "in_reply_to_id" : 213504242,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIzNDgyNzk3OQ==",
+      "original_commit_id" : "f29d03c08e587b9eddb4d205b46eff7cb01f0328",
+      "original_position" : 118,
+      "path" : "src/rpc/rawtransaction.cpp",
+      "position" : 123,
+      "pull_request_review_id" : 176554059,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932",
+      "updated_at" : "2018-11-20T00:06:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/234827979",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r234828603"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/234828603"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "@achow101 could you ack/nack on #12419, esp @MeshCollider https://github.com/bitcoin/bitcoin/pull/12419#issuecomment-437636604",
+      "commit_id" : "afdec9a0ef6c2d77e0a92650d8800e6be56d8950",
+      "created_at" : "2018-11-20T00:09:48Z",
+      "diff_hunk" : "@@ -1791,6 +1792,320 @@ UniValue converttopsbt(const JSONRPCRequest& request)\n     return EncodeBase64((unsigned char*)ssTx.data(), ssTx.size());\n }\n \n+UniValue utxoupdatepsbt(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() != 1)\n+        throw std::runtime_error(\n+                            \"utxoupdatepsbt \\\"psbt\\\"\\n\"\n+                            \"\\nUpdates a PSBT with witness UTXOs retrieved from the UTXO set or the mempool.\\n\"\n+                            \"\\nArguments:\\n\"\n+                            \"1. \\\"psbt\\\"                 (string) A base64 string of a PSBT\\n\"\n+                            \"\\nResult:\\n\"\n+                            \"  \\\"psbt\\\"          (string) The base64-encoded partially signed transaction with inputs updated\\n\"\n+                            \"\\nExamples:\\n\"\n+                            + HelpExampleCli(\"utxoupdatepsbt\", \"\\\"psbt\\\"\")\n+                            );\n+\n+    RPCTypeCheck(request.params, {UniValue::VSTR}, true);\n+\n+    // Unserialize the transactions\n+    PartiallySignedTransaction psbtx;\n+    std::string error;\n+    if (!DecodePSBT(psbtx, request.params[0].get_str(), error)) {\n+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf(\"TX decode failed %s\", error));\n+    }\n+\n+    // Fetch previous transactions (inputs):\n+    CCoinsView viewDummy;\n+    CCoinsViewCache view(&viewDummy);\n+    {\n+        LOCK2(cs_main, mempool.cs);\n+        CCoinsViewCache &viewChain = *pcoinsTip;\n+        CCoinsViewMemPool viewMempool(&viewChain, mempool);\n+        view.SetBackend(viewMempool); // temporarily switch cache backend to db+mempool view\n+\n+        for (const CTxIn& txin : psbtx.tx->vin) {\n+            view.AccessCoin(txin.prevout); // Load entries from viewChain into view; can fail.\n+        }\n+\n+        view.SetBackend(viewDummy); // switch back to avoid locking mempool for too long\n+    }\n+\n+    // Fill the inputs\n+    for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        if (input.non_witness_utxo || !input.witness_utxo.IsNull()) {\n+            continue;\n+        }\n+\n+        const Coin& coin = view.AccessCoin(psbtx.tx->vin[i].prevout);\n+\n+        std::vector<std::vector<unsigned char>> solutions_data;\n+        txnouttype which_type = Solver(coin.out.scriptPubKey, solutions_data);\n+        if (which_type == TX_WITNESS_V0_SCRIPTHASH || which_type == TX_WITNESS_V0_KEYHASH || which_type == TX_WITNESS_UNKNOWN) {\n+            input.witness_utxo = coin.out;\n+        }\n+    }\n+\n+    CDataStream ssTx(SER_NETWORK, PROTOCOL_VERSION);\n+    ssTx << psbtx;\n+    return EncodeBase64((unsigned char*)ssTx.data(), ssTx.size());\n+}\n+\n+UniValue joinpsbts(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() != 1)\n+        throw std::runtime_error(\n+                            \"joinpsbts [\\\"psbt\\\",...]\\n\"\n+                            \"\\nJoins multiple distinct PSBTs with different inputs and outputs into one PSBT with inputs and outputs from all of the PSBTs\\n\"\n+                            \"No input in any of the PSBTs can be in more than one of the PSBTs.\\n\"\n+                            \"\\nArguments:\\n\"\n+                            \"1. \\\"txs\\\"                   (string) A json array of base64 strings of partially signed transactions\\n\"\n+                            \"    [\\n\"\n+                            \"      \\\"psbt\\\"             (string) A base64 string of a PSBT\\n\"\n+                            \"      ,...\\n\"\n+                            \"    ]\\n\"\n+\n+                            \"\\nResult:\\n\"\n+                            \"  \\\"psbt\\\"          (string) The base64-encoded partially signed transaction\\n\"\n+                            \"\\nExamples:\\n\"\n+                            + HelpExampleCli(\"joinpsbts\", \"\\\"psbt\\\"\")\n+                            );\n+\n+    RPCTypeCheck(request.params, {UniValue::VARR}, true);\n+\n+    // Unserialize the transactions\n+    std::vector<PartiallySignedTransaction> psbtxs;\n+    UniValue txs = request.params[0].get_array();\n+    for (unsigned int i = 0; i < txs.size(); ++i) {\n+        PartiallySignedTransaction psbtx;\n+        std::string error;\n+        if (!DecodePSBT(psbtx, txs[i].get_str(), error)) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf(\"TX decode failed %s\", error));\n+        }\n+        psbtxs.push_back(psbtx);\n+    }\n+\n+    PartiallySignedTransaction merged_psbt(psbtxs[0]); // Copy the first one\n+\n+    // Clear signatures from all inputs\n+    for (auto& input : merged_psbt.inputs) {\n+        input.partial_sigs.clear();\n+    }\n+\n+    // Merge\n+    for (auto it = std::next(psbtxs.begin()); it != psbtxs.end(); ++it) {\n+        for (unsigned int i = 0; i < it->tx->vin.size(); ++i) {\n+            if (!merged_psbt.AddInput(it->tx->vin[i], it->inputs[i])) {\n+                throw JSONRPCError(RPC_INVALID_PARAMETER, \"An input exists in multiple PSBTs\");\n+            }\n+        }\n+        for (unsigned int i = 0; i < it->tx->vout.size(); ++i) {\n+            merged_psbt.AddOutput(it->tx->vout[i], it->outputs[i]);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r234828603",
+      "id" : 234828603,
+      "in_reply_to_id" : 213504324,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIzNDgyODYwMw==",
+      "original_commit_id" : "f29d03c08e587b9eddb4d205b46eff7cb01f0328",
+      "original_position" : 122,
+      "path" : "src/rpc/rawtransaction.cpp",
+      "position" : 127,
+      "pull_request_review_id" : 176554765,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932",
+      "updated_at" : "2018-11-20T00:09:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/234828603",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r234829077"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/234829077"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Should use `RPCHelpMan` from #14530.",
+      "commit_id" : "afdec9a0ef6c2d77e0a92650d8800e6be56d8950",
+      "created_at" : "2018-11-20T00:12:20Z",
+      "diff_hunk" : "@@ -1773,6 +1773,67 @@ UniValue converttopsbt(const JSONRPCRequest& request)\n     return EncodeBase64((unsigned char*)ssTx.data(), ssTx.size());\n }\n \n+UniValue utxoupdatepsbt(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() != 1)\n+        throw std::runtime_error(\n+            \"utxoupdatepsbt \\\"psbt\\\"\\n\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r234829077",
+      "id" : 234829077,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIzNDgyOTA3Nw==",
+      "original_commit_id" : "f2a2f06fed01829e1f1ae574f50cce841fdcbbff",
+      "original_position" : 8,
+      "path" : "src/rpc/rawtransaction.cpp",
+      "position" : 16,
+      "pull_request_review_id" : 176555323,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932",
+      "updated_at" : "2018-11-20T00:22:22Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/234829077",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r234830911"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/234830911"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Could add test for this error.",
+      "commit_id" : "afdec9a0ef6c2d77e0a92650d8800e6be56d8950",
+      "created_at" : "2018-11-20T00:22:00Z",
+      "diff_hunk" : "@@ -1773,6 +1773,67 @@ UniValue converttopsbt(const JSONRPCRequest& request)\n     return EncodeBase64((unsigned char*)ssTx.data(), ssTx.size());\n }\n \n+UniValue utxoupdatepsbt(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() != 1)\n+        throw std::runtime_error(\n+            \"utxoupdatepsbt \\\"psbt\\\"\\n\"\n+            \"\\nUpdates a PSBT with witness UTXOs retrieved from the UTXO set or the mempool.\\n\"\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"psbt\\\"                 (string) A base64 string of a PSBT\\n\"\n+            \"\\nResult:\\n\"\n+            \"  \\\"psbt\\\"          (string) The base64-encoded partially signed transaction with inputs updated\\n\"\n+            \"\\nExamples:\\n\"\n+            + HelpExampleCli(\"utxoupdatepsbt\", \"\\\"psbt\\\"\")\n+            );\n+\n+    RPCTypeCheck(request.params, {UniValue::VSTR}, true);\n+\n+    // Unserialize the transactions\n+    PartiallySignedTransaction psbtx;\n+    std::string error;\n+    if (!DecodePSBT(psbtx, request.params[0].get_str(), error)) {\n+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf(\"TX decode failed %s\", error));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r234830911",
+      "id" : 234830911,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIzNDgzMDkxMQ==",
+      "original_commit_id" : "f2a2f06fed01829e1f1ae574f50cce841fdcbbff",
+      "original_position" : 24,
+      "path" : "src/rpc/rawtransaction.cpp",
+      "position" : 32,
+      "pull_request_review_id" : 176555323,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932",
+      "updated_at" : "2018-11-20T00:22:22Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/234830911",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r234830933"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/234830933"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit, `{`",
+      "commit_id" : "afdec9a0ef6c2d77e0a92650d8800e6be56d8950",
+      "created_at" : "2018-11-20T00:22:07Z",
+      "diff_hunk" : "@@ -1773,6 +1773,67 @@ UniValue converttopsbt(const JSONRPCRequest& request)\n     return EncodeBase64((unsigned char*)ssTx.data(), ssTx.size());\n }\n \n+UniValue utxoupdatepsbt(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() != 1)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r234830933",
+      "id" : 234830933,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIzNDgzMDkzMw==",
+      "original_commit_id" : "f2a2f06fed01829e1f1ae574f50cce841fdcbbff",
+      "original_position" : 6,
+      "path" : "src/rpc/rawtransaction.cpp",
+      "position" : 14,
+      "pull_request_review_id" : 176555323,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932",
+      "updated_at" : "2018-11-20T00:22:22Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/234830933",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
    }
 ]
