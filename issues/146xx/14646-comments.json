@@ -3541,5 +3541,103 @@
          "type" : "User",
          "url" : "https://api.github.com/users/sipa"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/14646#discussion_r235785867"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14646"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/235785867"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Doesn't seem like there is a case where both `cache_read` and `cache_write` should be supplied, right? If you make that explicit / an error condition we can rely on it elsewhere.",
+      "commit_id" : "729b8187dd795e31a87cad9ce0ba3638cf01f502",
+      "created_at" : "2018-11-22T16:51:52Z",
+      "diff_hunk" : "@@ -202,212 +204,251 @@ class BIP32PubkeyProvider final : public PubkeyProvider\n     }\n };\n \n-/** A parsed addr(A) descriptor. */\n-class AddressDescriptor final : public Descriptor\n+/** Base class for all Descriptor implementations. */\n+class DescriptorImpl : public Descriptor\n {\n-    CTxDestination m_destination;\n+    //! Public key arguments for this descriptor (size 1 for PK, PKH, WPKH; any size of Multisig).\n+    const std::vector<std::unique_ptr<PubkeyProvider>> m_pubkey_args;\n+    //! The sub-descriptor argument (nullptr for everything but SH and WSH).\n+    const std::unique_ptr<DescriptorImpl> m_script_arg;\n+    //! The string name of the descriptor function.\n+    const std::string m_name;\n+\n+protected:\n+    //! Return a serialization of anything except pubkey and script arguments, to be prepended to those.\n+    virtual std::string ToStringExtra() const { return \"\"; }\n+\n+    /** A helper function to construct the scripts for this descriptor.\n+     *\n+     *  This function is invoked once for every CScript produced by evaluating\n+     *  m_script_arg, or just once in case m_script_arg is nullptr.\n+\n+     *  @param pubkeys The evaluations of the m_pubkey_args field.\n+     *  @param script The evaluation of m_script_arg (or nullptr when m_script_arg is nullptr).\n+     *  @param out A FlatSigningProvider to put scripts or public keys in that are necessary to the solver.\n+     *             The script and pubkeys argument to this function are automatically added.\n+     *  @return A vector with scriptPubKeys for this descriptor.\n+     */\n+    virtual std::vector<CScript> MakeScripts(const std::vector<CPubKey>& pubkeys, const CScript* script, FlatSigningProvider& out) const = 0;\n \n public:\n-    AddressDescriptor(CTxDestination destination) : m_destination(std::move(destination)) {}\n+    DescriptorImpl(std::vector<std::unique_ptr<PubkeyProvider>> pubkeys, std::unique_ptr<DescriptorImpl> script, const std::string& name) : m_pubkey_args(std::move(pubkeys)), m_script_arg(std::move(script)), m_name(name) {}\n \n-    bool IsRange() const override { return false; }\n-    std::string ToString() const override { return \"addr(\" + EncodeDestination(m_destination) + \")\"; }\n-    bool ToPrivateString(const SigningProvider& arg, std::string& out) const override { out = ToString(); return true; }\n-    bool Expand(int pos, const SigningProvider& arg, std::vector<CScript>& output_scripts, FlatSigningProvider& out) const override\n+    bool IsRange() const final\n     {\n-        output_scripts = std::vector<CScript>{GetScriptForDestination(m_destination)};\n-        return true;\n+        for (const auto& pubkey : m_pubkey_args) {\n+            if (pubkey->IsRange()) return true;\n+        }\n+        if (m_script_arg) {\n+            if (m_script_arg->IsRange()) return true;\n+        }\n+        return false;\n     }\n-};\n-\n-/** A parsed raw(H) descriptor. */\n-class RawDescriptor final : public Descriptor\n-{\n-    CScript m_script;\n \n-public:\n-    RawDescriptor(CScript script) : m_script(std::move(script)) {}\n-\n-    bool IsRange() const override { return false; }\n-    std::string ToString() const override { return \"raw(\" + HexStr(m_script.begin(), m_script.end()) + \")\"; }\n-    bool ToPrivateString(const SigningProvider& arg, std::string& out) const override { out = ToString(); return true; }\n-    bool Expand(int pos, const SigningProvider& arg, std::vector<CScript>& output_scripts, FlatSigningProvider& out) const override\n+    bool ToStringHelper(const SigningProvider* arg, std::string& out, bool priv) const\n     {\n-        output_scripts = std::vector<CScript>{m_script};\n+        std::string extra = ToStringExtra();\n+        size_t pos = extra.size() > 0 ? 1 : 0;\n+        std::string ret = m_name + \"(\" + extra;\n+        for (const auto& pubkey : m_pubkey_args) {\n+            if (pos++) ret += \",\";\n+            std::string tmp;\n+            if (priv) {\n+                if (!pubkey->ToPrivateString(*arg, tmp)) return false;\n+            } else {\n+                tmp = pubkey->ToString();\n+            }\n+            ret += std::move(tmp);\n+        }\n+        if (m_script_arg) {\n+            if (pos++) ret += \",\";\n+            std::string tmp;\n+            if (!m_script_arg->ToStringHelper(arg, tmp, priv)) return false;\n+            ret += std::move(tmp);\n+        }\n+        out = std::move(ret) + \")\";\n         return true;\n     }\n-};\n-\n-/** A parsed pk(P), pkh(P), or wpkh(P) descriptor. */\n-class SingleKeyDescriptor final : public Descriptor\n-{\n-    const std::function<CScript(const CPubKey&)> m_script_fn;\n-    const std::string m_fn_name;\n-    std::unique_ptr<PubkeyProvider> m_provider;\n \n-public:\n-    SingleKeyDescriptor(std::unique_ptr<PubkeyProvider> prov, const std::function<CScript(const CPubKey&)>& fn, const std::string& name) : m_script_fn(fn), m_fn_name(name), m_provider(std::move(prov)) {}\n-\n-    bool IsRange() const override { return m_provider->IsRange(); }\n-    std::string ToString() const override { return m_fn_name + \"(\" + m_provider->ToString() + \")\"; }\n-    bool ToPrivateString(const SigningProvider& arg, std::string& out) const override\n+    std::string ToString() const final\n     {\n         std::string ret;\n-        if (!m_provider->ToPrivateString(arg, ret)) return false;\n-        out = m_fn_name + \"(\" + std::move(ret) + \")\";\n-        return true;\n-    }\n-    bool Expand(int pos, const SigningProvider& arg, std::vector<CScript>& output_scripts, FlatSigningProvider& out) const override\n-    {\n-        CPubKey key;\n-        KeyOriginInfo info;\n-        if (!m_provider->GetPubKey(pos, arg, key, info)) return false;\n-        output_scripts = std::vector<CScript>{m_script_fn(key)};\n-        out.origins.emplace(key.GetID(), std::move(info));\n-        out.pubkeys.emplace(key.GetID(), key);\n-        return true;\n+        ToStringHelper(nullptr, ret, false);\n+        return ret;\n     }\n-};\n \n-CScript P2PKHGetScript(const CPubKey& pubkey) { return GetScriptForDestination(pubkey.GetID()); }\n-CScript P2PKGetScript(const CPubKey& pubkey) { return GetScriptForRawPubKey(pubkey); }\n-CScript P2WPKHGetScript(const CPubKey& pubkey) { return GetScriptForDestination(WitnessV0KeyHash(pubkey.GetID())); }\n+    bool ToPrivateString(const SigningProvider& arg, std::string& out) const override final { return ToStringHelper(&arg, out, true); }\n \n-/** A parsed multi(...) descriptor. */\n-class MultisigDescriptor : public Descriptor\n-{\n-    int m_threshold;\n-    std::vector<std::unique_ptr<PubkeyProvider>> m_providers;\n-\n-public:\n-    MultisigDescriptor(int threshold, std::vector<std::unique_ptr<PubkeyProvider>> providers) : m_threshold(threshold), m_providers(std::move(providers)) {}\n-\n-    bool IsRange() const override\n+    bool ExpandHelper(int pos, const SigningProvider& arg, Span<const unsigned char>* cache_read, std::vector<CScript>& output_scripts, FlatSigningProvider& out, std::vector<unsigned char>* cache_write) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/14646#discussion_r235785867",
+      "id" : 235785867,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIzNTc4NTg2Nw==",
+      "original_commit_id" : "729b8187dd795e31a87cad9ce0ba3638cf01f502",
+      "original_position" : 223,
+      "path" : "src/script/descriptor.cpp",
+      "position" : 223,
+      "pull_request_review_id" : 177733379,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14646",
+      "updated_at" : "2018-11-22T16:51:52Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/235785867",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/5470?v=4",
+         "events_url" : "https://api.github.com/users/Empact/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Empact/followers",
+         "following_url" : "https://api.github.com/users/Empact/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Empact/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Empact",
+         "id" : 5470,
+         "login" : "Empact",
+         "node_id" : "MDQ6VXNlcjU0NzA=",
+         "organizations_url" : "https://api.github.com/users/Empact/orgs",
+         "received_events_url" : "https://api.github.com/users/Empact/received_events",
+         "repos_url" : "https://api.github.com/users/Empact/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Empact/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Empact/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Empact"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/14646#discussion_r235786983"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14646"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/235786983"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "How about instead extracting `GetPubKeyInfo` and changing up the caller in `ExpandHelper` to only request the desired information? This looks doable if `cache_read` and `cache_write` are mutually exclusive.",
+      "commit_id" : "729b8187dd795e31a87cad9ce0ba3638cf01f502",
+      "created_at" : "2018-11-22T16:57:03Z",
+      "diff_hunk" : "@@ -94,9 +94,9 @@ class ConstPubkeyProvider final : public PubkeyProvider\n \n public:\n     ConstPubkeyProvider(const CPubKey& pubkey) : m_pubkey(pubkey) {}\n-    bool GetPubKey(int pos, const SigningProvider& arg, CPubKey& key, KeyOriginInfo& info) const override\n+    bool GetPubKey(int pos, const SigningProvider& arg, CPubKey* key, KeyOriginInfo& info) const override\n     {\n-        key = m_pubkey;\n+        if (key) *key = m_pubkey;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/14646#discussion_r235786983",
+      "id" : 235786983,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDIzNTc4Njk4Mw==",
+      "original_commit_id" : "729b8187dd795e31a87cad9ce0ba3638cf01f502",
+      "original_position" : 28,
+      "path" : "src/script/descriptor.cpp",
+      "position" : 28,
+      "pull_request_review_id" : 177734920,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14646",
+      "updated_at" : "2018-11-22T16:57:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/235786983",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/5470?v=4",
+         "events_url" : "https://api.github.com/users/Empact/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Empact/followers",
+         "following_url" : "https://api.github.com/users/Empact/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Empact/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Empact",
+         "id" : 5470,
+         "login" : "Empact",
+         "node_id" : "MDQ6VXNlcjU0NzA=",
+         "organizations_url" : "https://api.github.com/users/Empact/orgs",
+         "received_events_url" : "https://api.github.com/users/Empact/received_events",
+         "repos_url" : "https://api.github.com/users/Empact/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Empact/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Empact/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Empact"
+      }
    }
 ]
