@@ -1619,5 +1619,55 @@
          "type" : "User",
          "url" : "https://api.github.com/users/gmaxwell"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/14955#discussion_r243900544"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14955"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/243900544"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done.",
+      "commit_id" : "8dedc31e660b9f8f475832f68b66250bc64ff347",
+      "created_at" : "2018-12-25T10:54:28Z",
+      "diff_hunk" : "@@ -272,86 +294,217 @@ void GetOSRand(unsigned char *ent32)\n #endif\n }\n \n-void GetRandBytes(unsigned char* buf, int num)\n-{\n-    if (RAND_bytes(buf, num) != 1) {\n-        RandFailure();\n+namespace {\n+struct RNGState {\n+    Mutex cs;\n+    Mutex cs_openssl;\n+    unsigned char state[32] GUARDED_BY(cs) = {0};\n+    uint64_t counter GUARDED_BY(cs) = 0;\n+    bool initialized GUARDED_BY(cs) = false;\n+\n+    RNGState() noexcept\n+    {\n+        HWRandInit();\n     }\n+\n+    /** Extract up to 32 bytes of entropy from the RNG state, mixing in new entropy from hasher.\n+     *\n+     * If this function has never been called with full_init = true, false is returned.\n+     */\n+    bool MixExtract(unsigned char* out, int num, CSHA512&& hasher, bool full_init) noexcept\n+    {\n+        assert(num >= 0 && num <= 32);\n+        unsigned char buf[64];\n+        bool ret;\n+        {\n+            WAIT_LOCK(cs, lock);\n+            ret = (initialized |= full_init);\n+            // Write the current state of the RNG into the hasher\n+            hasher.Write(state, 32);\n+            // Write a new counter number into the state\n+            hasher.Write((const unsigned char*)&counter, sizeof(counter));\n+            ++counter;\n+            // Finalize the hasher\n+            hasher.Finalize(buf);\n+            // Store the last 32 bytes of the hash output as new RNG state.\n+            memcpy(state, buf + 32, 32);\n+        }\n+        // If desired, copy (up to) the first 32 bytes of the hash output as output.\n+        if (num) {\n+            memcpy(out, buf, num);\n+        }\n+        // Best effort cleanup of internal state\n+        hasher.Reset();\n+        memory_cleanse(buf, 64);\n+        return ret;\n+    }\n+};\n+\n+RNGState& GetRNGState() noexcept\n+{\n+    // This C++11 idiom relies on the guarantee that static variable are initialized\n+    // on first call, even when multiple parallel calls are permitted.\n+    static std::unique_ptr<RNGState> g_rng{new RNGState()};\n+    return *g_rng;\n+}\n }\n \n-static void AddDataToRng(void* data, size_t len);\n+static void SeedTimestamp(CSHA512& hasher) noexcept\n+{\n+    int64_t perfcounter = GetPerformanceCounter();\n+    hasher.Write((const unsigned char*)&perfcounter, sizeof(perfcounter));\n+}\n \n-void RandAddSeedSleep()\n+static void SeedFast(CSHA512& hasher) noexcept\n {\n-    int64_t nPerfCounter1 = GetPerformanceCounter();\n-    std::this_thread::sleep_for(std::chrono::milliseconds(1));\n-    int64_t nPerfCounter2 = GetPerformanceCounter();\n+    unsigned char buffer[32];\n \n-    // Combine with and update state\n-    AddDataToRng(&nPerfCounter1, sizeof(nPerfCounter1));\n-    AddDataToRng(&nPerfCounter2, sizeof(nPerfCounter2));\n+    // Stack pointer to indirectly commit to thread/callstack\n+    const unsigned char* ptr = buffer;\n+    hasher.Write((const unsigned char*)&ptr, sizeof(ptr));\n+\n+    // Hardware randomness is very fast when available; use it always.\n+    bool have_hw_rand = GetHWRand(buffer);\n+    if (have_hw_rand) hasher.Write(buffer, sizeof(buffer));\n \n-    memory_cleanse(&nPerfCounter1, sizeof(nPerfCounter1));\n-    memory_cleanse(&nPerfCounter2, sizeof(nPerfCounter2));\n+    // High-precision timestamp\n+    SeedTimestamp(hasher);\n }\n \n+static void SeedSlow(CSHA512& hasher, RNGState& rng) noexcept\n+{\n+    unsigned char buffer[32];\n \n-static Mutex cs_rng_state;\n-static unsigned char rng_state[32] = {0};\n-static uint64_t rng_counter = 0;\n+    // Everything that the 'fast' seeder includes\n+    SeedFast(hasher);\n \n-static void AddDataToRng(void* data, size_t len) {\n-    CSHA512 hasher;\n-    hasher.Write((const unsigned char*)&len, sizeof(len));\n-    hasher.Write((const unsigned char*)data, len);\n-    unsigned char buf[64];\n+    // OS randomness\n+    GetOSRand(buffer);\n+    hasher.Write(buffer, sizeof(buffer));\n+\n+    // OpenSSL RNG (for now)\n     {\n-        WAIT_LOCK(cs_rng_state, lock);\n-        hasher.Write(rng_state, sizeof(rng_state));\n-        hasher.Write((const unsigned char*)&rng_counter, sizeof(rng_counter));\n-        ++rng_counter;\n-        hasher.Finalize(buf);\n-        memcpy(rng_state, buf + 32, 32);\n+        std::lock_guard<std::mutex> lock(rng.cs_openssl);\n+        RAND_bytes(buffer, sizeof(buffer));\n     }\n-    memory_cleanse(buf, 64);\n+    hasher.Write(buffer, sizeof(buffer));\n+\n+    // High-precision timestamp.\n+    //\n+    // Note that we also commit to a timestamp in the Fast seeder, so we indirectly commit to a\n+    // benchmark of all the entropy gathering sources in this function).\n+    SeedTimestamp(hasher);\n }\n \n-void GetStrongRandBytes(unsigned char* out, int num)\n+static void SeedStrengthen(CSHA512& hasher, RNGState& rng)\n {\n-    assert(num <= 32);\n-    CSHA512 hasher;\n-    unsigned char buf[64];\n+    // Once per minute, strengthen the hash for 10ms.\n+    static std::atomic<int64_t> last_strengthen;\n+    int64_t current_time = GetTimeMicros();\n+    if (current_time > last_strengthen + 60000) {\n+        // Write the actual RNG state into the hasher, so it goes through the strengthening as well.\n+        unsigned char buf[32];\n+        if (rng.MixExtract(buf, 32, CSHA512(), false)) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/14955#discussion_r243900544",
+      "id" : 243900544,
+      "in_reply_to_id" : 243721722,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDI0MzkwMDU0NA==",
+      "original_commit_id" : "c2f3b3f4a4b1f1eea806f070dfa41edb52a6cb26",
+      "original_position" : 265,
+      "path" : "src/random.cpp",
+      "position" : null,
+      "pull_request_review_id" : 187782038,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14955",
+      "updated_at" : "2018-12-25T10:54:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/243900544",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
    }
 ]
