@@ -1525,5 +1525,85 @@
          "type" : "User",
          "url" : "https://api.github.com/users/gwillen"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r248126733"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/248126733"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "This doesn't match the code, right? \"next\" goes inside the input, not inside \"missing\"?",
+      "commit_id" : "afdec9a0ef6c2d77e0a92650d8800e6be56d8950",
+      "created_at" : "2019-01-16T01:43:07Z",
+      "diff_hunk" : "@@ -1773,6 +1774,324 @@ UniValue converttopsbt(const JSONRPCRequest& request)\n     return EncodeBase64((unsigned char*)ssTx.data(), ssTx.size());\n }\n \n+UniValue utxoupdatepsbt(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() != 1)\n+        throw std::runtime_error(\n+            \"utxoupdatepsbt \\\"psbt\\\"\\n\"\n+            \"\\nUpdates a PSBT with witness UTXOs retrieved from the UTXO set or the mempool.\\n\"\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"psbt\\\"                 (string) A base64 string of a PSBT\\n\"\n+            \"\\nResult:\\n\"\n+            \"  \\\"psbt\\\"          (string) The base64-encoded partially signed transaction with inputs updated\\n\"\n+            \"\\nExamples:\\n\"\n+            + HelpExampleCli(\"utxoupdatepsbt\", \"\\\"psbt\\\"\")\n+            );\n+\n+    RPCTypeCheck(request.params, {UniValue::VSTR}, true);\n+\n+    // Unserialize the transactions\n+    PartiallySignedTransaction psbtx;\n+    std::string error;\n+    if (!DecodePSBT(psbtx, request.params[0].get_str(), error)) {\n+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf(\"TX decode failed %s\", error));\n+    }\n+\n+    // Fetch previous transactions (inputs):\n+    CCoinsView viewDummy;\n+    CCoinsViewCache view(&viewDummy);\n+    {\n+        LOCK2(cs_main, mempool.cs);\n+        CCoinsViewCache &viewChain = *pcoinsTip;\n+        CCoinsViewMemPool viewMempool(&viewChain, mempool);\n+        view.SetBackend(viewMempool); // temporarily switch cache backend to db+mempool view\n+\n+        for (const CTxIn& txin : psbtx.tx->vin) {\n+            view.AccessCoin(txin.prevout); // Load entries from viewChain into view; can fail.\n+        }\n+\n+        view.SetBackend(viewDummy); // switch back to avoid locking mempool for too long\n+    }\n+\n+    // Fill the inputs\n+    for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {\n+        PSBTInput& input = psbtx.inputs.at(i);\n+\n+        if (input.non_witness_utxo || !input.witness_utxo.IsNull()) {\n+            continue;\n+        }\n+\n+        const Coin& coin = view.AccessCoin(psbtx.tx->vin[i].prevout);\n+\n+        std::vector<std::vector<unsigned char>> solutions_data;\n+        txnouttype which_type = Solver(coin.out.scriptPubKey, solutions_data);\n+        if (which_type == TX_WITNESS_V0_SCRIPTHASH || which_type == TX_WITNESS_V0_KEYHASH || which_type == TX_WITNESS_UNKNOWN) {\n+            input.witness_utxo = coin.out;\n+        }\n+    }\n+\n+    CDataStream ssTx(SER_NETWORK, PROTOCOL_VERSION);\n+    ssTx << psbtx;\n+    return EncodeBase64((unsigned char*)ssTx.data(), ssTx.size());\n+}\n+\n+UniValue joinpsbts(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() != 1)\n+        throw std::runtime_error(\n+            \"joinpsbts [\\\"psbt\\\",...]\\n\"\n+            \"\\nJoins multiple distinct PSBTs with different inputs and outputs into one PSBT with inputs and outputs from all of the PSBTs\\n\"\n+            \"No input in any of the PSBTs can be in more than one of the PSBTs.\\n\"\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"txs\\\"                   (string) A json array of base64 strings of partially signed transactions\\n\"\n+            \"    [\\n\"\n+            \"      \\\"psbt\\\"             (string) A base64 string of a PSBT\\n\"\n+            \"      ,...\\n\"\n+            \"    ]\\n\"\n+\n+            \"\\nResult:\\n\"\n+            \"  \\\"psbt\\\"          (string) The base64-encoded partially signed transaction\\n\"\n+            \"\\nExamples:\\n\"\n+            + HelpExampleCli(\"joinpsbts\", \"\\\"psbt\\\"\")\n+            );\n+\n+    RPCTypeCheck(request.params, {UniValue::VARR}, true);\n+\n+    // Unserialize the transactions\n+    std::vector<PartiallySignedTransaction> psbtxs;\n+    UniValue txs = request.params[0].get_array();\n+\n+    if (txs.size() <= 1) {\n+        throw JSONRPCError(RPC_INVALID_PARAMETER, \"At least two PSBTs are required to join PSBTs.\");\n+    }\n+\n+    for (unsigned int i = 0; i < txs.size(); ++i) {\n+        PartiallySignedTransaction psbtx;\n+        std::string error;\n+        if (!DecodePSBT(psbtx, txs[i].get_str(), error)) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf(\"TX decode failed %s\", error));\n+        }\n+        psbtxs.push_back(psbtx);\n+    }\n+\n+    PartiallySignedTransaction merged_psbt(psbtxs[0]); // Copy the first one\n+\n+    // Clear signatures from all inputs\n+    for (auto& input : merged_psbt.inputs) {\n+        input.partial_sigs.clear();\n+    }\n+\n+    // Merge\n+    for (auto it = std::next(psbtxs.begin()); it != psbtxs.end(); ++it) {\n+        for (unsigned int i = 0; i < it->tx->vin.size(); ++i) {\n+            if (!merged_psbt.AddInput(it->tx->vin[i], it->inputs[i])) {\n+                throw JSONRPCError(RPC_INVALID_PARAMETER, \"An input exists in multiple PSBTs\");\n+            }\n+        }\n+        for (unsigned int i = 0; i < it->tx->vout.size(); ++i) {\n+            merged_psbt.AddOutput(it->tx->vout[i], it->outputs[i]);\n+        }\n+    }\n+\n+    CDataStream ssTx(SER_NETWORK, PROTOCOL_VERSION);\n+    ssTx << merged_psbt;\n+    return EncodeBase64((unsigned char*)ssTx.data(), ssTx.size());\n+}\n+\n+UniValue analyzepsbt(const JSONRPCRequest& request)\n+{\n+    if (request.fHelp || request.params.size() != 1)\n+        throw std::runtime_error(\n+            \"analyzepsbt \\\"psbt\\\"\\n\"\n+            \"\\nAnalyzes and provides information about the current status of a PSBT and its inputs\\n\"\n+            \"\\nArguments:\\n\"\n+            \"1. \\\"psbt\\\"             (string) A base64 string of a PSBT\\n\"\n+\n+            \"\\nResult:\\n\"\n+            \"{\\n\"\n+            \"  \\\"inputs\\\" : [                      (array of json objects)\\n\"\n+            \"    {\\n\"\n+            \"      \\\"has_utxo\\\" : true|false     (boolean) Whether a UTXO is provided\\n\"\n+            \"      \\\"is_final\\\" : true|false     (boolean) Whether the input is finalized\\n\"\n+            \"      \\\"missing\\\" : {               (json object, optional) Things that are missing that are required to complete this input\\n\"\n+            \"        \\\"pubkeys\\\" : [             (array)\\n\"\n+            \"          \\\"keyid\\\"                 (string) Public key ID, hash160 of the public key, of a public key whose BIP 32 derivation path is missing\\n\"\n+            \"        ]\\n\"\n+            \"        \\\"signatures\\\" : [          (array)\\n\"\n+            \"          \\\"keyid\\\"                 (string) Public key ID, hash160 of the public key, of a public key whose signature is missing\\n\"\n+            \"        ]\\n\"\n+            \"        \\\"redeemscript\\\" : \\\"hash\\\"   (string) Hash160 of the redeemScript that is missing\\n\"\n+            \"        \\\"witnessscript\\\" : \\\"hash\\\"  (string) SHA256 of the witnessScript that is missing\\n\"\n+            \"        \\\"next\\\" : \\\"role\\\"           (string) Role of the next person that this input needs to go to\\n\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13932#discussion_r248126733",
+      "id" : 248126733,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDI0ODEyNjczMw==",
+      "original_commit_id" : "afdec9a0ef6c2d77e0a92650d8800e6be56d8950",
+      "original_position" : 160,
+      "path" : "src/rpc/rawtransaction.cpp",
+      "position" : 160,
+      "pull_request_review_id" : 192943548,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/13932",
+      "updated_at" : "2019-01-16T01:43:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/248126733",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/458997?v=4",
+         "events_url" : "https://api.github.com/users/gwillen/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/gwillen/followers",
+         "following_url" : "https://api.github.com/users/gwillen/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/gwillen/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/gwillen",
+         "id" : 458997,
+         "login" : "gwillen",
+         "node_id" : "MDQ6VXNlcjQ1ODk5Nw==",
+         "organizations_url" : "https://api.github.com/users/gwillen/orgs",
+         "received_events_url" : "https://api.github.com/users/gwillen/received_events",
+         "repos_url" : "https://api.github.com/users/gwillen/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/gwillen/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/gwillen/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/gwillen"
+      }
+   },
+   {
+      "author_association" : "CONTRIBUTOR",
+      "body" : "It looks like I'm going to depend on this for my offline-signing GUI work, so we can display nice messages in the GUI about the status of PSBTs that users hand us. Can I therefore encourage its revival? :-) @achow101 \r\n\r\nNote that, assuming #14978 goes in relatively soon, a little refactoring will be needed -- mostly just changing #includes I expect. The other PSBT RPCs have had their guts moved to another file, but I'm happy to do that for these RPCs as a followup PR to this one, if you like, so you don't have to modify this one too much. ",
+      "created_at" : "2019-01-16T01:46:04Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/13932#issuecomment-454619751",
+      "id" : 454619751,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/13932",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDQ1NDYxOTc1MQ==",
+      "updated_at" : "2019-01-16T01:49:54Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/454619751",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/458997?v=4",
+         "events_url" : "https://api.github.com/users/gwillen/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/gwillen/followers",
+         "following_url" : "https://api.github.com/users/gwillen/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/gwillen/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/gwillen",
+         "id" : 458997,
+         "login" : "gwillen",
+         "node_id" : "MDQ6VXNlcjQ1ODk5Nw==",
+         "organizations_url" : "https://api.github.com/users/gwillen/orgs",
+         "received_events_url" : "https://api.github.com/users/gwillen/received_events",
+         "repos_url" : "https://api.github.com/users/gwillen/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/gwillen/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/gwillen/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/gwillen"
+      }
    }
 ]
