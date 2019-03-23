@@ -3202,5 +3202,155 @@
          "type" : "User",
          "url" : "https://api.github.com/users/ryanofsky"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/14121#discussion_r268367938"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14121"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/268367938"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I agree, but the logic for block/undo files is weird because they are synchronized (like the undo file numbers increment when the block file numbers do, not at a size limit).\r\n\r\nWould be a good thing to look at refactoring after this is merged maybe.",
+      "commit_id" : "634693641d73f3bc70ba2c508bd4cb15d69e87b6",
+      "created_at" : "2019-03-22T23:36:39Z",
+      "diff_hunk" : "@@ -0,0 +1,272 @@\n+// Copyright (c) 2018 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <map>\n+\n+#include <index/blockfilterindex.h>\n+#include <util/system.h>\n+#include <validation.h>\n+\n+/* The index database stores three items for each block: the disk location of the encoded filter,\n+ * its dSHA256 hash, and the header. Those belonging to blocks on the active chain are indexed by\n+ * height, and those belonging to blocks that have been reorganized out of the active chain are\n+ * indexed by block hash. This ensures that filter data for any block that becomes part of the\n+ * active chain can always be retrieved, alleviating timing concerns.\n+ *\n+ * The filters themselves are stored in flat files and referenced by the LevelDB entries. This\n+ * minimizes the amount of data written to LevelDB and keeps the database values constant size.\n+ *\n+ * Keys for the height index have the type [DB_BLOCK_HEIGHT, uint32 (BE)]. The height is represented\n+ * as big-endian so that sequential reads of filters by height are fast.\n+ * Keys for the hash index have the type [DB_BLOCK_HASH, uint256].\n+ */\n+constexpr char DB_BLOCK_HASH = 's';\n+constexpr char DB_BLOCK_HEIGHT = 't';\n+constexpr char DB_FILTER_POS = 'P';\n+\n+constexpr unsigned int MAX_FILE_SIZE = 0x1000000; // 16 MiB\n+/** The pre-allocation chunk size for fltr?????.dat files */\n+constexpr unsigned int FILE_CHUNK_SIZE = 0x100000; // 1 MiB\n+\n+namespace {\n+    struct DBVal\n+    {\n+        uint256 hash;\n+        uint256 header;\n+        FlatFilePos pos;\n+\n+        ADD_SERIALIZE_METHODS;\n+\n+        template <typename Stream, typename Operation>\n+        inline void SerializationOp(Stream& s, Operation ser_action) {\n+            READWRITE(hash);\n+            READWRITE(header);\n+            READWRITE(pos);\n+        }\n+    };\n+\n+    struct DBHeightKey\n+    {\n+        int height;\n+\n+        DBHeightKey() : height(0) {}\n+        DBHeightKey(int height_in) : height(height_in) {}\n+\n+        template<typename Stream>\n+        void Serialize(Stream& s) const\n+        {\n+            ser_writedata8(s, DB_BLOCK_HEIGHT);\n+            ser_writedata32be(s, height);\n+        }\n+\n+        template<typename Stream>\n+        void Unserialize(Stream& s)\n+        {\n+            char prefix = ser_readdata8(s);\n+            if (prefix != DB_BLOCK_HEIGHT) {\n+                throw std::ios_base::failure(\"Invalid format for DB key\");\n+            }\n+            height = ser_readdata32be(s);\n+        }\n+    };\n+\n+    struct DBHashKey\n+    {\n+        uint256 hash;\n+\n+        DBHashKey(const uint256& hash_in) : hash(hash_in) {}\n+\n+        ADD_SERIALIZE_METHODS;\n+\n+        template <typename Stream, typename Operation>\n+        inline void SerializationOp(Stream& s, Operation ser_action) {\n+            char prefix = DB_BLOCK_HASH;\n+            READWRITE(prefix);\n+            if (prefix != DB_BLOCK_HASH) {\n+                throw std::ios_base::failure(\"Invalid format for DB key\");\n+            }\n+\n+            READWRITE(hash);\n+        }\n+    };\n+};\n+\n+BlockFilterIndex::BlockFilterIndex(BlockFilterType filter_type,\n+                                   size_t n_cache_size, bool f_memory, bool f_wipe)\n+    : m_filter_type(filter_type)\n+{\n+    const std::string& filter_name = BlockFilterTypeName(filter_type);\n+    if (filter_name == \"\") throw std::invalid_argument(\"unknown filter_type\");\n+\n+    fs::path path = GetDataDir() / \"indexes\" / \"blockfilter\" / filter_name;\n+    fs::create_directories(path);\n+\n+    m_name = filter_name + \" block filter index\";\n+    m_db = MakeUnique<BaseIndex::DB>(path / \"db\", n_cache_size, f_memory, f_wipe);\n+    m_filter_fileseq = MakeUnique<FlatFileSeq>(std::move(path), \"fltr\", FILE_CHUNK_SIZE);\n+}\n+\n+bool BlockFilterIndex::Init()\n+{\n+    if (!m_db->Read(DB_FILTER_POS, m_next_filter_pos)) {\n+        m_next_filter_pos.nFile = 0;\n+        m_next_filter_pos.nPos = 0;\n+    }\n+    return BaseIndex::Init();\n+}\n+\n+bool BlockFilterIndex::Commit(CDBBatch& batch)\n+{\n+    const FlatFilePos& pos = m_next_filter_pos;\n+\n+    // Flush current filter file to disk.\n+    CAutoFile file(m_filter_fileseq->Open(pos), SER_DISK, CLIENT_VERSION);\n+    if (file.IsNull()) {\n+        return error(\"%s: Failed to open filter file %d\", __func__, pos.nFile);\n+    }\n+    if (!FileCommit(file.Get())) {\n+        return error(\"%s: Failed to commit filter file %d\", __func__, pos.nFile);\n+    }\n+\n+    batch.Write(DB_FILTER_POS, pos);\n+    return BaseIndex::Commit(batch);\n+}\n+\n+size_t BlockFilterIndex::WriteFilterToDisk(FlatFilePos& pos, const BlockFilter& filter)\n+{\n+    assert(filter.GetFilterType() == GetFilterType());\n+\n+    size_t data_size =\n+        GetSerializeSize(filter.GetBlockHash(), CLIENT_VERSION) +\n+        GetSerializeSize(filter.GetEncodedFilter(), CLIENT_VERSION);\n+\n+    // If writing the filter would overflow the file, flush and move to the next one.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/14121#discussion_r268367938",
+      "id" : 268367938,
+      "in_reply_to_id" : 267362389,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDI2ODM2NzkzOA==",
+      "original_commit_id" : "ac208f820b2a80dd23f3a11cdb4da616a115123b",
+      "original_position" : 144,
+      "path" : "src/index/blockfilterindex.cpp",
+      "position" : 167,
+      "pull_request_review_id" : 218010532,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14121",
+      "updated_at" : "2019-03-22T23:36:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/268367938",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
+         "events_url" : "https://api.github.com/users/jimpo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jimpo/followers",
+         "following_url" : "https://api.github.com/users/jimpo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jimpo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jimpo",
+         "id" : 881253,
+         "login" : "jimpo",
+         "node_id" : "MDQ6VXNlcjg4MTI1Mw==",
+         "organizations_url" : "https://api.github.com/users/jimpo/orgs",
+         "received_events_url" : "https://api.github.com/users/jimpo/received_events",
+         "repos_url" : "https://api.github.com/users/jimpo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jimpo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jimpo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jimpo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/14121#discussion_r268368647"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14121"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/268368647"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I'd be happy to add to `test_bitcoin` or `TestingSetup` or something if people think these are useful in the test framework. I'm not really sure. Any opinions @jnewbery?",
+      "commit_id" : "634693641d73f3bc70ba2c508bd4cb15d69e87b6",
+      "created_at" : "2019-03-22T23:43:05Z",
+      "diff_hunk" : "@@ -64,6 +67,48 @@ static bool CheckFilterLookups(BlockFilterIndex& filter_index, const CBlockIndex\n     return true;\n }\n \n+static CBlock CreateBlock(const CBlockIndex* prev,\n+                          const std::vector<CMutableTransaction>& txns,\n+                          const CScript& scriptPubKey)\n+{\n+    const CChainParams& chainparams = Params();\n+    std::unique_ptr<CBlockTemplate> pblocktemplate = BlockAssembler(chainparams).CreateNewBlock(scriptPubKey);\n+    CBlock& block = pblocktemplate->block;\n+    block.hashPrevBlock = prev->GetBlockHash();\n+    block.nTime = prev->nTime + 1;\n+\n+    // Replace mempool-selected txns with just coinbase plus passed-in txns:\n+    block.vtx.resize(1);\n+    for (const CMutableTransaction& tx : txns)\n+        block.vtx.push_back(MakeTransactionRef(tx));\n+    // IncrementExtraNonce creates a valid coinbase and merkleRoot\n+    unsigned int extraNonce = 0;\n+    IncrementExtraNonce(&block, prev, extraNonce);\n+\n+    while (!CheckProofOfWork(block.GetHash(), block.nBits, chainparams.GetConsensus())) ++block.nNonce;\n+\n+    return block;\n+}\n+\n+static bool BuildChain(const CBlockIndex* pindex, const CScript& coinbase_script_pub_key,\n+                       size_t length, std::vector<std::shared_ptr<CBlock>>& chain)\n+{\n+    std::vector<CMutableTransaction> no_txns;\n+\n+    chain.resize(length);\n+    for (auto& block : chain) {\n+        block = std::make_shared<CBlock>(CreateBlock(pindex, no_txns, coinbase_script_pub_key));\n+        CBlockHeader header = block->GetBlockHeader();\n+\n+        CValidationState state;\n+        if (!ProcessNewBlockHeaders({header}, state, Params(), &pindex, nullptr)) {\n+            return false;\n+        }\n+    }\n+\n+    return true;\n+}",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/14121#discussion_r268368647",
+      "id" : 268368647,
+      "in_reply_to_id" : 267421501,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDI2ODM2ODY0Nw==",
+      "original_commit_id" : "4f7a4a593d200c26ca913552a63e887e0c07758f",
+      "original_position" : 55,
+      "path" : "src/test/blockfilter_index_tests.cpp",
+      "position" : 110,
+      "pull_request_review_id" : 218011412,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14121",
+      "updated_at" : "2019-03-22T23:43:05Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/268368647",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/881253?v=4",
+         "events_url" : "https://api.github.com/users/jimpo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jimpo/followers",
+         "following_url" : "https://api.github.com/users/jimpo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jimpo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jimpo",
+         "id" : 881253,
+         "login" : "jimpo",
+         "node_id" : "MDQ6VXNlcjg4MTI1Mw==",
+         "organizations_url" : "https://api.github.com/users/jimpo/orgs",
+         "received_events_url" : "https://api.github.com/users/jimpo/received_events",
+         "repos_url" : "https://api.github.com/users/jimpo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jimpo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jimpo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jimpo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/14121#discussion_r268370727"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14121"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/268370727"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "There are methods in `src/test/validation_block_tests.cpp` and `src/bench/block_assemble.cpp` that do something similar. I think copy-pasting them is fine unless it is more convenient to share code between them.",
+      "commit_id" : "634693641d73f3bc70ba2c508bd4cb15d69e87b6",
+      "created_at" : "2019-03-23T00:03:28Z",
+      "diff_hunk" : "@@ -64,6 +67,48 @@ static bool CheckFilterLookups(BlockFilterIndex& filter_index, const CBlockIndex\n     return true;\n }\n \n+static CBlock CreateBlock(const CBlockIndex* prev,\n+                          const std::vector<CMutableTransaction>& txns,\n+                          const CScript& scriptPubKey)\n+{\n+    const CChainParams& chainparams = Params();\n+    std::unique_ptr<CBlockTemplate> pblocktemplate = BlockAssembler(chainparams).CreateNewBlock(scriptPubKey);\n+    CBlock& block = pblocktemplate->block;\n+    block.hashPrevBlock = prev->GetBlockHash();\n+    block.nTime = prev->nTime + 1;\n+\n+    // Replace mempool-selected txns with just coinbase plus passed-in txns:\n+    block.vtx.resize(1);\n+    for (const CMutableTransaction& tx : txns)\n+        block.vtx.push_back(MakeTransactionRef(tx));\n+    // IncrementExtraNonce creates a valid coinbase and merkleRoot\n+    unsigned int extraNonce = 0;\n+    IncrementExtraNonce(&block, prev, extraNonce);\n+\n+    while (!CheckProofOfWork(block.GetHash(), block.nBits, chainparams.GetConsensus())) ++block.nNonce;\n+\n+    return block;\n+}\n+\n+static bool BuildChain(const CBlockIndex* pindex, const CScript& coinbase_script_pub_key,\n+                       size_t length, std::vector<std::shared_ptr<CBlock>>& chain)\n+{\n+    std::vector<CMutableTransaction> no_txns;\n+\n+    chain.resize(length);\n+    for (auto& block : chain) {\n+        block = std::make_shared<CBlock>(CreateBlock(pindex, no_txns, coinbase_script_pub_key));\n+        CBlockHeader header = block->GetBlockHeader();\n+\n+        CValidationState state;\n+        if (!ProcessNewBlockHeaders({header}, state, Params(), &pindex, nullptr)) {\n+            return false;\n+        }\n+    }\n+\n+    return true;\n+}",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/14121#discussion_r268370727",
+      "id" : 268370727,
+      "in_reply_to_id" : 267421501,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDI2ODM3MDcyNw==",
+      "original_commit_id" : "4f7a4a593d200c26ca913552a63e887e0c07758f",
+      "original_position" : 55,
+      "path" : "src/test/blockfilter_index_tests.cpp",
+      "position" : 110,
+      "pull_request_review_id" : 218013948,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/14121",
+      "updated_at" : "2019-03-23T00:03:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/268370727",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
    }
 ]
