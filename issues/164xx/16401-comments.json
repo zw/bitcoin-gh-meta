@@ -818,5 +818,54 @@
          "type" : "User",
          "url" : "https://api.github.com/users/NicolasDorier"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16401#discussion_r330106204"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16401"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/330106204"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "This is probably also a good spot for a `DCHECK` just to ensure that the assumption - \"this must pass based on the checks above\" - holds here.",
+      "commit_id" : "cd8f11aaaa7dd27f95af3d4cb85ff7c7607e76f9",
+      "created_at" : "2019-10-01T14:57:05Z",
+      "diff_hunk" : "@@ -1046,6 +1055,146 @@ bool MemPoolAccept::AcceptSingleTransaction(const CTransactionRef& ptx, ATMPArgs\n     return true;\n }\n \n+\n+bool MemPoolAccept::AcceptMultipleTransactions(const std::list<CTransactionRef>& tx_list, ATMPArgs& args)\n+{\n+    AssertLockHeld(cs_main);\n+    LOCK(m_pool.cs);\n+\n+    std::list<Workspace> tx_workspaces;\n+\n+    for (const CTransactionRef& ptx : tx_list) {\n+        // The last transaction must be validated for making it past the fee\n+        // checks on its own, to prevent packages from including low-fee,\n+        // unnecessary children that are attached to higher fee parents.\n+        tx_workspaces.emplace_back(Workspace(ptx, ptx != tx_list.back()));\n+        Workspace &ws = tx_workspaces.back();\n+\n+        if (!PreChecks(args, ws)) return false;\n+\n+        // For now, do not allow replacements in package transactions. If we\n+        // relax this, we would need to check that no child transaction depends\n+        // on any in-mempool transaction that conflicts with any package\n+        // transaction.\n+        if (!ws.m_conflicts.empty()) {\n+            return args.m_state.Invalid(ValidationInvalidReason::TX_MEMPOOL_POLICY, false, REJECT_NONSTANDARD, \"rbf-disallowed-in-package\", strprintf(\"mempool conflicts with tx %s\", ptx->GetHash().ToString()));\n+        }\n+        // Add this transaction to our coinsview, so that subsequent\n+        // transactions in this package will have their inputs available.\n+        m_viewmempool.AddPotentialTransaction(ptx);\n+    }\n+\n+    // Check overall package feerate\n+    size_t total_size=0;\n+    CAmount total_fee=0;\n+    uint64_t total_count = tx_list.size();\n+    for (const Workspace& ws : tx_workspaces) {\n+        total_size += ws.m_entry->GetTxSize();\n+        total_fee += ws.m_modified_fees;\n+    }\n+    if (!CheckFeeRate(total_size, total_fee, args.m_state)) return false;\n+\n+    // The ancestor/descendant limit calculations in PreChecks() will be overly\n+    // permissive, because not all ancestors will be known as we descend down\n+    // the package. Thus the ancestor checks done by\n+    // CalculateMemPoolAncestors() will be incomplete. If any ancestor or\n+    // descendant limit is violated in one of those checks, however, we know\n+    // the package will not be accepted when we include all ancestors, as the\n+    // ancestor/descendant size/counts only go up as we add more ancestors to\n+    // each transaction.\n+    // We will end up needing to recalculate setAncestors for each transaction\n+    // prior to calling Finalize, but we should do the correct package-size\n+    // calculations before we call ScriptChecks(), to avoid CPU-DoS.\n+\n+    // For now, do something conservative -- assume that the union of ancestors\n+    // of each transaction is an ancestor of every transaction, for package\n+    // size purposes.\n+    CTxMemPool::setEntries all_ancestors;\n+    for (const Workspace& ws : tx_workspaces) {\n+        all_ancestors.insert(ws.m_ancestors.begin(), ws.m_ancestors.end());\n+    }\n+\n+    if (total_count + all_ancestors.size() > m_limit_ancestors) {\n+        return args.m_state.Invalid(ValidationInvalidReason::TX_MEMPOOL_POLICY, false, REJECT_NONSTANDARD, \"too-long-package-mempool-chain\", strprintf(\"exceeds ancestor count limit [package: %u limit: %u]\", total_count + all_ancestors.size(), m_limit_ancestors));\n+    }\n+\n+    // Check the package limits for every ancestor, assuming the whole package\n+    // descends from each.\n+    size_t ancestor_size = total_size;\n+    for (auto tx_iter : all_ancestors) {\n+        if (tx_iter->GetSizeWithDescendants() + total_size > m_limit_descendant_size) {\n+            return args.m_state.Invalid(ValidationInvalidReason::TX_MEMPOOL_POLICY, false, REJECT_NONSTANDARD, \"too-long-package-mempool-chain\", strprintf(\"exceeds descendant size limit for tx %s [limit: %u]\", tx_iter->GetTx().GetHash().ToString(), m_limit_descendant_size));\n+        }\n+        if (tx_iter->GetCountWithDescendants() + total_count > m_limit_descendants) {\n+            return args.m_state.Invalid(ValidationInvalidReason::TX_MEMPOOL_POLICY, false, REJECT_NONSTANDARD, \"too-long-package-mempool-chain\", strprintf(\"exceeds descendant size limit for tx %s [limit: %u]\", tx_iter->GetTx().GetHash().ToString(), m_limit_descendants));\n+        }\n+        ancestor_size += tx_iter->GetTxSize();\n+    }\n+\n+    // In case we have no in-mempool ancestors, we must check the transaction\n+    // package itself.\n+    if (total_size > m_limit_descendant_size) {\n+        return args.m_state.Invalid(ValidationInvalidReason::TX_MEMPOOL_POLICY, false, REJECT_NONSTANDARD, \"too-long-package-mempool-chain\", strprintf(\"exceeds descendant size limit for tx %s [limit: %u]\", tx_list.front()->GetHash().ToString(), m_limit_descendant_size));\n+    }\n+    if (ancestor_size > m_limit_ancestor_size) {\n+        return args.m_state.Invalid(ValidationInvalidReason::TX_MEMPOOL_POLICY, false, REJECT_NONSTANDARD, \"too-long-package-mempool-chain\", strprintf(\"exceeds ancestor size limit for tx %s [limit: %u]\", tx_list.back()->GetHash().ToString(), m_limit_ancestor_size));\n+    }\n+\n+    // Make sure all transactions are ancestors of the last one.\n+    // For now, just check that the last transaction has all prior transactions\n+    // as direct inputs. We can relax this in the future for bigger packages.\n+    std::set<uint256> last_tx_parents;\n+    for (auto input : tx_list.back()->vin) {\n+        last_tx_parents.insert(input.prevout.hash);\n+    }\n+    for (auto ptx : tx_list) {\n+        if (ptx == tx_list.back()) break;\n+        if (last_tx_parents.count(ptx->GetHash()) == 0) {\n+            return args.m_state.Invalid(ValidationInvalidReason::TX_MEMPOOL_POLICY, false, REJECT_NONSTANDARD, \"non-standard-package-chain\", \"only direct parents are allowed in package\");\n+        }\n+    }\n+\n+    // Do the script checks after all policy checks are done\n+    std::vector<PrecomputedTransactionData> txdata;\n+    txdata.reserve(tx_list.size());\n+    for (auto wit = tx_workspaces.begin(); wit != tx_workspaces.end(); ++wit) {\n+        txdata.emplace_back(*wit->m_ptx);\n+        if (!PolicyScriptChecks(args, *wit, txdata.back())) return false;\n+    }\n+\n+    // This package should be accepted except possibly for failing in\n+    // TrimToSize(), which we can't exercise without actually adding to the\n+    // mempool and seeing what would happen. Note that we are not adding\n+    // these transactions to the script cache, unlike in the single-tx case.\n+    if (args.m_test_accept) return true;\n+\n+    // Add everything to the mempool, and make sure the last transaction makes\n+    // it in.\n+    size_t i=0;\n+    for (auto wit = tx_workspaces.begin(); wit != tx_workspaces.end(); ++wit, ++i) {\n+        // Recheck the scripts with consensus flags and cache script execution\n+        // success. We have to wait until all the inputs are in the mempool or\n+        // in the utxo set (for now) before we can invoke this. This should\n+        // not fail unless there's a logic bug in our script validation, but if\n+        // it somehow were to fail on some child tx, we would potentially be\n+        // allowing parents into the mempool with this logic.\n+        if (!ConsensusScriptChecks(args, *wit, txdata[i])) return false;\n+\n+        // Recalculate ancestors for every transaction after the first, because\n+        // previously the ancestor sets were missing package transactions that\n+        // were not yet in the mempool at the time PreChecks() was called.\n+        if (wit != tx_workspaces.begin()) {\n+            wit->m_ancestors.clear();\n+            std::string dummy_string;\n+            // Don't worry about the return value here; it must pass based on\n+            // the checks above. TODO: assert on passing?\n+            m_pool.CalculateMemPoolAncestors(*(wit->m_entry), wit->m_ancestors, m_limit_ancestors, m_limit_ancestor_size, m_limit_descendants, m_limit_descendant_size, dummy_string);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16401#discussion_r330106204",
+      "id" : 330106204,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDMzMDEwNjIwNA==",
+      "original_commit_id" : "92cc72905ab15f4474b055da95f5a45b7e8b90c8",
+      "original_position" : 264,
+      "path" : "src/validation.cpp",
+      "position" : 264,
+      "pull_request_review_id" : 295669946,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16401",
+      "updated_at" : "2019-10-01T14:57:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/330106204",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/69561?v=4",
+         "events_url" : "https://api.github.com/users/etscrivner/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/etscrivner/followers",
+         "following_url" : "https://api.github.com/users/etscrivner/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/etscrivner/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/etscrivner",
+         "id" : 69561,
+         "login" : "etscrivner",
+         "node_id" : "MDQ6VXNlcjY5NTYx",
+         "organizations_url" : "https://api.github.com/users/etscrivner/orgs",
+         "received_events_url" : "https://api.github.com/users/etscrivner/received_events",
+         "repos_url" : "https://api.github.com/users/etscrivner/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/etscrivner/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/etscrivner/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/etscrivner"
+      }
    }
 ]
