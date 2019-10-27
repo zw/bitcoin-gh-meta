@@ -44,7 +44,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "To also have CPU features bits for other architectures (on Linux) you could include `getauxval(AT_HWCAP)` and `getauxval(AT_HWCAP2)`.\r\n(maybe some other `getauxval` are relevant too, e.g. `AT_RANDOM` has 16 bytes of random data)",
-      "commit_id" : "0c6d5cb1f7fcf00fb7a900e5f5a1f2e1e2a49978",
+      "commit_id" : "eed8cfec452a538d644844fb96606e6bc24f47c8",
       "created_at" : "2019-10-27T09:39:41Z",
       "diff_hunk" : "@@ -0,0 +1,295 @@\n+// Copyright (c) 2009-2010 Satoshi Nakamoto\n+// Copyright (c) 2009-2019 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <crypto/sha512.h>\n+#include <vector>\n+#include <support/cleanse.h>\n+#include <climits>\n+#include <thread>\n+#include <string.h>\n+\n+#include <util/time.h> // for GetTime()\n+\n+#ifdef WIN32\n+#include <compat.h> // for Windows API\n+#else\n+#include <sys/time.h>\n+#include <sys/resource.h>\n+#include <sys/types.h>\n+#include <sys/utsname.h>\n+#include <sys/socket.h>\n+#include <sys/stat.h>\n+#include <ifaddrs.h>\n+#include <fcntl.h>\n+#include <netinet/ip.h>\n+#include <unistd.h>\n+#endif\n+\n+#if defined(__x86_64__) || defined(__amd64__) || defined(__i386__)\n+#include <cpuid.h>\n+#endif\n+\n+namespace {\n+\n+void RandAddSeedPerfmon(CSHA512& hasher)\n+{\n+#ifdef WIN32\n+    // Don't need this on Linux, OpenSSL automatically uses /dev/urandom\n+    // Seed with the entire set of perfmon data\n+\n+    // This can take up to 2 seconds, so only do it every 10 minutes\n+    static int64_t nLastPerfmon;\n+    if (GetTime() < nLastPerfmon + 10 * 60)\n+        return;\n+    nLastPerfmon = GetTime();\n+\n+    std::vector<unsigned char> vData(250000, 0);\n+    long ret = 0;\n+    unsigned long nSize = 0;\n+    const size_t nMaxSize = 10000000; // Bail out at more than 10MB of performance data\n+    while (true) {\n+        nSize = vData.size();\n+        ret = RegQueryValueExA(HKEY_PERFORMANCE_DATA, \"Global\", nullptr, nullptr, vData.data(), &nSize);\n+        if (ret != ERROR_MORE_DATA || vData.size() >= nMaxSize)\n+            break;\n+        vData.resize(std::max((vData.size() * 3) / 2, nMaxSize)); // Grow size of buffer exponentially\n+    }\n+    RegCloseKey(HKEY_PERFORMANCE_DATA);\n+    if (ret == ERROR_SUCCESS) {\n+        hasher.Write(vData.data(), nSize);\n+        memory_cleanse(vData.data(), nSize);\n+    } else {\n+        // Performance data is only a best-effort attempt at improving the\n+        // situation when the OS randomness (and other sources) aren't\n+        // adequate. As a result, failure to read it is isn't considered critical,\n+        // so we don't call RandFailure().\n+        // TODO: Add logging when the logger is made functional before global\n+        // constructors have been invoked.\n+    }\n+#endif\n+}\n+\n+/** Helper to easily feed data into a CSHA512.\n+ *\n+ * Note that this does not serialize the passed object (like stream.h's << operators do).\n+ * Its raw memory representation is used directly.\n+ */\n+template<typename T>\n+CSHA512& operator<<(CSHA512& hasher, const T& data) {\n+    hasher.Write((const unsigned char*)&data, sizeof(data));\n+    return hasher;\n+}\n+\n+#ifndef WIN32\n+void AddSockaddr(CSHA512& hasher, const struct sockaddr *addr)\n+{\n+    if (addr == nullptr) return;\n+    switch (addr->sa_family) {\n+    case AF_INET:\n+        hasher.Write((const unsigned char*)addr, sizeof(sockaddr_in));\n+        break;\n+    case AF_INET6:\n+        hasher.Write((const unsigned char*)addr, sizeof(sockaddr_in6));\n+        break;\n+    default:\n+        hasher.Write((const unsigned char*)&addr->sa_family, sizeof(addr->sa_family));\n+    }\n+}\n+\n+void AddStat(CSHA512& hasher, const struct stat& sb)\n+{\n+    hasher << sb.st_dev << sb.st_ino << sb.st_mode << sb.st_nlink << sb.st_uid << sb.st_gid << sb.st_size << sb.st_blksize << sb.st_blocks << sb.st_atime << sb.st_mtime << sb.st_ctime;\n+}\n+\n+void AddFile(CSHA512& hasher, const char *path)\n+{\n+    struct stat sb;\n+    int f = open(path, O_RDONLY);\n+    if (f != -1) {\n+        unsigned char fbuf[1024];\n+        int n;\n+        hasher.Write((const unsigned char*)&f, sizeof(f));\n+        if (fstat(f, &sb) == 0) {\n+            AddStat(hasher, sb);\n+        }\n+        do {\n+            n = read(f, fbuf, sizeof(fbuf));\n+            if (n > 0) hasher.Write(fbuf, n);\n+            /* not bothering with EINTR handling. */\n+        } while (n == sizeof(fbuf));\n+        close(f);\n+    }\n+}\n+\n+void AddPath(CSHA512& hasher, const char *path)\n+{\n+    struct stat sb;\n+    if (stat(path, &sb) == 0) {\n+        hasher.Write((const unsigned char*)path, strlen(path) + 1);\n+        AddStat(hasher, sb);\n+    }\n+}\n+#endif\n+\n+#if defined(__x86_64__) || defined(__amd64__) || defined(__i386__)\n+void GetCPUID(uint32_t leaf, uint32_t subleaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d)\n+{\n+    // We can't use __get_cpuid as it doesn't support subleafs.\n+#ifdef __GNUC__\n+    __cpuid_count(leaf, subleaf, a, b, c, d);\n+#else\n+    __asm__ (\"cpuid\" : \"=a\"(a), \"=b\"(b), \"=c\"(c), \"=d\"(d) : \"0\"(leaf), \"2\"(subleaf));\n+#endif\n+}\n+\n+void AddCPUID(CSHA512& hasher)\n+{\n+    uint32_t ax, bx, cx, dx;\n+    GetCPUID(0, 0, ax, bx, cx, dx);\n+    hasher << ax << bx << cx << dx;\n+    uint32_t max = ax;\n+    for (uint32_t leaf = 1; leaf < max; ++leaf) {\n+        for (uint32_t subleaf = 0;; ++subleaf) {\n+            GetCPUID(leaf, subleaf, ax, bx, cx, dx);\n+            hasher << leaf << subleaf << ax << bx << cx << dx;\n+            // Iterate over subleaves for leaf 4, 11, 13\n+            if (leaf != 4 && leaf != 11 && leaf != 13) break;\n+            if ((leaf == 4 || leaf == 13) && ax == 0) break;\n+            if (leaf == 11 && (cx & 0xFF00) == 0) break;\n+        }\n+    }\n+}\n+#endif\n+} // namespace\n+\n+void RandAddDynamicEnv(CSHA512& hasher)\n+{\n+    RandAddSeedPerfmon(hasher);\n+\n+#ifdef WIN32\n+    FILETIME ftime;\n+    GetSystemTimeAsFileTime(&ftime);\n+    hasher << ftime;\n+#else\n+    struct timespec ts;\n+    clock_gettime(CLOCK_MONOTONIC, &ts);\n+    struct timeval tv;\n+    gettimeofday(&tv, nullptr);\n+    hasher << ts.tv_sec << ts.tv_nsec << tv.tv_sec << tv.tv_usec;\n+\n+    // Current resource usage.\n+    struct rusage usage;\n+    if (getrusage(RUSAGE_SELF, &usage) == 0) {\n+        hasher << usage.ru_utime.tv_sec << usage.ru_utime.tv_usec << usage.ru_stime.tv_sec << usage.ru_stime.tv_usec;\n+        hasher << usage.ru_maxrss << usage.ru_minflt << usage.ru_majflt << usage.ru_inblock << usage.ru_oublock;\n+        hasher << usage.ru_nvcsw << usage.ru_nivcsw;\n+    }\n+#endif\n+\n+}\n+\n+void RandAddStaticEnv(CSHA512& hasher)\n+{\n+    // Some compile-time static properties\n+    uint32_t x;\n+    x = ((CHAR_MIN < 0) << 30) + (sizeof(void *) << 16) + (sizeof(long) << 8) + sizeof(int);\n+    hasher << x;\n+#if defined(__GNUC__) && defined(__GNUC_MINOR__) && defined(__GNUC_PATCHLEVEL__)\n+    x = (__GNUC_PATCHLEVEL__ << 16) + (__GNUC_MINOR__ << 8) + __GNUC__;\n+    hasher << x;\n+#endif\n+#if defined(_MSC_VER)\n+    x = _MSC_VER;\n+    hasher << x;\n+#endif\n+#if defined(__STDC_VERSION__)\n+    x = __STDC_VERSION__;\n+    hasher << x;\n+#endif\n+#if defined(_XOPEN_VERSION)\n+    x = _XOPEN_VERSION;\n+    hasher << x;\n+#endif\n+\n+#if defined(__x86_64__) || defined(__amd64__) || defined(__i386__)\n+    AddCPUID(hasher);\n+#endif",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/17270#discussion_r339333532",
@@ -53,10 +53,10 @@
       "original_commit_id" : "0c6d5cb1f7fcf00fb7a900e5f5a1f2e1e2a49978",
       "original_position" : 218,
       "path" : "src/randomenv.cpp",
-      "position" : 218,
+      "position" : 243,
       "pull_request_review_id" : 307563127,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17270",
-      "updated_at" : "2019-10-27T09:44:39Z",
+      "updated_at" : "2019-10-27T20:51:03Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/339333532",
       "user" : {
          "avatar_url" : "https://avatars0.githubusercontent.com/u/126646?v=4",
@@ -108,6 +108,87 @@
          "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17270#discussion_r339361181"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17270"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/339361181"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Good idea, added!",
+      "commit_id" : "eed8cfec452a538d644844fb96606e6bc24f47c8",
+      "created_at" : "2019-10-27T20:05:19Z",
+      "diff_hunk" : "@@ -0,0 +1,295 @@\n+// Copyright (c) 2009-2010 Satoshi Nakamoto\n+// Copyright (c) 2009-2019 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <crypto/sha512.h>\n+#include <vector>\n+#include <support/cleanse.h>\n+#include <climits>\n+#include <thread>\n+#include <string.h>\n+\n+#include <util/time.h> // for GetTime()\n+\n+#ifdef WIN32\n+#include <compat.h> // for Windows API\n+#else\n+#include <sys/time.h>\n+#include <sys/resource.h>\n+#include <sys/types.h>\n+#include <sys/utsname.h>\n+#include <sys/socket.h>\n+#include <sys/stat.h>\n+#include <ifaddrs.h>\n+#include <fcntl.h>\n+#include <netinet/ip.h>\n+#include <unistd.h>\n+#endif\n+\n+#if defined(__x86_64__) || defined(__amd64__) || defined(__i386__)\n+#include <cpuid.h>\n+#endif\n+\n+namespace {\n+\n+void RandAddSeedPerfmon(CSHA512& hasher)\n+{\n+#ifdef WIN32\n+    // Don't need this on Linux, OpenSSL automatically uses /dev/urandom\n+    // Seed with the entire set of perfmon data\n+\n+    // This can take up to 2 seconds, so only do it every 10 minutes\n+    static int64_t nLastPerfmon;\n+    if (GetTime() < nLastPerfmon + 10 * 60)\n+        return;\n+    nLastPerfmon = GetTime();\n+\n+    std::vector<unsigned char> vData(250000, 0);\n+    long ret = 0;\n+    unsigned long nSize = 0;\n+    const size_t nMaxSize = 10000000; // Bail out at more than 10MB of performance data\n+    while (true) {\n+        nSize = vData.size();\n+        ret = RegQueryValueExA(HKEY_PERFORMANCE_DATA, \"Global\", nullptr, nullptr, vData.data(), &nSize);\n+        if (ret != ERROR_MORE_DATA || vData.size() >= nMaxSize)\n+            break;\n+        vData.resize(std::max((vData.size() * 3) / 2, nMaxSize)); // Grow size of buffer exponentially\n+    }\n+    RegCloseKey(HKEY_PERFORMANCE_DATA);\n+    if (ret == ERROR_SUCCESS) {\n+        hasher.Write(vData.data(), nSize);\n+        memory_cleanse(vData.data(), nSize);\n+    } else {\n+        // Performance data is only a best-effort attempt at improving the\n+        // situation when the OS randomness (and other sources) aren't\n+        // adequate. As a result, failure to read it is isn't considered critical,\n+        // so we don't call RandFailure().\n+        // TODO: Add logging when the logger is made functional before global\n+        // constructors have been invoked.\n+    }\n+#endif\n+}\n+\n+/** Helper to easily feed data into a CSHA512.\n+ *\n+ * Note that this does not serialize the passed object (like stream.h's << operators do).\n+ * Its raw memory representation is used directly.\n+ */\n+template<typename T>\n+CSHA512& operator<<(CSHA512& hasher, const T& data) {\n+    hasher.Write((const unsigned char*)&data, sizeof(data));\n+    return hasher;\n+}\n+\n+#ifndef WIN32\n+void AddSockaddr(CSHA512& hasher, const struct sockaddr *addr)\n+{\n+    if (addr == nullptr) return;\n+    switch (addr->sa_family) {\n+    case AF_INET:\n+        hasher.Write((const unsigned char*)addr, sizeof(sockaddr_in));\n+        break;\n+    case AF_INET6:\n+        hasher.Write((const unsigned char*)addr, sizeof(sockaddr_in6));\n+        break;\n+    default:\n+        hasher.Write((const unsigned char*)&addr->sa_family, sizeof(addr->sa_family));\n+    }\n+}\n+\n+void AddStat(CSHA512& hasher, const struct stat& sb)\n+{\n+    hasher << sb.st_dev << sb.st_ino << sb.st_mode << sb.st_nlink << sb.st_uid << sb.st_gid << sb.st_size << sb.st_blksize << sb.st_blocks << sb.st_atime << sb.st_mtime << sb.st_ctime;\n+}\n+\n+void AddFile(CSHA512& hasher, const char *path)\n+{\n+    struct stat sb;\n+    int f = open(path, O_RDONLY);\n+    if (f != -1) {\n+        unsigned char fbuf[1024];\n+        int n;\n+        hasher.Write((const unsigned char*)&f, sizeof(f));\n+        if (fstat(f, &sb) == 0) {\n+            AddStat(hasher, sb);\n+        }\n+        do {\n+            n = read(f, fbuf, sizeof(fbuf));\n+            if (n > 0) hasher.Write(fbuf, n);\n+            /* not bothering with EINTR handling. */\n+        } while (n == sizeof(fbuf));\n+        close(f);\n+    }\n+}\n+\n+void AddPath(CSHA512& hasher, const char *path)\n+{\n+    struct stat sb;\n+    if (stat(path, &sb) == 0) {\n+        hasher.Write((const unsigned char*)path, strlen(path) + 1);\n+        AddStat(hasher, sb);\n+    }\n+}\n+#endif\n+\n+#if defined(__x86_64__) || defined(__amd64__) || defined(__i386__)\n+void GetCPUID(uint32_t leaf, uint32_t subleaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d)\n+{\n+    // We can't use __get_cpuid as it doesn't support subleafs.\n+#ifdef __GNUC__\n+    __cpuid_count(leaf, subleaf, a, b, c, d);\n+#else\n+    __asm__ (\"cpuid\" : \"=a\"(a), \"=b\"(b), \"=c\"(c), \"=d\"(d) : \"0\"(leaf), \"2\"(subleaf));\n+#endif\n+}\n+\n+void AddCPUID(CSHA512& hasher)\n+{\n+    uint32_t ax, bx, cx, dx;\n+    GetCPUID(0, 0, ax, bx, cx, dx);\n+    hasher << ax << bx << cx << dx;\n+    uint32_t max = ax;\n+    for (uint32_t leaf = 1; leaf < max; ++leaf) {\n+        for (uint32_t subleaf = 0;; ++subleaf) {\n+            GetCPUID(leaf, subleaf, ax, bx, cx, dx);\n+            hasher << leaf << subleaf << ax << bx << cx << dx;\n+            // Iterate over subleaves for leaf 4, 11, 13\n+            if (leaf != 4 && leaf != 11 && leaf != 13) break;\n+            if ((leaf == 4 || leaf == 13) && ax == 0) break;\n+            if (leaf == 11 && (cx & 0xFF00) == 0) break;\n+        }\n+    }\n+}\n+#endif\n+} // namespace\n+\n+void RandAddDynamicEnv(CSHA512& hasher)\n+{\n+    RandAddSeedPerfmon(hasher);\n+\n+#ifdef WIN32\n+    FILETIME ftime;\n+    GetSystemTimeAsFileTime(&ftime);\n+    hasher << ftime;\n+#else\n+    struct timespec ts;\n+    clock_gettime(CLOCK_MONOTONIC, &ts);\n+    struct timeval tv;\n+    gettimeofday(&tv, nullptr);\n+    hasher << ts.tv_sec << ts.tv_nsec << tv.tv_sec << tv.tv_usec;\n+\n+    // Current resource usage.\n+    struct rusage usage;\n+    if (getrusage(RUSAGE_SELF, &usage) == 0) {\n+        hasher << usage.ru_utime.tv_sec << usage.ru_utime.tv_usec << usage.ru_stime.tv_sec << usage.ru_stime.tv_usec;\n+        hasher << usage.ru_maxrss << usage.ru_minflt << usage.ru_majflt << usage.ru_inblock << usage.ru_oublock;\n+        hasher << usage.ru_nvcsw << usage.ru_nivcsw;\n+    }\n+#endif\n+\n+}\n+\n+void RandAddStaticEnv(CSHA512& hasher)\n+{\n+    // Some compile-time static properties\n+    uint32_t x;\n+    x = ((CHAR_MIN < 0) << 30) + (sizeof(void *) << 16) + (sizeof(long) << 8) + sizeof(int);\n+    hasher << x;\n+#if defined(__GNUC__) && defined(__GNUC_MINOR__) && defined(__GNUC_PATCHLEVEL__)\n+    x = (__GNUC_PATCHLEVEL__ << 16) + (__GNUC_MINOR__ << 8) + __GNUC__;\n+    hasher << x;\n+#endif\n+#if defined(_MSC_VER)\n+    x = _MSC_VER;\n+    hasher << x;\n+#endif\n+#if defined(__STDC_VERSION__)\n+    x = __STDC_VERSION__;\n+    hasher << x;\n+#endif\n+#if defined(_XOPEN_VERSION)\n+    x = _XOPEN_VERSION;\n+    hasher << x;\n+#endif\n+\n+#if defined(__x86_64__) || defined(__amd64__) || defined(__i386__)\n+    AddCPUID(hasher);\n+#endif",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17270#discussion_r339361181",
+      "id" : 339361181,
+      "in_reply_to_id" : 339333532,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDMzOTM2MTE4MQ==",
+      "original_commit_id" : "0c6d5cb1f7fcf00fb7a900e5f5a1f2e1e2a49978",
+      "original_position" : 218,
+      "path" : "src/randomenv.cpp",
+      "position" : 243,
+      "pull_request_review_id" : 307591830,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17270",
+      "updated_at" : "2019-10-27T20:51:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/339361181",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "Concept ACK: good idea",
+      "created_at" : "2019-10-27T20:30:07Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17270#issuecomment-546731211",
+      "id" : 546731211,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/17270",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDU0NjczMTIxMQ==",
+      "updated_at" : "2019-10-27T20:30:07Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/546731211",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/7826565?v=4",
+         "events_url" : "https://api.github.com/users/practicalswift/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/practicalswift/followers",
+         "following_url" : "https://api.github.com/users/practicalswift/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/practicalswift/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/practicalswift",
+         "id" : 7826565,
+         "login" : "practicalswift",
+         "node_id" : "MDQ6VXNlcjc4MjY1NjU=",
+         "organizations_url" : "https://api.github.com/users/practicalswift/orgs",
+         "received_events_url" : "https://api.github.com/users/practicalswift/received_events",
+         "repos_url" : "https://api.github.com/users/practicalswift/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/practicalswift/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/practicalswift/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/practicalswift"
       }
    }
 ]
