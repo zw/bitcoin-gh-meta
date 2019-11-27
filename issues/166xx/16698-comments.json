@@ -4006,5 +4006,283 @@
          "type" : "User",
          "url" : "https://api.github.com/users/adamjonas"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351404225"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16698"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/351404225"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This assertion timed out for me (\"not true after 60 seconds\") on the first run of 375 secs. Passed on a second run, then timed out in the same place again in the third run.  Passed a few more runs, then failed again.",
+      "commit_id" : "42c460a24f6d9d9c2c65c30287965acbce096ecf",
+      "created_at" : "2019-11-27T17:02:37Z",
+      "diff_hunk" : "@@ -0,0 +1,289 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2009-2019 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test mempool rebroadcast logic.\n+\n+\"\"\"\n+\n+from test_framework.mininode import P2PTxInvStore\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+        assert_approx,\n+        assert_equal,\n+        assert_greater_than,\n+        wait_until,\n+        disconnect_nodes,\n+        connect_nodes,\n+        create_confirmed_utxos,\n+)\n+import time\n+from decimal import Decimal\n+\n+# Constant from txmempool.h\n+MAX_REBROADCAST_WEIGHT = 3000000\n+\n+# Constant from consensus.h\n+MAX_BLOCK_WEIGHT = 4000000\n+\n+global_mocktime = 0\n+\n+class MempoolRebroadcastTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 2\n+        self.extra_args = [[\n+            \"-whitelist=127.0.0.1\",\n+            \"-txindex=1\"\n+            ]] * self.num_nodes\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+\n+    def run_test(self):\n+        self.test_simple_rebroadcast()\n+        self.test_recency_filter()\n+        self.test_fee_rate_cache()\n+\n+    def make_txn_at_fee_rate(self, input_utxo, outputs, outputs_sum, desired_fee_rate, change_address):\n+        node = self.nodes[0]\n+        node1 = self.nodes[1]\n+\n+        inputs = [{'txid': input_utxo['txid'], 'vout': input_utxo['vout']}]\n+\n+        # calculate how much input values add up to\n+        input_tx_hsh = input_utxo['txid']\n+        raw_tx = node.decoderawtransaction(node.getrawtransaction(input_tx_hsh))\n+        inputs_list = raw_tx['vout']\n+        if 'coinbase' in raw_tx['vin'][0].keys():\n+            return\n+        index = raw_tx['vin'][0]['vout']\n+        inputs_sum = inputs_list[index]['value']\n+\n+        # vsize is in bytes, cache fee rate is BTC / kB. Thus divide by 1000\n+        tx_vsize_with_change = 1660\n+        desired_fee_btc = desired_fee_rate * tx_vsize_with_change / 1000\n+        current_fee_btc = inputs_sum - Decimal(str(outputs_sum))\n+\n+        # add another output with change\n+        outputs[change_address] = float(current_fee_btc - desired_fee_btc)\n+        outputs_sum += outputs[change_address]\n+\n+        # form txn & submit to mempool\n+        raw_tx_hex = node.createrawtransaction(inputs, outputs)\n+        signed_tx = node.signrawtransactionwithwallet(raw_tx_hex)\n+        tx_hsh = node.sendrawtransaction(hexstring=signed_tx['hex'], maxfeerate=0)\n+        node1.sendrawtransaction(hexstring=signed_tx['hex'], maxfeerate=0)\n+\n+        # retrieve mempool txn to calculate fee rate\n+        mempool_entry = node.getmempoolentry(tx_hsh)\n+\n+        # check absolute fee matches up to expectations\n+        fee_calculated = inputs_sum - Decimal(str(outputs_sum))\n+        fee_got = mempool_entry['fee']\n+        assert_approx(float(fee_calculated), float(fee_got))\n+\n+        # mempool_entry['fee'] is in BTC, fee rate should be BTC / kb\n+        fee_rate = mempool_entry['fee']*1000/mempool_entry['vsize']\n+        assert_approx(float(fee_rate), float(desired_fee_rate))\n+\n+        return tx_hsh\n+\n+    def test_simple_rebroadcast(self):\n+        self.log.info(\"Test simplest rebroadcast case\")\n+\n+        node0 = self.nodes[0]\n+        node1 = self.nodes[1]\n+\n+        # generate mempool transactions that both nodes know about\n+        for _ in range(3):\n+            node0.sendtoaddress(node1.getnewaddress(), 4)\n+\n+        self.sync_all()\n+\n+        # generate mempool transactions that only node0 knows about\n+        disconnect_nodes(node0, 1)\n+\n+        for _ in range(3):\n+            node0.sendtoaddress(node1.getnewaddress(), 5)\n+\n+        # check that mempools are different\n+        assert_equal(len(node0.getrawmempool()), 6)\n+        assert_equal(len(node1.getrawmempool()), 3)\n+\n+        # reconnect the nodes\n+        connect_nodes(node0, 1)\n+\n+        # rebroadcast will only occur if there has been a block since the\n+        # last run of CacheMinRebroadcastFee. when we connect a new peer, rebroadcast\n+        # will be skipped on the first run, but caching will trigger.\n+        # have node1 generate so there are still mempool txns that need to be synched.\n+        node1.generate(1)\n+\n+        assert_equal(len(node1.getrawmempool()), 0)\n+        wait_until(lambda: len(node0.getrawmempool()) == 3)\n+\n+        # bump time to hit rebroadcast interval\n+        mocktime = int(time.time()) + 300 * 60\n+        node0.setmocktime(mocktime)\n+        node1.setmocktime(mocktime)\n+\n+        # check that node1 got txns bc rebroadcasting\n+        wait_until(lambda: len(node1.getrawmempool()) == 3, timeout=30)\n+\n+        global global_mocktime\n+        global_mocktime = mocktime\n+\n+    def test_recency_filter(self):\n+        self.log.info(\"Test recent txns don't get rebroadcast\")\n+\n+        node = self.nodes[0]\n+        node1 = self.nodes[1]\n+\n+        global global_mocktime\n+        mocktime = global_mocktime\n+\n+        node.setmocktime(global_mocktime)\n+        node1.setmocktime(global_mocktime)\n+\n+        # mine blocks to clear out the mempool\n+        node.generate(4)\n+        assert_equal(len(node.getrawmempool()), 0)\n+\n+        # add p2p connection\n+        conn = node.add_p2p_connection(P2PTxInvStore())\n+\n+        # create old txn\n+        node.sendtoaddress(node.getnewaddress(), 2)\n+        assert_equal(len(node.getrawmempool()), 1)\n+        wait_until(lambda: conn.get_invs(), timeout=30)\n+\n+        # bump mocktime to ensure the txn is old\n+        mocktime += 31 * 60 # seconds\n+        node.setmocktime(mocktime)\n+\n+        delta_time = 28 * 60 # seconds\n+        while True:\n+            # create a recent transaction\n+            new_tx = node1.sendtoaddress(node1.getnewaddress(), 2)\n+            new_tx_id = int(new_tx, 16)\n+\n+            # ensure node0 has the transaction\n+            wait_until(lambda: new_tx in node.getrawmempool())",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351404225",
+      "id" : 351404225,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM1MTQwNDIyNQ==",
+      "original_commit_id" : "42c460a24f6d9d9c2c65c30287965acbce096ecf",
+      "original_position" : 171,
+      "path" : "test/functional/mempool_rebroadcast.py",
+      "position" : 171,
+      "pull_request_review_id" : 323826007,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16698",
+      "updated_at" : "2019-11-27T17:54:55Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/351404225",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351412622"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16698"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/351412622"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I am unable to get this to pass in cadd572afd8b1468aee8a0a3ba65b5e38fc021dd or ffd154d06. Getting an 'Mempool sync timed out` AssertionError.",
+      "commit_id" : "42c460a24f6d9d9c2c65c30287965acbce096ecf",
+      "created_at" : "2019-11-27T17:21:21Z",
+      "diff_hunk" : "@@ -0,0 +1,210 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2009-2019 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test mempool rebroadcast logic.\n+\n+\"\"\"\n+\n+from test_framework.mininode import P2PTxInvStore\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+        assert_equal,\n+        assert_greater_than,\n+        wait_until,\n+        disconnect_nodes,\n+        connect_nodes,\n+        gen_return_txouts,\n+        create_confirmed_utxos,\n+        create_lots_of_big_transactions,\n+)\n+import time\n+\n+# Constant from txmempool.h\n+MAX_REBROADCAST_WEIGHT = 3000000\n+\n+class MempoolRebroadcastTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 2\n+        self.extra_args = [[\n+            \"-acceptnonstdtxn=1\",\n+            \"-blockmaxweight=3000000\",\n+            \"-whitelist=127.0.0.1\"\n+            ]] * self.num_nodes\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+\n+    def run_test(self):\n+        self.test_simple_rebroadcast()\n+        self.test_rebroadcast_top_txns()\n+        self.test_recency_filter()\n+\n+    # helper method that uses getblocktemplate with node arg\n+    # set to MAX_REBROADCAST_WEIGHT to find txns expected to\n+    # be rebroadcast\n+    def find_top_txns(self, node):\n+        tmpl = node.getblocktemplate({'rules': ['segwit']})\n+\n+        tx_hshs = []\n+        for tx in tmpl['transactions']:\n+            tx_hshs.append(tx['hash'])\n+\n+        return tx_hshs\n+\n+    def compare_txns_to_invs(self, txn_hshs, invs):\n+        tx_ids = [int(txhsh, 16) for txhsh in txn_hshs]\n+\n+        assert_equal(len(tx_ids), len(invs))\n+        assert_equal(tx_ids.sort(), invs.sort())\n+\n+    def test_simple_rebroadcast(self):\n+        self.log.info(\"Test simplest rebroadcast case\")\n+\n+        node0 = self.nodes[0]\n+        node1 = self.nodes[1]\n+\n+        # generate mempool transactions that both nodes know about\n+        for _ in range(3):\n+            node0.sendtoaddress(node1.getnewaddress(), 4)\n+\n+        self.sync_all()\n+\n+        # generate mempool transactions that only node0 knows about\n+        disconnect_nodes(node0, 1)\n+\n+        for _ in range(3):\n+            node0.sendtoaddress(node1.getnewaddress(), 5)\n+\n+        # check that mempools are different\n+        assert_equal(len(node0.getrawmempool()), 6)\n+        assert_equal(len(node1.getrawmempool()), 3)\n+\n+        # reconnect the nodes\n+        connect_nodes(node0, 1)\n+\n+        # rebroadcast will only occur if there has been a block since the\n+        # last run of CacheMinRebroadcastFee. when we connect a new peer, rebroadcast\n+        # will be skipped on the first run, but caching will trigger.\n+        # have node1 generate so there are still mempool txns that need to be synched.\n+        node1.generate(1)\n+\n+        assert_equal(len(node1.getrawmempool()), 0)\n+        wait_until(lambda: len(node0.getrawmempool()) == 3)\n+\n+        # bump time to hit rebroadcast interval\n+        mocktime = int(time.time()) + 300 * 60\n+        node0.setmocktime(mocktime)\n+        node1.setmocktime(mocktime)\n+\n+        # check that node1 got txns bc rebroadcasting\n+        wait_until(lambda: len(node1.getrawmempool()) == 3, timeout=30)\n+\n+    def test_rebroadcast_top_txns(self):\n+        self.log.info(\"Testing that only txns with top fee rate get rebroadcast\")\n+\n+        node = self.nodes[0]\n+        node.setmocktime(0)\n+\n+        # mine a block to clear out the mempool\n+        node.generate(1)\n+        assert_equal(len(node.getrawmempool()), 0)\n+\n+        conn1 = node.add_p2p_connection(P2PTxInvStore())\n+\n+        # create txns\n+        min_relay_fee = node.getnetworkinfo()[\"relayfee\"]\n+        txouts = gen_return_txouts()\n+        utxo_count = 90\n+        utxos = create_confirmed_utxos(min_relay_fee, node, utxo_count)\n+        base_fee = min_relay_fee*100 # our transactions are smaller than 100kb\n+        txids = []\n+\n+        # Create 3 batches of transactions at 3 different fee rate levels\n+        range_size = utxo_count // 3\n+\n+        for i in range(3):\n+            start_range = i * range_size\n+            end_range = start_range + range_size\n+            txids.append(create_lots_of_big_transactions(node, txouts, utxos[start_range:end_range], end_range - start_range, (i+1)*base_fee))\n+\n+        # 90 transactions should be created\n+        # confirm the invs were sent (initial broadcast)\n+        assert_equal(len(node.getrawmempool()), 90)\n+        wait_until(lambda: len(conn1.tx_invs_received) == 90)\n+\n+        # confirm txns are more than max rebroadcast amount\n+        assert_greater_than(node.getmempoolinfo()['bytes'], MAX_REBROADCAST_WEIGHT)\n+\n+        self.sync_all()",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351412622",
+      "id" : 351412622,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM1MTQxMjYyMg==",
+      "original_commit_id" : "cadd572afd8b1468aee8a0a3ba65b5e38fc021dd",
+      "original_position" : 139,
+      "path" : "test/functional/mempool_rebroadcast.py",
+      "position" : null,
+      "pull_request_review_id" : 323836870,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16698",
+      "updated_at" : "2019-11-27T17:49:31Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/351412622",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/755825?v=4",
+         "events_url" : "https://api.github.com/users/adamjonas/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/adamjonas/followers",
+         "following_url" : "https://api.github.com/users/adamjonas/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/adamjonas/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/adamjonas",
+         "id" : 755825,
+         "login" : "adamjonas",
+         "node_id" : "MDQ6VXNlcjc1NTgyNQ==",
+         "organizations_url" : "https://api.github.com/users/adamjonas/orgs",
+         "received_events_url" : "https://api.github.com/users/adamjonas/received_events",
+         "repos_url" : "https://api.github.com/users/adamjonas/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/adamjonas/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/adamjonas/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/adamjonas"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351428700"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16698"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/351428700"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Both at 42c460a24f6d9d9c2c65c30287965acbce096ecf and rebased to current master.\r\n\r\n```\r\n~/projects/bitcoin/bitcoin (pr/16698) $ test/functional/mempool_rebroadcast.py \r\n2019-11-27T17:51:11.955000Z TestFramework (INFO): Initializing test directory /tmp/bitcoin_func_test_g9hdr2e_\r\n2019-11-27T17:51:13.096000Z TestFramework (INFO): Test simplest rebroadcast case\r\n2019-11-27T17:51:14.928000Z TestFramework (INFO): Test recent txns don't get rebroadcast\r\n2019-11-27T17:56:31.453000Z TestFramework.utils (ERROR): wait_until() failed. Predicate: ''''\r\n            wait_until(lambda: new_tx in node.getrawmempool())\r\n'''\r\n2019-11-27T17:56:31.467000Z TestFramework (ERROR): Assertion failed\r\nTraceback (most recent call last):\r\n  File \"/home/jon/projects/bitcoin/bitcoin/test/functional/test_framework/test_framework.py\", line 111, in main\r\n    self.run_test()\r\n  File \"test/functional/mempool_rebroadcast.py\", line 44, in run_test\r\n    self.test_recency_filter()\r\n  File \"test/functional/mempool_rebroadcast.py\", line 171, in test_recency_filter\r\n    wait_until(lambda: new_tx in node.getrawmempool())\r\n  File \"/home/jon/projects/bitcoin/bitcoin/test/functional/test_framework/util.py\", line 229, in wait_until\r\n    raise AssertionError(\"Predicate {} not true after {} seconds\".format(predicate_source, timeout))\r\nAssertionError: Predicate ''''\r\n            wait_until(lambda: new_tx in node.getrawmempool())\r\n''' not true after 60 seconds\r\n2019-11-27T17:56:31.519000Z TestFramework (INFO): Stopping nodes\r\n```",
+      "commit_id" : "42c460a24f6d9d9c2c65c30287965acbce096ecf",
+      "created_at" : "2019-11-27T17:58:52Z",
+      "diff_hunk" : "@@ -0,0 +1,289 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2009-2019 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test mempool rebroadcast logic.\n+\n+\"\"\"\n+\n+from test_framework.mininode import P2PTxInvStore\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+        assert_approx,\n+        assert_equal,\n+        assert_greater_than,\n+        wait_until,\n+        disconnect_nodes,\n+        connect_nodes,\n+        create_confirmed_utxos,\n+)\n+import time\n+from decimal import Decimal\n+\n+# Constant from txmempool.h\n+MAX_REBROADCAST_WEIGHT = 3000000\n+\n+# Constant from consensus.h\n+MAX_BLOCK_WEIGHT = 4000000\n+\n+global_mocktime = 0\n+\n+class MempoolRebroadcastTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 2\n+        self.extra_args = [[\n+            \"-whitelist=127.0.0.1\",\n+            \"-txindex=1\"\n+            ]] * self.num_nodes\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+\n+    def run_test(self):\n+        self.test_simple_rebroadcast()\n+        self.test_recency_filter()\n+        self.test_fee_rate_cache()\n+\n+    def make_txn_at_fee_rate(self, input_utxo, outputs, outputs_sum, desired_fee_rate, change_address):\n+        node = self.nodes[0]\n+        node1 = self.nodes[1]\n+\n+        inputs = [{'txid': input_utxo['txid'], 'vout': input_utxo['vout']}]\n+\n+        # calculate how much input values add up to\n+        input_tx_hsh = input_utxo['txid']\n+        raw_tx = node.decoderawtransaction(node.getrawtransaction(input_tx_hsh))\n+        inputs_list = raw_tx['vout']\n+        if 'coinbase' in raw_tx['vin'][0].keys():\n+            return\n+        index = raw_tx['vin'][0]['vout']\n+        inputs_sum = inputs_list[index]['value']\n+\n+        # vsize is in bytes, cache fee rate is BTC / kB. Thus divide by 1000\n+        tx_vsize_with_change = 1660\n+        desired_fee_btc = desired_fee_rate * tx_vsize_with_change / 1000\n+        current_fee_btc = inputs_sum - Decimal(str(outputs_sum))\n+\n+        # add another output with change\n+        outputs[change_address] = float(current_fee_btc - desired_fee_btc)\n+        outputs_sum += outputs[change_address]\n+\n+        # form txn & submit to mempool\n+        raw_tx_hex = node.createrawtransaction(inputs, outputs)\n+        signed_tx = node.signrawtransactionwithwallet(raw_tx_hex)\n+        tx_hsh = node.sendrawtransaction(hexstring=signed_tx['hex'], maxfeerate=0)\n+        node1.sendrawtransaction(hexstring=signed_tx['hex'], maxfeerate=0)\n+\n+        # retrieve mempool txn to calculate fee rate\n+        mempool_entry = node.getmempoolentry(tx_hsh)\n+\n+        # check absolute fee matches up to expectations\n+        fee_calculated = inputs_sum - Decimal(str(outputs_sum))\n+        fee_got = mempool_entry['fee']\n+        assert_approx(float(fee_calculated), float(fee_got))\n+\n+        # mempool_entry['fee'] is in BTC, fee rate should be BTC / kb\n+        fee_rate = mempool_entry['fee']*1000/mempool_entry['vsize']\n+        assert_approx(float(fee_rate), float(desired_fee_rate))\n+\n+        return tx_hsh\n+\n+    def test_simple_rebroadcast(self):\n+        self.log.info(\"Test simplest rebroadcast case\")\n+\n+        node0 = self.nodes[0]\n+        node1 = self.nodes[1]\n+\n+        # generate mempool transactions that both nodes know about\n+        for _ in range(3):\n+            node0.sendtoaddress(node1.getnewaddress(), 4)\n+\n+        self.sync_all()\n+\n+        # generate mempool transactions that only node0 knows about\n+        disconnect_nodes(node0, 1)\n+\n+        for _ in range(3):\n+            node0.sendtoaddress(node1.getnewaddress(), 5)\n+\n+        # check that mempools are different\n+        assert_equal(len(node0.getrawmempool()), 6)\n+        assert_equal(len(node1.getrawmempool()), 3)\n+\n+        # reconnect the nodes\n+        connect_nodes(node0, 1)\n+\n+        # rebroadcast will only occur if there has been a block since the\n+        # last run of CacheMinRebroadcastFee. when we connect a new peer, rebroadcast\n+        # will be skipped on the first run, but caching will trigger.\n+        # have node1 generate so there are still mempool txns that need to be synched.\n+        node1.generate(1)\n+\n+        assert_equal(len(node1.getrawmempool()), 0)\n+        wait_until(lambda: len(node0.getrawmempool()) == 3)\n+\n+        # bump time to hit rebroadcast interval\n+        mocktime = int(time.time()) + 300 * 60\n+        node0.setmocktime(mocktime)\n+        node1.setmocktime(mocktime)\n+\n+        # check that node1 got txns bc rebroadcasting\n+        wait_until(lambda: len(node1.getrawmempool()) == 3, timeout=30)\n+\n+        global global_mocktime\n+        global_mocktime = mocktime\n+\n+    def test_recency_filter(self):\n+        self.log.info(\"Test recent txns don't get rebroadcast\")\n+\n+        node = self.nodes[0]\n+        node1 = self.nodes[1]\n+\n+        global global_mocktime\n+        mocktime = global_mocktime\n+\n+        node.setmocktime(global_mocktime)\n+        node1.setmocktime(global_mocktime)\n+\n+        # mine blocks to clear out the mempool\n+        node.generate(4)\n+        assert_equal(len(node.getrawmempool()), 0)\n+\n+        # add p2p connection\n+        conn = node.add_p2p_connection(P2PTxInvStore())\n+\n+        # create old txn\n+        node.sendtoaddress(node.getnewaddress(), 2)\n+        assert_equal(len(node.getrawmempool()), 1)\n+        wait_until(lambda: conn.get_invs(), timeout=30)\n+\n+        # bump mocktime to ensure the txn is old\n+        mocktime += 31 * 60 # seconds\n+        node.setmocktime(mocktime)\n+\n+        delta_time = 28 * 60 # seconds\n+        while True:\n+            # create a recent transaction\n+            new_tx = node1.sendtoaddress(node1.getnewaddress(), 2)\n+            new_tx_id = int(new_tx, 16)\n+\n+            # ensure node0 has the transaction\n+            wait_until(lambda: new_tx in node.getrawmempool())",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351428700",
+      "id" : 351428700,
+      "in_reply_to_id" : 351404225,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM1MTQyODcwMA==",
+      "original_commit_id" : "42c460a24f6d9d9c2c65c30287965acbce096ecf",
+      "original_position" : 171,
+      "path" : "test/functional/mempool_rebroadcast.py",
+      "position" : 171,
+      "pull_request_review_id" : 323857341,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16698",
+      "updated_at" : "2019-11-27T17:58:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/351428700",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351430669"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16698"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/351430669"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "This on my first run as well, but then passed six in a row so didn't report.",
+      "commit_id" : "42c460a24f6d9d9c2c65c30287965acbce096ecf",
+      "created_at" : "2019-11-27T18:03:55Z",
+      "diff_hunk" : "@@ -0,0 +1,289 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2009-2019 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test mempool rebroadcast logic.\n+\n+\"\"\"\n+\n+from test_framework.mininode import P2PTxInvStore\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+        assert_approx,\n+        assert_equal,\n+        assert_greater_than,\n+        wait_until,\n+        disconnect_nodes,\n+        connect_nodes,\n+        create_confirmed_utxos,\n+)\n+import time\n+from decimal import Decimal\n+\n+# Constant from txmempool.h\n+MAX_REBROADCAST_WEIGHT = 3000000\n+\n+# Constant from consensus.h\n+MAX_BLOCK_WEIGHT = 4000000\n+\n+global_mocktime = 0\n+\n+class MempoolRebroadcastTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 2\n+        self.extra_args = [[\n+            \"-whitelist=127.0.0.1\",\n+            \"-txindex=1\"\n+            ]] * self.num_nodes\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+\n+    def run_test(self):\n+        self.test_simple_rebroadcast()\n+        self.test_recency_filter()\n+        self.test_fee_rate_cache()\n+\n+    def make_txn_at_fee_rate(self, input_utxo, outputs, outputs_sum, desired_fee_rate, change_address):\n+        node = self.nodes[0]\n+        node1 = self.nodes[1]\n+\n+        inputs = [{'txid': input_utxo['txid'], 'vout': input_utxo['vout']}]\n+\n+        # calculate how much input values add up to\n+        input_tx_hsh = input_utxo['txid']\n+        raw_tx = node.decoderawtransaction(node.getrawtransaction(input_tx_hsh))\n+        inputs_list = raw_tx['vout']\n+        if 'coinbase' in raw_tx['vin'][0].keys():\n+            return\n+        index = raw_tx['vin'][0]['vout']\n+        inputs_sum = inputs_list[index]['value']\n+\n+        # vsize is in bytes, cache fee rate is BTC / kB. Thus divide by 1000\n+        tx_vsize_with_change = 1660\n+        desired_fee_btc = desired_fee_rate * tx_vsize_with_change / 1000\n+        current_fee_btc = inputs_sum - Decimal(str(outputs_sum))\n+\n+        # add another output with change\n+        outputs[change_address] = float(current_fee_btc - desired_fee_btc)\n+        outputs_sum += outputs[change_address]\n+\n+        # form txn & submit to mempool\n+        raw_tx_hex = node.createrawtransaction(inputs, outputs)\n+        signed_tx = node.signrawtransactionwithwallet(raw_tx_hex)\n+        tx_hsh = node.sendrawtransaction(hexstring=signed_tx['hex'], maxfeerate=0)\n+        node1.sendrawtransaction(hexstring=signed_tx['hex'], maxfeerate=0)\n+\n+        # retrieve mempool txn to calculate fee rate\n+        mempool_entry = node.getmempoolentry(tx_hsh)\n+\n+        # check absolute fee matches up to expectations\n+        fee_calculated = inputs_sum - Decimal(str(outputs_sum))\n+        fee_got = mempool_entry['fee']\n+        assert_approx(float(fee_calculated), float(fee_got))\n+\n+        # mempool_entry['fee'] is in BTC, fee rate should be BTC / kb\n+        fee_rate = mempool_entry['fee']*1000/mempool_entry['vsize']\n+        assert_approx(float(fee_rate), float(desired_fee_rate))\n+\n+        return tx_hsh\n+\n+    def test_simple_rebroadcast(self):\n+        self.log.info(\"Test simplest rebroadcast case\")\n+\n+        node0 = self.nodes[0]\n+        node1 = self.nodes[1]\n+\n+        # generate mempool transactions that both nodes know about\n+        for _ in range(3):\n+            node0.sendtoaddress(node1.getnewaddress(), 4)\n+\n+        self.sync_all()\n+\n+        # generate mempool transactions that only node0 knows about\n+        disconnect_nodes(node0, 1)\n+\n+        for _ in range(3):\n+            node0.sendtoaddress(node1.getnewaddress(), 5)\n+\n+        # check that mempools are different\n+        assert_equal(len(node0.getrawmempool()), 6)\n+        assert_equal(len(node1.getrawmempool()), 3)\n+\n+        # reconnect the nodes\n+        connect_nodes(node0, 1)\n+\n+        # rebroadcast will only occur if there has been a block since the\n+        # last run of CacheMinRebroadcastFee. when we connect a new peer, rebroadcast\n+        # will be skipped on the first run, but caching will trigger.\n+        # have node1 generate so there are still mempool txns that need to be synched.\n+        node1.generate(1)\n+\n+        assert_equal(len(node1.getrawmempool()), 0)\n+        wait_until(lambda: len(node0.getrawmempool()) == 3)\n+\n+        # bump time to hit rebroadcast interval\n+        mocktime = int(time.time()) + 300 * 60\n+        node0.setmocktime(mocktime)\n+        node1.setmocktime(mocktime)\n+\n+        # check that node1 got txns bc rebroadcasting\n+        wait_until(lambda: len(node1.getrawmempool()) == 3, timeout=30)\n+\n+        global global_mocktime\n+        global_mocktime = mocktime\n+\n+    def test_recency_filter(self):\n+        self.log.info(\"Test recent txns don't get rebroadcast\")\n+\n+        node = self.nodes[0]\n+        node1 = self.nodes[1]\n+\n+        global global_mocktime\n+        mocktime = global_mocktime\n+\n+        node.setmocktime(global_mocktime)\n+        node1.setmocktime(global_mocktime)\n+\n+        # mine blocks to clear out the mempool\n+        node.generate(4)\n+        assert_equal(len(node.getrawmempool()), 0)\n+\n+        # add p2p connection\n+        conn = node.add_p2p_connection(P2PTxInvStore())\n+\n+        # create old txn\n+        node.sendtoaddress(node.getnewaddress(), 2)\n+        assert_equal(len(node.getrawmempool()), 1)\n+        wait_until(lambda: conn.get_invs(), timeout=30)\n+\n+        # bump mocktime to ensure the txn is old\n+        mocktime += 31 * 60 # seconds\n+        node.setmocktime(mocktime)\n+\n+        delta_time = 28 * 60 # seconds\n+        while True:\n+            # create a recent transaction\n+            new_tx = node1.sendtoaddress(node1.getnewaddress(), 2)\n+            new_tx_id = int(new_tx, 16)\n+\n+            # ensure node0 has the transaction\n+            wait_until(lambda: new_tx in node.getrawmempool())",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351430669",
+      "id" : 351430669,
+      "in_reply_to_id" : 351404225,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM1MTQzMDY2OQ==",
+      "original_commit_id" : "42c460a24f6d9d9c2c65c30287965acbce096ecf",
+      "original_position" : 171,
+      "path" : "test/functional/mempool_rebroadcast.py",
+      "position" : 171,
+      "pull_request_review_id" : 323859923,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16698",
+      "updated_at" : "2019-11-27T18:03:55Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/351430669",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/755825?v=4",
+         "events_url" : "https://api.github.com/users/adamjonas/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/adamjonas/followers",
+         "following_url" : "https://api.github.com/users/adamjonas/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/adamjonas/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/adamjonas",
+         "id" : 755825,
+         "login" : "adamjonas",
+         "node_id" : "MDQ6VXNlcjc1NTgyNQ==",
+         "organizations_url" : "https://api.github.com/users/adamjonas/orgs",
+         "received_events_url" : "https://api.github.com/users/adamjonas/received_events",
+         "repos_url" : "https://api.github.com/users/adamjonas/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/adamjonas/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/adamjonas/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/adamjonas"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351431222"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16698"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/351431222"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Nit: Wouldn't it be better to use the one line if coding style?",
+      "commit_id" : "42c460a24f6d9d9c2c65c30287965acbce096ecf",
+      "created_at" : "2019-11-27T18:05:17Z",
+      "diff_hunk" : "@@ -406,6 +452,12 @@ void BlockAssembler::addPackageTxs(int &nPackagesSelected, int &nDescendantsUpda\n         // This transaction will make it in; reset the failed counter.\n         nConsecutiveFailed = 0;\n \n+        CFeeRate newFeeRate(packageFees, packageSize * WITNESS_SCALE_FACTOR);\n+\n+        if (newFeeRate < minPackageFeeRate) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351431222",
+      "id" : 351431222,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM1MTQzMTIyMg==",
+      "original_commit_id" : "42c460a24f6d9d9c2c65c30287965acbce096ecf",
+      "original_position" : 105,
+      "path" : "src/miner.cpp",
+      "position" : 105,
+      "pull_request_review_id" : 323860643,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16698",
+      "updated_at" : "2019-11-27T18:05:18Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/351431222",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/12272949?v=4",
+         "events_url" : "https://api.github.com/users/emilengler/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/emilengler/followers",
+         "following_url" : "https://api.github.com/users/emilengler/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/emilengler/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/emilengler",
+         "id" : 12272949,
+         "login" : "emilengler",
+         "node_id" : "MDQ6VXNlcjEyMjcyOTQ5",
+         "organizations_url" : "https://api.github.com/users/emilengler/orgs",
+         "received_events_url" : "https://api.github.com/users/emilengler/received_events",
+         "repos_url" : "https://api.github.com/users/emilengler/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/emilengler/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/emilengler/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/emilengler"
+      }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "I think we should try to hold off nits until further concept acks and\ndevelopment\n\nOn Wed, Nov 27, 2019, 1:05 PM Emil Engler <notifications@github.com> wrote:\n\n> *@emilengler* commented on this pull request.\n> ------------------------------\n>\n> In src/miner.cpp\n> <https://github.com/bitcoin/bitcoin/pull/16698#discussion_r351431222>:\n>\n> > @@ -406,6 +452,12 @@ void BlockAssembler::addPackageTxs(int &nPackagesSelected, int &nDescendantsUpda\n>          // This transaction will make it in; reset the failed counter.\n>          nConsecutiveFailed = 0;\n>\n> +        CFeeRate newFeeRate(packageFees, packageSize * WITNESS_SCALE_FACTOR);\n> +\n> +        if (newFeeRate < minPackageFeeRate) {\n>\n> Nit: Wouldn't it be better to use the one line if coding style?\n>\n> â\n> You are receiving this because you were mentioned.\n> Reply to this email directly, view it on GitHub\n> <https://github.com/bitcoin/bitcoin/pull/16698?email_source=notifications&email_token=ABMAFU2BUVGFY7OHVHV7D2LQV2ZGDA5CNFSM4IPBPTD2YY3PNVWWK3TUL52HS4DFWFIHK3DMKJSXC5LFON2FEZLWNFSXPKTDN5WW2ZLOORPWSZGOCNG3RIY#pullrequestreview-323860643>,\n> or unsubscribe\n> <https://github.com/notifications/unsubscribe-auth/ABMAFU4O72DQV3NMFNPPUFTQV2ZGDANCNFSM4IPBPTDQ>\n> .\n>\n",
+      "created_at" : "2019-11-27T18:16:27Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16698#issuecomment-559199311",
+      "id" : 559199311,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/16698",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDU1OTE5OTMxMQ==",
+      "updated_at" : "2019-11-27T18:16:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/559199311",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
    }
 ]
