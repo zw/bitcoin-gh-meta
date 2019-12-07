@@ -564,5 +564,86 @@
          "type" : "User",
          "url" : "https://api.github.com/users/andrewtoth"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17653#discussion_r355133850"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17653"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/355133850"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Done",
+      "commit_id" : "de2a77fbc210365bf154633ddb0af3ecc1477e12",
+      "created_at" : "2019-12-07T17:35:00Z",
+      "diff_hunk" : "@@ -220,6 +220,155 @@ static UniValue generatetoaddress(const JSONRPCRequest& request)\n     return generateBlocks(coinbase_script, nGenerate, nMaxTries);\n }\n \n+static std::string GenerateCustomBlock(const CScript& coinbase_script, const std::vector<CTransactionRef>& txs)\n+{\n+    CBlock block;\n+    CChainParams chainparams(Params());\n+\n+    CBlockIndex* previous_index;\n+    {\n+        LOCK(cs_main);\n+        previous_index = ::ChainActive().Tip();\n+    }\n+    CHECK_NONFATAL(previous_index != nullptr);\n+\n+    const int height = previous_index->nHeight + 1;\n+\n+    // Create coinbase transaction.\n+    CMutableTransaction coinbase_tx;\n+    coinbase_tx.vin.resize(1);\n+    coinbase_tx.vin[0].prevout.SetNull();\n+    coinbase_tx.vout.resize(1);\n+    coinbase_tx.vout[0].scriptPubKey = coinbase_script;\n+    coinbase_tx.vout[0].nValue = GetBlockSubsidy(height, chainparams.GetConsensus());\n+    coinbase_tx.vin[0].scriptSig = CScript() << height << OP_0;\n+    block.vtx.push_back(MakeTransactionRef(std::move(coinbase_tx)));\n+\n+    // Add transactions\n+    block.vtx.insert(block.vtx.end(), txs.begin(), txs.end());\n+\n+    block.nVersion = ComputeBlockVersion(previous_index, chainparams.GetConsensus());\n+    if (chainparams.MineBlocksOnDemand())\n+        block.nVersion = gArgs.GetArg(\"-blockversion\", block.nVersion);\n+\n+    // Fill in header\n+    block.hashPrevBlock = previous_index->GetBlockHash();\n+    block.nTime = GetAdjustedTime();\n+    UpdateTime(&block, chainparams.GetConsensus(), previous_index);\n+    block.nBits = GetNextWorkRequired(previous_index, &block, chainparams.GetConsensus());\n+    block.nNonce = 0;\n+\n+    GenerateCoinbaseCommitment(block, previous_index, chainparams.GetConsensus());\n+\n+    {\n+        LOCK(cs_main);\n+        unsigned int extra_nonce = 0;\n+        IncrementExtraNonce(&block, ::ChainActive().Tip(), extra_nonce);\n+\n+        BlockValidationState state;\n+        if (!TestBlockValidity(state, chainparams, block, previous_index, false, false)) {\n+            throw JSONRPCError(RPC_VERIFY_ERROR, strprintf(\"TestBlockValidity failed: %s\", FormatStateMessage(state)));\n+        }\n+    }\n+\n+    int max_tries{1000000};\n+\n+    while (max_tries > 0 && !CheckProofOfWork(block.GetHash(), block.nBits, chainparams.GetConsensus()) && !ShutdownRequested()) {\n+        ++block.nNonce;\n+        --max_tries;\n+    }\n+\n+    if (max_tries == 0) {\n+        throw JSONRPCError(RPC_INTERNAL_ERROR, \"Exceeded max tries\");\n+    }\n+\n+    std::shared_ptr<const CBlock> shared_block = std::make_shared<const CBlock>(block);\n+    if (!ProcessNewBlock(chainparams, shared_block, true, nullptr))\n+        throw JSONRPCError(RPC_INTERNAL_ERROR, \"ProcessNewBlock, block not accepted\");\n+\n+    return block.GetHash().GetHex();\n+}\n+\n+static UniValue generatecustomblock(const JSONRPCRequest& request)\n+{\n+    RPCHelpMan{\"generatecustomblock\",\n+        \"\\nMine a custom block with a set of transactions immediately to a specified address or descriptor (before the RPC call returns)\\n\",\n+        {\n+            {\"address/descriptor\", RPCArg::Type::STR, RPCArg::Optional::NO, \"The address or descriptor to send the newly generated bitcoin to.\"},\n+            {\"transactions\", RPCArg::Type::ARR, RPCArg::Optional::NO, \"An array of hex strings which are either txids or raw transactions.\\n\"\n+                \"Txids must reference transactions currently in the mempool.\",\n+                {\n+                    {\"rawtx/txid\", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, \"\"},\n+                },\n+            }\n+        },\n+        RPCResult{\n+            \"blockhash     (hex) hash of generated block\\n\"\n+        },\n+        RPCExamples{\n+            \"\\nGenerate a block to myaddress, with txs rawtx and mempool_txid\\n\"\n+            + HelpExampleCli(\"generatecustomblock\", R\"(\"myaddress\" '[\"rawtx\", \"mempool_txid\"]')\")\n+        },\n+    }.Check(request);\n+\n+    const auto address_or_descriptor = request.params[0].get_str();\n+    CScript coinbase_script;\n+\n+    FlatSigningProvider key_provider;\n+    std::string error;\n+    const auto desc = Parse(address_or_descriptor, key_provider, error, /* require_checksum = */ false);\n+    if (desc) {\n+        if (desc->IsRange()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Ranged descriptor not accepted. Maybe pass through deriveaddresses first?\");\n+        }\n+\n+        FlatSigningProvider provider;\n+        std::vector<CScript> scripts;\n+        if (!desc->Expand(0, key_provider, scripts, provider)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf(\"Cannot derive script without private keys\"));\n+        }\n+\n+        CHECK_NONFATAL(scripts.size() == 1);\n+        coinbase_script = scripts.at(0);\n+\n+    } else {\n+        const auto destination = DecodeDestination(address_or_descriptor);\n+        if (!IsValidDestination(destination)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Error: Invalid address or descriptor\");\n+        }\n+\n+        coinbase_script = GetScriptForDestination(destination);\n+    }\n+\n+    std::vector<CTransactionRef> txs;\n+    const auto raw_txs_or_txids = request.params[1].get_array();\n+    for (size_t i = 0; i < raw_txs_or_txids.size(); i++) {\n+        const auto str(raw_txs_or_txids[i].get_str());\n+\n+        uint256 hash;\n+        CMutableTransaction mtx;\n+        if (ParseHashStr(str, hash)) {\n+\n+            LOCK(mempool.cs);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17653#discussion_r355133850",
+      "id" : 355133850,
+      "in_reply_to_id" : 353262967,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM1NTEzMzg1MA==",
+      "original_commit_id" : "de2a77fbc210365bf154633ddb0af3ecc1477e12",
+      "original_position" : 133,
+      "path" : "src/rpc/mining.cpp",
+      "position" : 133,
+      "pull_request_review_id" : 328567175,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17653",
+      "updated_at" : "2019-12-07T17:35:00Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/355133850",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/237213?v=4",
+         "events_url" : "https://api.github.com/users/andrewtoth/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/andrewtoth/followers",
+         "following_url" : "https://api.github.com/users/andrewtoth/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/andrewtoth/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/andrewtoth",
+         "id" : 237213,
+         "login" : "andrewtoth",
+         "node_id" : "MDQ6VXNlcjIzNzIxMw==",
+         "organizations_url" : "https://api.github.com/users/andrewtoth/orgs",
+         "received_events_url" : "https://api.github.com/users/andrewtoth/received_events",
+         "repos_url" : "https://api.github.com/users/andrewtoth/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/andrewtoth/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/andrewtoth/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/andrewtoth"
+      }
+   },
+   {
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Closed by mistake. Reopened new PR #17693 ",
+      "created_at" : "2019-12-07T17:35:20Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17653#issuecomment-562870873",
+      "id" : 562870873,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/17653",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDU2Mjg3MDg3Mw==",
+      "updated_at" : "2019-12-07T17:35:20Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/562870873",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/237213?v=4",
+         "events_url" : "https://api.github.com/users/andrewtoth/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/andrewtoth/followers",
+         "following_url" : "https://api.github.com/users/andrewtoth/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/andrewtoth/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/andrewtoth",
+         "id" : 237213,
+         "login" : "andrewtoth",
+         "node_id" : "MDQ6VXNlcjIzNzIxMw==",
+         "organizations_url" : "https://api.github.com/users/andrewtoth/orgs",
+         "received_events_url" : "https://api.github.com/users/andrewtoth/received_events",
+         "repos_url" : "https://api.github.com/users/andrewtoth/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/andrewtoth/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/andrewtoth/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/andrewtoth"
+      }
    }
 ]
