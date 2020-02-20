@@ -2070,5 +2070,55 @@
          "type" : "User",
          "url" : "https://api.github.com/users/luke-jr"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18077#discussion_r381830792"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18077"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/381830792"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "The logic to handle being assigned a different external port number by the gateway uses the `g_mapport_external_port` variable.",
+      "commit_id" : "03e2733be1772ef69caf34e84c7b400f64a8ea9f",
+      "created_at" : "2020-02-20T07:49:34Z",
+      "diff_hunk" : "@@ -0,0 +1,320 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include <config/bitcoin-config.h>\n+#endif\n+\n+#include <mapport.h>\n+\n+#include <clientversion.h>\n+#include <logging.h>\n+#include <net.h>\n+#include <netaddress.h>\n+#include <netbase.h>\n+#include <threadinterrupt.h>\n+#include <util/system.h>\n+\n+#ifdef USE_NATPMP\n+#include <natpmp.h>\n+#ifdef WIN32\n+#include <winsock2.h>\n+#else\n+#include <netinet/in.h>\n+#endif // #ifdef WIN32\n+#endif // #ifdef USE_NATPMP\n+\n+#ifdef USE_UPNP\n+#include <miniupnpc/miniupnpc.h>\n+#include <miniupnpc/upnpcommands.h>\n+#include <miniupnpc/upnperrors.h>\n+// The minimum supported miniUPnPc API version is set to 10. This keeps compatibility\n+// with Ubuntu 16.04 LTS and Debian 8 libminiupnpc-dev packages.\n+static_assert(MINIUPNPC_API_VERSION >= 10, \"miniUPnPc API version >= 10 assumed\");\n+#endif // #ifdef USE_UPNP\n+\n+#include <cassert>\n+#include <chrono>\n+#include <functional>\n+#include <string>\n+#include <thread>\n+\n+#if defined(USE_NATPMP) || defined(USE_UPNP)\n+static CThreadInterrupt g_mapport_interrupt;\n+static std::thread g_mapport_thread;\n+static MapPortProto g_mapport_current_proto = MapPortProto::NONE;\n+static unsigned int g_mapport_target_proto = g_mapport_current_proto;\n+static uint16_t g_mapport_external_port = 0;\n+static constexpr auto PORT_MAPPING_REANNOUNCE_PERIOD = std::chrono::minutes(20);\n+static constexpr auto PORT_MAPPING_RETRY_PERIOD = std::chrono::minutes(5);\n+\n+#ifdef USE_NATPMP\n+static bool NatpmpInit(natpmp_t* natpmp)\n+{\n+    const int r_init = initnatpmp(natpmp, /* detect gateway automatically */ 0, /* forced gateway - NOT APPLIED*/ 0);\n+    if (r_init == 0) return true;\n+    LogPrintf(\"NAT-PMP: initnatpmp() failed with %d error.\\n\", r_init);\n+    return false;\n+}\n+\n+static bool NatpmpDiscover(natpmp_t* natpmp, struct in_addr& external_ipv4_addr)\n+{\n+    const int r_send = sendpublicaddressrequest(natpmp);\n+    if (r_send == 2 /* OK */) {\n+        int r_read;\n+        natpmpresp_t response;\n+        do {\n+            r_read = readnatpmpresponseorretry(natpmp, &response);\n+        } while (r_read == NATPMP_TRYAGAIN);\n+\n+        if (r_read == 0) {\n+            external_ipv4_addr = response.pnu.publicaddress.addr;\n+            return true;\n+        } else if (r_read == NATPMP_ERR_NOGATEWAYSUPPORT) {\n+            LogPrintf(\"NAT-PMP: The gateway does not support NAT-PMP.\\n\");\n+        } else {\n+            LogPrintf(\"NAT-PMP: readnatpmpresponseorretry() for public address failed with %d error.\\n\", r_read);\n+        }\n+\n+    } else {\n+        LogPrintf(\"NAT-PMP: sendpublicaddressrequest() failed with %d error.\\n\", r_send);\n+    }\n+\n+    return false;\n+}\n+\n+static bool NatpmpMapping(natpmp_t* natpmp, const struct in_addr& external_ipv4_addr, uint16_t private_port, bool& external_ip_discovered)\n+{\n+    const uint16_t suggested_external_port = g_mapport_external_port ? g_mapport_external_port : private_port;\n+    const int r_send = sendnewportmappingrequest(natpmp, NATPMP_PROTOCOL_TCP, private_port, suggested_external_port, 3600 /*seconds*/);\n+    if (r_send == 12 /* OK */) {\n+        int r_read;\n+        natpmpresp_t response;\n+        do {\n+            r_read = readnatpmpresponseorretry(natpmp, &response);\n+        } while (r_read == NATPMP_TRYAGAIN);\n+\n+        if (r_read == 0) {\n+            auto pm = response.pnu.newportmapping;\n+            if (private_port == pm.privateport && pm.lifetime > 0) {\n+                g_mapport_current_proto = MapPortProto::NAT_PMP;\n+                g_mapport_external_port = pm.mappedpublicport;\n+                const CService external{external_ipv4_addr, pm.mappedpublicport};\n+                if (!external_ip_discovered && fDiscover) {\n+                    AddLocal(external, LOCAL_MAPPED);\n+                    external_ip_discovered = true;\n+                }\n+\n+                LogPrintf(\"NAT-PMP: Port mapping successful. External address = %s\\n\", external.ToString());\n+                return true;\n+            } else {\n+                LogPrintf(\"NAT-PMP: Port mapping failed.\\n\");\n+            }\n+\n+        } else if (r_read == NATPMP_ERR_NOGATEWAYSUPPORT) {\n+            LogPrintf(\"NAT-PMP: The gateway does not support NAT-PMP.\\n\");\n+        } else {\n+            LogPrintf(\"NAT-PMP: readnatpmpresponseorretry() for port mapping failed with %d error.\\n\", r_read);\n+        }\n+\n+    } else {\n+        LogPrintf(\"NAT-PMP: sendnewportmappingrequest() failed with %d error.\\n\", r_send);\n+    }\n+\n+    return false;\n+}\n+\n+static bool ThreadNatpmp()\n+{\n+    bool ret = false;\n+    natpmp_t natpmp;\n+    struct in_addr external_ipv4_addr;\n+    if (NatpmpInit(&natpmp) && NatpmpDiscover(&natpmp, external_ipv4_addr)) {\n+        bool external_ip_discovered = false;\n+        const uint16_t private_port = GetListenPort();\n+        do {\n+            ret = NatpmpMapping(&natpmp, external_ipv4_addr, private_port, external_ip_discovered);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18077#discussion_r381830792",
+      "id" : 381830792,
+      "in_reply_to_id" : 381558659,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM4MTgzMDc5Mg==",
+      "original_commit_id" : "03e2733be1772ef69caf34e84c7b400f64a8ea9f",
+      "original_position" : 137,
+      "path" : "src/mapport.cpp",
+      "position" : 137,
+      "pull_request_review_id" : 361688719,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18077",
+      "updated_at" : "2020-02-20T07:49:34Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/381830792",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/32963518?v=4",
+         "events_url" : "https://api.github.com/users/hebasto/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/hebasto/followers",
+         "following_url" : "https://api.github.com/users/hebasto/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/hebasto/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/hebasto",
+         "id" : 32963518,
+         "login" : "hebasto",
+         "node_id" : "MDQ6VXNlcjMyOTYzNTE4",
+         "organizations_url" : "https://api.github.com/users/hebasto/orgs",
+         "received_events_url" : "https://api.github.com/users/hebasto/received_events",
+         "repos_url" : "https://api.github.com/users/hebasto/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/hebasto/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/hebasto/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/hebasto"
+      }
    }
 ]
