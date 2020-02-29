@@ -2624,5 +2624,250 @@
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16528#discussion_r386015063"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16528"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/386015063"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Try `ExpandFromCache(` before `Expand(`? ",
+      "commit_id" : "8f282ebaf0ddd120f5fa0f9d0a1b2b46f7ac5b40",
+      "created_at" : "2020-02-29T09:22:31Z",
+      "diff_hunk" : "@@ -1434,3 +1496,594 @@ std::set<CKeyID> LegacyScriptPubKeyMan::GetKeys() const\n     }\n     return set_address;\n }\n+\n+void LegacyScriptPubKeyMan::SetType(OutputType type, bool internal) {}\n+\n+bool DescriptorScriptPubKeyMan::GetNewDestination(const OutputType type, CTxDestination& dest, std::string& error)\n+{\n+    if (!CanGetAddresses(internal)) {\n+        error = \"No private keys available\";\n+        return false;\n+    }\n+    {\n+        LOCK(cs_desc_man);\n+        if (descriptor.descriptor->IsSingleType() && type != address_type) {\n+            throw std::runtime_error(std::string(__func__) + \": Types are inconsistent\");\n+        }\n+\n+        TopUp();\n+\n+        // Get the scriptPubKey from the descriptor\n+        FlatSigningProvider out_keys;\n+        std::vector<CScript> scripts_temp;\n+        if (descriptor.range_end <= m_max_desc_index && !TopUp(1)) {\n+            // We can't generate anymore keys\n+            error = \"Error: Keypool ran out, please call keypoolrefill first\";\n+            return false;\n+        }\n+        if (!descriptor.descriptor->ExpandFromCache(descriptor.next_index, descriptor.cache, scripts_temp, out_keys)) {\n+            // We can't generate anymore keys\n+            error = \"Error: Keypool ran out, please call keypoolrefill first\";\n+            return false;\n+        }\n+\n+        if (descriptor.descriptor->IsSingleType()) {\n+            Optional<OutputType> out_script_type = descriptor.descriptor->GetOutputType();\n+            if (out_script_type && out_script_type == type) {\n+                ExtractDestination(scripts_temp[0], dest);\n+            } else {\n+                throw std::runtime_error(std::string(__func__) + \": Types are inconsistent. Stored type does not match type of newly generated address\");\n+            }\n+        } else {\n+            // This is a combo descriptor which should not be an active descriptor\n+            assert(false);\n+        }\n+        descriptor.next_index++;\n+        WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), descriptor);\n+        return true;\n+    }\n+}\n+\n+isminetype DescriptorScriptPubKeyMan::IsMine(const CScript& script) const\n+{\n+    LOCK(cs_desc_man);\n+    if (m_map_script_pub_keys.count(script) > 0) {\n+        return ISMINE_SPENDABLE;\n+    }\n+    return ISMINE_NO;\n+}\n+\n+bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n+{\n+    {\n+        LOCK(cs_desc_man);\n+        if (!m_map_keys.empty())\n+            return false;\n+\n+        bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n+        bool keyFail = false;\n+        CryptedKeyMap::const_iterator mi = m_map_crypted_keys.begin();\n+        for (; mi != m_map_crypted_keys.end(); ++mi)\n+        {\n+            const CPubKey &pubkey = (*mi).second.first;\n+            const std::vector<unsigned char> &crypted_secret = (*mi).second.second;\n+            CKey key;\n+            if (!DecryptKey(master_key, crypted_secret, pubkey, key))\n+            {\n+                keyFail = true;\n+                break;\n+            }\n+            keyPass = true;\n+            if (m_decryption_thoroughly_checked)\n+                break;\n+        }\n+        if (keyPass && keyFail)\n+        {\n+            LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n+            throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n+        }\n+        if (keyFail || (!keyPass && !accept_no_keys))\n+            return false;\n+        m_decryption_thoroughly_checked = true;\n+    }\n+    return true;\n+}\n+\n+bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n+{\n+    LOCK(cs_desc_man);\n+    if (!m_map_crypted_keys.empty()) {\n+        return false;\n+    }\n+\n+    for (const KeyMap::value_type& key_in : m_map_keys)\n+    {\n+        const CKey &key = key_in.second;\n+        CPubKey pubkey = key.GetPubKey();\n+        CKeyingMaterial secret(key.begin(), key.end());\n+        std::vector<unsigned char> crypted_secret;\n+        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n+            return false;\n+        }\n+        m_map_crypted_keys[pubkey.GetID()] = make_pair(pubkey, crypted_secret);\n+        batch->WriteCryptedDescriptorKey(GetID(), pubkey, crypted_secret);\n+    }\n+    m_map_keys.clear();\n+    return true;\n+}\n+\n+bool DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, CTxDestination& address, int64_t& index, CKeyPool& keypool)\n+{\n+    LOCK(cs_desc_man);\n+    std::string error;\n+    bool result = GetNewDestination(type, address, error);\n+    index = descriptor.next_index - 1;\n+    return result;\n+}\n+\n+void DescriptorScriptPubKeyMan::ReturnDestination(int64_t index, bool internal, const CTxDestination& addr)\n+{\n+    LOCK(cs_desc_man);\n+    // Only return when the index was the most recent\n+    if (descriptor.next_index - 1 == index) {\n+        descriptor.next_index--;\n+    }\n+    WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), descriptor);\n+    NotifyCanGetAddressesChanged();\n+}\n+\n+std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys() const\n+{\n+    AssertLockHeld(cs_desc_man);\n+    if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {\n+        KeyMap keys;\n+        for (auto key_pair : m_map_crypted_keys) {\n+            const CPubKey& pubkey = key_pair.second.first;\n+            const std::vector<unsigned char>& crypted_secret = key_pair.second.second;\n+            CKey key;\n+            DecryptKey(m_storage.GetEncryptionKey(), crypted_secret, pubkey, key);\n+            keys[pubkey.GetID()] = key;\n+        }\n+        return keys;\n+    }\n+    return m_map_keys;\n+}\n+\n+bool DescriptorScriptPubKeyMan::TopUp(unsigned int size)\n+{\n+    LOCK(cs_desc_man);\n+    unsigned int target_size;\n+    if (size > 0)\n+        target_size = size;\n+    else\n+        target_size = std::max(gArgs.GetArg(\"-keypool\", DEFAULT_KEYPOOL_SIZE), (int64_t) 0);\n+    target_size = std::max((int32_t)target_size, 1);\n+\n+    // Calculate the new range_end\n+    int32_t new_range_end = std::max(descriptor.next_index + (int32_t)target_size, descriptor.range_end);\n+\n+    // If the descriptor is not ranged, we actually just want to fill the first cache item\n+    if (!descriptor.descriptor->IsRange()) {\n+        new_range_end = 1;\n+        descriptor.range_end = 1;\n+        descriptor.range_start = 0;\n+    }\n+\n+    FlatSigningProvider provider;\n+    provider.keys = GetKeys();\n+\n+    WalletBatch batch(m_storage.GetDatabase());\n+    uint256 id = GetID();\n+    for (int32_t i = m_max_desc_index + 1; i < new_range_end; ++i) {\n+        FlatSigningProvider out_keys;\n+        std::vector<CScript> scripts_temp;\n+        DescriptorCache cache;\n+        if (!descriptor.descriptor->Expand(i, provider, scripts_temp, out_keys, &cache)) {\n+            // Maybe we have a cached xpub and we can expand from cache\n+            if (!descriptor.descriptor->ExpandFromCache(i, descriptor.cache, scripts_temp, out_keys)) return false;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16528#discussion_r386015063",
+      "id" : 386015063,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM4NjAxNTA2Mw==",
+      "original_commit_id" : "8f282ebaf0ddd120f5fa0f9d0a1b2b46f7ac5b40",
+      "original_position" : 292,
+      "path" : "src/wallet/scriptpubkeyman.cpp",
+      "position" : 292,
+      "pull_request_review_id" : 366787922,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16528",
+      "updated_at" : "2020-02-29T10:19:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/386015063",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16528#discussion_r386015338"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16528"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/386015338"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "\"No addresses available\"\r\n\r\nIt may also be worth clarifying that although `CanGetAddresses()` considers `descriptor.next_index < descriptor.range_end`, each topup bumps `range_end`, except for wallets with hardened derivation, with encrypted or without private keys. Those wallets need to call `keypoolrefill`.",
+      "commit_id" : "8f282ebaf0ddd120f5fa0f9d0a1b2b46f7ac5b40",
+      "created_at" : "2020-02-29T09:27:42Z",
+      "diff_hunk" : "@@ -1434,3 +1496,594 @@ std::set<CKeyID> LegacyScriptPubKeyMan::GetKeys() const\n     }\n     return set_address;\n }\n+\n+void LegacyScriptPubKeyMan::SetType(OutputType type, bool internal) {}\n+\n+bool DescriptorScriptPubKeyMan::GetNewDestination(const OutputType type, CTxDestination& dest, std::string& error)\n+{\n+    if (!CanGetAddresses(internal)) {\n+        error = \"No private keys available\";",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16528#discussion_r386015338",
+      "id" : 386015338,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM4NjAxNTMzOA==",
+      "original_commit_id" : "8f282ebaf0ddd120f5fa0f9d0a1b2b46f7ac5b40",
+      "original_position" : 114,
+      "path" : "src/wallet/scriptpubkeyman.cpp",
+      "position" : 114,
+      "pull_request_review_id" : 366787922,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16528",
+      "updated_at" : "2020-02-29T10:19:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/386015338",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16528#discussion_r386016600"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16528"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/386016600"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "`m_max_cached_index`?",
+      "commit_id" : "8f282ebaf0ddd120f5fa0f9d0a1b2b46f7ac5b40",
+      "created_at" : "2020-02-29T09:51:15Z",
+      "diff_hunk" : "@@ -458,9 +477,104 @@ class LegacySigningProvider : public SigningProvider\n     bool GetCScript(const CScriptID &scriptid, CScript& script) const override { return m_spk_man.GetCScript(scriptid, script); }\n     bool HaveCScript(const CScriptID &scriptid) const override { return m_spk_man.HaveCScript(scriptid); }\n     bool GetPubKey(const CKeyID &address, CPubKey& pubkey) const override { return m_spk_man.GetPubKey(address, pubkey); }\n-    bool GetKey(const CKeyID &address, CKey& key) const override { return m_spk_man.GetKey(address, key); }\n-    bool HaveKey(const CKeyID &address) const override { return m_spk_man.HaveKey(address); }\n+    bool GetKey(const CKeyID &address, CKey& key) const override { return false; }\n+    bool HaveKey(const CKeyID &address) const override { return false; }\n     bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override { return m_spk_man.GetKeyOrigin(keyid, info); }\n };\n \n+class DescriptorScriptPubKeyMan : public ScriptPubKeyMan\n+{\n+private:\n+    WalletDescriptor descriptor GUARDED_BY(cs_desc_man);\n+\n+    using ScriptPubKeyMap = std::map<CScript, int32_t>; // Map of scripts to descriptor range index\n+    using CryptedKeyMap = std::map<CKeyID, std::pair<CPubKey, std::vector<unsigned char>>>;\n+    using KeyMap = std::map<CKeyID, CKey>;\n+\n+    ScriptPubKeyMap m_map_script_pub_keys GUARDED_BY(cs_desc_man);\n+    int32_t m_max_desc_index = -1;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16528#discussion_r386016600",
+      "id" : 386016600,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM4NjAxNjYwMA==",
+      "original_commit_id" : "8f282ebaf0ddd120f5fa0f9d0a1b2b46f7ac5b40",
+      "original_position" : 99,
+      "path" : "src/wallet/scriptpubkeyman.h",
+      "position" : 99,
+      "pull_request_review_id" : 366787922,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16528",
+      "updated_at" : "2020-02-29T10:19:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/386016600",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16528#discussion_r386016947"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16528"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/386016947"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Do this before (or instead of) `CanGetAddresses()` for readability?",
+      "commit_id" : "8f282ebaf0ddd120f5fa0f9d0a1b2b46f7ac5b40",
+      "created_at" : "2020-02-29T09:58:38Z",
+      "diff_hunk" : "@@ -1434,3 +1496,594 @@ std::set<CKeyID> LegacyScriptPubKeyMan::GetKeys() const\n     }\n     return set_address;\n }\n+\n+void LegacyScriptPubKeyMan::SetType(OutputType type, bool internal) {}\n+\n+bool DescriptorScriptPubKeyMan::GetNewDestination(const OutputType type, CTxDestination& dest, std::string& error)\n+{\n+    if (!CanGetAddresses(internal)) {\n+        error = \"No private keys available\";\n+        return false;\n+    }\n+    {\n+        LOCK(cs_desc_man);\n+        if (descriptor.descriptor->IsSingleType() && type != address_type) {\n+            throw std::runtime_error(std::string(__func__) + \": Types are inconsistent\");\n+        }\n+\n+        TopUp();\n+\n+        // Get the scriptPubKey from the descriptor\n+        FlatSigningProvider out_keys;\n+        std::vector<CScript> scripts_temp;\n+        if (descriptor.range_end <= m_max_desc_index && !TopUp(1)) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16528#discussion_r386016947",
+      "id" : 386016947,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM4NjAxNjk0Nw==",
+      "original_commit_id" : "8f282ebaf0ddd120f5fa0f9d0a1b2b46f7ac5b40",
+      "original_position" : 128,
+      "path" : "src/wallet/scriptpubkeyman.cpp",
+      "position" : 128,
+      "pull_request_review_id" : 366787922,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16528",
+      "updated_at" : "2020-02-29T10:19:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/386016947",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/16528#discussion_r386017234"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16528"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/386017234"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Worth documenting that this tops up the descriptor cache, which is the legacy keypool analogue. Unlike legacy spkms, some data in the descriptor keypool may be ephemeral. For wallets without private keys and with unhardened derivation, the keypool is saved as a single xpub. This xpub is expanded by Topup() when the wallet is first loaded.",
+      "commit_id" : "8f282ebaf0ddd120f5fa0f9d0a1b2b46f7ac5b40",
+      "created_at" : "2020-02-29T10:03:37Z",
+      "diff_hunk" : "@@ -458,9 +477,104 @@ class LegacySigningProvider : public SigningProvider\n     bool GetCScript(const CScriptID &scriptid, CScript& script) const override { return m_spk_man.GetCScript(scriptid, script); }\n     bool HaveCScript(const CScriptID &scriptid) const override { return m_spk_man.HaveCScript(scriptid); }\n     bool GetPubKey(const CKeyID &address, CPubKey& pubkey) const override { return m_spk_man.GetPubKey(address, pubkey); }\n-    bool GetKey(const CKeyID &address, CKey& key) const override { return m_spk_man.GetKey(address, key); }\n-    bool HaveKey(const CKeyID &address) const override { return m_spk_man.HaveKey(address); }\n+    bool GetKey(const CKeyID &address, CKey& key) const override { return false; }\n+    bool HaveKey(const CKeyID &address) const override { return false; }\n     bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override { return m_spk_man.GetKeyOrigin(keyid, info); }\n };\n \n+class DescriptorScriptPubKeyMan : public ScriptPubKeyMan\n+{\n+private:\n+    WalletDescriptor descriptor GUARDED_BY(cs_desc_man);\n+\n+    using ScriptPubKeyMap = std::map<CScript, int32_t>; // Map of scripts to descriptor range index\n+    using CryptedKeyMap = std::map<CKeyID, std::pair<CPubKey, std::vector<unsigned char>>>;\n+    using KeyMap = std::map<CKeyID, CKey>;\n+\n+    ScriptPubKeyMap m_map_script_pub_keys GUARDED_BY(cs_desc_man);\n+    int32_t m_max_desc_index = -1;\n+\n+    OutputType address_type;\n+    bool internal;\n+\n+    KeyMap m_map_keys GUARDED_BY(cs_desc_man);\n+    CryptedKeyMap m_map_crypted_keys GUARDED_BY(cs_desc_man);\n+\n+    bool SetCrypted();\n+\n+    //! keeps track of whether Unlock has run a thorough check before\n+    bool m_decryption_thoroughly_checked = false;\n+\n+    bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey);\n+\n+    KeyMap GetKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);\n+\n+    std::unique_ptr<FlatSigningProvider> GetSigningProvider(const CScript& script, bool include_private = false) const;\n+public:\n+    DescriptorScriptPubKeyMan(WalletStorage& storage, WalletDescriptor& descriptor)\n+        :   ScriptPubKeyMan(storage),\n+            descriptor(descriptor)\n+        {}\n+    DescriptorScriptPubKeyMan(WalletStorage& storage, OutputType address_type, bool internal)\n+        :   ScriptPubKeyMan(storage),\n+            address_type(address_type), internal(internal)\n+        {}\n+\n+    mutable RecursiveMutex cs_desc_man;\n+\n+    bool GetNewDestination(const OutputType type, CTxDestination& dest, std::string& error) override;\n+    isminetype IsMine(const CScript& script) const override;\n+\n+    bool CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys = false) override;\n+    bool Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch) override;\n+\n+    bool GetReservedDestination(const OutputType type, bool internal, CTxDestination& address, int64_t& index, CKeyPool& keypool) override;\n+    void ReturnDestination(int64_t index, bool internal, const CTxDestination& addr) override;\n+\n+    bool TopUp(unsigned int size = 0) override;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16528#discussion_r386017234",
+      "id" : 386017234,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM4NjAxNzIzNA==",
+      "original_commit_id" : "8f282ebaf0ddd120f5fa0f9d0a1b2b46f7ac5b40",
+      "original_position" : 138,
+      "path" : "src/wallet/scriptpubkeyman.h",
+      "position" : 138,
+      "pull_request_review_id" : 366787922,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/16528",
+      "updated_at" : "2020-02-29T10:19:07Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/386017234",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
    }
 ]
