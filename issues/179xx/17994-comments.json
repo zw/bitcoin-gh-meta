@@ -569,5 +569,86 @@
          "type" : "User",
          "url" : "https://api.github.com/users/kallewoof"
       }
+   },
+   {
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I reproduced the bug in a controlled, deterministic environment with a [unit test + tweaks](https://gist.github.com/vasild/8c06b3dbc493522f683a671d71b4c122). The current patch in this PR (4808122) indeed fixes it, but it introduces another problem - it would wrongly skip finalizing of the undo files in case the blocks are downloaded in-height-order.\r\n\r\nThere are two cases when we should finalize an undo file (IFF):\r\n* we have just moved to a subsequent one (like with block files) - \"normal\" in-height-order scenario or\r\n* we are coming back to a lower undo file from a higher undo file to complete an out-of-order block's undo and this undo slot is the last/final in the lower undo file.\r\n\r\nThe following patch (on top of master @ 9cc7eba1b) fixes it:\r\n\r\n```diff\r\n--- a/src/validation.cpp\r\n+++ b/src/validation.cpp\r\n@@ -131,13 +131,39 @@ CTxMemPool mempool(&feeEstimator);\r\n // Internal stuff\r\n namespace {\r\n     CBlockIndex* pindexBestInvalid = nullptr;\r\n \r\n     RecursiveMutex cs_LastBlockFile;\r\n     std::vector<CBlockFileInfo> vinfoBlockFile;\r\n+\r\n+    /** Last blk*.dat file that has been written to.\r\n+     * Used to detect when we move from blkN to blkN+1 so we can trigger a\r\n+     * finalization of blkN.\r\n+     * Blocks are appended to blk files in the order they are received from\r\n+     * the network (which may not be height order). When a blk file is about\r\n+     * to become larger than MAX_BLOCKFILE_SIZE then we move to the next blk\r\n+     * file and finalize the one we just left.\r\n+     */\r\n     int nLastBlockFile = 0;\r\n+\r\n+    /** Highest rev*.dat file that has been written to.\r\n+     * Used to detect the last write to revN so it can be finalized.\r\n+     * Undo files don't have a max size limit. For every block that resides in\r\n+     * blkN, its corresponding undo resides in revN.\r\n+     * However, the undo for a given block is only appended to the rev file\r\n+     * after all blocks at a lower height have been stored together with their\r\n+     * undos. It follows that block and undo data may be in different order\r\n+     * in the corresponding blk and rev files, for example:\r\n+     * blkN: block5, block7, block6\r\n+     * revN: block5, block6, block7\r\n+     * if block7 was received before block6.\r\n+     * Also we may write to revN after writing to revM, for N < M which never\r\n+     * happens with blk files.\r\n+     */\r\n+    int nHighestUndoFile = 0;\r\n+\r\n     /** Global flag to indicate we should check to see if there are\r\n      *  block/undo files that should be deleted.  Set on startup\r\n      *  or if we allocate more file space when we're in prune mode\r\n      */\r\n     bool fCheckForPruning = false;\r\n \r\n@@ -1733,23 +1759,25 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI\r\n     // move best block pointer to prevout block\r\n     view.SetBestBlock(pindex->pprev->GetBlockHash());\r\n \r\n     return fClean ? DISCONNECT_OK : DISCONNECT_UNCLEAN;\r\n }\r\n \r\n-void static FlushBlockFile(bool fFinalize = false)\r\n+static void FlushUndoFile(int undo_file, bool finalize = false)\r\n {\r\n-    LOCK(cs_LastBlockFile);\r\n-\r\n-    FlatFilePos block_pos_old(nLastBlockFile, vinfoBlockFile[nLastBlockFile].nSize);\r\n-    FlatFilePos undo_pos_old(nLastBlockFile, vinfoBlockFile[nLastBlockFile].nUndoSize);\r\n+    FlatFilePos pos(undo_file, vinfoBlockFile[undo_file].nUndoSize);\r\n+    if (!UndoFileSeq().Flush(pos, finalize)) {\r\n+        AbortNode(\"Flushing undo file to disk failed. This is likely the result of an I/O error.\");\r\n+    }\r\n+}\r\n \r\n-    bool status = true;\r\n-    status &= BlockFileSeq().Flush(block_pos_old, fFinalize);\r\n-    status &= UndoFileSeq().Flush(undo_pos_old, fFinalize);\r\n-    if (!status) {\r\n+static void FlushBlockFile(bool fFinalize = false)\r\n+{\r\n+    LOCK(cs_LastBlockFile);\r\n+    FlatFilePos pos(nLastBlockFile, vinfoBlockFile[nLastBlockFile].nSize);\r\n+    if (!BlockFileSeq().Flush(pos, fFinalize)) {\r\n         AbortNode(\"Flushing block file to disk failed. This is likely the result of an I/O error.\");\r\n     }\r\n }\r\n \r\n static bool FindUndoPos(BlockValidationState &state, int nFile, FlatFilePos &pos, unsigned int nAddSize);\r\n \r\n@@ -1760,12 +1788,37 @@ static bool WriteUndoDataForBlock(const CBlockUndo& blockundo, BlockValidationSt\r\n         FlatFilePos _pos;\r\n         if (!FindUndoPos(state, pindex->nFile, _pos, ::GetSerializeSize(blockundo, CLIENT_VERSION) + 40))\r\n             return error(\"ConnectBlock(): FindUndoPos failed\");\r\n         if (!UndoWriteToDisk(blockundo, _pos, pindex->pprev->GetBlockHash(), chainparams.MessageStart()))\r\n             return AbortNode(state, \"Failed to write undo data\");\r\n \r\n+        const unsigned thisHeight = static_cast<unsigned>(pindex->nHeight);\r\n+\r\n+        // Flush and finalize the preceding undo file in the case when blocks\r\n+        // come in height order and we have moved to a subsequent undo file.\r\n+        const bool movedToSubsequent = _pos.nFile > nHighestUndoFile;\r\n+        const bool adjacentHeights =\r\n+            thisHeight == vinfoBlockFile[nHighestUndoFile].nHeightLast + 1;\r\n+\r\n+        if (movedToSubsequent && adjacentHeights) {\r\n+            FlushUndoFile(nHighestUndoFile, true);\r\n+        }\r\n+\r\n+        // Flush and finalize the old undo file if we went back to write\r\n+        // to it and we wrote its last entry.\r\n+        const bool wroteToOldFile = _pos.nFile < nHighestUndoFile;\r\n+        const bool isLastEntry = thisHeight == vinfoBlockFile[_pos.nFile].nHeightLast;\r\n+\r\n+        if (wroteToOldFile && isLastEntry) {\r\n+            FlushUndoFile(_pos.nFile, true);\r\n+        }\r\n+\r\n+        if (movedToSubsequent) {\r\n+            nHighestUndoFile = _pos.nFile;\r\n+        }\r\n+\r\n         // update nUndoPos in block index\r\n         pindex->nUndoPos = _pos.nPos;\r\n         pindex->nStatus |= BLOCK_HAVE_UNDO;\r\n         setDirtyBlockIndex.insert(pindex);\r\n     }\r\n \r\n@@ -2291,12 +2344,13 @@ bool CChainState::FlushStateToDisk(\r\n             }\r\n             {\r\n                 LOG_TIME_MILLIS(\"write block and undo data to disk\", BCLog::BENCH);\r\n \r\n                 // First make sure all block and undo data is flushed to disk.\r\n                 FlushBlockFile();\r\n+                FlushUndoFile(nHighestUndoFile);\r\n             }\r\n \r\n             // Then update all block file information (which may refer to block and undo files).\r\n             {\r\n                 LOG_TIME_MILLIS(\"write block index to disk\", BCLog::BENCH);\r\n \r\n```\r\n\r\nFeel free to pick it in its entirety, just pieces of it, just the idea or propose another approach. I will test it.\r\n\r\n[Annotated debug output with the bug present and with the bug fixed (by the above patch).](https://gist.github.com/vasild/34e342c869aff9a5a870b3ef3fff154c)\r\n\r\nRun the unit test like `./src/test/test_bitcoin --run_test=\"*/download_blocks_out_of_order\" --log_level=all -x 0 > /tmp/log`\r\nFilter its output: `grep -w BBB /tmp/log |sed -E -e 's/^2020[^ ]+ //' -e 's/BBB //'`\r\n\r\nI hope this helps!",
+      "created_at" : "2020-03-14T09:07:46Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17994#issuecomment-599031098",
+      "id" : 599031098,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/17994",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDU5OTAzMTA5OA==",
+      "updated_at" : "2020-03-14T09:07:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/599031098",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17994#discussion_r392570411"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17994"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/392570411"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "No worries. I started at this problem long enough and finally it cracked.\r\n\r\nIndeed `_pos.nFile < nLastBlockFile` is never true if blocks come in-height-order and this needs to be adjusted. However, just removing that condition, as I suggest above, is not ok because then the second condition will be true for every in-height-order write and this will cause excessive flushing and finalizing. See the proposed [patch](https://github.com/bitcoin/bitcoin/pull/17994#issuecomment-599031098) for a fully working solution (I hope).",
+      "commit_id" : "48081229c10969ac5993c826c8bd7687cd0503e5",
+      "created_at" : "2020-03-14T09:11:51Z",
+      "diff_hunk" : "@@ -1757,6 +1761,12 @@ static bool WriteUndoDataForBlock(const CBlockUndo& blockundo, BlockValidationSt\n             return error(\"ConnectBlock(): FindUndoPos failed\");\n         if (!UndoWriteToDisk(blockundo, _pos, pindex->pprev->GetBlockHash(), chainparams.MessageStart()))\n             return AbortNode(state, \"Failed to write undo data\");\n+        // rev files are written in block height order, whereas blk files are written as blocks come in (often out of order)\n+        // we want to flush the rev (undo) file once we've written the last block, which is indicated by the last height\n+        // in the block file info as below\n+        if (_pos.nFile < nLastBlockFile && static_cast<uint32_t>(pindex->nHeight) == vinfoBlockFile[_pos.nFile].nHeightLast) {\n+            FlushUndoFile(_pos.nFile, true);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17994#discussion_r392570411",
+      "id" : 392570411,
+      "in_reply_to_id" : 391249970,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDM5MjU3MDQxMQ==",
+      "original_commit_id" : "48081229c10969ac5993c826c8bd7687cd0503e5",
+      "original_position" : 40,
+      "path" : "src/validation.cpp",
+      "position" : 40,
+      "pull_request_review_id" : 374709388,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17994",
+      "updated_at" : "2020-03-14T09:11:51Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/392570411",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
    }
 ]
