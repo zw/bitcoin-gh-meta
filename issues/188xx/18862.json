@@ -1,0 +1,79 @@
+{
+   "assignee" : null,
+   "assignees" : [],
+   "author_association" : "MEMBER",
+   "body" : "https://github.com/bitcoin/bitcoin/commit/ae30d40e50e9d63d875d29d54d22147b09fc420c\r\nThe return type of [`fdelt_chk`](https://sourceware.org/git/?p=glibc.git;a=blob;f=debug/fdelt_chk.c;h=f62ce7349707cb68f55831c1c591fd7387a90258;hb=HEAD) changed from `unsigned  long int` to `long int` in glibc 2.16. See [this commit](https://sourceware.org/git/?p=glibc.git;a=commit;h=ceb9e56b3d1f8c1922e0526c2e841373843460e2). Now that we require [glibc >=2.17](https://github.com/bitcoin/bitcoin/pull/17538) we can remove our back-compat code.\r\n\r\nhttps://github.com/bitcoin/bitcoin/commit/ab7bce584ae02bf25e2e91aa54f9b0249427127d\r\nWhile looking at the above changes, I noticed that our glibc fdelt sanity check doesn't seem to be checking anything. `fdelt_warn()` also isn't something we'd want to actually \"trigger\" at runtime, as doing so would cause `bitcoind` to abort.\r\n\r\nThe comments:\r\n> // trigger: Call FD_SET to trigger __fdelt_chk. FORTIFY_SOURCE must be defined\r\n> //   as >0 and optimizations must be set to at least -O2.\r\n\r\nsuggest calling FD_SET to check the invocation of `fdelt_chk` (this is [aliased with fdelt_warn in glibc](https://sourceware.org/git/?p=glibc.git;a=blob;f=debug/fdelt_chk.c;h=f62ce7349707cb68f55831c1c591fd7387a90258;hb=HEAD)). However just calling `FD_SET()` will not necessarily cause the compiler to insert a call to `fd_warn()`.\r\n\r\nWhether or not GCC (Clang does not have as good support for replacing functions with `_chk` variants) inserts a call to `fdelt_warn()` depends on if the compiler can determine if the value passed in is a compile time constant (using [`__builtin_constant_p`](https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html)) and whether the value is < 0 or >= `FD_SETSIZE`. The glibc implementation is [here](https://sourceware.org/git/?p=glibc.git;a=blob;f=misc/bits/select2.h;h=7e17430ed94dd1679af10afa3d74795f9c97c0e8;hb=HEAD). This means our check should never cause a call to be inserted.\r\n\r\nCompiling master without `--glibc-back-compat` (if you do pass `--glibc-back-compat` the outcome is still the same; however the abort will only happen with >=`FD_SETSIZE` as that is what our [fdelt_warn()](https://github.com/bitcoin/bitcoin/blob/master/src/compat/glibc_compat.cpp#L24) checks for), there are no calls to `fdelt_warn()` inserted by the compiler:\r\n```bash\r\nobjdump -dC bitcoind | grep sanity_fdelt\r\n...\r\n0000000000399d20 <sanity_test_fdelt()>:\r\n  399d20:       48 81 ec 98 00 00 00    sub    $0x98,%rsp\r\n  399d27:       b9 10 00 00 00          mov    $0x10,%ecx\r\n  399d2c:       64 48 8b 04 25 28 00    mov    %fs:0x28,%rax\r\n  399d33:       00 00\r\n  399d35:       48 89 84 24 88 00 00    mov    %rax,0x88(%rsp)\r\n  399d3c:       00\r\n  399d3d:       31 c0                   xor    %eax,%eax\r\n  399d3f:       48 89 e7                mov    %rsp,%rdi\r\n  399d42:       fc                      cld\r\n  399d43:       f3 48 ab                rep stos %rax,%es:(%rdi)\r\n  399d46:       48 8b 84 24 88 00 00    mov    0x88(%rsp),%rax\r\n  399d4d:       00\r\n  399d4e:       64 48 33 04 25 28 00    xor    %fs:0x28,%rax\r\n  399d55:       00 00\r\n  399d57:       75 0d                   jne    399d66 <sanity_test_fdelt()+0x46>\r\n  399d59:       b8 01 00 00 00          mov    $0x1,%eax\r\n  399d5e:       48 81 c4 98 00 00 00    add    $0x98,%rsp\r\n  399d65:       c3                      retq\r\n  399d66:       e8 85 df c8 ff          callq  27cf0 <__stack_chk_fail@plt>\r\n  399d6b:       0f 1f 44 00 00          nopl   0x0(%rax,%rax,1)\r\n\r\n```\r\n\r\nIf you modify the sanity test to pass `-1` or `FD_SETSIZE` to `FD_SET`, you'll see calls to `fdelt_warn` inserted, and the runtime behaviour is an abort as expected.\r\n\r\n```diff\r\ndiff --git a/src/compat/glibc_sanity_fdelt.cpp b/src/compat/glibc_sanity_fdelt.cpp\r\nindex 87140d0c7..16974bfa0 100644\r\n--- a/src/compat/glibc_sanity_fdelt.cpp\r\n+++ b/src/compat/glibc_sanity_fdelt.cpp\r\n@@ -20,7 +20,7 @@ bool sanity_test_fdelt()\r\n {\r\n     fd_set fds;\r\n     FD_ZERO(&fds);\r\n-    FD_SET(0, &fds);\r\n+    FD_SET(FD_SETSIZE, &fds);\r\n     return FD_ISSET(0, &fds);\r\n }\r\n #endif\r\n```\r\n\r\n```bash\r\n0000000000399d20 <sanity_test_fdelt()>:\r\n  399d20:\t48 81 ec 98 00 00 00 \tsub    $0x98,%rsp\r\n  399d27:\tb9 10 00 00 00       \tmov    $0x10,%ecx\r\n  399d2c:\t64 48 8b 04 25 28 00 \tmov    %fs:0x28,%rax\r\n  399d33:\t00 00 \r\n  399d35:\t48 89 84 24 88 00 00 \tmov    %rax,0x88(%rsp)\r\n  399d3c:\t00 \r\n  399d3d:\t31 c0                \txor    %eax,%eax\r\n  399d3f:\t48 89 e7             \tmov    %rsp,%rdi\r\n  399d42:\tfc                   \tcld    \r\n  399d43:\tf3 48 ab             \trep stos %rax,%es:(%rdi)\r\n  399d46:\t48 c7 c7 ff ff ff ff \tmov    $0xffffffffffffffff,%rdi\r\n  399d4d:\te8 3e ff ff ff       \tcallq  399c90 <__fdelt_warn>\r\n  399d52:\t0f b6 04 24          \tmovzbl (%rsp),%eax\r\n  399d56:\t83 e0 01             \tand    $0x1,%eax\r\n  399d59:\t48 8b 94 24 88 00 00 \tmov    0x88(%rsp),%rdx\r\n  399d60:\t00 \r\n  399d61:\t64 48 33 14 25 28 00 \txor    %fs:0x28,%rdx\r\n  399d68:\t00 00 \r\n  399d6a:\t75 08                \tjne    399d74 <sanity_test_fdelt()+0x54>\r\n  399d6c:\t48 81 c4 98 00 00 00 \tadd    $0x98,%rsp\r\n  399d73:\tc3                   \tretq   \r\n  399d74:\te8 77 df c8 ff       \tcallq  27cf0 <__stack_chk_fail@plt>\r\n  399d79:\t0f 1f 80 00 00 00 00 \tnopl   0x0(%rax)\r\n ```\r\n  \r\n ```bash\r\n src/bitcoind\r\n*** buffer overflow detected ***: src/bitcoind terminated\r\nAborted\r\n ```\r\n\r\nI think the test should should be removed and replaced (if possible) with additional checks in security-check.py. I was thinking about adding a version of [this script](https://github.com/fanquake/core-review/blob/master/fortify.py) as part of the output, but that needs more thought. I'll address this in a follow up.",
+   "closed_at" : null,
+   "closed_by" : null,
+   "comments" : 0,
+   "comments_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/18862/comments",
+   "created_at" : "2020-05-04T08:43:46Z",
+   "events_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/18862/events",
+   "html_url" : "https://github.com/bitcoin/bitcoin/pull/18862",
+   "id" : 611702469,
+   "labels" : [
+      {
+         "color" : "5319e7",
+         "default" : false,
+         "description" : null,
+         "id" : 61889416,
+         "name" : "Build system",
+         "node_id" : "MDU6TGFiZWw2MTg4OTQxNg==",
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/labels/Build%20system"
+      },
+      {
+         "color" : "bfd4f2",
+         "default" : false,
+         "description" : "",
+         "id" : 1947349437,
+         "name" : "Needs Guix build",
+         "node_id" : "MDU6TGFiZWwxOTQ3MzQ5NDM3",
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/labels/Needs%20Guix%20build"
+      },
+      {
+         "color" : "8c9e07",
+         "default" : false,
+         "description" : "",
+         "id" : 997854106,
+         "name" : "Needs gitian build",
+         "node_id" : "MDU6TGFiZWw5OTc4NTQxMDY=",
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/labels/Needs%20gitian%20build"
+      }
+   ],
+   "labels_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/18862/labels{/name}",
+   "locked" : false,
+   "milestone" : null,
+   "node_id" : "MDExOlB1bGxSZXF1ZXN0NDEyODEzOTA4",
+   "number" : 18862,
+   "pull_request" : {
+      "diff_url" : "https://github.com/bitcoin/bitcoin/pull/18862.diff",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18862",
+      "patch_url" : "https://github.com/bitcoin/bitcoin/pull/18862.patch",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18862"
+   },
+   "repository_url" : "https://api.github.com/repos/bitcoin/bitcoin",
+   "state" : "open",
+   "title" : "Remove fdelt_chk back-compat code and sanity check",
+   "updated_at" : "2020-05-04T08:43:46Z",
+   "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/18862",
+   "user" : {
+      "avatar_url" : "https://avatars2.githubusercontent.com/u/863730?v=4",
+      "events_url" : "https://api.github.com/users/fanquake/events{/privacy}",
+      "followers_url" : "https://api.github.com/users/fanquake/followers",
+      "following_url" : "https://api.github.com/users/fanquake/following{/other_user}",
+      "gists_url" : "https://api.github.com/users/fanquake/gists{/gist_id}",
+      "gravatar_id" : "",
+      "html_url" : "https://github.com/fanquake",
+      "id" : 863730,
+      "login" : "fanquake",
+      "node_id" : "MDQ6VXNlcjg2MzczMA==",
+      "organizations_url" : "https://api.github.com/users/fanquake/orgs",
+      "received_events_url" : "https://api.github.com/users/fanquake/received_events",
+      "repos_url" : "https://api.github.com/users/fanquake/repos",
+      "site_admin" : false,
+      "starred_url" : "https://api.github.com/users/fanquake/starred{/owner}{/repo}",
+      "subscriptions_url" : "https://api.github.com/users/fanquake/subscriptions",
+      "type" : "User",
+      "url" : "https://api.github.com/users/fanquake"
+   }
+}
