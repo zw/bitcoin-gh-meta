@@ -7120,5 +7120,61 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jonatack"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18242#discussion_r424904659"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18242"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/424904659"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Not sure. If `size_or_shortid` is `0` (due to a `std::ios_base::failure` or if `vRecv` contain `0`), I'd like to enter this `if` to set `command_name` to `unknown-0`.\r\nOtherwise `command_name` would be unset for a size of `0` (which is somehow a undefined short-id).",
+      "commit_id" : "b9468fa767d1daa08924a9fefe5227b2f6688e53",
+      "created_at" : "2020-05-14T06:44:19Z",
+      "diff_hunk" : "@@ -719,6 +723,173 @@ CNetMessage V1TransportDeserializer::GetMessage(const CMessageHeader::MessageSta\n     return msg;\n }\n \n+int V2TransportDeserializer::Read(const char* pch, unsigned int bytes)\n+{\n+    if (!m_in_data) {\n+        // copy data to temporary parsing buffer\n+        const unsigned int remaining = CHACHA20_POLY1305_AEAD_AAD_LEN - m_hdr_pos;\n+        const unsigned int copy_bytes = std::min(remaining, bytes);\n+\n+        memcpy(&vRecv[m_hdr_pos], pch, copy_bytes);\n+        m_hdr_pos += copy_bytes;\n+\n+        // if AAD incomplete, exit\n+        if (m_hdr_pos < CHACHA20_POLY1305_AEAD_AAD_LEN) {\n+            return copy_bytes;\n+        }\n+\n+        // we got the AAD bytes at this point (3 bytes encrypted packet length)\n+        // we keep the sequence numbers unchanged at this point. Once the message is authenticated and decrypted, we increase the sequence numbers (or the aad_pos)\n+        if (!m_aead->GetLength(&m_message_size, m_aad_seqnr, m_aad_pos, (const uint8_t*)vRecv.data())) {\n+            return -1;\n+        }\n+\n+        // check and unset rekey bit\n+        // the counterparty can signal a post-this-message rekey by setting the\n+        // most significant bit in the (unencrypted) length\n+        m_rekey_flag = static_cast<bool>(m_message_size & (1U << 23));\n+        if (m_rekey_flag) {\n+            LogPrint(BCLog::NET, \"Rekey flag detected\\n\");\n+            m_message_size &= ~(1U << 23);\n+        }\n+\n+        // reject messages larger than MAX_SIZE\n+        if (m_message_size > MAX_SIZE) {\n+            return -1;\n+        }\n+\n+        // switch state to reading message data\n+        m_in_data = true;\n+\n+        return copy_bytes;\n+    } else {\n+        // Read the message data (command, payload & MAC)\n+        const unsigned int remaining = m_message_size + CHACHA20_POLY1305_AEAD_TAG_LEN - m_data_pos;\n+        const unsigned int copy_bytes = std::min(remaining, bytes);\n+\n+        // extend buffer, respect previous copied AAD part\n+        if (vRecv.size() < CHACHA20_POLY1305_AEAD_AAD_LEN + m_data_pos + copy_bytes) {\n+            // Allocate up to 256 KiB ahead, but never more than the total message size (incl. AAD & TAG).\n+            vRecv.resize(std::min(CHACHA20_POLY1305_AEAD_AAD_LEN + m_message_size + CHACHA20_POLY1305_AEAD_TAG_LEN, CHACHA20_POLY1305_AEAD_AAD_LEN + m_data_pos + copy_bytes + 256 * 1024 + CHACHA20_POLY1305_AEAD_TAG_LEN));\n+        }\n+\n+        memcpy(&vRecv[CHACHA20_POLY1305_AEAD_AAD_LEN + m_data_pos], pch, copy_bytes);\n+        m_data_pos += copy_bytes;\n+\n+        return copy_bytes;\n+    }\n+}\n+\n+CNetMessage V2TransportDeserializer::GetMessage(const CMessageHeader::MessageStartChars& message_start, int64_t time)\n+{\n+    // In v2, vRecv contains the encrypted payload plus the MAC tag (1+bytes serialized message command + ? bytes message payload + 16 byte mac tag)\n+    assert(Complete());\n+\n+    // defensive decoding (MAC check, decryption, command deserialization)\n+    // we'll always return a CNetMessage (even if encryption fails), we always increase the AEAD sequence numbers\n+    bool valid_checksum = false;\n+    bool valid_header = false;\n+    std::string command_name;\n+\n+    // count bytes we decrypted including MAC tag + AD\n+    m_bytes_decrypted += vRecv.size();\n+\n+    if (m_aead->Crypt(m_payload_seqnr, m_aad_seqnr, m_aad_pos, (unsigned char*)vRecv.data(), vRecv.size(), (const uint8_t*)vRecv.data(), vRecv.size(), false)) {\n+        // MAC check was successful\n+        valid_checksum = true;\n+\n+        // okay, we could decrypt it, now remove packet length and MAC tag\n+        assert(vRecv.size() > CHACHA20_POLY1305_AEAD_AAD_LEN + CHACHA20_POLY1305_AEAD_TAG_LEN);\n+        // CDataStream::erase at the begin will just increase the read pos\n+        vRecv.erase(vRecv.begin(), vRecv.begin() + CHACHA20_POLY1305_AEAD_AAD_LEN);\n+        vRecv.erase(vRecv.end() - CHACHA20_POLY1305_AEAD_TAG_LEN, vRecv.end());\n+\n+        uint8_t size_or_shortid = 0;\n+        try {\n+            vRecv >> size_or_shortid;\n+        } catch (const std::ios_base::failure&) {\n+            LogPrint(BCLog::NET, \"Invalid command name\\n\");\n+        }\n+        if (size_or_shortid > 0 && size_or_shortid <= NET_P2P_V2_CMD_MAX_CHARS_SIZE && vRecv.size() >= size_or_shortid) {\n+            // first byte is a number between 1 and 12. Must be a string command.\n+            valid_header = true;\n+\n+            // use direct read since we already read the varlens size uint8_t\n+            command_name.resize(size_or_shortid);\n+            vRecv.read(&command_name[0], size_or_shortid);\n+        }\n+        // try for short ID in case the first byte is a number larger than 12\n+        if (!valid_header && size_or_shortid >= 0) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18242#discussion_r424904659",
+      "id" : 424904659,
+      "in_reply_to_id" : 424750339,
+      "line" : 822,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQyNDkwNDY1OQ==",
+      "original_commit_id" : "b9468fa767d1daa08924a9fefe5227b2f6688e53",
+      "original_line" : 822,
+      "original_position" : 125,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 125,
+      "pull_request_review_id" : 411505955,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18242",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-05-14T06:44:19Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/424904659",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/178464?v=4",
+         "events_url" : "https://api.github.com/users/jonasschnelli/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonasschnelli/followers",
+         "following_url" : "https://api.github.com/users/jonasschnelli/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonasschnelli/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonasschnelli",
+         "id" : 178464,
+         "login" : "jonasschnelli",
+         "node_id" : "MDQ6VXNlcjE3ODQ2NA==",
+         "organizations_url" : "https://api.github.com/users/jonasschnelli/orgs",
+         "received_events_url" : "https://api.github.com/users/jonasschnelli/received_events",
+         "repos_url" : "https://api.github.com/users/jonasschnelli/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonasschnelli/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonasschnelli/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonasschnelli"
+      }
    }
 ]
