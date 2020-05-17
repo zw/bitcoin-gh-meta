@@ -3120,5 +3120,61 @@
          "type" : "User",
          "url" : "https://api.github.com/users/hebasto"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18881#discussion_r426232697"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18881"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/426232697"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "@MarcoFalke \r\n\r\nI can confirm that the following patch fixes all of the memory errors mentioned in this pull:\r\n```diff\r\ndiff --git a/src/sync.cpp b/src/sync.cpp\r\nindex 41c75302d..9b99f5cfa 100644\r\n--- a/src/sync.cpp\r\n+++ b/src/sync.cpp\r\n@@ -89,7 +89,12 @@ LockData& GetLockData() {\r\n     return *lockdata;\r\n }\r\n \r\n-static thread_local LockStack g_lockstack;\r\n+LockStack& GetLockStack() {\r\n+    // This approach guarantees that the *lockstack object is not destroyed until after its last use.\r\n+    // The operating system automatically reclaims all the memory in a program's heap when that program exits.\r\n+    static thread_local LockStack* lockstack{new LockStack()};\r\n+    return *lockstack;\r\n+}\r\n \r\n static void potential_deadlock_detected(const std::pair<void*, void*>& mismatch, const LockStack& s1, const LockStack& s2)\r\n {\r\n@@ -126,16 +131,17 @@ static void push_lock(void* c, const CLockLocation& locklocation)\r\n     LockData& lockdata = GetLockData();\r\n     std::lock_guard<std::mutex> lock(lockdata.dd_mutex);\r\n \r\n-    g_lockstack.push_back(std::make_pair(c, locklocation));\r\n+    LockStack& lockstack = GetLockStack();\r\n+    lockstack.push_back(std::make_pair(c, locklocation));\r\n \r\n-    for (const std::pair<void*, CLockLocation>& i : g_lockstack) {\r\n+    for (const std::pair<void*, CLockLocation>& i : lockstack) {\r\n         if (i.first == c)\r\n             break;\r\n \r\n         std::pair<void*, void*> p1 = std::make_pair(i.first, c);\r\n         if (lockdata.lockorders.count(p1))\r\n             continue;\r\n-        lockdata.lockorders.emplace(p1, g_lockstack);\r\n+        lockdata.lockorders.emplace(p1, lockstack);\r\n \r\n         std::pair<void*, void*> p2 = std::make_pair(c, i.first);\r\n         lockdata.invlockorders.insert(p2);\r\n@@ -146,7 +152,7 @@ static void push_lock(void* c, const CLockLocation& locklocation)\r\n \r\n static void pop_lock()\r\n {\r\n-    g_lockstack.pop_back();\r\n+    GetLockStack().pop_back();\r\n }\r\n \r\n void EnterCritical(const char* pszName, const char* pszFile, int nLine, void* cs, bool fTry)\r\n@@ -156,8 +162,9 @@ void EnterCritical(const char* pszName, const char* pszFile, int nLine, void* cs\r\n \r\n void CheckLastCritical(void* cs, std::string& lockname, const char* guardname, const char* file, int line)\r\n {\r\n-    if (!g_lockstack.empty()) {\r\n-        const auto& lastlock = g_lockstack.back();\r\n+    LockStack& lockstack = GetLockStack();\r\n+    if (!lockstack.empty()) {\r\n+        const auto& lastlock = lockstack.back();\r\n         if (lastlock.first == cs) {\r\n             lockname = lastlock.second.Name();\r\n             return;\r\n@@ -174,14 +181,16 @@ void LeaveCritical()\r\n std::string LocksHeld()\r\n {\r\n     std::string result;\r\n-    for (const std::pair<void*, CLockLocation>& i : g_lockstack)\r\n+    LockStack& lockstack = GetLockStack();\r\n+    for (const std::pair<void*, CLockLocation>& i : lockstack)\r\n         result += i.second.ToString() + std::string(\"\\n\");\r\n     return result;\r\n }\r\n \r\n void AssertLockHeldInternal(const char* pszName, const char* pszFile, int nLine, void* cs)\r\n {\r\n-    for (const std::pair<void*, CLockLocation>& i : g_lockstack)\r\n+    LockStack& lockstack = GetLockStack();\r\n+    for (const std::pair<void*, CLockLocation>& i : lockstack)\r\n         if (i.first == cs)\r\n             return;\r\n     tfm::format(std::cerr, \"Assertion failed: lock %s not held in %s:%i; locks held:\\n%s\", pszName, pszFile, nLine, LocksHeld());\r\n@@ -190,7 +199,8 @@ void AssertLockHeldInternal(const char* pszName, const char* pszFile, int nLine,\r\n \r\n void AssertLockNotHeldInternal(const char* pszName, const char* pszFile, int nLine, void* cs)\r\n {\r\n-    for (const std::pair<void*, CLockLocation>& i : g_lockstack) {\r\n+    LockStack& lockstack = GetLockStack();\r\n+    for (const std::pair<void*, CLockLocation>& i : lockstack) {\r\n         if (i.first == cs) {\r\n             tfm::format(std::cerr, \"Assertion failed: lock %s held in %s:%i; locks held:\\n%s\", pszName, pszFile, nLine, LocksHeld());\r\n             abort();\r\n```\r\n\r\nGoing to investigate for any regression.",
+      "commit_id" : "6bc686839a7cc09e3586e2a47ae4f16b5d918d3a",
+      "created_at" : "2020-05-17T08:23:24Z",
+      "diff_hunk" : "@@ -78,21 +78,15 @@ typedef std::map<std::pair<void*, void*>, LockStack> LockOrders;\n typedef std::set<std::pair<void*, void*> > InvLockOrders;\n \n struct LockData {\n-    // Very ugly hack: as the global constructs and destructors run single\n-    // threaded, we use this boolean to know whether LockData still exists,\n-    // as DeleteLock can get called by global RecursiveMutex destructors\n-    // after LockData disappears.\n-    bool available;\n-    LockData() : available(true) {}\n-    ~LockData() { available = false; }\n-\n     LockOrders lockorders;\n     InvLockOrders invlockorders;\n     std::mutex dd_mutex;\n };\n LockData& GetLockData() {\n-    static LockData lockdata;\n-    return lockdata;\n+    // This approach guarantees that the *lockdata object is not destroyed until after its last use.\n+    // The operating system automatically reclaims all the memory in a program's heap when that program exits.\n+    static LockData* lockdata{new LockData()};\n+    return *lockdata;\n }\n \n static thread_local LockStack g_lockstack;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18881#discussion_r426232697",
+      "id" : 426232697,
+      "in_reply_to_id" : 423808117,
+      "line" : 92,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQyNjIzMjY5Nw==",
+      "original_commit_id" : "6bc686839a7cc09e3586e2a47ae4f16b5d918d3a",
+      "original_line" : 92,
+      "original_position" : 25,
+      "original_start_line" : null,
+      "path" : "src/sync.cpp",
+      "position" : 25,
+      "pull_request_review_id" : 413138747,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18881",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-05-17T08:23:24Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/426232697",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/32963518?v=4",
+         "events_url" : "https://api.github.com/users/hebasto/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/hebasto/followers",
+         "following_url" : "https://api.github.com/users/hebasto/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/hebasto/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/hebasto",
+         "id" : 32963518,
+         "login" : "hebasto",
+         "node_id" : "MDQ6VXNlcjMyOTYzNTE4",
+         "organizations_url" : "https://api.github.com/users/hebasto/orgs",
+         "received_events_url" : "https://api.github.com/users/hebasto/received_events",
+         "repos_url" : "https://api.github.com/users/hebasto/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/hebasto/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/hebasto/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/hebasto"
+      }
    }
 ]
