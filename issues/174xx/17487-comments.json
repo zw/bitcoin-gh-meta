@@ -3988,5 +3988,92 @@
          "type" : "User",
          "url" : "https://api.github.com/users/Sjors"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17487#discussion_r433520706"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17487"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/433520706"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "If `HaveCoinInCache()` isn't explicit enough, should it be removed from lower in the test, or is that different somehow?",
+      "commit_id" : "8d5994ef2235c6706440bc18968006cd04c22fb4",
+      "created_at" : "2020-06-01T22:21:19Z",
+      "diff_hunk" : "@@ -861,4 +879,207 @@ BOOST_AUTO_TEST_CASE(ccoins_write)\n                     CheckWriteCoins(parent_value, child_value, parent_value, parent_flags, child_flags, parent_flags);\n }\n \n+\n+Coin MakeCoin()\n+{\n+    Coin coin;\n+    coin.out.nValue = InsecureRand32();\n+    coin.nHeight = InsecureRandRange(4096);\n+    coin.fCoinBase = 0;\n+    return coin;\n+}\n+\n+\n+//! For CCoinsViewCache instances backed by either another cache instance and\n+//! leveldb, test cache behavior and flag state (DIRTY/FRESH) by\n+//!\n+//! 1. Adding a random coin to the child-most cache,\n+//! 2. Flushing all caches (without erasing),\n+//! 3. Ensure the entry still exists in the cache and has been written to parent,\n+//! 4. (if `do_erasing_flush`) Flushing the caches again (with erasing),\n+//! 5. (if `do_erasing_flush`) Ensure the entry has been written to the parent and is no longer in the cache,\n+//! 6. Spend the coin, ensure it no longer exists in the parent.\n+//!\n+void TestFlushBehavior(\n+    CCoinsViewCacheTest* view,\n+    CCoinsViewDB& base,\n+    std::vector<CCoinsViewCacheTest*>& all_caches,\n+    bool do_erasing_flush)\n+{\n+    CAmount value;\n+    char flags;\n+    uint256 txid;\n+    COutPoint outp;\n+    Coin coin;\n+    size_t cache_usage;\n+\n+    auto flush_all = [&all_caches](bool erase) {\n+        // Flush in reverse order to ensure that flushes happen from children up.\n+        for (auto i = all_caches.rbegin(); i != all_caches.rend(); ++i) {\n+            auto cache = *i;\n+            cache->SetBestBlock(InsecureRand256());  // Hack to allow flushing.\n+            erase ? cache->Flush() : cache->Sync();\n+        }\n+    };\n+\n+    txid = InsecureRand256();\n+    outp = COutPoint(txid, 0);\n+    coin = MakeCoin();\n+    // Ensure the coins views haven't seen this coin before.\n+    BOOST_CHECK(!base.HaveCoin(outp));\n+    BOOST_CHECK(!view->HaveCoin(outp));\n+\n+    // --- 1. Adding a random coin to the child cache\n+    //\n+    Coin tmpCoin{coin};\n+    view->AddCoin(outp, std::move(tmpCoin), false);\n+\n+    cache_usage = view->DynamicMemoryUsage();\n+    // `base` shouldn't have coin (no flush yet) but `view` should have cached it.\n+    BOOST_CHECK(!base.HaveCoin(outp));\n+    BOOST_CHECK(view->HaveCoin(outp));\n+\n+    GetCoinsMapEntry(view->map(), value, flags, outp);\n+    BOOST_CHECK_EQUAL(value, coin.out.nValue);\n+    BOOST_CHECK_EQUAL(flags, DIRTY|FRESH);\n+\n+    // --- 2. Flushing all caches (without erasing)\n+    //\n+    flush_all(/*erase*/ false);\n+\n+    // CoinsMap usage should be unchanged since we didn't erase anything.\n+    BOOST_CHECK_EQUAL(cache_usage, view->DynamicMemoryUsage());\n+\n+    // --- 3. Ensuring the entry still exists in the cache and has been written to parent\n+    //\n+    GetCoinsMapEntry(view->map(), value, flags, outp);\n+    BOOST_CHECK_EQUAL(value, coin.out.nValue);\n+    BOOST_CHECK_EQUAL(flags, 0);  // Flags should have been wiped.\n+\n+    // Both views should now have the coin.\n+    BOOST_CHECK(base.HaveCoin(outp));\n+    BOOST_CHECK(view->HaveCoin(outp));\n+\n+    if (do_erasing_flush) {\n+        // --- 4. Flushing the caches again (with erasing)\n+        //\n+        flush_all(/*erase*/ true);\n+\n+        // Memory usage should have gone down.\n+        BOOST_CHECK(view->DynamicMemoryUsage() < cache_usage);\n+\n+        // --- 5. Ensuring the entry is no longer in the cache\n+        //\n+        GetCoinsMapEntry(view->map(), value, flags, outp);\n+        BOOST_CHECK_EQUAL(value, ABSENT);\n+        BOOST_CHECK_EQUAL(flags, NO_ENTRY);\n+\n+        view->AccessCoin(outp);\n+        GetCoinsMapEntry(view->map(), value, flags, outp);\n+        BOOST_CHECK_EQUAL(value, coin.out.nValue);\n+        BOOST_CHECK_EQUAL(flags, 0);\n+    }\n+\n+    // Can't overwrite an entry without specifying that an overwrite is\n+    // expected.\n+    Coin tmpCoin2{coin};\n+    BOOST_CHECK_THROW(\n+        view->AddCoin(outp, std::move(tmpCoin2), /*possible_overwrite*/ false),\n+        std::logic_error);\n+\n+    // --- 6. Spend the coin.\n+    //\n+    BOOST_CHECK(view->SpendCoin(outp));\n+\n+    // The coin should be in the cache, but pruned and marked dirty.\n+    GetCoinsMapEntry(view->map(), value, flags, outp);\n+    BOOST_CHECK_EQUAL(value, PRUNED);\n+    BOOST_CHECK_EQUAL(flags, DIRTY);\n+    BOOST_CHECK(!view->HaveCoin(outp)); // Coin should be considered spent in `view`.\n+    BOOST_CHECK(base.HaveCoin(outp));  // But coin should still be unspent in `base`.\n+\n+    flush_all(/*erase*/ false);\n+\n+    // Coin should be considered spent in both views.\n+    BOOST_CHECK(!view->HaveCoin(outp));\n+    BOOST_CHECK(!base.HaveCoin(outp));\n+\n+    // Spent coin should not be spendable.\n+    BOOST_CHECK(!view->SpendCoin(outp));\n+\n+    // --- Bonus check: ensure that a coin added to the base view via one cache\n+    //     can be spent by another cache which has never seen it.\n+    //\n+    txid = InsecureRand256();\n+    outp = COutPoint(txid, 0);\n+    coin = MakeCoin();\n+    BOOST_CHECK(!base.HaveCoin(outp));\n+    BOOST_CHECK(!all_caches[0]->HaveCoin(outp));\n+    BOOST_CHECK(!all_caches[1]->HaveCoin(outp));\n+\n+    all_caches[0]->AddCoin(outp, std::move(coin), false);\n+    all_caches[0]->Sync();\n+    BOOST_CHECK(base.HaveCoin(outp));\n+    BOOST_CHECK(all_caches[0]->HaveCoin(outp));\n+    BOOST_CHECK(!all_caches[1]->HaveCoinInCache(outp));\n+\n+    BOOST_CHECK(all_caches[1]->SpendCoin(outp));\n+    flush_all(/*erase*/ false);\n+    BOOST_CHECK(!base.HaveCoin(outp));\n+    BOOST_CHECK(!all_caches[0]->HaveCoin(outp));\n+    BOOST_CHECK(!all_caches[1]->HaveCoin(outp));\n+\n+    flush_all(/*erase*/ true); // Erase all cache content.\n+\n+    // --- Bonus check 2: ensure that a FRESH coin is deleted by Sync()\n+    //\n+    txid = InsecureRand256();\n+    outp = COutPoint(txid, 0);\n+    coin = MakeCoin();\n+    BOOST_CHECK(!base.HaveCoin(outp));\n+    BOOST_CHECK(!all_caches[0]->HaveCoin(outp));\n+    BOOST_CHECK(!all_caches[1]->HaveCoin(outp));\n+\n+    // Add and spend from same cache without flushing.\n+    all_caches[0]->AddCoin(outp, std::move(coin), false);\n+\n+    // Coin should be FRESH in the cache.\n+    GetCoinsMapEntry(all_caches[0]->map(), value, flags, outp);\n+    BOOST_CHECK_EQUAL(value, coin.out.nValue);\n+    BOOST_CHECK_EQUAL(flags, DIRTY|FRESH);\n+\n+    // Base shouldn't have seen coin.\n+    BOOST_CHECK(!base.HaveCoin(outp));\n+\n+    BOOST_CHECK(all_caches[0]->SpendCoin(outp));\n+    all_caches[0]->Sync();\n+\n+    // Ensure there is no sign of the coin after spend/flush.\n+    GetCoinsMapEntry(all_caches[0]->map(), value, flags, outp);\n+    BOOST_CHECK_EQUAL(value, ABSENT);\n+    BOOST_CHECK_EQUAL(flags, NO_ENTRY);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17487#discussion_r433520706",
+      "id" : 433520706,
+      "in_reply_to_id" : 377376708,
+      "line" : 1078,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQzMzUyMDcwNg==",
+      "original_commit_id" : "eebaca7620bbd0af0ec385c6c7d47b2b4b524d55",
+      "original_line" : 1078,
+      "original_position" : 311,
+      "original_start_line" : 1058,
+      "path" : "src/test/coins_tests.cpp",
+      "position" : 306,
+      "pull_request_review_id" : 422221355,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17487",
+      "side" : "RIGHT",
+      "start_line" : 1076,
+      "start_side" : "RIGHT",
+      "updated_at" : "2020-06-01T22:21:19Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/433520706",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "utACK 8d5994ef2235c6706440bc18968006cd04c22fb4",
+      "created_at" : "2020-06-01T22:21:58Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17487#issuecomment-637156481",
+      "id" : 637156481,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/17487",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDYzNzE1NjQ4MQ==",
+      "updated_at" : "2020-06-01T22:21:58Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/637156481",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
    }
 ]
