@@ -106,7 +106,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "I'm afraid `std::to_string` is locale dependent.\r\n\r\n---\r\n\r\nFor those interested in permanently killing the locale dependency bug class, consider reviewing:\r\n* #18124 â init: Clarify C and C++ locale assumptions. Add locale sanity checks to verify assumptions at run-time\r\n* #18126 â tests: Add fuzzing harness testing the locale independence of the `strencodings.h` functions\r\n* #18147 â qt: Kill the locale dependency bug class by not allowing Qt to mess with `LC_NUMERIC`\r\n",
-      "commit_id" : "2f1becfee378b68161f308887b5e7cc823f5ed7b",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
       "created_at" : "2020-03-04T20:49:13Z",
       "diff_hunk" : "@@ -3258,6 +3403,331 @@ bool static ProcessMessage(CNode* pfrom, const std::string& strCommand, CDataStr\n         return true;\n     }\n \n+    // Received from an inbound peer planning to reconcilie transactions with us, or\n+    // from an outgoing peer demonstrating readiness to do reconciliations.\n+    // If received from outgoing, adds the peer to the reconciliation queue.\n+    if (strCommand == NetMsgType::SENDRECON) {\n+        if (!pfrom->m_tx_relay) return true;\n+        if(pfrom->m_recon_state != nullptr) return true; // Do not support reconciliation salt/version updates.\n+\n+        bool recon_sender, recon_responder;\n+        uint64_t remote_salt;\n+        uint32_t recon_version;\n+        vRecv >> recon_sender >> recon_responder >> recon_version >> remote_salt;\n+        if (recon_version != 1) return true;\n+\n+        // According to current erlay spec.\n+        if (recon_sender == recon_responder) return true;\n+\n+        if (pfrom->fInbound) {\n+            if (!recon_sender) return true;\n+            // Do not flood through inbound connections which support reconciliation to save bandwidth.\n+            pfrom->m_flood_to = false;\n+        } else {\n+            if (!recon_responder) return true;\n+            uint64_t outbound_flooding = connman->GetOutboundCountByTxRelayType(true);\n+            if (outbound_flooding > MAX_OUTBOUND_FLOOD_TO)\n+                pfrom->m_flood_to = false;\n+        }\n+\n+        pfrom->m_recon_state = MakeUnique<CNode::ReconState>();\n+        pfrom->m_recon_state->sender = recon_sender;\n+        pfrom->m_recon_state->responder = recon_responder;\n+        pfrom->m_recon_state->local_q = DEFAULT_RECON_Q;\n+\n+        uint64_t local_salt = connman->m_local_recon_salt;\n+\n+        std::string salt1, salt2;\n+        if (remote_salt < local_salt) {\n+            salt1 = std::to_string(remote_salt);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r387925726",
@@ -124,7 +124,7 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2020-04-21T19:31:17Z",
+      "updated_at" : "2020-04-28T01:04:48Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/387925726",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/7826565?v=4",
@@ -533,7 +533,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "I think that this is UB (if no wtxid for a shortid is found, there is a LogPrint, but the item is still dereferenced).\r\nWhile this should explain the strange wtxids with lots of 0s, it doesn't explain the why no mapping is found to begin with.",
-      "commit_id" : "2f1becfee378b68161f308887b5e7cc823f5ed7b",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
       "created_at" : "2020-04-21T16:19:22Z",
       "diff_hunk" : "@@ -628,6 +628,135 @@ int CNode::GetSendVersion() const\n     return nSendVersion;\n }\n \n+void CNode::FinalizeReconciliation(bool clear_local_set, LocalQAction action, uint8_t actual_local_missing, uint8_t actual_remote_missing)\n+{\n+    // According to the erlay spec, reconciliation is initiated by inbound peers.\n+    if (m_recon_state->sender) {\n+        assert(m_recon_state->incoming_recon != CNode::ReconPhase::NONE);\n+        m_recon_state->incoming_recon = CNode::ReconPhase::NONE;\n+    } else {\n+        // When reconciliation initialized by us is done, update local q for future reconciliations.\n+        if (action == LocalQAction::Q_RECOMPUTE) {\n+            assert(m_recon_state->outgoing_recon != CNode::ReconPhase::NONE);\n+            uint8_t local_set_size;\n+            if (m_recon_state->outgoing_recon == CNode::ReconPhase::BISEC_REQUESTED) {\n+                local_set_size = m_recon_state->local_set_snapshot.size();\n+            } else {\n+                local_set_size = m_recon_state->local_set.size();\n+            }\n+            uint8_t remote_set_size = local_set_size + actual_local_missing - actual_remote_missing;\n+            uint8_t set_size_diff = std::abs(local_set_size - remote_set_size);\n+            uint8_t min_size = std::min(local_set_size, remote_set_size);\n+            uint8_t actual_difference = actual_local_missing + actual_remote_missing;\n+            if (min_size != 0)\n+                m_recon_state->local_q = double(actual_difference - set_size_diff) / min_size;\n+        } else if (action == LocalQAction::Q_INCREASE) {\n+            m_recon_state->local_q *= 1.1;\n+        } else if (action == LocalQAction::Q_SET_DEFAULT) {\n+            m_recon_state->local_q = DEFAULT_RECON_Q;\n+        }\n+        m_recon_state->outgoing_recon = CNode::ReconPhase::NONE;\n+    }\n+    if (clear_local_set) m_recon_state->local_set.clear();\n+\n+    m_recon_state->local_short_id_mapping.clear();\n+    // This is currently belt-and-suspenders, as the code should work even without these calls.\n+    m_recon_state->local_set_snapshot.clear();\n+    m_recon_state->capacity_snapshot = 0;\n+    m_recon_state->remote_sketch_snapshot = nullptr;\n+    m_recon_state->local_sketch_snapshot = nullptr;\n+}\n+\n+uint32_t CNode::ComputeShortID(uint256 wtxid)\n+{\n+    uint64_t k0 = m_recon_state->salt.GetUint64(0);\n+    uint64_t k1 = m_recon_state->salt.GetUint64(1);\n+    uint64_t s = SipHashUint256(k0, k1, wtxid);\n+    uint32_t short_txid = 1 + (s & 0xFFFFFFFF);\n+    m_recon_state->local_short_id_mapping.insert(std::pair<uint32_t, uint256>(short_txid, wtxid));\n+    return short_txid;\n+}\n+\n+minisketch* CNode::ComputeSketch(bool use_own_q, BisectionChunk bisection_chunk, uint16_t capacity)\n+{\n+    std::vector<uint32_t> short_ids;\n+    if (m_recon_state->incoming_recon == ReconPhase::BISEC_REQUESTED || m_recon_state->outgoing_recon == ReconPhase::BISEC_REQUESTED) {\n+        // During bisection, all the relevant transactions are stored in the snapshot.\n+        // Original set is used to not miss transactions received during the reconciliation elsewhere.\n+        if (m_recon_state->local_set_snapshot.size() == 0) {\n+            return nullptr;\n+        }\n+        for (uint256 wtxid : m_recon_state->local_set_snapshot) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        std::vector<uint32_t> bisec_short_ids;\n+        for (uint32_t short_id : short_ids) {\n+            if (bisection_chunk == BISECTION_LOW) {\n+                if (short_id <= BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            } else {\n+                if (short_id > BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            }\n+        }\n+        short_ids = bisec_short_ids;\n+        // For bisection, use capacity used in the initial reconciliation.\n+        capacity = m_recon_state->capacity_snapshot;\n+    } else {\n+        for (uint256 wtxid : m_recon_state->local_set) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        if (capacity == 0) {\n+            // Estimate locally, as requested by the calling function.\n+            int set_size_diff = m_recon_state->local_set.size() - m_recon_state->remote_set_size;\n+            double q = use_own_q ? m_recon_state->local_q : m_recon_state->remote_q;\n+            capacity = 1 + q * fmin(m_recon_state->local_set.size(), m_recon_state->remote_set_size) +\n+                       abs(set_size_diff);\n+        }\n+        capacity = std::min(capacity, MAX_SKETCH_CAPACITY);\n+        // If bisection is required, we will use this capacity from the initial reconciliation.\n+        m_recon_state->capacity_snapshot = capacity;\n+    }\n+    if (short_ids.size() == 0) return nullptr;\n+    minisketch* sketch = minisketch_create(RECON_FIELD_SIZE, 0, capacity);\n+    for (uint32_t short_id : short_ids) {\n+        minisketch_add_uint64(sketch, short_id);\n+    }\n+    return sketch;\n+}\n+\n+std::vector<uint256> CNode::GetRelevantIDsFromShortIDs(uint64_t diff[], uint8_t diff_size, std::vector<uint32_t>& local_missing, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (int i = 0; i < diff_size; ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(diff[i]);\n+        if (local_tx != m_recon_state->local_short_id_mapping.end()) {\n+            remote_missing.push_back(local_tx->second);\n+        } else {\n+            local_missing.push_back(diff[i]);\n+        }\n+    }\n+    return remote_missing;\n+}\n+\n+std::vector<uint256> CNode::GetWTXIDsFromShortIDs(const std::vector<uint32_t> remote_missing_short_ids, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (size_t i = 0; i < remote_missing_short_ids.size(); ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(remote_missing_short_ids[i]);\n+        if (local_tx == m_recon_state->local_short_id_mapping.end()) {\n+            LogPrint(BCLog::NET, \"Unknown transaction requested by short id=%d by peer=%d\\n\", remote_missing_short_ids[i], GetId());\n+        }\n+        remote_missing.push_back(local_tx->second);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r412301986",
@@ -551,7 +551,7 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2020-04-21T19:31:17Z",
+      "updated_at" : "2020-04-28T01:04:48Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412301986",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/48763452?v=4",
@@ -586,9 +586,9 @@
             "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412342381"
          }
       },
-      "author_association" : "CONTRIBUTOR",
+      "author_association" : "MEMBER",
       "body" : "I found an issue, will commit the fix later today!\r\nBasically, sometimes reconcil. difference finding gives a false positive: it looks like a success, but some difference elements are missing.\r\nThis is just a natural property of math in minisketch. I'll submit a workaround.",
-      "commit_id" : "2f1becfee378b68161f308887b5e7cc823f5ed7b",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
       "created_at" : "2020-04-21T17:17:13Z",
       "diff_hunk" : "@@ -628,6 +628,135 @@ int CNode::GetSendVersion() const\n     return nSendVersion;\n }\n \n+void CNode::FinalizeReconciliation(bool clear_local_set, LocalQAction action, uint8_t actual_local_missing, uint8_t actual_remote_missing)\n+{\n+    // According to the erlay spec, reconciliation is initiated by inbound peers.\n+    if (m_recon_state->sender) {\n+        assert(m_recon_state->incoming_recon != CNode::ReconPhase::NONE);\n+        m_recon_state->incoming_recon = CNode::ReconPhase::NONE;\n+    } else {\n+        // When reconciliation initialized by us is done, update local q for future reconciliations.\n+        if (action == LocalQAction::Q_RECOMPUTE) {\n+            assert(m_recon_state->outgoing_recon != CNode::ReconPhase::NONE);\n+            uint8_t local_set_size;\n+            if (m_recon_state->outgoing_recon == CNode::ReconPhase::BISEC_REQUESTED) {\n+                local_set_size = m_recon_state->local_set_snapshot.size();\n+            } else {\n+                local_set_size = m_recon_state->local_set.size();\n+            }\n+            uint8_t remote_set_size = local_set_size + actual_local_missing - actual_remote_missing;\n+            uint8_t set_size_diff = std::abs(local_set_size - remote_set_size);\n+            uint8_t min_size = std::min(local_set_size, remote_set_size);\n+            uint8_t actual_difference = actual_local_missing + actual_remote_missing;\n+            if (min_size != 0)\n+                m_recon_state->local_q = double(actual_difference - set_size_diff) / min_size;\n+        } else if (action == LocalQAction::Q_INCREASE) {\n+            m_recon_state->local_q *= 1.1;\n+        } else if (action == LocalQAction::Q_SET_DEFAULT) {\n+            m_recon_state->local_q = DEFAULT_RECON_Q;\n+        }\n+        m_recon_state->outgoing_recon = CNode::ReconPhase::NONE;\n+    }\n+    if (clear_local_set) m_recon_state->local_set.clear();\n+\n+    m_recon_state->local_short_id_mapping.clear();\n+    // This is currently belt-and-suspenders, as the code should work even without these calls.\n+    m_recon_state->local_set_snapshot.clear();\n+    m_recon_state->capacity_snapshot = 0;\n+    m_recon_state->remote_sketch_snapshot = nullptr;\n+    m_recon_state->local_sketch_snapshot = nullptr;\n+}\n+\n+uint32_t CNode::ComputeShortID(uint256 wtxid)\n+{\n+    uint64_t k0 = m_recon_state->salt.GetUint64(0);\n+    uint64_t k1 = m_recon_state->salt.GetUint64(1);\n+    uint64_t s = SipHashUint256(k0, k1, wtxid);\n+    uint32_t short_txid = 1 + (s & 0xFFFFFFFF);\n+    m_recon_state->local_short_id_mapping.insert(std::pair<uint32_t, uint256>(short_txid, wtxid));\n+    return short_txid;\n+}\n+\n+minisketch* CNode::ComputeSketch(bool use_own_q, BisectionChunk bisection_chunk, uint16_t capacity)\n+{\n+    std::vector<uint32_t> short_ids;\n+    if (m_recon_state->incoming_recon == ReconPhase::BISEC_REQUESTED || m_recon_state->outgoing_recon == ReconPhase::BISEC_REQUESTED) {\n+        // During bisection, all the relevant transactions are stored in the snapshot.\n+        // Original set is used to not miss transactions received during the reconciliation elsewhere.\n+        if (m_recon_state->local_set_snapshot.size() == 0) {\n+            return nullptr;\n+        }\n+        for (uint256 wtxid : m_recon_state->local_set_snapshot) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        std::vector<uint32_t> bisec_short_ids;\n+        for (uint32_t short_id : short_ids) {\n+            if (bisection_chunk == BISECTION_LOW) {\n+                if (short_id <= BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            } else {\n+                if (short_id > BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            }\n+        }\n+        short_ids = bisec_short_ids;\n+        // For bisection, use capacity used in the initial reconciliation.\n+        capacity = m_recon_state->capacity_snapshot;\n+    } else {\n+        for (uint256 wtxid : m_recon_state->local_set) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        if (capacity == 0) {\n+            // Estimate locally, as requested by the calling function.\n+            int set_size_diff = m_recon_state->local_set.size() - m_recon_state->remote_set_size;\n+            double q = use_own_q ? m_recon_state->local_q : m_recon_state->remote_q;\n+            capacity = 1 + q * fmin(m_recon_state->local_set.size(), m_recon_state->remote_set_size) +\n+                       abs(set_size_diff);\n+        }\n+        capacity = std::min(capacity, MAX_SKETCH_CAPACITY);\n+        // If bisection is required, we will use this capacity from the initial reconciliation.\n+        m_recon_state->capacity_snapshot = capacity;\n+    }\n+    if (short_ids.size() == 0) return nullptr;\n+    minisketch* sketch = minisketch_create(RECON_FIELD_SIZE, 0, capacity);\n+    for (uint32_t short_id : short_ids) {\n+        minisketch_add_uint64(sketch, short_id);\n+    }\n+    return sketch;\n+}\n+\n+std::vector<uint256> CNode::GetRelevantIDsFromShortIDs(uint64_t diff[], uint8_t diff_size, std::vector<uint32_t>& local_missing, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (int i = 0; i < diff_size; ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(diff[i]);\n+        if (local_tx != m_recon_state->local_short_id_mapping.end()) {\n+            remote_missing.push_back(local_tx->second);\n+        } else {\n+            local_missing.push_back(diff[i]);\n+        }\n+    }\n+    return remote_missing;\n+}\n+\n+std::vector<uint256> CNode::GetWTXIDsFromShortIDs(const std::vector<uint32_t> remote_missing_short_ids, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (size_t i = 0; i < remote_missing_short_ids.size(); ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(remote_missing_short_ids[i]);\n+        if (local_tx == m_recon_state->local_short_id_mapping.end()) {\n+            LogPrint(BCLog::NET, \"Unknown transaction requested by short id=%d by peer=%d\\n\", remote_missing_short_ids[i], GetId());\n+        }\n+        remote_missing.push_back(local_tx->second);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r412342381",
@@ -607,7 +607,7 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2020-04-21T19:31:17Z",
+      "updated_at" : "2020-04-28T01:04:48Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412342381",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/7975071?v=4",
@@ -642,9 +642,9 @@
             "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412382710"
          }
       },
-      "author_association" : "CONTRIBUTOR",
+      "author_association" : "MEMBER",
       "body" : "Still not sure why it would be UB here? It just accesses the existing array element..",
-      "commit_id" : "2f1becfee378b68161f308887b5e7cc823f5ed7b",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
       "created_at" : "2020-04-21T18:13:33Z",
       "diff_hunk" : "@@ -628,6 +628,135 @@ int CNode::GetSendVersion() const\n     return nSendVersion;\n }\n \n+void CNode::FinalizeReconciliation(bool clear_local_set, LocalQAction action, uint8_t actual_local_missing, uint8_t actual_remote_missing)\n+{\n+    // According to the erlay spec, reconciliation is initiated by inbound peers.\n+    if (m_recon_state->sender) {\n+        assert(m_recon_state->incoming_recon != CNode::ReconPhase::NONE);\n+        m_recon_state->incoming_recon = CNode::ReconPhase::NONE;\n+    } else {\n+        // When reconciliation initialized by us is done, update local q for future reconciliations.\n+        if (action == LocalQAction::Q_RECOMPUTE) {\n+            assert(m_recon_state->outgoing_recon != CNode::ReconPhase::NONE);\n+            uint8_t local_set_size;\n+            if (m_recon_state->outgoing_recon == CNode::ReconPhase::BISEC_REQUESTED) {\n+                local_set_size = m_recon_state->local_set_snapshot.size();\n+            } else {\n+                local_set_size = m_recon_state->local_set.size();\n+            }\n+            uint8_t remote_set_size = local_set_size + actual_local_missing - actual_remote_missing;\n+            uint8_t set_size_diff = std::abs(local_set_size - remote_set_size);\n+            uint8_t min_size = std::min(local_set_size, remote_set_size);\n+            uint8_t actual_difference = actual_local_missing + actual_remote_missing;\n+            if (min_size != 0)\n+                m_recon_state->local_q = double(actual_difference - set_size_diff) / min_size;\n+        } else if (action == LocalQAction::Q_INCREASE) {\n+            m_recon_state->local_q *= 1.1;\n+        } else if (action == LocalQAction::Q_SET_DEFAULT) {\n+            m_recon_state->local_q = DEFAULT_RECON_Q;\n+        }\n+        m_recon_state->outgoing_recon = CNode::ReconPhase::NONE;\n+    }\n+    if (clear_local_set) m_recon_state->local_set.clear();\n+\n+    m_recon_state->local_short_id_mapping.clear();\n+    // This is currently belt-and-suspenders, as the code should work even without these calls.\n+    m_recon_state->local_set_snapshot.clear();\n+    m_recon_state->capacity_snapshot = 0;\n+    m_recon_state->remote_sketch_snapshot = nullptr;\n+    m_recon_state->local_sketch_snapshot = nullptr;\n+}\n+\n+uint32_t CNode::ComputeShortID(uint256 wtxid)\n+{\n+    uint64_t k0 = m_recon_state->salt.GetUint64(0);\n+    uint64_t k1 = m_recon_state->salt.GetUint64(1);\n+    uint64_t s = SipHashUint256(k0, k1, wtxid);\n+    uint32_t short_txid = 1 + (s & 0xFFFFFFFF);\n+    m_recon_state->local_short_id_mapping.insert(std::pair<uint32_t, uint256>(short_txid, wtxid));\n+    return short_txid;\n+}\n+\n+minisketch* CNode::ComputeSketch(bool use_own_q, BisectionChunk bisection_chunk, uint16_t capacity)\n+{\n+    std::vector<uint32_t> short_ids;\n+    if (m_recon_state->incoming_recon == ReconPhase::BISEC_REQUESTED || m_recon_state->outgoing_recon == ReconPhase::BISEC_REQUESTED) {\n+        // During bisection, all the relevant transactions are stored in the snapshot.\n+        // Original set is used to not miss transactions received during the reconciliation elsewhere.\n+        if (m_recon_state->local_set_snapshot.size() == 0) {\n+            return nullptr;\n+        }\n+        for (uint256 wtxid : m_recon_state->local_set_snapshot) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        std::vector<uint32_t> bisec_short_ids;\n+        for (uint32_t short_id : short_ids) {\n+            if (bisection_chunk == BISECTION_LOW) {\n+                if (short_id <= BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            } else {\n+                if (short_id > BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            }\n+        }\n+        short_ids = bisec_short_ids;\n+        // For bisection, use capacity used in the initial reconciliation.\n+        capacity = m_recon_state->capacity_snapshot;\n+    } else {\n+        for (uint256 wtxid : m_recon_state->local_set) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        if (capacity == 0) {\n+            // Estimate locally, as requested by the calling function.\n+            int set_size_diff = m_recon_state->local_set.size() - m_recon_state->remote_set_size;\n+            double q = use_own_q ? m_recon_state->local_q : m_recon_state->remote_q;\n+            capacity = 1 + q * fmin(m_recon_state->local_set.size(), m_recon_state->remote_set_size) +\n+                       abs(set_size_diff);\n+        }\n+        capacity = std::min(capacity, MAX_SKETCH_CAPACITY);\n+        // If bisection is required, we will use this capacity from the initial reconciliation.\n+        m_recon_state->capacity_snapshot = capacity;\n+    }\n+    if (short_ids.size() == 0) return nullptr;\n+    minisketch* sketch = minisketch_create(RECON_FIELD_SIZE, 0, capacity);\n+    for (uint32_t short_id : short_ids) {\n+        minisketch_add_uint64(sketch, short_id);\n+    }\n+    return sketch;\n+}\n+\n+std::vector<uint256> CNode::GetRelevantIDsFromShortIDs(uint64_t diff[], uint8_t diff_size, std::vector<uint32_t>& local_missing, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (int i = 0; i < diff_size; ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(diff[i]);\n+        if (local_tx != m_recon_state->local_short_id_mapping.end()) {\n+            remote_missing.push_back(local_tx->second);\n+        } else {\n+            local_missing.push_back(diff[i]);\n+        }\n+    }\n+    return remote_missing;\n+}\n+\n+std::vector<uint256> CNode::GetWTXIDsFromShortIDs(const std::vector<uint32_t> remote_missing_short_ids, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (size_t i = 0; i < remote_missing_short_ids.size(); ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(remote_missing_short_ids[i]);\n+        if (local_tx == m_recon_state->local_short_id_mapping.end()) {\n+            LogPrint(BCLog::NET, \"Unknown transaction requested by short id=%d by peer=%d\\n\", remote_missing_short_ids[i], GetId());\n+        }\n+        remote_missing.push_back(local_tx->second);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r412382710",
@@ -663,7 +663,7 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2020-04-21T19:31:17Z",
+      "updated_at" : "2020-04-28T01:04:48Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412382710",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/7975071?v=4",
@@ -700,7 +700,7 @@
       },
       "author_association" : "MEMBER",
       "body" : "You can't dereference local_tx when it is .end().",
-      "commit_id" : "2f1becfee378b68161f308887b5e7cc823f5ed7b",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
       "created_at" : "2020-04-21T18:16:16Z",
       "diff_hunk" : "@@ -628,6 +628,135 @@ int CNode::GetSendVersion() const\n     return nSendVersion;\n }\n \n+void CNode::FinalizeReconciliation(bool clear_local_set, LocalQAction action, uint8_t actual_local_missing, uint8_t actual_remote_missing)\n+{\n+    // According to the erlay spec, reconciliation is initiated by inbound peers.\n+    if (m_recon_state->sender) {\n+        assert(m_recon_state->incoming_recon != CNode::ReconPhase::NONE);\n+        m_recon_state->incoming_recon = CNode::ReconPhase::NONE;\n+    } else {\n+        // When reconciliation initialized by us is done, update local q for future reconciliations.\n+        if (action == LocalQAction::Q_RECOMPUTE) {\n+            assert(m_recon_state->outgoing_recon != CNode::ReconPhase::NONE);\n+            uint8_t local_set_size;\n+            if (m_recon_state->outgoing_recon == CNode::ReconPhase::BISEC_REQUESTED) {\n+                local_set_size = m_recon_state->local_set_snapshot.size();\n+            } else {\n+                local_set_size = m_recon_state->local_set.size();\n+            }\n+            uint8_t remote_set_size = local_set_size + actual_local_missing - actual_remote_missing;\n+            uint8_t set_size_diff = std::abs(local_set_size - remote_set_size);\n+            uint8_t min_size = std::min(local_set_size, remote_set_size);\n+            uint8_t actual_difference = actual_local_missing + actual_remote_missing;\n+            if (min_size != 0)\n+                m_recon_state->local_q = double(actual_difference - set_size_diff) / min_size;\n+        } else if (action == LocalQAction::Q_INCREASE) {\n+            m_recon_state->local_q *= 1.1;\n+        } else if (action == LocalQAction::Q_SET_DEFAULT) {\n+            m_recon_state->local_q = DEFAULT_RECON_Q;\n+        }\n+        m_recon_state->outgoing_recon = CNode::ReconPhase::NONE;\n+    }\n+    if (clear_local_set) m_recon_state->local_set.clear();\n+\n+    m_recon_state->local_short_id_mapping.clear();\n+    // This is currently belt-and-suspenders, as the code should work even without these calls.\n+    m_recon_state->local_set_snapshot.clear();\n+    m_recon_state->capacity_snapshot = 0;\n+    m_recon_state->remote_sketch_snapshot = nullptr;\n+    m_recon_state->local_sketch_snapshot = nullptr;\n+}\n+\n+uint32_t CNode::ComputeShortID(uint256 wtxid)\n+{\n+    uint64_t k0 = m_recon_state->salt.GetUint64(0);\n+    uint64_t k1 = m_recon_state->salt.GetUint64(1);\n+    uint64_t s = SipHashUint256(k0, k1, wtxid);\n+    uint32_t short_txid = 1 + (s & 0xFFFFFFFF);\n+    m_recon_state->local_short_id_mapping.insert(std::pair<uint32_t, uint256>(short_txid, wtxid));\n+    return short_txid;\n+}\n+\n+minisketch* CNode::ComputeSketch(bool use_own_q, BisectionChunk bisection_chunk, uint16_t capacity)\n+{\n+    std::vector<uint32_t> short_ids;\n+    if (m_recon_state->incoming_recon == ReconPhase::BISEC_REQUESTED || m_recon_state->outgoing_recon == ReconPhase::BISEC_REQUESTED) {\n+        // During bisection, all the relevant transactions are stored in the snapshot.\n+        // Original set is used to not miss transactions received during the reconciliation elsewhere.\n+        if (m_recon_state->local_set_snapshot.size() == 0) {\n+            return nullptr;\n+        }\n+        for (uint256 wtxid : m_recon_state->local_set_snapshot) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        std::vector<uint32_t> bisec_short_ids;\n+        for (uint32_t short_id : short_ids) {\n+            if (bisection_chunk == BISECTION_LOW) {\n+                if (short_id <= BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            } else {\n+                if (short_id > BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            }\n+        }\n+        short_ids = bisec_short_ids;\n+        // For bisection, use capacity used in the initial reconciliation.\n+        capacity = m_recon_state->capacity_snapshot;\n+    } else {\n+        for (uint256 wtxid : m_recon_state->local_set) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        if (capacity == 0) {\n+            // Estimate locally, as requested by the calling function.\n+            int set_size_diff = m_recon_state->local_set.size() - m_recon_state->remote_set_size;\n+            double q = use_own_q ? m_recon_state->local_q : m_recon_state->remote_q;\n+            capacity = 1 + q * fmin(m_recon_state->local_set.size(), m_recon_state->remote_set_size) +\n+                       abs(set_size_diff);\n+        }\n+        capacity = std::min(capacity, MAX_SKETCH_CAPACITY);\n+        // If bisection is required, we will use this capacity from the initial reconciliation.\n+        m_recon_state->capacity_snapshot = capacity;\n+    }\n+    if (short_ids.size() == 0) return nullptr;\n+    minisketch* sketch = minisketch_create(RECON_FIELD_SIZE, 0, capacity);\n+    for (uint32_t short_id : short_ids) {\n+        minisketch_add_uint64(sketch, short_id);\n+    }\n+    return sketch;\n+}\n+\n+std::vector<uint256> CNode::GetRelevantIDsFromShortIDs(uint64_t diff[], uint8_t diff_size, std::vector<uint32_t>& local_missing, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (int i = 0; i < diff_size; ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(diff[i]);\n+        if (local_tx != m_recon_state->local_short_id_mapping.end()) {\n+            remote_missing.push_back(local_tx->second);\n+        } else {\n+            local_missing.push_back(diff[i]);\n+        }\n+    }\n+    return remote_missing;\n+}\n+\n+std::vector<uint256> CNode::GetWTXIDsFromShortIDs(const std::vector<uint32_t> remote_missing_short_ids, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (size_t i = 0; i < remote_missing_short_ids.size(); ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(remote_missing_short_ids[i]);\n+        if (local_tx == m_recon_state->local_short_id_mapping.end()) {\n+            LogPrint(BCLog::NET, \"Unknown transaction requested by short id=%d by peer=%d\\n\", remote_missing_short_ids[i], GetId());\n+        }\n+        remote_missing.push_back(local_tx->second);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r412384640",
@@ -719,7 +719,7 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2020-04-21T19:31:17Z",
+      "updated_at" : "2020-04-28T01:04:48Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412384640",
       "user" : {
          "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
@@ -756,7 +756,7 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "I may be off, but if `local_tx == m_recon_state->local_short_id_mapping.end()`, `local_tx->second` is still accessed after the LogPrint - isn't that illegal? ",
-      "commit_id" : "2f1becfee378b68161f308887b5e7cc823f5ed7b",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
       "created_at" : "2020-04-21T18:23:20Z",
       "diff_hunk" : "@@ -628,6 +628,135 @@ int CNode::GetSendVersion() const\n     return nSendVersion;\n }\n \n+void CNode::FinalizeReconciliation(bool clear_local_set, LocalQAction action, uint8_t actual_local_missing, uint8_t actual_remote_missing)\n+{\n+    // According to the erlay spec, reconciliation is initiated by inbound peers.\n+    if (m_recon_state->sender) {\n+        assert(m_recon_state->incoming_recon != CNode::ReconPhase::NONE);\n+        m_recon_state->incoming_recon = CNode::ReconPhase::NONE;\n+    } else {\n+        // When reconciliation initialized by us is done, update local q for future reconciliations.\n+        if (action == LocalQAction::Q_RECOMPUTE) {\n+            assert(m_recon_state->outgoing_recon != CNode::ReconPhase::NONE);\n+            uint8_t local_set_size;\n+            if (m_recon_state->outgoing_recon == CNode::ReconPhase::BISEC_REQUESTED) {\n+                local_set_size = m_recon_state->local_set_snapshot.size();\n+            } else {\n+                local_set_size = m_recon_state->local_set.size();\n+            }\n+            uint8_t remote_set_size = local_set_size + actual_local_missing - actual_remote_missing;\n+            uint8_t set_size_diff = std::abs(local_set_size - remote_set_size);\n+            uint8_t min_size = std::min(local_set_size, remote_set_size);\n+            uint8_t actual_difference = actual_local_missing + actual_remote_missing;\n+            if (min_size != 0)\n+                m_recon_state->local_q = double(actual_difference - set_size_diff) / min_size;\n+        } else if (action == LocalQAction::Q_INCREASE) {\n+            m_recon_state->local_q *= 1.1;\n+        } else if (action == LocalQAction::Q_SET_DEFAULT) {\n+            m_recon_state->local_q = DEFAULT_RECON_Q;\n+        }\n+        m_recon_state->outgoing_recon = CNode::ReconPhase::NONE;\n+    }\n+    if (clear_local_set) m_recon_state->local_set.clear();\n+\n+    m_recon_state->local_short_id_mapping.clear();\n+    // This is currently belt-and-suspenders, as the code should work even without these calls.\n+    m_recon_state->local_set_snapshot.clear();\n+    m_recon_state->capacity_snapshot = 0;\n+    m_recon_state->remote_sketch_snapshot = nullptr;\n+    m_recon_state->local_sketch_snapshot = nullptr;\n+}\n+\n+uint32_t CNode::ComputeShortID(uint256 wtxid)\n+{\n+    uint64_t k0 = m_recon_state->salt.GetUint64(0);\n+    uint64_t k1 = m_recon_state->salt.GetUint64(1);\n+    uint64_t s = SipHashUint256(k0, k1, wtxid);\n+    uint32_t short_txid = 1 + (s & 0xFFFFFFFF);\n+    m_recon_state->local_short_id_mapping.insert(std::pair<uint32_t, uint256>(short_txid, wtxid));\n+    return short_txid;\n+}\n+\n+minisketch* CNode::ComputeSketch(bool use_own_q, BisectionChunk bisection_chunk, uint16_t capacity)\n+{\n+    std::vector<uint32_t> short_ids;\n+    if (m_recon_state->incoming_recon == ReconPhase::BISEC_REQUESTED || m_recon_state->outgoing_recon == ReconPhase::BISEC_REQUESTED) {\n+        // During bisection, all the relevant transactions are stored in the snapshot.\n+        // Original set is used to not miss transactions received during the reconciliation elsewhere.\n+        if (m_recon_state->local_set_snapshot.size() == 0) {\n+            return nullptr;\n+        }\n+        for (uint256 wtxid : m_recon_state->local_set_snapshot) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        std::vector<uint32_t> bisec_short_ids;\n+        for (uint32_t short_id : short_ids) {\n+            if (bisection_chunk == BISECTION_LOW) {\n+                if (short_id <= BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            } else {\n+                if (short_id > BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            }\n+        }\n+        short_ids = bisec_short_ids;\n+        // For bisection, use capacity used in the initial reconciliation.\n+        capacity = m_recon_state->capacity_snapshot;\n+    } else {\n+        for (uint256 wtxid : m_recon_state->local_set) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        if (capacity == 0) {\n+            // Estimate locally, as requested by the calling function.\n+            int set_size_diff = m_recon_state->local_set.size() - m_recon_state->remote_set_size;\n+            double q = use_own_q ? m_recon_state->local_q : m_recon_state->remote_q;\n+            capacity = 1 + q * fmin(m_recon_state->local_set.size(), m_recon_state->remote_set_size) +\n+                       abs(set_size_diff);\n+        }\n+        capacity = std::min(capacity, MAX_SKETCH_CAPACITY);\n+        // If bisection is required, we will use this capacity from the initial reconciliation.\n+        m_recon_state->capacity_snapshot = capacity;\n+    }\n+    if (short_ids.size() == 0) return nullptr;\n+    minisketch* sketch = minisketch_create(RECON_FIELD_SIZE, 0, capacity);\n+    for (uint32_t short_id : short_ids) {\n+        minisketch_add_uint64(sketch, short_id);\n+    }\n+    return sketch;\n+}\n+\n+std::vector<uint256> CNode::GetRelevantIDsFromShortIDs(uint64_t diff[], uint8_t diff_size, std::vector<uint32_t>& local_missing, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (int i = 0; i < diff_size; ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(diff[i]);\n+        if (local_tx != m_recon_state->local_short_id_mapping.end()) {\n+            remote_missing.push_back(local_tx->second);\n+        } else {\n+            local_missing.push_back(diff[i]);\n+        }\n+    }\n+    return remote_missing;\n+}\n+\n+std::vector<uint256> CNode::GetWTXIDsFromShortIDs(const std::vector<uint32_t> remote_missing_short_ids, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (size_t i = 0; i < remote_missing_short_ids.size(); ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(remote_missing_short_ids[i]);\n+        if (local_tx == m_recon_state->local_short_id_mapping.end()) {\n+            LogPrint(BCLog::NET, \"Unknown transaction requested by short id=%d by peer=%d\\n\", remote_missing_short_ids[i], GetId());\n+        }\n+        remote_missing.push_back(local_tx->second);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r412389472",
@@ -775,7 +775,7 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2020-04-21T19:31:17Z",
+      "updated_at" : "2020-04-28T01:04:48Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412389472",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/48763452?v=4",
@@ -810,9 +810,9 @@
             "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412404625"
          }
       },
-      "author_association" : "CONTRIBUTOR",
+      "author_association" : "MEMBER",
       "body" : "Oh, i see you are definitely right, it's a bug!",
-      "commit_id" : "2f1becfee378b68161f308887b5e7cc823f5ed7b",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
       "created_at" : "2020-04-21T18:46:18Z",
       "diff_hunk" : "@@ -628,6 +628,135 @@ int CNode::GetSendVersion() const\n     return nSendVersion;\n }\n \n+void CNode::FinalizeReconciliation(bool clear_local_set, LocalQAction action, uint8_t actual_local_missing, uint8_t actual_remote_missing)\n+{\n+    // According to the erlay spec, reconciliation is initiated by inbound peers.\n+    if (m_recon_state->sender) {\n+        assert(m_recon_state->incoming_recon != CNode::ReconPhase::NONE);\n+        m_recon_state->incoming_recon = CNode::ReconPhase::NONE;\n+    } else {\n+        // When reconciliation initialized by us is done, update local q for future reconciliations.\n+        if (action == LocalQAction::Q_RECOMPUTE) {\n+            assert(m_recon_state->outgoing_recon != CNode::ReconPhase::NONE);\n+            uint8_t local_set_size;\n+            if (m_recon_state->outgoing_recon == CNode::ReconPhase::BISEC_REQUESTED) {\n+                local_set_size = m_recon_state->local_set_snapshot.size();\n+            } else {\n+                local_set_size = m_recon_state->local_set.size();\n+            }\n+            uint8_t remote_set_size = local_set_size + actual_local_missing - actual_remote_missing;\n+            uint8_t set_size_diff = std::abs(local_set_size - remote_set_size);\n+            uint8_t min_size = std::min(local_set_size, remote_set_size);\n+            uint8_t actual_difference = actual_local_missing + actual_remote_missing;\n+            if (min_size != 0)\n+                m_recon_state->local_q = double(actual_difference - set_size_diff) / min_size;\n+        } else if (action == LocalQAction::Q_INCREASE) {\n+            m_recon_state->local_q *= 1.1;\n+        } else if (action == LocalQAction::Q_SET_DEFAULT) {\n+            m_recon_state->local_q = DEFAULT_RECON_Q;\n+        }\n+        m_recon_state->outgoing_recon = CNode::ReconPhase::NONE;\n+    }\n+    if (clear_local_set) m_recon_state->local_set.clear();\n+\n+    m_recon_state->local_short_id_mapping.clear();\n+    // This is currently belt-and-suspenders, as the code should work even without these calls.\n+    m_recon_state->local_set_snapshot.clear();\n+    m_recon_state->capacity_snapshot = 0;\n+    m_recon_state->remote_sketch_snapshot = nullptr;\n+    m_recon_state->local_sketch_snapshot = nullptr;\n+}\n+\n+uint32_t CNode::ComputeShortID(uint256 wtxid)\n+{\n+    uint64_t k0 = m_recon_state->salt.GetUint64(0);\n+    uint64_t k1 = m_recon_state->salt.GetUint64(1);\n+    uint64_t s = SipHashUint256(k0, k1, wtxid);\n+    uint32_t short_txid = 1 + (s & 0xFFFFFFFF);\n+    m_recon_state->local_short_id_mapping.insert(std::pair<uint32_t, uint256>(short_txid, wtxid));\n+    return short_txid;\n+}\n+\n+minisketch* CNode::ComputeSketch(bool use_own_q, BisectionChunk bisection_chunk, uint16_t capacity)\n+{\n+    std::vector<uint32_t> short_ids;\n+    if (m_recon_state->incoming_recon == ReconPhase::BISEC_REQUESTED || m_recon_state->outgoing_recon == ReconPhase::BISEC_REQUESTED) {\n+        // During bisection, all the relevant transactions are stored in the snapshot.\n+        // Original set is used to not miss transactions received during the reconciliation elsewhere.\n+        if (m_recon_state->local_set_snapshot.size() == 0) {\n+            return nullptr;\n+        }\n+        for (uint256 wtxid : m_recon_state->local_set_snapshot) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        std::vector<uint32_t> bisec_short_ids;\n+        for (uint32_t short_id : short_ids) {\n+            if (bisection_chunk == BISECTION_LOW) {\n+                if (short_id <= BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            } else {\n+                if (short_id > BISECTION_MEDIAN) {\n+                    bisec_short_ids.push_back(short_id);\n+                }\n+            }\n+        }\n+        short_ids = bisec_short_ids;\n+        // For bisection, use capacity used in the initial reconciliation.\n+        capacity = m_recon_state->capacity_snapshot;\n+    } else {\n+        for (uint256 wtxid : m_recon_state->local_set) {\n+            short_ids.push_back(ComputeShortID(wtxid));\n+        }\n+\n+        if (capacity == 0) {\n+            // Estimate locally, as requested by the calling function.\n+            int set_size_diff = m_recon_state->local_set.size() - m_recon_state->remote_set_size;\n+            double q = use_own_q ? m_recon_state->local_q : m_recon_state->remote_q;\n+            capacity = 1 + q * fmin(m_recon_state->local_set.size(), m_recon_state->remote_set_size) +\n+                       abs(set_size_diff);\n+        }\n+        capacity = std::min(capacity, MAX_SKETCH_CAPACITY);\n+        // If bisection is required, we will use this capacity from the initial reconciliation.\n+        m_recon_state->capacity_snapshot = capacity;\n+    }\n+    if (short_ids.size() == 0) return nullptr;\n+    minisketch* sketch = minisketch_create(RECON_FIELD_SIZE, 0, capacity);\n+    for (uint32_t short_id : short_ids) {\n+        minisketch_add_uint64(sketch, short_id);\n+    }\n+    return sketch;\n+}\n+\n+std::vector<uint256> CNode::GetRelevantIDsFromShortIDs(uint64_t diff[], uint8_t diff_size, std::vector<uint32_t>& local_missing, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (int i = 0; i < diff_size; ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(diff[i]);\n+        if (local_tx != m_recon_state->local_short_id_mapping.end()) {\n+            remote_missing.push_back(local_tx->second);\n+        } else {\n+            local_missing.push_back(diff[i]);\n+        }\n+    }\n+    return remote_missing;\n+}\n+\n+std::vector<uint256> CNode::GetWTXIDsFromShortIDs(const std::vector<uint32_t> remote_missing_short_ids, CConnman* connman)\n+{\n+    std::vector<uint256> remote_missing;\n+    for (size_t i = 0; i < remote_missing_short_ids.size(); ++i) {\n+        auto local_tx = m_recon_state->local_short_id_mapping.find(remote_missing_short_ids[i]);\n+        if (local_tx == m_recon_state->local_short_id_mapping.end()) {\n+            LogPrint(BCLog::NET, \"Unknown transaction requested by short id=%d by peer=%d\\n\", remote_missing_short_ids[i], GetId());\n+        }\n+        remote_missing.push_back(local_tx->second);",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r412404625",
@@ -831,7 +831,7 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2020-04-21T19:31:17Z",
+      "updated_at" : "2020-04-28T01:04:48Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412404625",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/7975071?v=4",
@@ -930,25 +930,25 @@
       },
       "author_association" : "CONTRIBUTOR",
       "body" : "One more potential issue: If I understand it correctly, `m_recon_state` is null if our peer does not signal Erlay support. So we should check if `m_recon_state` is non-null before accessing its members here.\r\n\r\nOtherwise an attacker could not signal Erlay but then send Erlay-specific messages to crash our node. Same applies for the other new messages `NetMsgType::SKETCH` etc. below.",
-      "commit_id" : "2f1becfee378b68161f308887b5e7cc823f5ed7b",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
       "created_at" : "2020-04-22T00:39:24Z",
       "diff_hunk" : "@@ -3417,6 +3447,274 @@ bool ProcessMessage(CNode* pfrom, const std::string& msg_type, CDataStream& vRec\n         return true;\n     }\n \n+    std::chrono::microseconds current_time = GetTime<std::chrono::microseconds>();\n+\n+    // Record an (expected) reconciliation request with parameters to respond when time comes.\n+    // All initial reconciliation responses will be done at the same time to prevent tx-related privacy leaks.\n+    if (strCommand == NetMsgType::REQRECON) {\n+        if (!pfrom->m_recon_state->sender) return true;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r412586167",
       "id" : 412586167,
-      "line" : 3455,
+      "line" : 3492,
       "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQxMjU4NjE2Nw==",
       "original_commit_id" : "0a262c092f6fe29d6964fe6fd1f1d98d08db44dd",
-      "original_line" : 3455,
+      "original_line" : 3492,
       "original_position" : 69,
       "original_start_line" : null,
       "path" : "src/net_processing.cpp",
-      "position" : 558,
+      "position" : 577,
       "pull_request_review_id" : 397767143,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18261",
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2020-04-22T00:39:24Z",
+      "updated_at" : "2020-04-28T01:04:48Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412586167",
       "user" : {
          "avatar_url" : "https://avatars2.githubusercontent.com/u/48763452?v=4",
@@ -983,28 +983,28 @@
             "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412589714"
          }
       },
-      "author_association" : "CONTRIBUTOR",
+      "author_association" : "MEMBER",
       "body" : "Definitely an issue, will address!\r\nI had asserts all over, and then was replacing them with returns, but this one requires 2 checks for m_recon_state and for sender :)",
-      "commit_id" : "2f1becfee378b68161f308887b5e7cc823f5ed7b",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
       "created_at" : "2020-04-22T00:50:10Z",
       "diff_hunk" : "@@ -3417,6 +3447,274 @@ bool ProcessMessage(CNode* pfrom, const std::string& msg_type, CDataStream& vRec\n         return true;\n     }\n \n+    std::chrono::microseconds current_time = GetTime<std::chrono::microseconds>();\n+\n+    // Record an (expected) reconciliation request with parameters to respond when time comes.\n+    // All initial reconciliation responses will be done at the same time to prevent tx-related privacy leaks.\n+    if (strCommand == NetMsgType::REQRECON) {\n+        if (!pfrom->m_recon_state->sender) return true;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r412589714",
       "id" : 412589714,
       "in_reply_to_id" : 412586167,
-      "line" : 3455,
+      "line" : 3492,
       "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQxMjU4OTcxNA==",
       "original_commit_id" : "0a262c092f6fe29d6964fe6fd1f1d98d08db44dd",
-      "original_line" : 3455,
+      "original_line" : 3492,
       "original_position" : 69,
       "original_start_line" : null,
       "path" : "src/net_processing.cpp",
-      "position" : 558,
+      "position" : 577,
       "pull_request_review_id" : 397770157,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18261",
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2020-04-22T00:50:11Z",
+      "updated_at" : "2020-04-28T01:04:48Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/412589714",
       "user" : {
          "avatar_url" : "https://avatars3.githubusercontent.com/u/7975071?v=4",
@@ -1118,6 +1118,171 @@
          "subscriptions_url" : "https://api.github.com/users/naumenkogs/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/naumenkogs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r436293837"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18261"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/436293837"
+         }
+      },
+      "author_association" : "NONE",
+      "body" : "this could say BIP 330",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
+      "created_at" : "2020-06-06T19:20:37Z",
+      "diff_hunk" : "@@ -362,12 +402,13 @@ const uint32_t MSG_TYPE_MASK    = 0xffffffff >> 2;\n  * These numbers are defined by the protocol. When adding a new value, be sure\n  * to mention it in the respective BIP.\n  */\n-enum GetDataMsg\n+enum GetDataMsg : uint32_t\n {\n     UNDEFINED = 0,\n     MSG_TX = 1,\n     MSG_BLOCK = 2,\n-    // The following can only occur in getdata. Invs always use TX or BLOCK.\n+    MSG_WTX = 5, // Defined in BIP XXX",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r436293837",
+      "id" : 436293837,
+      "line" : 410,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQzNjI5MzgzNw==",
+      "original_commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
+      "original_line" : 410,
+      "original_position" : 58,
+      "original_start_line" : null,
+      "path" : "src/protocol.h",
+      "position" : 58,
+      "pull_request_review_id" : 425762827,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18261",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-06-06T19:20:37Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/436293837",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/284023?v=4",
+         "events_url" : "https://api.github.com/users/ysangkok/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ysangkok/followers",
+         "following_url" : "https://api.github.com/users/ysangkok/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ysangkok/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ysangkok",
+         "id" : 284023,
+         "login" : "ysangkok",
+         "node_id" : "MDQ6VXNlcjI4NDAyMw==",
+         "organizations_url" : "https://api.github.com/users/ysangkok/orgs",
+         "received_events_url" : "https://api.github.com/users/ysangkok/received_events",
+         "repos_url" : "https://api.github.com/users/ysangkok/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ysangkok/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ysangkok/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ysangkok"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r436293867"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18261"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/436293867"
+         }
+      },
+      "author_association" : "NONE",
+      "body" : "also, could say BIP 330",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
+      "created_at" : "2020-06-06T19:20:59Z",
+      "diff_hunk" : "@@ -234,6 +234,46 @@ extern const char *GETBLOCKTXN;\n  * @since protocol version 70014 as described by BIP 152\n  */\n extern const char *BLOCKTXN;\n+/**\n+ * Indicates that a node prefers to relay transactions via wtxid, rather than\n+ * txid.\n+ * @since protocol version 70016 as described by BIP XXX.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r436293867",
+      "id" : 436293867,
+      "line" : 240,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQzNjI5Mzg2Nw==",
+      "original_commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
+      "original_line" : 240,
+      "original_position" : 7,
+      "original_start_line" : null,
+      "path" : "src/protocol.h",
+      "position" : 7,
+      "pull_request_review_id" : 425762847,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18261",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-06-06T19:20:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/436293867",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/284023?v=4",
+         "events_url" : "https://api.github.com/users/ysangkok/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ysangkok/followers",
+         "following_url" : "https://api.github.com/users/ysangkok/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ysangkok/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ysangkok",
+         "id" : 284023,
+         "login" : "ysangkok",
+         "node_id" : "MDQ6VXNlcjI4NDAyMw==",
+         "organizations_url" : "https://api.github.com/users/ysangkok/orgs",
+         "received_events_url" : "https://api.github.com/users/ysangkok/received_events",
+         "repos_url" : "https://api.github.com/users/ysangkok/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ysangkok/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ysangkok/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ysangkok"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r436294048"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18261"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/436294048"
+         }
+      },
+      "author_association" : "NONE",
+      "body" : "wouldn't it be better to have this guarded by an ifdef?",
+      "commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
+      "created_at" : "2020-06-06T19:23:41Z",
+      "diff_hunk" : "@@ -0,0 +1,231 @@\n+/**********************************************************************\n+ * Copyright (c) 2018 Pieter Wuille, Greg Maxwell, Gleb Naumenko      *\n+ * Distributed under the MIT software license, see the accompanying   *\n+ * file LICENSE or http://www.opensource.org/licenses/mit-license.php.*\n+ **********************************************************************/\n+\n+#include \"../include/minisketch.h\"\n+#include <string.h>\n+#include <memory>\n+#include <vector>\n+#include <algorithm>\n+#include <random>\n+#include <iostream>\n+#include <thread>\n+#include \"util.h\"\n+\n+uint64_t Combination(uint64_t n, uint64_t k) {\n+    if (n - k < k) k = n - k;\n+    uint64_t ret = 1;\n+    for (uint64_t i = 1; i <= k; ++i) {\n+        ret = (ret * n) / i;\n+        --n;\n+    }\n+    return ret;\n+}\n+\n+void TestAll(int bits, int impl, int count, uint32_t threadid, uint32_t threads, std::vector<uint64_t>& ret) {\n+    minisketch* state = minisketch_create(bits, impl, count);\n+    if (!state) return;\n+\n+    // Iterate over all (bits)-bit sketches with (count) syndromes.\n+    for (uint64_t x = threadid; (x >> (bits * count)) == 0; x += threads) {\n+        // Construct the serialization and load it.\n+        unsigned char ser[8];\n+        ser[0] = x;\n+        ser[1] = x >> 8;\n+        ser[2] = x >> 16;\n+        ser[3] = x >> 24;\n+        ser[4] = x >> 32;\n+        ser[5] = x >> 40;\n+        ser[6] = x >> 48;\n+        ser[7] = x >> 56;\n+\n+        minisketch_deserialize(state, ser);\n+\n+        // Compute all the solutions.\n+        uint64_t roots[64];\n+        int num_roots = minisketch_decode(state, 64, roots);\n+\n+        // If there are solutions:\n+        if (num_roots >= 0) {\n+            // Asking for one root less should fail.\n+            CHECK(num_roots < 1 || minisketch_decode(state, num_roots - 1, roots) == -1);\n+            // Reconstruct the sketch from the solutions.\n+            minisketch* state2 = minisketch_create(bits, 0, count);\n+            for (int i = 0; i < num_roots; ++i) {\n+                minisketch_add_uint64(state2, roots[i]);\n+            }\n+            // Serialize it.\n+            unsigned char nser[8] = {0};\n+            minisketch_serialize(state2, nser);\n+            // Compare it to the original.\n+            CHECK(memcmp(ser, nser, 8) == 0);\n+            // Count it.\n+            if (num_roots +1 >= (int)ret.size()) ret.resize(num_roots + 2);\n+            ret[num_roots + 1]++;\n+            minisketch_destroy(state2);\n+        } else {\n+            if (ret.size() == 0) ret.resize(1);\n+            ret[0]++;\n+        }\n+    }\n+    minisketch_destroy(state);\n+}\n+\n+std::vector<uint64_t> TestAll(int bits, int impl, int count, uint32_t threads) {\n+    std::vector<std::vector<uint64_t>> outputs;\n+    std::vector<std::thread> thread_list;\n+    thread_list.reserve(threads);\n+    outputs.resize(threads);\n+    for (uint32_t i = 0; i < threads; ++i) {\n+        thread_list.emplace_back([=,&outputs](){ TestAll(bits, impl, count, i, threads, outputs[i]); });\n+    }\n+    std::vector<uint64_t> ret;\n+    for (uint32_t i = 0; i < threads; ++i) {\n+        thread_list[i].join();\n+        if (ret.size() < outputs[i].size()) ret.resize(outputs[i].size());\n+        for (size_t j = 0; j < outputs[i].size(); ++j) {\n+            ret[j] += outputs[i][j];\n+        }\n+    }\n+    if (ret.size()) {\n+        for (int i = 1; i <= count + 1; ++i) {\n+            CHECK(ret[i] == Combination((uint64_t(1) << bits) - 1, i - 1));\n+        }\n+    }\n+    return ret;\n+}\n+\n+void TestRand(int bits, int impl, int count, int iter) {\n+    std::vector<uint64_t> elems(count);\n+    std::vector<uint64_t> roots(count + 1);\n+    std::random_device rnd;\n+    std::uniform_int_distribution<uint64_t> dist(1, bits == 64 ? -1 : ((uint64_t(1) << bits) - 1));\n+\n+    for (int i = 0; i < iter; ++i) {\n+        bool overfill = iter & 1; // Test some cases with overfull sketches that may not decode.\n+        minisketch* state = minisketch_create(bits, impl, count);\n+        if (!state) return;\n+        minisketch* basestate = minisketch_create(bits, 0, count);\n+        for (int j = 0; j < count + 3*overfill; ++j) {\n+            uint64_t r = dist(rnd);\n+            if (!overfill) elems[j] = r;\n+            minisketch_add_uint64(state, r);\n+            minisketch_add_uint64(basestate, r);\n+        }\n+        roots.assign(count + 1, 0);\n+        std::vector<unsigned char> data, basedata;\n+        basedata.resize(((count + 1) * bits + 7) / 8);\n+        data.resize(((count + 1) * bits + 7) / 8);\n+        minisketch_serialize(basestate, basedata.data());\n+        minisketch_serialize(state, data.data());\n+        CHECK(data == basedata);\n+        minisketch_deserialize(state, basedata.data());\n+        int num_roots = minisketch_decode(state, count + 1, roots.data());\n+        CHECK(overfill || num_roots >= 0);\n+        CHECK(num_roots < 1 || minisketch_decode(state, num_roots - 1, roots.data()) == -1); // Decoding with a too-low maximum should fail.\n+        if (!overfill) {\n+            std::sort(roots.begin(), roots.begin() + num_roots);\n+//            fprintf(stderr, \"Solut: \");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18261#discussion_r436294048",
+      "id" : 436294048,
+      "line" : 130,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQzNjI5NDA0OA==",
+      "original_commit_id" : "5f81325bf1d2a32f6dcfb9a9b8c5106af6289b9f",
+      "original_line" : 130,
+      "original_position" : 130,
+      "original_start_line" : null,
+      "path" : "src/minisketch/src/test-exhaust.cpp",
+      "position" : 130,
+      "pull_request_review_id" : 425763015,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18261",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-06-06T19:23:41Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/436294048",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/284023?v=4",
+         "events_url" : "https://api.github.com/users/ysangkok/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ysangkok/followers",
+         "following_url" : "https://api.github.com/users/ysangkok/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ysangkok/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ysangkok",
+         "id" : 284023,
+         "login" : "ysangkok",
+         "node_id" : "MDQ6VXNlcjI4NDAyMw==",
+         "organizations_url" : "https://api.github.com/users/ysangkok/orgs",
+         "received_events_url" : "https://api.github.com/users/ysangkok/received_events",
+         "repos_url" : "https://api.github.com/users/ysangkok/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ysangkok/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ysangkok/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ysangkok"
       }
    }
 ]
