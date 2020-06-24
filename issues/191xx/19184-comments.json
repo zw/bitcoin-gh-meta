@@ -1103,5 +1103,281 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jnewbery"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r444548281"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/444548281"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I didn't understand why you were defining this alias until I tried to recompile without and it barfed. Do you think a comment that this is required for the Key Extractor concept (https://www.boost.org/doc/libs/1_54_0/libs/multi_index/doc/reference/key_extraction.html#key_extractors) would help, or is this well known?",
+      "commit_id" : "1edf64025ef71125cd3bc506b7fa7125ffb1b958",
+      "created_at" : "2020-06-23T22:43:32Z",
+      "diff_hunk" : "@@ -0,0 +1,341 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_TXREQUEST_H\n+#define BITCOIN_TXREQUEST_H\n+\n+#include <crypto/siphash.h>\n+#include <uint256.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/mem_fun.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <vector>\n+\n+#include <stdint.h>\n+\n+\n+/** A functor with embedded salt that computes priority of a txid/peer combination.\n+ *\n+ * The priority is used to order candidates for a given txid; lower priority values are selected first. It has the\n+ * following properties:\n+ * - Priorities for outbound peers are always lower than inbound peers, making them always preferred.\n+ * - Within the set of outbound peers and within the set of inbound peers:\n+ *   - The very first announcement for a given txid is always lowest.\n+ *   - Announcements after the first one are ordered uniformly randomly (using a salted hash of txid/peer).\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic);\n+    uint64_t operator()(const uint256& txid, uint64_t peer, bool inbound, bool first) const\n+    {\n+        uint64_t low_bits = 0;\n+        if (!first) {\n+            low_bits = CSipHasher(m_k0, m_k1).Write(txid.begin(), txid.size()).Write(peer).Finalize() >> 1;\n+        }\n+        return low_bits | uint64_t(inbound) << 63;\n+    }\n+};\n+\n+/** Data structure to keep track of, and schedule, transaction downloads from peers.\n+ *\n+ * === High level behavior ===\n+ *\n+ * Transaction downloads are attempted in random order, first choosing among outbound peers, then inbound ones.\n+ * Inbound peers are only considered after a (configurable) inbound delay, to give time to outbound peers. When a\n+ * NOTFOUND is received, an invalid transaction is received, or a download times out (after a configurable delay),\n+ * the next candidate is immediately scheduled according to the same rules above. The same transaction is never\n+ * re-requested from the same peer, unless the transaction was forgotten about in the mean time. This happens\n+ * whenever no candidates remain, or when a transaction is successfully received.\n+ *\n+ *\n+ * === Specification ===\n+ *\n+ * The data structure maintains a collection of entries:\n+ *\n+ * - CANDIDATE (txid, peer, reqtime) entries representing txids that were announced by peer, and become available for\n+ *   download after reqtime has passed (which is immediately for outbound peers, and inbound_delay after announcement\n+ *   for inbound ones).\n+ *\n+ * - REQUESTED (txid, peer, exptime) entries representing txids that have been requested, and we're awaiting a\n+ *   response for from that peer. The exptime value determines when the request times out.\n+ *\n+ * - COMPLETED (txid, peer) entries representing txids that have been requested from a peer, but they timed out, a\n+ *   NOTFOUND message was received for them, or an invalid response was received. They're only kept around to prevent\n+ *   downloading them again. If only COMPLETED entries exist for a given txid remain (so no CANDIDATE or REQUESTED\n+ *   ones), all of them are deleted (this is an invariant, and maintained by all operations below).\n+ *\n+ * The following operations are supported on this data structure:\n+ *\n+ * - ReceivedInv(txid, peer) adds a new CANDIDATE entry, unless one already exists for that (txid, peer) combination\n+ *   (whether it's CANDIDATE, REQUESTED, or COMPLETED).\n+ *\n+ * - DeletedPeer(peer) deletes all entries for a given peer. It should be called when a peer goes offline.\n+ *\n+ * - AlreadyHaveTx(txid) deletes all entries for a given txid. It should be called when a transaction is successfully\n+ *   added to the mempool, seen in a block, or for whatever reason we no longer care about it.\n+ *\n+ * - ReceivedResponse(peer, txid) converts any CANDIDATE or REQUESTED entry to a COMPLETED one. It should be called\n+ *   whenever a transaction or NOTFOUND was received from a peer. When the transaction is acceptable, AlreadyHaveTx\n+ *   should be called instead of (or in addition to) this operation.\n+ *\n+ * - GetRequestable(peer) does the following:\n+ *   - Convert all REQUESTED entries (for all txids/peers) with (exptime <= now) to COMPLETED entries.\n+ *   - Requestable txids are selected: txids which have no REQUESTED entry, and for which this peer has the\n+ *     lowest-priority CANDIDATE entry among all CANDIDATEs with (reqtime <= now) at the time of the GetRequestable\n+ *     call. As the high bit of the priority is whether or not the peer is inbound, this will always prefer an\n+ *     outbound peer as long as one is available.\n+ *   - The selected txids are sorted in order of announcement and returned (even if multiple were added at the same\n+ *     time, or even when the clock went backwards while they were being added).\n+ *\n+ * - RequestedTx(peer, txid) converts the CANDIDATE entry for the provided peer and txid into a REQUESTED one, with\n+ *   exptime set to (now + timeout). It can ONLY be called immediately after GetRequestable was called (for the same\n+ *   peer), with only AlreadyHaveTx and other RequestedTx calls (both for other txids) in between. Any other\n+ *   non-const operation removes the ability to call RequestedTx.\n+ */\n+class TxRequestTracker {\n+    //! Configuration option: delay before downloading from inbound connection.\n+    const std::chrono::microseconds m_inbound_delay;\n+    //! Configuration option: timeout after requesting a download.\n+    const std::chrono::microseconds m_timeout;\n+\n+    //! The various states a (txid,node) pair can be in.\n+    //! Note that CANDIDATE is split up into 3 substates (NEW, BEST, OTHER), allowing more efficient implementation.\n+    //! Also note that the sorting order of EntryTxid relies on the specific order of values in this enum.\n+    enum class State : uint8_t {\n+        //! A CANDIDATE entry whose reqtime is in the future.\n+        CANDIDATE_NEW,\n+        //! The best CANDIDATE for a given txid; only if there is no REQUESTED entry already for that txid.\n+        //! The CANDIDATE_BEST is the lowest-priority entry among all CANDIDATE_OTHER (and _BEST) ones for that txid.\n+        CANDIDATE_BEST,\n+        //! A REQUESTED entry.\n+        REQUESTED,\n+        //! A CANDIDATE entry that's not CANDIDATE_NEW or CANDIDATE_BEST.\n+        CANDIDATE_OTHER,\n+        //! A COMPLETED entry.\n+        COMPLETED,\n+    };\n+\n+    //! Tag for the EntryPeer-based index.\n+    struct ByPeer {};\n+    //! Tag for the EntryTxid-based index.\n+    struct ByTxid {};\n+    //! Tag for the EntryTime-based index.\n+    struct ByTime {};\n+\n+    //! The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txid)\n+    using EntryPeer = std::tuple<uint64_t, bool, const uint256&>;\n+\n+    //! The ByTxid index is sorted by (txid, state, priority [CANDIDATE_OTHER]; 0 [otherwise])\n+    using EntryTxid = std::tuple<const uint256&, State, uint64_t>;\n+\n+    //! The ByTime index is sorted by (0 [CANDIDATE_NEW,REQUESTED]; 1 [COMPLETED];\n+    // 2 [CANDIDATE_OTHER,CANDIDATE_BEST], time)\n+    using EntryTime = std::pair<int, std::chrono::microseconds>;\n+\n+    //! The current sequence number. Increases for every announcement. This is used to sort txids returned by\n+    //! GetRequestable in announcement order.\n+    uint64_t m_sequence{0};\n+\n+    //! An announcement entry.\n+    struct Entry {\n+        //! Txid that was announced.\n+        const uint256 m_txid;\n+        //! For CANDIDATE{OTHER,_DELAYED,_BEST} the reqtime; for REQUESTED the exptime\n+        std::chrono::microseconds m_time;\n+        //! What peer the request was from.\n+        const uint64_t m_peer;\n+        //! What sequence number this announcement has.\n+        const uint64_t m_sequence : 59;\n+        //! Whether it's from an outbound peer or not.\n+        const bool m_inbound : 1;\n+        //! What state this announcement is in.\n+        State m_state : 3;\n+        //! Whether this was the very first announcement for this txid.\n+        //! It's only modified right after insertion, at which point it doesn't affect position\n+        //! in any of the indexes. Make it mutable to enable changing without triggering reindex.\n+        mutable bool m_first : 1;\n+\n+        //! Whether this entry is selected. There can be at most 1 selected peer per txid.\n+        bool IsSelected() const { return m_state == State::CANDIDATE_BEST || m_state == State::REQUESTED; }\n+\n+        //! Whether this entry is waiting for a certain time to pass.\n+        bool IsWaiting() const { return m_state == State::REQUESTED || m_state == State::CANDIDATE_NEW; }\n+\n+        //! Whether this entry can feasibly be selected if the current IsSelected() one disappears.\n+        bool IsSelectable() const { return m_state == State::CANDIDATE_OTHER || m_state == State::CANDIDATE_BEST; }\n+\n+        //! Construct a new entry from scratch\n+        Entry(const uint256& txid, uint64_t peer, bool inbound, State state, std::chrono::microseconds time, uint64_t\n+            sequence) : m_txid(txid), m_time(time), m_peer(peer), m_sequence(sequence), m_inbound(inbound),\n+            m_state(state), m_first(false) {}\n+\n+        //! Compute this Entry's priority.\n+        uint64_t ComputePriority(const PriorityComputer& computer) const\n+        {\n+            return computer(m_txid, m_peer, m_inbound, m_first);\n+        }\n+\n+        //! Extract the EntryPeer from this Entry.\n+        EntryPeer ExtractPeer() const { return EntryPeer{m_peer, m_state == State::CANDIDATE_BEST, m_txid}; }\n+\n+        //! Extract the EntryTxid from this Entry.\n+        EntryTxid ExtractTxid(const PriorityComputer& computer) const\n+        {\n+            return EntryTxid{m_txid, m_state, m_state == State::CANDIDATE_OTHER ? ComputePriority(computer) : 0};\n+        }\n+\n+        //! Extract the EntryTime from this Entry.\n+        EntryTime ExtractTime() const { return EntryTime{IsWaiting() ? 0 : IsSelectable() ? 2 : 1, m_time}; }\n+    };\n+\n+    //! This tracker's priority computer.\n+    const PriorityComputer m_computer;\n+\n+    //! An extractor for EntryTxids (with encapsulated PriorityComputer reference).\n+    struct EntryTxidExtractor {\n+    private:\n+        const PriorityComputer& m_computer;\n+    public:\n+        EntryTxidExtractor(const PriorityComputer& computer) : m_computer(computer) {}\n+        using result_type = EntryTxid;\n+        result_type operator()(const Entry& entry) const { return entry.ExtractTxid(m_computer); }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r444548281",
+      "id" : 444548281,
+      "line" : 207,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ0NDU0ODI4MQ==",
+      "original_commit_id" : "1edf64025ef71125cd3bc506b7fa7125ffb1b958",
+      "original_line" : 207,
+      "original_position" : 207,
+      "original_start_line" : 206,
+      "path" : "src/txrequest.h",
+      "position" : 207,
+      "pull_request_review_id" : 436209763,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184",
+      "side" : "RIGHT",
+      "start_line" : 206,
+      "start_side" : "RIGHT",
+      "updated_at" : "2020-06-24T00:38:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/444548281",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r444549027"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/444549027"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "`s/CANDIDATE{OTHER,_DELAYED,_BEST}/CANDIDATE_{NEW,BEST,OTHER}/`",
+      "commit_id" : "1edf64025ef71125cd3bc506b7fa7125ffb1b958",
+      "created_at" : "2020-06-23T22:45:47Z",
+      "diff_hunk" : "@@ -0,0 +1,341 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_TXREQUEST_H\n+#define BITCOIN_TXREQUEST_H\n+\n+#include <crypto/siphash.h>\n+#include <uint256.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/mem_fun.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <vector>\n+\n+#include <stdint.h>\n+\n+\n+/** A functor with embedded salt that computes priority of a txid/peer combination.\n+ *\n+ * The priority is used to order candidates for a given txid; lower priority values are selected first. It has the\n+ * following properties:\n+ * - Priorities for outbound peers are always lower than inbound peers, making them always preferred.\n+ * - Within the set of outbound peers and within the set of inbound peers:\n+ *   - The very first announcement for a given txid is always lowest.\n+ *   - Announcements after the first one are ordered uniformly randomly (using a salted hash of txid/peer).\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic);\n+    uint64_t operator()(const uint256& txid, uint64_t peer, bool inbound, bool first) const\n+    {\n+        uint64_t low_bits = 0;\n+        if (!first) {\n+            low_bits = CSipHasher(m_k0, m_k1).Write(txid.begin(), txid.size()).Write(peer).Finalize() >> 1;\n+        }\n+        return low_bits | uint64_t(inbound) << 63;\n+    }\n+};\n+\n+/** Data structure to keep track of, and schedule, transaction downloads from peers.\n+ *\n+ * === High level behavior ===\n+ *\n+ * Transaction downloads are attempted in random order, first choosing among outbound peers, then inbound ones.\n+ * Inbound peers are only considered after a (configurable) inbound delay, to give time to outbound peers. When a\n+ * NOTFOUND is received, an invalid transaction is received, or a download times out (after a configurable delay),\n+ * the next candidate is immediately scheduled according to the same rules above. The same transaction is never\n+ * re-requested from the same peer, unless the transaction was forgotten about in the mean time. This happens\n+ * whenever no candidates remain, or when a transaction is successfully received.\n+ *\n+ *\n+ * === Specification ===\n+ *\n+ * The data structure maintains a collection of entries:\n+ *\n+ * - CANDIDATE (txid, peer, reqtime) entries representing txids that were announced by peer, and become available for\n+ *   download after reqtime has passed (which is immediately for outbound peers, and inbound_delay after announcement\n+ *   for inbound ones).\n+ *\n+ * - REQUESTED (txid, peer, exptime) entries representing txids that have been requested, and we're awaiting a\n+ *   response for from that peer. The exptime value determines when the request times out.\n+ *\n+ * - COMPLETED (txid, peer) entries representing txids that have been requested from a peer, but they timed out, a\n+ *   NOTFOUND message was received for them, or an invalid response was received. They're only kept around to prevent\n+ *   downloading them again. If only COMPLETED entries exist for a given txid remain (so no CANDIDATE or REQUESTED\n+ *   ones), all of them are deleted (this is an invariant, and maintained by all operations below).\n+ *\n+ * The following operations are supported on this data structure:\n+ *\n+ * - ReceivedInv(txid, peer) adds a new CANDIDATE entry, unless one already exists for that (txid, peer) combination\n+ *   (whether it's CANDIDATE, REQUESTED, or COMPLETED).\n+ *\n+ * - DeletedPeer(peer) deletes all entries for a given peer. It should be called when a peer goes offline.\n+ *\n+ * - AlreadyHaveTx(txid) deletes all entries for a given txid. It should be called when a transaction is successfully\n+ *   added to the mempool, seen in a block, or for whatever reason we no longer care about it.\n+ *\n+ * - ReceivedResponse(peer, txid) converts any CANDIDATE or REQUESTED entry to a COMPLETED one. It should be called\n+ *   whenever a transaction or NOTFOUND was received from a peer. When the transaction is acceptable, AlreadyHaveTx\n+ *   should be called instead of (or in addition to) this operation.\n+ *\n+ * - GetRequestable(peer) does the following:\n+ *   - Convert all REQUESTED entries (for all txids/peers) with (exptime <= now) to COMPLETED entries.\n+ *   - Requestable txids are selected: txids which have no REQUESTED entry, and for which this peer has the\n+ *     lowest-priority CANDIDATE entry among all CANDIDATEs with (reqtime <= now) at the time of the GetRequestable\n+ *     call. As the high bit of the priority is whether or not the peer is inbound, this will always prefer an\n+ *     outbound peer as long as one is available.\n+ *   - The selected txids are sorted in order of announcement and returned (even if multiple were added at the same\n+ *     time, or even when the clock went backwards while they were being added).\n+ *\n+ * - RequestedTx(peer, txid) converts the CANDIDATE entry for the provided peer and txid into a REQUESTED one, with\n+ *   exptime set to (now + timeout). It can ONLY be called immediately after GetRequestable was called (for the same\n+ *   peer), with only AlreadyHaveTx and other RequestedTx calls (both for other txids) in between. Any other\n+ *   non-const operation removes the ability to call RequestedTx.\n+ */\n+class TxRequestTracker {\n+    //! Configuration option: delay before downloading from inbound connection.\n+    const std::chrono::microseconds m_inbound_delay;\n+    //! Configuration option: timeout after requesting a download.\n+    const std::chrono::microseconds m_timeout;\n+\n+    //! The various states a (txid,node) pair can be in.\n+    //! Note that CANDIDATE is split up into 3 substates (NEW, BEST, OTHER), allowing more efficient implementation.\n+    //! Also note that the sorting order of EntryTxid relies on the specific order of values in this enum.\n+    enum class State : uint8_t {\n+        //! A CANDIDATE entry whose reqtime is in the future.\n+        CANDIDATE_NEW,\n+        //! The best CANDIDATE for a given txid; only if there is no REQUESTED entry already for that txid.\n+        //! The CANDIDATE_BEST is the lowest-priority entry among all CANDIDATE_OTHER (and _BEST) ones for that txid.\n+        CANDIDATE_BEST,\n+        //! A REQUESTED entry.\n+        REQUESTED,\n+        //! A CANDIDATE entry that's not CANDIDATE_NEW or CANDIDATE_BEST.\n+        CANDIDATE_OTHER,\n+        //! A COMPLETED entry.\n+        COMPLETED,\n+    };\n+\n+    //! Tag for the EntryPeer-based index.\n+    struct ByPeer {};\n+    //! Tag for the EntryTxid-based index.\n+    struct ByTxid {};\n+    //! Tag for the EntryTime-based index.\n+    struct ByTime {};\n+\n+    //! The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txid)\n+    using EntryPeer = std::tuple<uint64_t, bool, const uint256&>;\n+\n+    //! The ByTxid index is sorted by (txid, state, priority [CANDIDATE_OTHER]; 0 [otherwise])\n+    using EntryTxid = std::tuple<const uint256&, State, uint64_t>;\n+\n+    //! The ByTime index is sorted by (0 [CANDIDATE_NEW,REQUESTED]; 1 [COMPLETED];\n+    // 2 [CANDIDATE_OTHER,CANDIDATE_BEST], time)\n+    using EntryTime = std::pair<int, std::chrono::microseconds>;\n+\n+    //! The current sequence number. Increases for every announcement. This is used to sort txids returned by\n+    //! GetRequestable in announcement order.\n+    uint64_t m_sequence{0};\n+\n+    //! An announcement entry.\n+    struct Entry {\n+        //! Txid that was announced.\n+        const uint256 m_txid;\n+        //! For CANDIDATE{OTHER,_DELAYED,_BEST} the reqtime; for REQUESTED the exptime",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r444549027",
+      "id" : 444549027,
+      "line" : 149,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ0NDU0OTAyNw==",
+      "original_commit_id" : "1edf64025ef71125cd3bc506b7fa7125ffb1b958",
+      "original_line" : 149,
+      "original_position" : 149,
+      "original_start_line" : null,
+      "path" : "src/txrequest.h",
+      "position" : 149,
+      "pull_request_review_id" : 436209763,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-06-24T00:38:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/444549027",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r444579417"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/444579417"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I don't think this will ever do anything. By the time we process this orphan transaction, we will have already called `AlreadyHaveTx()` in a `SendMessages()` call.",
+      "commit_id" : "1edf64025ef71125cd3bc506b7fa7125ffb1b958",
+      "created_at" : "2020-06-24T00:29:53Z",
+      "diff_hunk" : "@@ -1951,6 +1835,7 @@ void static ProcessOrphanTx(CConnman* connman, CTxMemPool& mempool, std::set<uin\n         if (setMisbehaving.count(fromPeer)) continue;\n         if (AcceptToMemoryPool(mempool, orphan_state, porphanTx, &removed_txn, false /* bypass_limits */, 0 /* nAbsurdFee */)) {\n             LogPrint(BCLog::MEMPOOL, \"   accepted orphan tx %s\\n\", orphanHash.ToString());\n+            g_txrequest.AlreadyHaveTx(orphanHash);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r444579417",
+      "id" : 444579417,
+      "line" : 1838,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ0NDU3OTQxNw==",
+      "original_commit_id" : "1edf64025ef71125cd3bc506b7fa7125ffb1b958",
+      "original_line" : 1838,
+      "original_position" : 206,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : 206,
+      "pull_request_review_id" : 436209763,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-06-24T00:38:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/444579417",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r444581417"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/444581417"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "There's a slight inconsistency here: if the transaction is successfully accepted to the mempool, then we call `AlreadyHaveTx()` immediately to remove it from `g_txrequest`, but if it's an orphan, then we only call `AlreadyHaveTx()` the next time a peer would potentially request it in `SendMessages()` (and I think the `AlreadyHaveTx()` call in `ProcessOrphanTx()` is basically always a no-op).\r\n\r\nFor consistency, perhaps we should only call `AlreadyHaveTx()` in `SendMessages()`.",
+      "commit_id" : "1edf64025ef71125cd3bc506b7fa7125ffb1b958",
+      "created_at" : "2020-06-24T00:37:43Z",
+      "diff_hunk" : "@@ -2817,16 +2702,14 @@ void ProcessMessage(\n \n         TxValidationState state;\n \n-        CNodeState* nodestate = State(pfrom.GetId());\n-        nodestate->m_tx_download.m_tx_announced.erase(inv.hash);\n-        nodestate->m_tx_download.m_tx_in_flight.erase(inv.hash);\n-        EraseTxRequest(inv.hash);\n+        g_txrequest.ReceivedResponse(pfrom.GetId(), inv.hash);\n \n         std::list<CTransactionRef> lRemovedTxn;\n \n         if (!AlreadyHave(inv, mempool) &&\n             AcceptToMemoryPool(mempool, state, ptx, &lRemovedTxn, false /* bypass_limits */, 0 /* nAbsurdFee */)) {\n             mempool.check(&::ChainstateActive().CoinsTip());\n+            g_txrequest.AlreadyHaveTx(inv.hash);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r444581417",
+      "id" : 444581417,
+      "line" : 2712,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ0NDU4MTQxNw==",
+      "original_commit_id" : "1edf64025ef71125cd3bc506b7fa7125ffb1b958",
+      "original_line" : 2712,
+      "original_position" : 234,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : 234,
+      "pull_request_review_id" : 436209763,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-06-24T00:38:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/444581417",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r444584736"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/444584736"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Looks like that warning is kind-of a bug in gcc (you can apparently put any value from the underlying type in the enum, and it's complaining that they won't all fit), but it's not fixed until gcc 8.4 or 9.3 -- https://gcc.gnu.org/bugzilla/show_bug.cgi?id=61414",
+      "commit_id" : "1edf64025ef71125cd3bc506b7fa7125ffb1b958",
+      "created_at" : "2020-06-24T00:50:48Z",
+      "diff_hunk" : "@@ -0,0 +1,342 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_TXREQUEST_H\n+#define BITCOIN_TXREQUEST_H\n+\n+#include <crypto/siphash.h>\n+#include <uint256.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/identity.hpp>\n+#include <boost/multi_index/mem_fun.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <vector>\n+\n+#include <stdint.h>\n+\n+\n+/** A functor with embedded salt that computes priority of a txid/peer combination.\n+ *\n+ * The priority is used to order candidates for a given txid; lower priority values are selected first. It has the\n+ * following properties:\n+ * - Priorities for outbound peers are always lower than inbound peers, making them always preferred.\n+ * - Within the set of outbound peers and within the set of inbound peers:\n+ *   - The very first announcement for a given txid is always lowest.\n+ *   - Announcements after the first one are ordered uniformly randomly (using a salted hash of txid/peer).\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic);\n+    PriorityComputer(const PriorityComputer& other) = default;\n+    uint64_t operator()(const uint256& txid, uint64_t peer, bool inbound, bool first) const\n+    {\n+        uint64_t low_bits = 0;\n+        if (!first) {\n+            low_bits = CSipHasher(m_k0, m_k1).Write(txid.begin(), txid.size()).Write(peer).Finalize() >> 1;\n+        }\n+        return low_bits | uint64_t(inbound) << 63;\n+    }\n+};\n+\n+/** Data structure to keep track of, and schedule, transaction downloads from peers.\n+ *\n+ * === High level behavior ===\n+ *\n+ * Transaction downloads are attempted in random order, first choosing among outbound peers, then inbound ones.\n+ * Inbound peers are only considered after a (configurable) inbound delay, to give time to outbound peers. When a\n+ * NOTFOUND is received, an invalid transaction is received, or a download times out (after a configurable delay),\n+ * the next candidate is immediately scheduled according to the same rules above. The same transaction is never\n+ * re-requested from the same peer, unless the transaction was forgotten about in the mean time. This happens\n+ * whenever no candidates remain, or when a transaction is succesfully received.\n+ *\n+ *\n+ * === Specification ===\n+ *\n+ * The data structure maintains a collection of entries:\n+ *\n+ * - CANDIDATE (txid, peer, reqtime) entries representing txids that were announced by peer, and become available for\n+ *   download after reqtime has passed (which is immediately for outbound peers, and inbound_delay after announcement\n+ *   for inbound ones).\n+ *\n+ * - REQUESTED (txid, peer, exptime) entries representing txids that have been requested, and we're awaiting a response\n+ *   for from that peer. The exptime value determines when the request times out.\n+ *\n+ * - COMPLETED (txid, peer) entries representing txids that have been requested from a peer, but they timed out, a\n+ *   NOTFOUND message was received for them, or an invalid response was received. They're only kept around to prevent\n+ *   downloading them again. If only COMPLETED entries exist for a given txid remain (so no CANDIDATE or REQUESTED\n+ *   ones), all of them are deleted (this is an invariant, and maintained by all operations below).\n+ *\n+ * The following operations are supported on this data structure:\n+ *\n+ * - ReceivedInv(txid, peer) adds a new CANDIDATE entry, unless one already exists for that (txid, peer) combination\n+ *   (whether it's CANDIDATE, REQUESTED, or COMPLETED).\n+ *\n+ * - DeletedPeer(peer) deletes all entries for a given peer. It should be called when a peer goes offline.\n+ *\n+ * - AlreadyHaveTx(txid) deletes all entries for a given txid. It should be called when a transaction is succesfully\n+ *   added to the mempool, seen in a block, or for whatever reason we no longer care about it.\n+ *\n+ * - ReceivedResponse(peer, txid) converts any CANDIDATE or REQUESTED entry to a COMPLETED one. It should be called\n+ *   whenever a transaction or NOTFOUND was received from a peer. When the transaction is acceptable, AlreadyHaveTx\n+ *   should be called instead of (or in addition to) this operation.\n+\n+ * - GetRequestable(peer) does the following:\n+ *   - Convert all REQUESTED entries (for all txids/peers) with (exptime <= now) to COMPLETED entries.\n+ *   - Requestable txids are selected: txids which have no REQUESTED entry, and for which this peer has the\n+ *     lowest-priority CANDIDATE entry among all CANDIDATEs with (reqtime <= now) at the time of the GetRequestable\n+ *     call. As the high bit of the priority is whether or not the peer is inbound, this will always prefer an\n+ *     outbound peer as long as one is available.\n+ *   - The selected txids are sorted in order of announcement and returned (even if multiple were added at the same\n+ *     time, or even when the clock went backwards while they were being added).\n+ *\n+ * - RequestedTx(peer, txid) converts the CANDIDATE entry for the provided peer and txid into a REQUESTED one, with\n+ *   exptime set to (now + timeout). It can ONLY be called immediately after GetRequestable was called (for the same\n+ *   peer), with only AlreadyHaveTx and other RequestedTx calls (both for other txids) in between. Any other\n+ *   non-const operation removes the ability to call RequestedTx.\n+ */\n+class TxRequestTracker {\n+    //! Configuration option: delay before downloading from inbound connection.\n+    const std::chrono::microseconds m_inbound_delay;\n+    //! Configuration option: timeout after requesting a download.\n+    const std::chrono::microseconds m_timeout;\n+\n+    //! The various states a (txid,node) pair can be in.\n+    //! Note that CANDIDATE is split up into 3 substates (NEW, BEST, OTHER), allowing more efficient implementation.\n+    enum class State : uint8_t {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r444584736",
+      "id" : 444584736,
+      "in_reply_to_id" : 443051085,
+      "line" : 110,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ0NDU4NDczNg==",
+      "original_commit_id" : "0b836eafc029127b42e699d579cdecb985b938b7",
+      "original_line" : 110,
+      "original_position" : 111,
+      "original_start_line" : null,
+      "path" : "src/txrequest.h",
+      "position" : 110,
+      "pull_request_review_id" : 436253001,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-06-24T00:50:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/444584736",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
    }
 ]
