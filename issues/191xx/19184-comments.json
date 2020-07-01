@@ -2476,5 +2476,116 @@
          "type" : "User",
          "url" : "https://api.github.com/users/sipa"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r448636680"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/448636680"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "c204530ae289c263f0a9b791bbcd031a552c3253\r\n\r\n> and std::next(it) may be deleted in the process\r\n\r\nAnd is it safe to use `it` if next is erased? Otherwise I was expecting `lower_bound` call in each iteration.",
+      "commit_id" : "c8cde8b61c9a2d8a923528384d24beb6f3687bb4",
+      "created_at" : "2020-07-01T21:55:15Z",
+      "diff_hunk" : "@@ -0,0 +1,241 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <random.h>\n+#include <uint256.h>\n+\n+#include <chrono>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+PriorityComputer::PriorityComputer(bool deterministic) :\n+    m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+    m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+TxRequestTracker::TxRequestTracker(std::chrono::microseconds inbound_delay, std::chrono::microseconds timeout,\n+    bool deterministic) :\n+    m_inbound_delay(inbound_delay),\n+    m_timeout(timeout),\n+    m_computer(deterministic),\n+    // Explicitly initialize m_index as we need to pass a reference to m_computer to\n+    // EntryTxidExtractor.\n+    m_index(boost::make_tuple(\n+        boost::make_tuple(\n+            boost::multi_index::const_mem_fun<Entry, EntryPeer, &Entry::ExtractPeer>(),\n+            std::less<EntryPeer>()\n+        ),\n+        boost::make_tuple(\n+            EntryTxidExtractor(m_computer),\n+            std::less<EntryTxid>()\n+        ),\n+        boost::make_tuple(\n+            boost::multi_index::const_mem_fun<Entry, EntryTime, &Entry::ExtractTime>(),\n+            std::less<EntryTime>()\n+        )\n+    )) {}\n+\n+void TxRequestTracker::PromoteCandidateNew(typename TxRequestTracker::Index::index<ByTxid>::type::iterator it)\n+{\n+    assert(it->GetState() == State::CANDIDATE_NEW);\n+    // Convert CANDIDATE_NEW to CANDIDATE_OTHER first.\n+    Modify<ByTxid>(it, [](Entry& entry){ entry.SetState(State::CANDIDATE_OTHER); });\n+    // The following code relies on the fact that the ByTxid is sorted by txid, and then by state (first _NEW, then\n+    // _BEST/REQUESTED, then _OTHER). Within the _OTHER entries, the best one (lowest priority) comes first. Thus, if\n+    // an existing _BEST exists for the same txid that this entry may be preferred over, it must immediately precede\n+    // the newly created _OTHER.\n+    if (it == m_index.get<ByTxid>().begin() || std::prev(it)->m_txid != it->m_txid ||\n+        std::prev(it)->GetState() == State::CANDIDATE_NEW) {\n+        // This is the new best CANDIDATE_OTHER, and there is no IsSelected() entry for this txid already.\n+        Modify<ByTxid>(it, [](Entry& entry){ entry.SetState(State::CANDIDATE_BEST); });\n+    } else if (std::prev(it)->GetState() == State::CANDIDATE_BEST) {\n+        uint64_t priority_old = std::prev(it)->ComputePriority(m_computer);\n+        uint64_t priority_new = it->ComputePriority(m_computer);\n+        if (priority_new < priority_old) {\n+            // There is a CANDIDATE_BEST entry already, but this one is better.\n+            Modify<ByTxid>(std::prev(it), [](Entry& entry){ entry.SetState(State::CANDIDATE_OTHER); });\n+            Modify<ByTxid>(it, [](Entry& entry){ entry.SetState(State::CANDIDATE_BEST); });\n+        }\n+    }\n+}\n+\n+void TxRequestTracker::ChangeAndReselect(typename TxRequestTracker::Index::index<ByTxid>::type::iterator it,\n+    TxRequestTracker::State new_state)\n+{\n+    if (it->IsSelected()) {\n+        auto it_next = std::next(it);\n+        // The next best CANDIDATE_OTHER, if any, immediately follows the REQUESTED or CANDIDATE_BEST entry in the\n+        // ByTxid index.\n+        if (it_next != m_index.get<ByTxid>().end() && it_next->m_txid == it->m_txid &&\n+            it_next->GetState() == State::CANDIDATE_OTHER) {\n+            // If one such CANDIDATE_OTHER exists (for this txid), convert it to CANDIDATE_BEST.\n+            Modify<ByTxid>(it_next, [](Entry& entry){ entry.SetState(State::CANDIDATE_BEST); });\n+        }\n+    }\n+    Modify<ByTxid>(it, [new_state](Entry& entry){ entry.SetState(new_state); });\n+    assert(!it->IsSelected());\n+}\n+\n+bool TxRequestTracker::MakeCompleted(typename TxRequestTracker::Index::index<ByTxid>::type::iterator it)\n+{\n+    // Nothing to be done if it's already COMPLETED.\n+    if (it->GetState() == State::COMPLETED) return true;\n+\n+    if ((it == m_index.get<ByTxid>().begin() || std::prev(it)->m_txid != it->m_txid) &&\n+        (std::next(it) == m_index.get<ByTxid>().end() || std::next(it)->m_txid != it->m_txid ||\n+        std::next(it)->GetState() == State::COMPLETED)) {\n+        // This is the first entry for this txid, and the last non-COMPLETED one. There are only COMPLETED ones left.\n+        // Delete them all.\n+        uint256 txid = it->m_txid;\n+        do {\n+            it = Erase<ByTxid>(it);\n+        } while (it != m_index.get<ByTxid>().end() && it->m_txid == txid);\n+        return false;\n+    }\n+\n+    // Mark the entry COMPLETED, and select the best best entry if needed.\n+    ChangeAndReselect(it, State::COMPLETED);\n+\n+    return true;\n+}\n+\n+void TxRequestTracker::SetTimePoint(std::chrono::microseconds now)\n+{\n+    // Iterate over all CANDIDATE_NEW and REQUESTED from old to new, as long as they're in the past,\n+    // and convert them to CANDIDATE_OTHER and COMPLETED respectively.\n+    while (!m_index.empty()) {\n+        auto it = m_index.get<ByTime>().begin();\n+        if (it->GetState() == State::CANDIDATE_NEW && it->m_time <= now) {\n+            PromoteCandidateNew(m_index.project<ByTxid>(it));\n+        } else if (it->GetState() == State::REQUESTED && it->m_time <= now) {\n+            MakeCompleted(m_index.project<ByTxid>(it));\n+        } else {\n+            break;\n+        }\n+    }\n+\n+    while (!m_index.empty()) {\n+        // If time went backwards, we may need to demote CANDIDATE_BEST and CANDIDATE_OTHER entries back\n+        // to CANDIDATE_NEW. This is an unusual edge case, and unlikely to matter in production. However,\n+        // it makes it much easier to specify and test TxRequestTracker's behaviour.\n+        auto it = std::prev(m_index.get<ByTime>().end());\n+        if (it->IsSelectable() && it->m_time > now) {\n+            ChangeAndReselect(m_index.project<ByTxid>(it), State::CANDIDATE_NEW);\n+        } else {\n+            break;\n+        }\n+    }\n+}\n+\n+void TxRequestTracker::AlreadyHaveTx(const uint256& txid)\n+{\n+    auto it = m_index.get<ByTxid>().lower_bound(EntryTxid{txid, State::CANDIDATE_NEW, 0});\n+    while (it != m_index.get<ByTxid>().end() && it->m_txid == txid) {\n+        it = Erase<ByTxid>(it);\n+    }\n+}\n+\n+static const uint256 UINT256_ZERO;\n+\n+void TxRequestTracker::DeletedPeer(uint64_t peer)\n+{\n+    auto& index = m_index.get<ByPeer>();\n+    auto it = index.lower_bound(EntryPeer{peer, false, UINT256_ZERO});\n+    while (it != index.end() && it->m_peer == peer) {\n+        // Check what to continue with after this iteration. Note that 'it' may change position, and std::next(it)\n+        // may be deleted in the process, so this needs to be decided beforehand.\n+        auto it_next = (std::next(it) == index.end() || std::next(it)->m_peer != peer) ? index.end() : std::next(it);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r448636680",
+      "id" : 448636680,
+      "line" : 152,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ0ODYzNjY4MA==",
+      "original_commit_id" : "c204530ae289c263f0a9b791bbcd031a552c3253",
+      "original_line" : 152,
+      "original_position" : 152,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 152,
+      "pull_request_review_id" : 441221565,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-07-01T22:13:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/448636680",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/3534524?v=4",
+         "events_url" : "https://api.github.com/users/promag/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/promag/followers",
+         "following_url" : "https://api.github.com/users/promag/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/promag/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/promag",
+         "id" : 3534524,
+         "login" : "promag",
+         "node_id" : "MDQ6VXNlcjM1MzQ1MjQ=",
+         "organizations_url" : "https://api.github.com/users/promag/orgs",
+         "received_events_url" : "https://api.github.com/users/promag/received_events",
+         "repos_url" : "https://api.github.com/users/promag/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/promag/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/promag/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/promag"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r448645723"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/448645723"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Yes, iterator validation for multi_index entries is like std::set; erasing entries does not affect the validity of iterators to other entries.",
+      "commit_id" : "c8cde8b61c9a2d8a923528384d24beb6f3687bb4",
+      "created_at" : "2020-07-01T22:20:50Z",
+      "diff_hunk" : "@@ -0,0 +1,241 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <random.h>\n+#include <uint256.h>\n+\n+#include <chrono>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+PriorityComputer::PriorityComputer(bool deterministic) :\n+    m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+    m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+TxRequestTracker::TxRequestTracker(std::chrono::microseconds inbound_delay, std::chrono::microseconds timeout,\n+    bool deterministic) :\n+    m_inbound_delay(inbound_delay),\n+    m_timeout(timeout),\n+    m_computer(deterministic),\n+    // Explicitly initialize m_index as we need to pass a reference to m_computer to\n+    // EntryTxidExtractor.\n+    m_index(boost::make_tuple(\n+        boost::make_tuple(\n+            boost::multi_index::const_mem_fun<Entry, EntryPeer, &Entry::ExtractPeer>(),\n+            std::less<EntryPeer>()\n+        ),\n+        boost::make_tuple(\n+            EntryTxidExtractor(m_computer),\n+            std::less<EntryTxid>()\n+        ),\n+        boost::make_tuple(\n+            boost::multi_index::const_mem_fun<Entry, EntryTime, &Entry::ExtractTime>(),\n+            std::less<EntryTime>()\n+        )\n+    )) {}\n+\n+void TxRequestTracker::PromoteCandidateNew(typename TxRequestTracker::Index::index<ByTxid>::type::iterator it)\n+{\n+    assert(it->GetState() == State::CANDIDATE_NEW);\n+    // Convert CANDIDATE_NEW to CANDIDATE_OTHER first.\n+    Modify<ByTxid>(it, [](Entry& entry){ entry.SetState(State::CANDIDATE_OTHER); });\n+    // The following code relies on the fact that the ByTxid is sorted by txid, and then by state (first _NEW, then\n+    // _BEST/REQUESTED, then _OTHER). Within the _OTHER entries, the best one (lowest priority) comes first. Thus, if\n+    // an existing _BEST exists for the same txid that this entry may be preferred over, it must immediately precede\n+    // the newly created _OTHER.\n+    if (it == m_index.get<ByTxid>().begin() || std::prev(it)->m_txid != it->m_txid ||\n+        std::prev(it)->GetState() == State::CANDIDATE_NEW) {\n+        // This is the new best CANDIDATE_OTHER, and there is no IsSelected() entry for this txid already.\n+        Modify<ByTxid>(it, [](Entry& entry){ entry.SetState(State::CANDIDATE_BEST); });\n+    } else if (std::prev(it)->GetState() == State::CANDIDATE_BEST) {\n+        uint64_t priority_old = std::prev(it)->ComputePriority(m_computer);\n+        uint64_t priority_new = it->ComputePriority(m_computer);\n+        if (priority_new < priority_old) {\n+            // There is a CANDIDATE_BEST entry already, but this one is better.\n+            Modify<ByTxid>(std::prev(it), [](Entry& entry){ entry.SetState(State::CANDIDATE_OTHER); });\n+            Modify<ByTxid>(it, [](Entry& entry){ entry.SetState(State::CANDIDATE_BEST); });\n+        }\n+    }\n+}\n+\n+void TxRequestTracker::ChangeAndReselect(typename TxRequestTracker::Index::index<ByTxid>::type::iterator it,\n+    TxRequestTracker::State new_state)\n+{\n+    if (it->IsSelected()) {\n+        auto it_next = std::next(it);\n+        // The next best CANDIDATE_OTHER, if any, immediately follows the REQUESTED or CANDIDATE_BEST entry in the\n+        // ByTxid index.\n+        if (it_next != m_index.get<ByTxid>().end() && it_next->m_txid == it->m_txid &&\n+            it_next->GetState() == State::CANDIDATE_OTHER) {\n+            // If one such CANDIDATE_OTHER exists (for this txid), convert it to CANDIDATE_BEST.\n+            Modify<ByTxid>(it_next, [](Entry& entry){ entry.SetState(State::CANDIDATE_BEST); });\n+        }\n+    }\n+    Modify<ByTxid>(it, [new_state](Entry& entry){ entry.SetState(new_state); });\n+    assert(!it->IsSelected());\n+}\n+\n+bool TxRequestTracker::MakeCompleted(typename TxRequestTracker::Index::index<ByTxid>::type::iterator it)\n+{\n+    // Nothing to be done if it's already COMPLETED.\n+    if (it->GetState() == State::COMPLETED) return true;\n+\n+    if ((it == m_index.get<ByTxid>().begin() || std::prev(it)->m_txid != it->m_txid) &&\n+        (std::next(it) == m_index.get<ByTxid>().end() || std::next(it)->m_txid != it->m_txid ||\n+        std::next(it)->GetState() == State::COMPLETED)) {\n+        // This is the first entry for this txid, and the last non-COMPLETED one. There are only COMPLETED ones left.\n+        // Delete them all.\n+        uint256 txid = it->m_txid;\n+        do {\n+            it = Erase<ByTxid>(it);\n+        } while (it != m_index.get<ByTxid>().end() && it->m_txid == txid);\n+        return false;\n+    }\n+\n+    // Mark the entry COMPLETED, and select the best best entry if needed.\n+    ChangeAndReselect(it, State::COMPLETED);\n+\n+    return true;\n+}\n+\n+void TxRequestTracker::SetTimePoint(std::chrono::microseconds now)\n+{\n+    // Iterate over all CANDIDATE_NEW and REQUESTED from old to new, as long as they're in the past,\n+    // and convert them to CANDIDATE_OTHER and COMPLETED respectively.\n+    while (!m_index.empty()) {\n+        auto it = m_index.get<ByTime>().begin();\n+        if (it->GetState() == State::CANDIDATE_NEW && it->m_time <= now) {\n+            PromoteCandidateNew(m_index.project<ByTxid>(it));\n+        } else if (it->GetState() == State::REQUESTED && it->m_time <= now) {\n+            MakeCompleted(m_index.project<ByTxid>(it));\n+        } else {\n+            break;\n+        }\n+    }\n+\n+    while (!m_index.empty()) {\n+        // If time went backwards, we may need to demote CANDIDATE_BEST and CANDIDATE_OTHER entries back\n+        // to CANDIDATE_NEW. This is an unusual edge case, and unlikely to matter in production. However,\n+        // it makes it much easier to specify and test TxRequestTracker's behaviour.\n+        auto it = std::prev(m_index.get<ByTime>().end());\n+        if (it->IsSelectable() && it->m_time > now) {\n+            ChangeAndReselect(m_index.project<ByTxid>(it), State::CANDIDATE_NEW);\n+        } else {\n+            break;\n+        }\n+    }\n+}\n+\n+void TxRequestTracker::AlreadyHaveTx(const uint256& txid)\n+{\n+    auto it = m_index.get<ByTxid>().lower_bound(EntryTxid{txid, State::CANDIDATE_NEW, 0});\n+    while (it != m_index.get<ByTxid>().end() && it->m_txid == txid) {\n+        it = Erase<ByTxid>(it);\n+    }\n+}\n+\n+static const uint256 UINT256_ZERO;\n+\n+void TxRequestTracker::DeletedPeer(uint64_t peer)\n+{\n+    auto& index = m_index.get<ByPeer>();\n+    auto it = index.lower_bound(EntryPeer{peer, false, UINT256_ZERO});\n+    while (it != index.end() && it->m_peer == peer) {\n+        // Check what to continue with after this iteration. Note that 'it' may change position, and std::next(it)\n+        // may be deleted in the process, so this needs to be decided beforehand.\n+        auto it_next = (std::next(it) == index.end() || std::next(it)->m_peer != peer) ? index.end() : std::next(it);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19184#discussion_r448645723",
+      "id" : 448645723,
+      "in_reply_to_id" : 448636680,
+      "line" : 152,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ0ODY0NTcyMw==",
+      "original_commit_id" : "c204530ae289c263f0a9b791bbcd031a552c3253",
+      "original_line" : 152,
+      "original_position" : 152,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 152,
+      "pull_request_review_id" : 441232686,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19184",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-07-01T22:43:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/448645723",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
    }
 ]
