@@ -62,5 +62,37 @@
          "type" : "User",
          "url" : "https://api.github.com/users/theuni"
       }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "> Nice find. Though I don't understand the interaction with lto or #19530 ?\r\n\r\nThe interaction is that at least when building a dylib, and using LTO, LLVM adds some actions to the compiler runtime which invoke `dsymutil`. You can test this by building #19530 + [your patch](https://github.com/bitcoin/bitcoin/pull/19530#issuecomment-660166898) and doing a libconsensus build (I've trimmed some other warnings that aren't relevant to this PR):\r\n```bash\r\nmake -C depends/ -j6 HOST=x86_64-apple-darwin16\r\n./autogen.sh\r\n./configure --prefix=/bitcoin/depends/x86_64-apple-darwin16 --with-gui=no --disable-wallet --disable-tests --disable-bench --with-utils=no --with-daemon=no --with-libs=yes\r\nmake -j8\r\n...\r\nmake[3]: Leaving directory '/bitcoin/src/secp256k1'\r\n  CXXLD    libbitcoinconsensus.la\r\n../libtool: line 10643: x86_64-apple-darwin16-dsymutil: command not found\r\nmake[2]: Leaving directory '/bitcoin/src'\r\n```\r\n\r\nWith this patch, `dsymutil` is found, but unless you're building for debugging it's not really interesting, so I also tried that.\r\n\r\nWhen building #19530 + your patch + this PR and `--enable-debug` I'd end up with warnings and an empty .dSYM:\r\n```bash\r\n./autogen.sh\r\n./configure --prefix=/bitcoin/depends/x86_64-apple-darwin16 --with-gui=no --disable-wallet --disable-tests --disable-bench --with-utils=no --with-daemon=no --with-libs=yes --enable-debug\r\nmake -j8 V=1\r\n...\r\nlibtool: link: /bitcoin/depends/x86_64-apple-darwin16/share/../native/bin/x86_64-apple-darwin16-dsymutil .libs/libbitcoinconsensus.0.dylib || :\r\nwarning: (x86_64) /tmp/lto.o unable to open object file: No such file or directory\r\n<snip>\r\nwarning: (x86_64) /tmp/lto.o unable to open object file: No such file or directory\r\nwarning: no debug symbols in executable (-arch x86_64)\r\nlibtool: link: (cd \".libs\" && rm -f \"libbitcoinconsensus.dylib\" && ln -s \"libbitcoinconsensus.0.dylib\" \"libbitcoinconsensus.dylib\")\r\n```\r\n\r\nThe solution seemed to be to pass `-object_path_lto` through to `ld64`. Doing that I end up with a properly generated `.dSYM`:\r\n```bash\r\n./autogen.sh\r\n./configure --prefix=/bitcoin/depends/x86_64-apple-darwin16 --with-gui=no --disable-wallet --disable-tests --disable-bench --with-utils=no --with-daemon=no --with-libs=yes --enable-debug LDFLAGS=\"-Wl,-object_path_lto /temp_dir\"\r\nmake -j8\r\n...\r\nllvm-dwarfdump-7 src/.libs/libbitcoinconsensus.0.dylib.dSYM\r\nsrc/.libs/libbitcoinconsensus.0.dylib.dSYM/Contents/Resources/DWARF/libbitcoinconsensus.0.dylib:\tfile format Mach-O 64-bit x86-64\r\n\r\n.debug_info contents:\r\n0x00000000: Compile Unit: length = 0x0000036c version = 0x0004 abbr_offset = 0x0000 addr_size = 0x08 (next unit at 0x00000370)\r\n\r\n0x0000000b: DW_TAG_compile_unit\r\n              DW_AT_producer\t(\"clang version 8.0.0 (tags/RELEASE_800/final)\")\r\n              DW_AT_language\t(DW_LANG_C_plus_plus)\r\n              DW_AT_name\t(\"support/cleanse.cpp\")\r\n              DW_AT_stmt_list\t(0x00000000)\r\n              DW_AT_comp_dir\t(\"/bitcoin/src\")\r\n              DW_AT_GNU_pubnames\t(true)\r\n              DW_AT_APPLE_optimized\t(true)\r\n              DW_AT_low_pc\t(0x0000000000000fc0)\r\n              DW_AT_high_pc\t(0x0000000000000ff8)\r\n\r\n0x0000002a:   DW_TAG_namespace\r\n                DW_AT_name\t(\"std\")\r\n\r\n0x0000002f:     DW_TAG_namespace\r\n                  DW_AT_name\t(\"__1\")\r\n                  DW_AT_export_symbols\t(true)\r\n\r\n0x00000034:       DW_TAG_imported_declaration\r\n                    DW_AT_decl_file\t(\"/bitcoin/depends/SDKs/Xcode-11.3.1-11C505-extracted-SDK-with-libcxx-headers/usr/include/c++/v1/cstring\")\r\n                    DW_AT_decl_line\t(69)\r\n                    DW_AT_import\t(0x00000000000000d7)\r\n<snip>\r\n0x00000620:   DW_TAG_const_type\r\n                DW_AT_type\t(0x00000000000005d9 \"AES_state\")\r\n\r\n0x00000625:   DW_TAG_subprogram\r\n                DW_AT_linkage_name\t(\"_ZL17KeySetupTransformP9AES_statePKS_\")\r\n                DW_AT_name\t(\"KeySetupTransform\")\r\n                DW_AT_decl_file\t(\"/bitcoin/src/./crypto/ctaes/ctaes.c\")\r\n                DW_AT_decl_line\t(378)\r\n                DW_AT_APPLE_optimized\t(true)\r\n                DW_AT_inline\t(DW_INL_inlined)\r\n```\r\n\r\nThere's at least [one mention]((https://github.com/llvm/llvm-project/blob/89de0d8dfbb9a6ff1f8b141ed70b563ecc094878/clang/lib/Driver/ToolChains/Darwin.cpp#L230-L232)) of LTO and dsymutil in the Darwin Driver that would suggest that we shouldn't have to pass this through explicitly? Although maybe something isn't hooked up correctly:\r\n\r\n> // If we are using full LTO, then automatically create a temporary file\r\n> // path for the linker to use, so that it's lifetime will extend past a\r\n> // possible dsymutil step.\r\n> ....\r\n> // If we are using thin LTO, then create a directory instead.\r\n\r\nIn any case that is discussion for the #19530. I'll make sure I dig around in LLVM some more.\r\n\r\n> Should we add one for nmedit as well? I know we don't need lipo.\r\n\r\nI haven't seen any obvious calls / usage of `nmedit` so far, but if you'd prefer I can add it here anyways.\r\n",
+      "created_at" : "2020-07-23T14:28:13Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19565#issuecomment-663039202",
+      "id" : 663039202,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/19565",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDY2MzAzOTIwMg==",
+      "performed_via_github_app" : null,
+      "updated_at" : "2020-07-23T14:28:13Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/663039202",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/863730?v=4",
+         "events_url" : "https://api.github.com/users/fanquake/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/fanquake/followers",
+         "following_url" : "https://api.github.com/users/fanquake/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/fanquake/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/fanquake",
+         "id" : 863730,
+         "login" : "fanquake",
+         "node_id" : "MDQ6VXNlcjg2MzczMA==",
+         "organizations_url" : "https://api.github.com/users/fanquake/orgs",
+         "received_events_url" : "https://api.github.com/users/fanquake/received_events",
+         "repos_url" : "https://api.github.com/users/fanquake/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/fanquake/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/fanquake/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/fanquake"
+      }
    }
 ]
