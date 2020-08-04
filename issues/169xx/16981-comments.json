@@ -3743,5 +3743,37 @@
          "type" : "User",
          "url" : "https://api.github.com/users/hebasto"
       }
+   },
+   {
+      "author_association" : "CONTRIBUTOR",
+      "body" : "#### TL;DR\r\nI think the PR is good as it is can and should be merged.\r\n\r\n@hebasto, I understand exactly what's going on, and having that corrupted file really helped, thanks. Before explaining what I found, can you try a different fix, this will confirm my understanding. At [this point](https://github.com/LarryRuane/bitcoin/blob/5b1e92f539c24b6518f577b92874ccac0bbf617f/src/validation.cpp#L4730) in `LoadExternalBlockFile()`:\r\n```\r\n// Skip the rest of this block; position to the marker before the next block.\r\nnRewind = nBlockPos + nSize;\r\n```\r\nJust comment out that setting of `nRewind`. I expect that all the blocks will load (you won't see `Loaded 0 blocks...` messages).\r\n\r\n#### Explanation\r\nThere's a bad block whose [marker bytes](https://github.com/bitcoin/bitcoin/blob/3c93623be20d534bb653410db03d38152135e2e6/src/chainparams.cpp#L97), 0xf9, 0xbe, 0xb4, 0xd9, start at offset 0x3147657. The size field that follows is 0xf3afd = 998141, which is reasonable. This is the number of bytes of the serialized block. If you move ahead that many bytes in the stream, you should be at the marker bytes of the next block (or be at the end of the file). That should be 0x3147657 + 4 + 4 + 998141 = 0x323b15c. Looking at that part of the hex dump of the file, we see:\r\n```\r\n0323b150  ac ad 21 07 00 f9 be b4  d9 03 3b 0f 00 02 00 00  |..!.......;.....|\r\n```\r\nThat's 16 bytes, and offset 0xc should be the next marker bytes, but instead we see the marker bytes starting at offset 0x5. These are the marker bytes for a legitimate block, and if we don't load it, all subsequent blocks will have no parent.\r\n\r\nSo, with the PR, what happens is, we deserialize just the header, and it's probably impossible for that to fail because it's just 80 bytes and everything is fixed-sized. Its parent isn't found (of course, since its prevhash is garbage, doesn't even start with zeros), so we add an entry to `mapBlocksUnknownParent[]`, and then _skip ahead_ to where we think the next block's marker bytes start. But that's just beyond where the marker bytes are, so miss that entire block. We get resynchronized (`FindByte()`) with the _following_ block.\r\n\r\nIn contrast, with master, the attempt to deserialize the entire block fails, so we resynchronize starting at the byte after that bad block's first marker byte, and thus we do find and load this block.\r\n\r\nThe additional call to `CheckProofOfWork()` that @hebasto [suggested](https://github.com/bitcoin/bitcoin/pull/16981#issuecomment-664474119) acts here as a sanity-check on the block header, which this nonsense header fails, so then again we attempt to resynchronize starting at the byte after that bad block's first marker byte, and we find the next block.\r\n\r\nSo, a way to summarize the problem is that this PR makes the block size (that follows the marker bytes, `nSize`) more important than it is with master. On master, when we fail to deserialize the block, we go back to resynchronizing with the stream (looking for the marker bytes) and the block size isn't used.\r\n\r\nOne thing we can do to fix this in this PR is that, after deserializing just the header, if its parent hasn't been seen, then after adding it to `mapBlocksUnknownParent`, we could resynchronize with the stream, instead of just skipping ahead by the size of the block. We can do that by removing [this line](https://github.com/LarryRuane/bitcoin/blob/5b1e92f539c24b6518f577b92874ccac0bbf617f/src/validation.cpp#L4730). But that would be much slower. I coded a patch to speed up `FindByte()`:\r\n```diff\r\n--- a/src/streams.h\r\n+++ b/src/streams.h\r\n@@ -851,12 +851,21 @@ public:\r\n \r\n     //! search for a given byte in the stream, and remain positioned on it\r\n     void FindByte(char ch) {\r\n+        // start is the index into vchBuf[] at which to start searching\r\n+        size_t start = nReadPos % vchBuf.size();\r\n         while (true) {\r\n             if (nReadPos == nSrcPos)\r\n                 Fill();\r\n-            if (vchBuf[nReadPos % vchBuf.size()] == ch)\r\n-                break;\r\n-            nReadPos++;\r\n+            size_t n = vchBuf.size() - start;\r\n+            if (n > nSrcPos - nReadPos)\r\n+                n = nSrcPos - nReadPos;\r\n+            auto it_start = vchBuf.begin()+start;\r\n+            auto it_find = std::find(it_start, it_start+n, ch);\r\n+            size_t inc = it_find - it_start;\r\n+            nReadPos += inc;\r\n+            if (inc < n) break;\r\n+            start += inc;\r\n+            if (start >= vchBuf.size()) start = 0;\r\n         }\r\n```\r\nAnd this works, and is much faster (`std::find()` seems to be very efficient in this case).\r\n\r\nBut on further reflection, I don't think we should do this, because this fixes only this specific kind of file corruption -- _this problem can happen anyway_. There can be all kinds of corruption that makes a block unserializable, and once that happens, all subsequent blocks cannot be loaded. But I have seen that when this occurs, the node is able to download blocks from peers and synchronize with the network anyway. It's true that it doesn't seem to _correct_  damaged `blk.dat` files, but if that's worth doing, it should be for a separate PR.\r\n\r\nBut I'll do some benchmarking to see if this resynchronizing (with the faster `FindByte()`) is close to the PR as it is now, and if it's only a few percent slower, maybe it's worth doing. I'll give an update later.",
+      "created_at" : "2020-08-04T15:06:16Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/16981#issuecomment-668652146",
+      "id" : 668652146,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/16981",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDY2ODY1MjE0Ng==",
+      "performed_via_github_app" : null,
+      "updated_at" : "2020-08-04T15:06:16Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/668652146",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/8321330?v=4",
+         "events_url" : "https://api.github.com/users/LarryRuane/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/LarryRuane/followers",
+         "following_url" : "https://api.github.com/users/LarryRuane/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/LarryRuane/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/LarryRuane",
+         "id" : 8321330,
+         "login" : "LarryRuane",
+         "node_id" : "MDQ6VXNlcjgzMjEzMzA=",
+         "organizations_url" : "https://api.github.com/users/LarryRuane/orgs",
+         "received_events_url" : "https://api.github.com/users/LarryRuane/received_events",
+         "repos_url" : "https://api.github.com/users/LarryRuane/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/LarryRuane/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/LarryRuane/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/LarryRuane"
+      }
    }
 ]
