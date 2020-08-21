@@ -19244,5 +19244,173 @@
          "type" : "User",
          "url" : "https://api.github.com/users/instagibbs"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r474385753"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/474385753"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I need the sighash to sign the transaction, and I need the cache to get the sighash.",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-21T03:17:46Z",
+      "diff_hunk" : "@@ -1258,65 +1349,207 @@ class CTransactionSignatureSerializer\n     }\n };\n \n+/** Compute the (single) SHA256 of the concatenation of all prevouts of a tx. */\n template <class T>\n uint256 GetPrevoutHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.prevout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all nSequences of a tx. */\n template <class T>\n uint256 GetSequenceHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.nSequence;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all txouts of a tx. */\n template <class T>\n uint256 GetOutputsHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txout : txTo.vout) {\n         ss << txout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all amounts spent by a tx. */\n+uint256 GetSpentAmountsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.nValue;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+/** Compute the (single) SHA256 of the concatenation of all scriptPubKeys spent by a tx. */\n+uint256 GetSpentScriptsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.scriptPubKey;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+\n } // namespace\n \n template <class T>\n-void PrecomputedTransactionData::Init(const T& txTo)\n+void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut> spent_outputs)\n {\n-    assert(!m_ready);\n+    assert(!m_spent_outputs_ready);\n \n-    // Cache is calculated only for transactions with witness\n-    if (txTo.HasWitness()) {\n-        hashPrevouts = GetPrevoutHash(txTo);\n-        hashSequence = GetSequenceHash(txTo);\n-        hashOutputs = GetOutputsHash(txTo);\n+    m_spent_outputs = std::move(spent_outputs);\n+    if (!m_spent_outputs.empty()) {\n+        assert(m_spent_outputs.size() == txTo.vin.size());\n+        m_spent_outputs_ready = true;\n+    }\n+\n+    // Determine which precomputation-impacting features this transaction uses.\n+    bool uses_bip143 = false;\n+    bool uses_bip341 = false;\n+    for (size_t inpos = 0; inpos < txTo.vin.size(); ++inpos) {\n+        if (!txTo.vin[inpos].scriptWitness.IsNull()) {\n+            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&\n+                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {\n+                // Treat every native witness v1 spend as a Taproot spend. This only works if spent_outputs was\n+                // provided as well, but if it wasn't, actual validation will fail anyway.\n+                uses_bip341 = true;\n+            } else {\n+                // Treat every spend that's not known to native witness v1 as a Witness v0 spend. This branch may\n+                // also be taken for unknown witness versions, but it is harmless, and being precise would require\n+                // P2SH evaluation to find the redeemScript.\n+                uses_bip143 = true;\n+            }\n+        }\n     }\n \n-    m_ready = true;\n+    if (uses_bip143 || uses_bip341) {\n+        // Computations shared between both sighash schemes.\n+        m_bip341_prevouts_hash = GetPrevoutHash(txTo);\n+        m_bip341_sequences_hash = GetSequenceHash(txTo);\n+        m_bip341_outputs_hash = GetOutputsHash(txTo);\n+    }\n+    if (uses_bip143) {\n+        hashPrevouts = SHA256Uint256(m_bip341_prevouts_hash);\n+        hashSequence = SHA256Uint256(m_bip341_sequences_hash);\n+        hashOutputs = SHA256Uint256(m_bip341_outputs_hash);\n+        m_bip143_ready = true;\n+    }\n+    if (uses_bip341) {\n+        m_bip341_spent_amounts_hash = GetSpentAmountsHash(m_spent_outputs);\n+        m_bip341_spent_scripts_hash = GetSpentScriptsHash(m_spent_outputs);\n+        m_bip341_ready = true;\n+    }\n }\n \n template <class T>\n PrecomputedTransactionData::PrecomputedTransactionData(const T& txTo)\n {\n-    Init(txTo);\n+    Init(txTo, {});\n }\n \n // explicit instantiation\n-template void PrecomputedTransactionData::Init(const CTransaction& txTo);\n-template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo);\n+template void PrecomputedTransactionData::Init(const CTransaction& txTo, std::vector<CTxOut> spent_outputs);\n+template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo, std::vector<CTxOut> spent_outputs);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CTransaction& txTo);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CMutableTransaction& txTo);\n \n+static const CHashWriter HASHER_TAPSIGHASH = TaggedHash(\"TapSighash\");\n+static const CHashWriter HASHER_TAPLEAF = TaggedHash(\"TapLeaf\");\n+static const CHashWriter HASHER_TAPBRANCH = TaggedHash(\"TapBranch\");\n+static const CHashWriter HASHER_TAPTWEAK = TaggedHash(\"TapTweak\");\n+\n+template<typename T>\n+bool SignatureHashSchnorr(uint256& hash_out, const ScriptExecutionData& execdata, const T& tx_to, const uint32_t in_pos, const uint8_t hash_type, const SigVersion sigversion, const PrecomputedTransactionData* cache)\n+{\n+    uint8_t ext_flag;\n+    switch (sigversion) {\n+    case SigVersion::TAPROOT:\n+        ext_flag = 0;\n+        break;\n+    case SigVersion::TAPSCRIPT:\n+        ext_flag = 1;\n+        break;\n+    default:\n+        assert(false);\n+    }\n+    assert(in_pos < tx_to.vin.size());\n+    assert(cache != nullptr && cache->m_bip341_ready && cache->m_spent_outputs_ready);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r474385753",
+      "id" : 474385753,
+      "in_reply_to_id" : 473553826,
+      "line" : 1489,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NDM4NTc1Mw==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1489,
+      "original_position" : 360,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 360,
+      "pull_request_review_id" : 472119514,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-21T03:17:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/474385753",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/250224?v=4",
+         "events_url" : "https://api.github.com/users/kallewoof/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/kallewoof/followers",
+         "following_url" : "https://api.github.com/users/kallewoof/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/kallewoof/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/kallewoof",
+         "id" : 250224,
+         "login" : "kallewoof",
+         "node_id" : "MDQ6VXNlcjI1MDIyNA==",
+         "organizations_url" : "https://api.github.com/users/kallewoof/orgs",
+         "received_events_url" : "https://api.github.com/users/kallewoof/received_events",
+         "repos_url" : "https://api.github.com/users/kallewoof/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/kallewoof/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/kallewoof/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/kallewoof"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r474390723"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/474390723"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "There is no signing code yet, so this may go in a number of different ways, but I was imagining that the cache would indeed be used for signing as well, as it becomes increasingly inconvenient to pass all arguments (including all spent UTXOs now!) along down into the signing function.\r\n\r\nIn fact, I think after the change to use the cache to pass that information along, we can stop passing scriptPubKey/amount/txFrom to `SignSignature`... but that's for much later.\r\n\r\n@kallewoof It's indeed ugly in the signing case that the scriptWitness is used to determine if a transaction is a witness input. I'll change that for now to just default to BIP143 caching unless it's clearly a BIP341 spend, instead of relying on there being a non-empty witness.",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-21T03:39:36Z",
+      "diff_hunk" : "@@ -1258,65 +1349,207 @@ class CTransactionSignatureSerializer\n     }\n };\n \n+/** Compute the (single) SHA256 of the concatenation of all prevouts of a tx. */\n template <class T>\n uint256 GetPrevoutHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.prevout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all nSequences of a tx. */\n template <class T>\n uint256 GetSequenceHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.nSequence;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all txouts of a tx. */\n template <class T>\n uint256 GetOutputsHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txout : txTo.vout) {\n         ss << txout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all amounts spent by a tx. */\n+uint256 GetSpentAmountsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.nValue;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+/** Compute the (single) SHA256 of the concatenation of all scriptPubKeys spent by a tx. */\n+uint256 GetSpentScriptsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.scriptPubKey;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+\n } // namespace\n \n template <class T>\n-void PrecomputedTransactionData::Init(const T& txTo)\n+void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut> spent_outputs)\n {\n-    assert(!m_ready);\n+    assert(!m_spent_outputs_ready);\n \n-    // Cache is calculated only for transactions with witness\n-    if (txTo.HasWitness()) {\n-        hashPrevouts = GetPrevoutHash(txTo);\n-        hashSequence = GetSequenceHash(txTo);\n-        hashOutputs = GetOutputsHash(txTo);\n+    m_spent_outputs = std::move(spent_outputs);\n+    if (!m_spent_outputs.empty()) {\n+        assert(m_spent_outputs.size() == txTo.vin.size());\n+        m_spent_outputs_ready = true;\n+    }\n+\n+    // Determine which precomputation-impacting features this transaction uses.\n+    bool uses_bip143 = false;\n+    bool uses_bip341 = false;\n+    for (size_t inpos = 0; inpos < txTo.vin.size(); ++inpos) {\n+        if (!txTo.vin[inpos].scriptWitness.IsNull()) {\n+            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&\n+                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {\n+                // Treat every native witness v1 spend as a Taproot spend. This only works if spent_outputs was\n+                // provided as well, but if it wasn't, actual validation will fail anyway.\n+                uses_bip341 = true;\n+            } else {\n+                // Treat every spend that's not known to native witness v1 as a Witness v0 spend. This branch may\n+                // also be taken for unknown witness versions, but it is harmless, and being precise would require\n+                // P2SH evaluation to find the redeemScript.\n+                uses_bip143 = true;\n+            }\n+        }\n     }\n \n-    m_ready = true;\n+    if (uses_bip143 || uses_bip341) {\n+        // Computations shared between both sighash schemes.\n+        m_bip341_prevouts_hash = GetPrevoutHash(txTo);\n+        m_bip341_sequences_hash = GetSequenceHash(txTo);\n+        m_bip341_outputs_hash = GetOutputsHash(txTo);\n+    }\n+    if (uses_bip143) {\n+        hashPrevouts = SHA256Uint256(m_bip341_prevouts_hash);\n+        hashSequence = SHA256Uint256(m_bip341_sequences_hash);\n+        hashOutputs = SHA256Uint256(m_bip341_outputs_hash);\n+        m_bip143_ready = true;\n+    }\n+    if (uses_bip341) {\n+        m_bip341_spent_amounts_hash = GetSpentAmountsHash(m_spent_outputs);\n+        m_bip341_spent_scripts_hash = GetSpentScriptsHash(m_spent_outputs);\n+        m_bip341_ready = true;\n+    }\n }\n \n template <class T>\n PrecomputedTransactionData::PrecomputedTransactionData(const T& txTo)\n {\n-    Init(txTo);\n+    Init(txTo, {});\n }\n \n // explicit instantiation\n-template void PrecomputedTransactionData::Init(const CTransaction& txTo);\n-template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo);\n+template void PrecomputedTransactionData::Init(const CTransaction& txTo, std::vector<CTxOut> spent_outputs);\n+template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo, std::vector<CTxOut> spent_outputs);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CTransaction& txTo);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CMutableTransaction& txTo);\n \n+static const CHashWriter HASHER_TAPSIGHASH = TaggedHash(\"TapSighash\");\n+static const CHashWriter HASHER_TAPLEAF = TaggedHash(\"TapLeaf\");\n+static const CHashWriter HASHER_TAPBRANCH = TaggedHash(\"TapBranch\");\n+static const CHashWriter HASHER_TAPTWEAK = TaggedHash(\"TapTweak\");\n+\n+template<typename T>\n+bool SignatureHashSchnorr(uint256& hash_out, const ScriptExecutionData& execdata, const T& tx_to, const uint32_t in_pos, const uint8_t hash_type, const SigVersion sigversion, const PrecomputedTransactionData* cache)\n+{\n+    uint8_t ext_flag;\n+    switch (sigversion) {\n+    case SigVersion::TAPROOT:\n+        ext_flag = 0;\n+        break;\n+    case SigVersion::TAPSCRIPT:\n+        ext_flag = 1;\n+        break;\n+    default:\n+        assert(false);\n+    }\n+    assert(in_pos < tx_to.vin.size());\n+    assert(cache != nullptr && cache->m_bip341_ready && cache->m_spent_outputs_ready);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r474390723",
+      "id" : 474390723,
+      "in_reply_to_id" : 473553826,
+      "line" : 1489,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NDM5MDcyMw==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1489,
+      "original_position" : 360,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 360,
+      "pull_request_review_id" : 472124884,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-21T03:39:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/474390723",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r474392228"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/474392228"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "@sipa I worked around it on my end, so feel free to leave it as is until a decision is made on how signing should work!",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-21T03:46:35Z",
+      "diff_hunk" : "@@ -1258,65 +1349,207 @@ class CTransactionSignatureSerializer\n     }\n };\n \n+/** Compute the (single) SHA256 of the concatenation of all prevouts of a tx. */\n template <class T>\n uint256 GetPrevoutHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.prevout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all nSequences of a tx. */\n template <class T>\n uint256 GetSequenceHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.nSequence;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all txouts of a tx. */\n template <class T>\n uint256 GetOutputsHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txout : txTo.vout) {\n         ss << txout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all amounts spent by a tx. */\n+uint256 GetSpentAmountsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.nValue;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+/** Compute the (single) SHA256 of the concatenation of all scriptPubKeys spent by a tx. */\n+uint256 GetSpentScriptsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.scriptPubKey;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+\n } // namespace\n \n template <class T>\n-void PrecomputedTransactionData::Init(const T& txTo)\n+void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut> spent_outputs)\n {\n-    assert(!m_ready);\n+    assert(!m_spent_outputs_ready);\n \n-    // Cache is calculated only for transactions with witness\n-    if (txTo.HasWitness()) {\n-        hashPrevouts = GetPrevoutHash(txTo);\n-        hashSequence = GetSequenceHash(txTo);\n-        hashOutputs = GetOutputsHash(txTo);\n+    m_spent_outputs = std::move(spent_outputs);\n+    if (!m_spent_outputs.empty()) {\n+        assert(m_spent_outputs.size() == txTo.vin.size());\n+        m_spent_outputs_ready = true;\n+    }\n+\n+    // Determine which precomputation-impacting features this transaction uses.\n+    bool uses_bip143 = false;\n+    bool uses_bip341 = false;\n+    for (size_t inpos = 0; inpos < txTo.vin.size(); ++inpos) {\n+        if (!txTo.vin[inpos].scriptWitness.IsNull()) {\n+            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&\n+                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {\n+                // Treat every native witness v1 spend as a Taproot spend. This only works if spent_outputs was\n+                // provided as well, but if it wasn't, actual validation will fail anyway.\n+                uses_bip341 = true;\n+            } else {\n+                // Treat every spend that's not known to native witness v1 as a Witness v0 spend. This branch may\n+                // also be taken for unknown witness versions, but it is harmless, and being precise would require\n+                // P2SH evaluation to find the redeemScript.\n+                uses_bip143 = true;\n+            }\n+        }\n     }\n \n-    m_ready = true;\n+    if (uses_bip143 || uses_bip341) {\n+        // Computations shared between both sighash schemes.\n+        m_bip341_prevouts_hash = GetPrevoutHash(txTo);\n+        m_bip341_sequences_hash = GetSequenceHash(txTo);\n+        m_bip341_outputs_hash = GetOutputsHash(txTo);\n+    }\n+    if (uses_bip143) {\n+        hashPrevouts = SHA256Uint256(m_bip341_prevouts_hash);\n+        hashSequence = SHA256Uint256(m_bip341_sequences_hash);\n+        hashOutputs = SHA256Uint256(m_bip341_outputs_hash);\n+        m_bip143_ready = true;\n+    }\n+    if (uses_bip341) {\n+        m_bip341_spent_amounts_hash = GetSpentAmountsHash(m_spent_outputs);\n+        m_bip341_spent_scripts_hash = GetSpentScriptsHash(m_spent_outputs);\n+        m_bip341_ready = true;\n+    }\n }\n \n template <class T>\n PrecomputedTransactionData::PrecomputedTransactionData(const T& txTo)\n {\n-    Init(txTo);\n+    Init(txTo, {});\n }\n \n // explicit instantiation\n-template void PrecomputedTransactionData::Init(const CTransaction& txTo);\n-template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo);\n+template void PrecomputedTransactionData::Init(const CTransaction& txTo, std::vector<CTxOut> spent_outputs);\n+template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo, std::vector<CTxOut> spent_outputs);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CTransaction& txTo);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CMutableTransaction& txTo);\n \n+static const CHashWriter HASHER_TAPSIGHASH = TaggedHash(\"TapSighash\");\n+static const CHashWriter HASHER_TAPLEAF = TaggedHash(\"TapLeaf\");\n+static const CHashWriter HASHER_TAPBRANCH = TaggedHash(\"TapBranch\");\n+static const CHashWriter HASHER_TAPTWEAK = TaggedHash(\"TapTweak\");\n+\n+template<typename T>\n+bool SignatureHashSchnorr(uint256& hash_out, const ScriptExecutionData& execdata, const T& tx_to, const uint32_t in_pos, const uint8_t hash_type, const SigVersion sigversion, const PrecomputedTransactionData* cache)\n+{\n+    uint8_t ext_flag;\n+    switch (sigversion) {\n+    case SigVersion::TAPROOT:\n+        ext_flag = 0;\n+        break;\n+    case SigVersion::TAPSCRIPT:\n+        ext_flag = 1;\n+        break;\n+    default:\n+        assert(false);\n+    }\n+    assert(in_pos < tx_to.vin.size());\n+    assert(cache != nullptr && cache->m_bip341_ready && cache->m_spent_outputs_ready);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r474392228",
+      "id" : 474392228,
+      "in_reply_to_id" : 473553826,
+      "line" : 1489,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NDM5MjIyOA==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1489,
+      "original_position" : 360,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 360,
+      "pull_request_review_id" : 472126516,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-21T03:46:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/474392228",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/250224?v=4",
+         "events_url" : "https://api.github.com/users/kallewoof/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/kallewoof/followers",
+         "following_url" : "https://api.github.com/users/kallewoof/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/kallewoof/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/kallewoof",
+         "id" : 250224,
+         "login" : "kallewoof",
+         "node_id" : "MDQ6VXNlcjI1MDIyNA==",
+         "organizations_url" : "https://api.github.com/users/kallewoof/orgs",
+         "received_events_url" : "https://api.github.com/users/kallewoof/received_events",
+         "repos_url" : "https://api.github.com/users/kallewoof/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/kallewoof/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/kallewoof/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/kallewoof"
+      }
    }
 ]
