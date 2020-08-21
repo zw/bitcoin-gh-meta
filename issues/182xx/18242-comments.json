@@ -5668,7 +5668,6 @@
       "diff_hunk" : "@@ -701,6 +703,69 @@ class V1TransportDeserializer final : public TransportDeserializer\n     CNetMessage GetMessage(const CMessageHeader::MessageStartChars& message_start, int64_t time) override;\n };\n \n+// ChaCha20 must never reuse a {key, nonce} for encryption nor may it be\n+// used to encrypt more than 2^70 bytes under the same {key, nonce}\n+// Re-key after 1GB (RFC4253 / SSH recommendation) or after 1h\n+static constexpr unsigned int REKEY_LIMIT_BYTES = (1024 * 1024 * 1024);\n+static constexpr unsigned int REKEY_LIMIT_TIME = 3600;\n+static constexpr unsigned int REKEY_ABORT_LIMIT_BYTES = REKEY_LIMIT_BYTES * 1.1; // abort after ~10% tolerance buffer\n+static constexpr unsigned int REKEY_ABORT_LIMIT_TIME = REKEY_LIMIT_BYTES * 1.1;  // abort after ~10% tolerance buffer\n+static constexpr unsigned int MIN_REKEY_TIME = 10;                               // minimal rekey time to avoid DOS\n+\n+class V2TransportDeserializer : public TransportDeserializer\n+{\n+private:\n+    std::unique_ptr<ChaCha20Poly1305AEAD> m_aead;\n+    CPrivKey m_aead_k1; //keep the keys for later rekeying\n+    CPrivKey m_aead_k2;\n+    uint64_t m_bytes_decrypted = 0; // counter of bytes decrypted under the same key\n+    int64_t m_time_last_rekey = 0;\n+    uint256 m_session_id;           // the encryption session_id, relevant for rekeying\n+    uint64_t m_payload_seqnr = 0;   // sequence number for the payload\n+    uint64_t m_aad_seqnr = 0;       // sequence number for the packet length (AD)\n+    int m_aad_pos = 0;              // position in the aad keystream\n+    bool m_in_data = false;         // parsing header (false) or data (true)\n+    uint32_t m_message_size = 0;    // expected message size\n+    CDataStream vRecv;              // received message data\n+    unsigned int m_hdr_pos = 0;     // read pos in header\n+    unsigned int m_data_pos = 0;    // read pos in data\n+    bool m_rekey_flag = false;      // rekey in message detected\n+\n+public:\n+    V2TransportDeserializer(const CPrivKey& k1, const CPrivKey& k2, const uint256& session_id) : m_aead(new ChaCha20Poly1305AEAD(k1.data(), k1.size(), k2.data(), k2.size())), m_aead_k1(k1), m_aead_k2(k2), m_time_last_rekey(GetTime()), m_session_id(session_id), vRecv(SER_NETWORK, INIT_PROTO_VERSION)",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/18242#discussion_r420909652",
       "id" : 420909652,
-      "in_reply_to_id" : 418206782,
       "line" : 778,
       "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQyMDkwOTY1Mg==",
       "original_commit_id" : "d9081b32a36135c4fe10838cbfc181fb410f7a9a",
@@ -10885,6 +10884,117 @@
       "performed_via_github_app" : null,
       "updated_at" : "2020-08-13T08:33:29Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/673342550",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18242#discussion_r474682022"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18242"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/474682022"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "In commit 52a2032 \"Add BIP324 v2 transport serializer and deserializer\"\r\n\r\n<details><summary>some suggested changes in <code>src/net.h::V2TransportDeserializer</code></summary><p>\r\n\r\n```diff\r\ndiff --git a/src/net.h b/src/net.h\r\nindex bf909d82d7..ee2f174ad8 100644\r\n--- a/src/net.h\r\n+++ b/src/net.h\r\n@@ -790,19 +790,19 @@ public:\r\n         m_data_pos = 0;\r\n         m_rekey_flag = false;\r\n     }\r\n-    bool Complete() const\r\n+    bool Complete() const override\r\n     {\r\n         if (!m_in_data) {\r\n             return false;\r\n         }\r\n         return (m_message_size + CHACHA20_POLY1305_AEAD_TAG_LEN == m_data_pos);\r\n     }\r\n-    void SetVersion(int nVersionIn)\r\n+    void SetVersion(int nVersionIn) override\r\n     {\r\n         vRecv.SetVersion(nVersionIn);\r\n     }\r\n-    int Read(const char* pch, unsigned int nBytes);\r\n-    CNetMessage GetMessage(const CMessageHeader::MessageStartChars& message_start, std::chrono::microseconds time);\r\n+    int Read(const char* pch, unsigned int nBytes) override;\r\n+    CNetMessage GetMessage(const CMessageHeader::MessageStartChars& message_start, std::chrono::microseconds time) override;\r\n };\r\n\r\n /** The TransportSerializer prepares messages for the network transport\r\n```\r\n</p></details>\r\n\r\nto fix these\r\n\r\n<details><summary>gcc/clang compiler warnings/errors</summary><p>\r\n\r\n```\r\nIn file included from init.cpp:29:\r\n./net.h:793:10: error: âvirtual bool V2TransportDeserializer::Complete() constâ can be marked override [-Werror=suggest-override]\r\n  793 |     bool Complete() const\r\n      |          ^~~~~~~~\r\n./net.h:800:10: error: âvirtual void V2TransportDeserializer::SetVersion(int)â can be marked override [-Werror=suggest-override]\r\n  800 |     void SetVersion(int nVersionIn)\r\n      |          ^~~~~~~~~~\r\n./net.h:804:9: error: âvirtual int V2TransportDeserializer::Read(const char*, unsigned int)â can be marked override [-Werror=suggest-override]\r\n  804 |     int Read(const char* pch, unsigned int nBytes);\r\n      |         ^~~~\r\n./net.h:805:17: error: âvirtual CNetMessage V2TransportDeserializer::GetMessage(const unsigned char (&)[4], std::chrono::microseconds)â can be marked override [-Werror=suggest-override]\r\n  805 |     CNetMessage GetMessage(const CMessageHeader::MessageStartChars& message_start, std::chrono::microseconds time);\r\n      |                 ^~~~~~~~~~\r\ncc1plus: some warnings being treated as errors\r\nmake[2]: *** [Makefile:11597: libbitcoin_server_a-init.o] Error 1\r\nmake[2]: *** Waiting for unfinished jobs....\r\nIn file included from net.cpp:10:\r\n./net.h:793:10: error: âvirtual bool V2TransportDeserializer::Complete() constâ can be marked override [-Werror=suggest-override]\r\n  793 |     bool Complete() const\r\n      |          ^~~~~~~~\r\n./net.h:800:10: error: âvirtual void V2TransportDeserializer::SetVersion(int)â can be marked override [-Werror=suggest-override]\r\n  800 |     void SetVersion(int nVersionIn)\r\n      |          ^~~~~~~~~~\r\n./net.h:804:9: error: âvirtual int V2TransportDeserializer::Read(const char*, unsigned int)â can be marked override [-Werror=suggest-override]\r\n  804 |     int Read(const char* pch, unsigned int nBytes);\r\n      |         ^~~~\r\n./net.h:805:17: error: âvirtual CNetMessage V2TransportDeserializer::GetMessage(const unsigned char (&)[4], std::chrono::microseconds)â can be marked override [-Werror=suggest-override]\r\n  805 |     CNetMessage GetMessage(const CMessageHeader::MessageStartChars& message_start, std::chrono::microseconds time);\r\n      |                 ^~~~~~~~~~\r\nnet.cpp: In member function âvirtual CNetMessage V2TransportDeserializer::GetMessage(const unsigned char (&)[4], std::chrono::microseconds)â:\r\nnet.cpp:839:46: warning: comparison is always true due to limited range of data type [-Wtype-limits]\r\n  839 |         if (!valid_header && size_or_shortid >= 0) {\r\n      |                              ~~~~~~~~~~~~~~~~^~~~\r\ncc1plus: some warnings being treated as errors\r\nmake[2]: *** [Makefile:11653: libbitcoin_server_a-net.o] Error 1\r\nIn file included from ./net_processing.h:10,\r\n                 from net_processing.cpp:6:\r\n./net.h:793:10: error: âvirtual bool V2TransportDeserializer::Complete() constâ can be marked override [-Werror=suggest-override]\r\n  793 |     bool Complete() const\r\n      |          ^~~~~~~~\r\n./net.h:800:10: error: âvirtual void V2TransportDeserializer::SetVersion(int)â can be marked override [-Werror=suggest-override]\r\n  800 |     void SetVersion(int nVersionIn)\r\n      |          ^~~~~~~~~~\r\n./net.h:804:9: error: âvirtual int V2TransportDeserializer::Read(const char*, unsigned int)â can be marked override [-Werror=suggest-override]\r\n  804 |     int Read(const char* pch, unsigned int nBytes);\r\n      |         ^~~~\r\n./net.h:805:17: error: âvirtual CNetMessage V2TransportDeserializer::GetMessage(const unsigned char (&)[4], std::chrono::microseconds)â can be marked override [-Werror=suggest-override]\r\n  805 |     CNetMessage GetMessage(const CMessageHeader::MessageStartChars& message_start, std::chrono::microseconds time);\r\n      |                 ^~~~~~~~~~\r\ncc1plus: some warnings being treated as errors\r\nmake[2]: *** [Makefile:11667: libbitcoin_server_a-net_processing.o] Error 1\r\nmake[2]: Leaving directory '/home/jon/projects/bitcoin/bitcoin/src'\r\nmake[1]: *** [Makefile:18858: all-recursive] Error 1\r\nmake[1]: Leaving directory '/home/jon/projects/bitcoin/bitcoin/src'\r\nmake: *** [Makefile:790: all-recursive] Error 1\r\n```\r\n</p></details>\r\n\r\nappeased the compiler and moving forward with review",
+      "commit_id" : "b1ef92ae52e7df88376dcc63507c50879fa15386",
+      "created_at" : "2020-08-21T13:02:12Z",
+      "diff_hunk" : "@@ -743,6 +745,66 @@ class V1TransportDeserializer final : public TransportDeserializer\n     CNetMessage GetMessage(const CMessageHeader::MessageStartChars& message_start, std::chrono::microseconds time) override;\n };\n \n+// ChaCha20 must never reuse a {key, nonce} for encryption nor may it be\n+// used to encrypt more than 2^70 bytes under the same {key, nonce}\n+// Re-key after 1GB (RFC4253 / SSH recommendation) or after 1h\n+static constexpr unsigned int REKEY_LIMIT_BYTES = (1024 * 1024 * 1024);\n+static constexpr unsigned int REKEY_LIMIT_TIME = 3600;\n+static constexpr unsigned int REKEY_ABORT_LIMIT_BYTES = REKEY_LIMIT_BYTES * 1.1; // abort after ~10% tolerance buffer\n+static constexpr unsigned int REKEY_ABORT_LIMIT_TIME = REKEY_LIMIT_BYTES * 1.1;  // abort after ~10% tolerance buffer\n+static constexpr unsigned int MIN_REKEY_TIME = 10;                               // minimal rekey time to avoid DOS\n+\n+/** V2TransportDeserializer is a transport deserializer after BIP324 */\n+class V2TransportDeserializer : public TransportDeserializer\n+{\n+private:\n+    std::unique_ptr<ChaCha20Poly1305AEAD> m_aead;\n+    CPrivKey m_aead_k1; //keep the keys for later rekeying\n+    CPrivKey m_aead_k2;\n+    uint64_t m_bytes_decrypted = 0; // counter of bytes decrypted under the same key\n+    int64_t m_time_last_rekey = 0;  // recorded time when the last rekey happened\n+    uint256 m_session_id;           // the encryption session_id, relevant for rekeying\n+    uint64_t m_payload_seqnr = 0;   // sequence number for the payload\n+    uint64_t m_aad_seqnr = 0;       // sequence number for the packet length (AD)\n+    int m_aad_pos = 0;              // position in the aad keystream\n+    bool m_in_data = false;         // parsing header (false) or data (true)\n+    uint32_t m_message_size = 0;    // expected message size\n+    CDataStream vRecv;              // received message data\n+    unsigned int m_hdr_pos = 0;     // read pos in header\n+    unsigned int m_data_pos = 0;    // read pos in data\n+    bool m_rekey_flag = false;      // rekey in message detected\n+\n+public:\n+    V2TransportDeserializer(const CPrivKey& k1, const CPrivKey& k2, const uint256& session_id) : m_aead(new ChaCha20Poly1305AEAD(k1.data(), k1.size(), k2.data(), k2.size())), m_aead_k1(k1), m_aead_k2(k2), m_time_last_rekey(GetTime()), m_session_id(session_id), vRecv(SER_NETWORK, INIT_PROTO_VERSION)\n+    {\n+        Reset();\n+    }\n+\n+    void Reset()\n+    {\n+        vRecv.clear();\n+        vRecv.resize(CHACHA20_POLY1305_AEAD_AAD_LEN);\n+        m_in_data = false;\n+        m_hdr_pos = 0;\n+        m_message_size = 0;\n+        m_data_pos = 0;\n+        m_rekey_flag = false;\n+    }\n+    bool Complete() const\n+    {\n+        if (!m_in_data) {\n+            return false;\n+        }\n+        return (m_message_size + CHACHA20_POLY1305_AEAD_TAG_LEN == m_data_pos);\n+    }\n+    void SetVersion(int nVersionIn)\n+    {\n+        vRecv.SetVersion(nVersionIn);\n+    }\n+    int Read(const char* pch, unsigned int nBytes);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18242#discussion_r474682022",
+      "id" : 474682022,
+      "line" : 804,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NDY4MjAyMg==",
+      "original_commit_id" : "b1ef92ae52e7df88376dcc63507c50879fa15386",
+      "original_line" : 804,
+      "original_position" : 71,
+      "original_start_line" : null,
+      "path" : "src/net.h",
+      "position" : 71,
+      "pull_request_review_id" : 472468219,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18242",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-21T13:02:12Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/474682022",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18242#discussion_r474684477"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18242"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/474684477"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "When rebuilding, the compiler is warning about this now:\r\n```\r\nnet.cpp: In member function âvirtual CNetMessage V2TransportDeserializer::GetMessage(const unsigned char (&)[4], std::chrono::microseconds)â:\r\nnet.cpp:839:46: warning: comparison is always true due to limited range of data type [-Wtype-limits]\r\n  839 |         if (!valid_header && size_or_shortid >= 0) {\r\n      |                              ~~~~~~~~~~~~~~~~^~~~\r\n```\r\n",
+      "commit_id" : "b1ef92ae52e7df88376dcc63507c50879fa15386",
+      "created_at" : "2020-08-21T13:07:06Z",
+      "diff_hunk" : "@@ -719,6 +723,173 @@ CNetMessage V1TransportDeserializer::GetMessage(const CMessageHeader::MessageSta\n     return msg;\n }\n \n+int V2TransportDeserializer::Read(const char* pch, unsigned int bytes)\n+{\n+    if (!m_in_data) {\n+        // copy data to temporary parsing buffer\n+        const unsigned int remaining = CHACHA20_POLY1305_AEAD_AAD_LEN - m_hdr_pos;\n+        const unsigned int copy_bytes = std::min(remaining, bytes);\n+\n+        memcpy(&vRecv[m_hdr_pos], pch, copy_bytes);\n+        m_hdr_pos += copy_bytes;\n+\n+        // if AAD incomplete, exit\n+        if (m_hdr_pos < CHACHA20_POLY1305_AEAD_AAD_LEN) {\n+            return copy_bytes;\n+        }\n+\n+        // we got the AAD bytes at this point (3 bytes encrypted packet length)\n+        // we keep the sequence numbers unchanged at this point. Once the message is authenticated and decrypted, we increase the sequence numbers (or the aad_pos)\n+        if (!m_aead->GetLength(&m_message_size, m_aad_seqnr, m_aad_pos, (const uint8_t*)vRecv.data())) {\n+            return -1;\n+        }\n+\n+        // check and unset rekey bit\n+        // the counterparty can signal a post-this-message rekey by setting the\n+        // most significant bit in the (unencrypted) length\n+        m_rekey_flag = static_cast<bool>(m_message_size & (1U << 23));\n+        if (m_rekey_flag) {\n+            LogPrint(BCLog::NET, \"Rekey flag detected\\n\");\n+            m_message_size &= ~(1U << 23);\n+        }\n+\n+        // reject messages larger than MAX_SIZE\n+        if (m_message_size > MAX_SIZE) {\n+            return -1;\n+        }\n+\n+        // switch state to reading message data\n+        m_in_data = true;\n+\n+        return copy_bytes;\n+    } else {\n+        // Read the message data (command, payload & MAC)\n+        const unsigned int remaining = m_message_size + CHACHA20_POLY1305_AEAD_TAG_LEN - m_data_pos;\n+        const unsigned int copy_bytes = std::min(remaining, bytes);\n+\n+        // extend buffer, respect previous copied AAD part\n+        if (vRecv.size() < CHACHA20_POLY1305_AEAD_AAD_LEN + m_data_pos + copy_bytes) {\n+            // Allocate up to 256 KiB ahead, but never more than the total message size (incl. AAD & TAG).\n+            vRecv.resize(std::min(CHACHA20_POLY1305_AEAD_AAD_LEN + m_message_size + CHACHA20_POLY1305_AEAD_TAG_LEN, CHACHA20_POLY1305_AEAD_AAD_LEN + m_data_pos + copy_bytes + 256 * 1024 + CHACHA20_POLY1305_AEAD_TAG_LEN));\n+        }\n+\n+        memcpy(&vRecv[CHACHA20_POLY1305_AEAD_AAD_LEN + m_data_pos], pch, copy_bytes);\n+        m_data_pos += copy_bytes;\n+\n+        return copy_bytes;\n+    }\n+}\n+\n+CNetMessage V2TransportDeserializer::GetMessage(const CMessageHeader::MessageStartChars& message_start, int64_t time)\n+{\n+    // In v2, vRecv contains the encrypted payload plus the MAC tag (1+bytes serialized message command + ? bytes message payload + 16 byte mac tag)\n+    assert(Complete());\n+\n+    // defensive decoding (MAC check, decryption, command deserialization)\n+    // we'll always return a CNetMessage (even if encryption fails), we always increase the AEAD sequence numbers\n+    bool valid_checksum = false;\n+    bool valid_header = false;\n+    std::string command_name;\n+\n+    // count bytes we decrypted including MAC tag + AD\n+    m_bytes_decrypted += vRecv.size();\n+\n+    if (m_aead->Crypt(m_payload_seqnr, m_aad_seqnr, m_aad_pos, (unsigned char*)vRecv.data(), vRecv.size(), (const uint8_t*)vRecv.data(), vRecv.size(), false)) {\n+        // MAC check was successful\n+        valid_checksum = true;\n+\n+        // okay, we could decrypt it, now remove packet length and MAC tag\n+        assert(vRecv.size() > CHACHA20_POLY1305_AEAD_AAD_LEN + CHACHA20_POLY1305_AEAD_TAG_LEN);\n+        // CDataStream::erase at the begin will just increase the read pos\n+        vRecv.erase(vRecv.begin(), vRecv.begin() + CHACHA20_POLY1305_AEAD_AAD_LEN);\n+        vRecv.erase(vRecv.end() - CHACHA20_POLY1305_AEAD_TAG_LEN, vRecv.end());\n+\n+        uint8_t size_or_shortid = 0;\n+        try {\n+            vRecv >> size_or_shortid;\n+        } catch (const std::ios_base::failure&) {\n+            LogPrint(BCLog::NET, \"Invalid command name\\n\");\n+        }\n+        if (size_or_shortid > 0 && size_or_shortid <= NET_P2P_V2_CMD_MAX_CHARS_SIZE && vRecv.size() >= size_or_shortid) {\n+            // first byte is a number between 1 and 12. Must be a string command.\n+            valid_header = true;\n+\n+            // use direct read since we already read the varlens size uint8_t\n+            command_name.resize(size_or_shortid);\n+            vRecv.read(&command_name[0], size_or_shortid);\n+        }\n+        // try for short ID in case the first byte is a number larger than 12\n+        if (!valid_header && size_or_shortid >= 0) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18242#discussion_r474684477",
+      "id" : 474684477,
+      "in_reply_to_id" : 424750339,
+      "line" : 839,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NDY4NDQ3Nw==",
+      "original_commit_id" : "b9468fa767d1daa08924a9fefe5227b2f6688e53",
+      "original_line" : 839,
+      "original_position" : 125,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 125,
+      "pull_request_review_id" : 472471550,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18242",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-21T13:07:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/474684477",
       "user" : {
          "avatar_url" : "https://avatars1.githubusercontent.com/u/2415484?v=4",
          "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
