@@ -19412,5 +19412,887 @@
          "type" : "User",
          "url" : "https://api.github.com/users/kallewoof"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475112530"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475112530"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "oh I was having a special brain moment thinking it was a conditional check on if the cache existed.",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-22T17:31:38Z",
+      "diff_hunk" : "@@ -1258,65 +1349,207 @@ class CTransactionSignatureSerializer\n     }\n };\n \n+/** Compute the (single) SHA256 of the concatenation of all prevouts of a tx. */\n template <class T>\n uint256 GetPrevoutHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.prevout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all nSequences of a tx. */\n template <class T>\n uint256 GetSequenceHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.nSequence;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all txouts of a tx. */\n template <class T>\n uint256 GetOutputsHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txout : txTo.vout) {\n         ss << txout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all amounts spent by a tx. */\n+uint256 GetSpentAmountsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.nValue;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+/** Compute the (single) SHA256 of the concatenation of all scriptPubKeys spent by a tx. */\n+uint256 GetSpentScriptsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.scriptPubKey;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+\n } // namespace\n \n template <class T>\n-void PrecomputedTransactionData::Init(const T& txTo)\n+void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut> spent_outputs)\n {\n-    assert(!m_ready);\n+    assert(!m_spent_outputs_ready);\n \n-    // Cache is calculated only for transactions with witness\n-    if (txTo.HasWitness()) {\n-        hashPrevouts = GetPrevoutHash(txTo);\n-        hashSequence = GetSequenceHash(txTo);\n-        hashOutputs = GetOutputsHash(txTo);\n+    m_spent_outputs = std::move(spent_outputs);\n+    if (!m_spent_outputs.empty()) {\n+        assert(m_spent_outputs.size() == txTo.vin.size());\n+        m_spent_outputs_ready = true;\n+    }\n+\n+    // Determine which precomputation-impacting features this transaction uses.\n+    bool uses_bip143 = false;\n+    bool uses_bip341 = false;\n+    for (size_t inpos = 0; inpos < txTo.vin.size(); ++inpos) {\n+        if (!txTo.vin[inpos].scriptWitness.IsNull()) {\n+            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&\n+                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {\n+                // Treat every native witness v1 spend as a Taproot spend. This only works if spent_outputs was\n+                // provided as well, but if it wasn't, actual validation will fail anyway.\n+                uses_bip341 = true;\n+            } else {\n+                // Treat every spend that's not known to native witness v1 as a Witness v0 spend. This branch may\n+                // also be taken for unknown witness versions, but it is harmless, and being precise would require\n+                // P2SH evaluation to find the redeemScript.\n+                uses_bip143 = true;\n+            }\n+        }\n     }\n \n-    m_ready = true;\n+    if (uses_bip143 || uses_bip341) {\n+        // Computations shared between both sighash schemes.\n+        m_bip341_prevouts_hash = GetPrevoutHash(txTo);\n+        m_bip341_sequences_hash = GetSequenceHash(txTo);\n+        m_bip341_outputs_hash = GetOutputsHash(txTo);\n+    }\n+    if (uses_bip143) {\n+        hashPrevouts = SHA256Uint256(m_bip341_prevouts_hash);\n+        hashSequence = SHA256Uint256(m_bip341_sequences_hash);\n+        hashOutputs = SHA256Uint256(m_bip341_outputs_hash);\n+        m_bip143_ready = true;\n+    }\n+    if (uses_bip341) {\n+        m_bip341_spent_amounts_hash = GetSpentAmountsHash(m_spent_outputs);\n+        m_bip341_spent_scripts_hash = GetSpentScriptsHash(m_spent_outputs);\n+        m_bip341_ready = true;\n+    }\n }\n \n template <class T>\n PrecomputedTransactionData::PrecomputedTransactionData(const T& txTo)\n {\n-    Init(txTo);\n+    Init(txTo, {});\n }\n \n // explicit instantiation\n-template void PrecomputedTransactionData::Init(const CTransaction& txTo);\n-template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo);\n+template void PrecomputedTransactionData::Init(const CTransaction& txTo, std::vector<CTxOut> spent_outputs);\n+template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo, std::vector<CTxOut> spent_outputs);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CTransaction& txTo);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CMutableTransaction& txTo);\n \n+static const CHashWriter HASHER_TAPSIGHASH = TaggedHash(\"TapSighash\");\n+static const CHashWriter HASHER_TAPLEAF = TaggedHash(\"TapLeaf\");\n+static const CHashWriter HASHER_TAPBRANCH = TaggedHash(\"TapBranch\");\n+static const CHashWriter HASHER_TAPTWEAK = TaggedHash(\"TapTweak\");\n+\n+template<typename T>\n+bool SignatureHashSchnorr(uint256& hash_out, const ScriptExecutionData& execdata, const T& tx_to, const uint32_t in_pos, const uint8_t hash_type, const SigVersion sigversion, const PrecomputedTransactionData* cache)\n+{\n+    uint8_t ext_flag;\n+    switch (sigversion) {\n+    case SigVersion::TAPROOT:\n+        ext_flag = 0;\n+        break;\n+    case SigVersion::TAPSCRIPT:\n+        ext_flag = 1;\n+        break;\n+    default:\n+        assert(false);\n+    }\n+    assert(in_pos < tx_to.vin.size());\n+    assert(cache != nullptr && cache->m_bip341_ready && cache->m_spent_outputs_ready);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475112530",
+      "id" : 475112530,
+      "in_reply_to_id" : 473553826,
+      "line" : 1489,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NTExMjUzMA==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1489,
+      "original_position" : 360,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 360,
+      "pull_request_review_id" : 472940286,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-22T17:31:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475112530",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475863712"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475863712"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I think we should probably require `spent_outputs` in the constructor. That gets us a compile-time error rather than a runtime surprise, if any code is missing an update.\r\n\r\nAside from tests (which have a mere 4 uses), it's only used in libbitcoinconsensus, where the omission is arguably a bug (impossible to use existing APIs for Taproot verification).",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-24T20:06:56Z",
+      "diff_hunk" : "@@ -1258,65 +1349,207 @@ class CTransactionSignatureSerializer\n     }\n };\n \n+/** Compute the (single) SHA256 of the concatenation of all prevouts of a tx. */\n template <class T>\n uint256 GetPrevoutHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.prevout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all nSequences of a tx. */\n template <class T>\n uint256 GetSequenceHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.nSequence;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all txouts of a tx. */\n template <class T>\n uint256 GetOutputsHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txout : txTo.vout) {\n         ss << txout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all amounts spent by a tx. */\n+uint256 GetSpentAmountsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.nValue;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+/** Compute the (single) SHA256 of the concatenation of all scriptPubKeys spent by a tx. */\n+uint256 GetSpentScriptsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.scriptPubKey;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+\n } // namespace\n \n template <class T>\n-void PrecomputedTransactionData::Init(const T& txTo)\n+void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut> spent_outputs)\n {\n-    assert(!m_ready);\n+    assert(!m_spent_outputs_ready);\n \n-    // Cache is calculated only for transactions with witness\n-    if (txTo.HasWitness()) {\n-        hashPrevouts = GetPrevoutHash(txTo);\n-        hashSequence = GetSequenceHash(txTo);\n-        hashOutputs = GetOutputsHash(txTo);\n+    m_spent_outputs = std::move(spent_outputs);\n+    if (!m_spent_outputs.empty()) {\n+        assert(m_spent_outputs.size() == txTo.vin.size());\n+        m_spent_outputs_ready = true;\n+    }\n+\n+    // Determine which precomputation-impacting features this transaction uses.\n+    bool uses_bip143 = false;\n+    bool uses_bip341 = false;\n+    for (size_t inpos = 0; inpos < txTo.vin.size(); ++inpos) {\n+        if (!txTo.vin[inpos].scriptWitness.IsNull()) {\n+            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&\n+                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {\n+                // Treat every native witness v1 spend as a Taproot spend. This only works if spent_outputs was\n+                // provided as well, but if it wasn't, actual validation will fail anyway.\n+                uses_bip341 = true;\n+            } else {\n+                // Treat every spend that's not known to native witness v1 as a Witness v0 spend. This branch may\n+                // also be taken for unknown witness versions, but it is harmless, and being precise would require\n+                // P2SH evaluation to find the redeemScript.\n+                uses_bip143 = true;\n+            }\n+        }\n     }\n \n-    m_ready = true;\n+    if (uses_bip143 || uses_bip341) {\n+        // Computations shared between both sighash schemes.\n+        m_bip341_prevouts_hash = GetPrevoutHash(txTo);\n+        m_bip341_sequences_hash = GetSequenceHash(txTo);\n+        m_bip341_outputs_hash = GetOutputsHash(txTo);\n+    }\n+    if (uses_bip143) {\n+        hashPrevouts = SHA256Uint256(m_bip341_prevouts_hash);\n+        hashSequence = SHA256Uint256(m_bip341_sequences_hash);\n+        hashOutputs = SHA256Uint256(m_bip341_outputs_hash);\n+        m_bip143_ready = true;\n+    }\n+    if (uses_bip341) {\n+        m_bip341_spent_amounts_hash = GetSpentAmountsHash(m_spent_outputs);\n+        m_bip341_spent_scripts_hash = GetSpentScriptsHash(m_spent_outputs);\n+        m_bip341_ready = true;\n+    }\n }\n \n template <class T>\n PrecomputedTransactionData::PrecomputedTransactionData(const T& txTo)\n {\n-    Init(txTo);\n+    Init(txTo, {});",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475863712",
+      "id" : 475863712,
+      "line" : 1460,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NTg2MzcxMg==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1460,
+      "original_position" : 329,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 329,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475863712",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475947567"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475947567"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Please rename things that change meaning. eg, `GetPrevoutSHA256`",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-24T23:13:32Z",
+      "diff_hunk" : "@@ -1258,65 +1349,207 @@ class CTransactionSignatureSerializer\n     }\n };\n \n+/** Compute the (single) SHA256 of the concatenation of all prevouts of a tx. */",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475947567",
+      "id" : 475947567,
+      "line" : 1352,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NTk0NzU2Nw==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1352,
+      "original_position" : 209,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 209,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475947567",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475951884"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475951884"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "(Review TODO: Check that this is actually true, even when no signature checking occurs.)",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-24T23:19:41Z",
+      "diff_hunk" : "@@ -1258,65 +1349,207 @@ class CTransactionSignatureSerializer\n     }\n };\n \n+/** Compute the (single) SHA256 of the concatenation of all prevouts of a tx. */\n template <class T>\n uint256 GetPrevoutHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.prevout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all nSequences of a tx. */\n template <class T>\n uint256 GetSequenceHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txin : txTo.vin) {\n         ss << txin.nSequence;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all txouts of a tx. */\n template <class T>\n uint256 GetOutputsHash(const T& txTo)\n {\n     CHashWriter ss(SER_GETHASH, 0);\n     for (const auto& txout : txTo.vout) {\n         ss << txout;\n     }\n-    return ss.GetHash();\n+    return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all amounts spent by a tx. */\n+uint256 GetSpentAmountsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.nValue;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+/** Compute the (single) SHA256 of the concatenation of all scriptPubKeys spent by a tx. */\n+uint256 GetSpentScriptsHash(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.scriptPubKey;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+\n } // namespace\n \n template <class T>\n-void PrecomputedTransactionData::Init(const T& txTo)\n+void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut> spent_outputs)\n {\n-    assert(!m_ready);\n+    assert(!m_spent_outputs_ready);\n \n-    // Cache is calculated only for transactions with witness\n-    if (txTo.HasWitness()) {\n-        hashPrevouts = GetPrevoutHash(txTo);\n-        hashSequence = GetSequenceHash(txTo);\n-        hashOutputs = GetOutputsHash(txTo);\n+    m_spent_outputs = std::move(spent_outputs);\n+    if (!m_spent_outputs.empty()) {\n+        assert(m_spent_outputs.size() == txTo.vin.size());\n+        m_spent_outputs_ready = true;\n+    }\n+\n+    // Determine which precomputation-impacting features this transaction uses.\n+    bool uses_bip143 = false;\n+    bool uses_bip341 = false;\n+    for (size_t inpos = 0; inpos < txTo.vin.size(); ++inpos) {\n+        if (!txTo.vin[inpos].scriptWitness.IsNull()) {\n+            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&\n+                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {\n+                // Treat every native witness v1 spend as a Taproot spend. This only works if spent_outputs was\n+                // provided as well, but if it wasn't, actual validation will fail anyway.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475951884",
+      "id" : 475951884,
+      "line" : 1427,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NTk1MTg4NA==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1427,
+      "original_position" : 294,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 294,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475951884",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475978120"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475978120"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Technically, Tapscript itself is a form of P2SH, just not BIP16 P2SH.\r\n\r\nThe comment here confused me. Perhaps \"non-BIP16-wrapped\"?",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-24T23:56:52Z",
+      "diff_hunk" : "@@ -114,41 +120,115 @@ enum\n     // Making OP_CODESEPARATOR and FindAndDelete fail any non-segwit scripts\n     //\n     SCRIPT_VERIFY_CONST_SCRIPTCODE = (1U << 16),\n+\n+    // Taproot/Tapscript validation (BIPs 341 & 342)\n+    //\n+    SCRIPT_VERIFY_TAPROOT = (1U << 17),\n+\n+    // Making unknown Taproot leaf versions non-standard\n+    //\n+    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION = (1U << 18),\n+\n+    // Making the use of (unknown) annexes non-standard (currently no annexes are known)\n+    //\n+    SCRIPT_VERIFY_DISCOURAGE_UNKNOWN_ANNEX = (1U << 19),\n+\n+    // Making unknown OP_SUCCESS non-standard\n+    SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS = (1U << 20),\n+\n+    // Making unknown public key versions (in BIP 342 scripts) non-standard\n+    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE = (1U << 21),\n };\n \n bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, unsigned int flags, ScriptError* serror);\n \n struct PrecomputedTransactionData\n {\n+    // BIP341 precomputed data.\n+    // These are single-SHA256, see https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#cite_note-15.\n+    uint256 m_bip341_prevouts_hash;\n+    uint256 m_bip341_sequences_hash;\n+    uint256 m_bip341_outputs_hash;\n+    uint256 m_bip341_spent_amounts_hash;\n+    uint256 m_bip341_spent_scripts_hash;\n+    //! Whether the 5 fields above are initialized.\n+    bool m_bip341_ready = false;\n+\n+    // BIP143 precomputed data (double-SHA256).\n     uint256 hashPrevouts, hashSequence, hashOutputs;\n-    bool m_ready = false;\n+    //! Whether the 3 fields above are initialized.\n+    bool m_bip143_ready = false;\n+\n+    std::vector<CTxOut> m_spent_outputs;\n+    //! Whether m_spent_outputs is initialized.\n+    bool m_spent_outputs_ready = false;\n \n     PrecomputedTransactionData() = default;\n \n     template <class T>\n-    void Init(const T& tx);\n+    void Init(const T& tx, std::vector<CTxOut> spent_outputs);\n \n     template <class T>\n     explicit PrecomputedTransactionData(const T& tx);\n };\n \n enum class SigVersion\n {\n-    BASE = 0,\n-    WITNESS_V0 = 1,\n+    BASE = 0,        //!< Bare scripts and P2SH redeemscripts; see BIP 16\n+    WITNESS_V0 = 1,  //!< Witness v0 (P2WPKH and P2WSH); see BIP 141\n+    TAPROOT = 2,     //!< Witness v1 with non-P2SH 32 byte program (Taproot), key path spending; see BIP 341\n+    TAPSCRIPT = 3,   //!< Witness v1 with non-P2SH 32 byte program (Taproot), script path spending, leaf version 0xc0 (Tapscript); see BIP 342",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475978120",
+      "id" : 475978120,
+      "line" : 180,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NTk3ODEyMA==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 180,
+      "original_position" : 87,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.h",
+      "position" : 87,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475978120",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475990462"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475990462"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Should this be non-experimental before merging?",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T00:15:09Z",
+      "diff_hunk" : "@@ -1610,7 +1610,7 @@ if test x$need_bundled_univalue = xyes; then\n   AC_CONFIG_SUBDIRS([src/univalue])\n fi\n \n-ac_configure_args=\"${ac_configure_args} --disable-shared --with-pic --enable-benchmark=no --with-bignum=no --enable-module-recovery\"\n+ac_configure_args=\"${ac_configure_args} --disable-shared --with-pic --enable-benchmark=no --with-bignum=no --enable-module-recovery --enable-module-schnorrsig --enable-experimental\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475990462",
+      "id" : 475990462,
+      "line" : 1613,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NTk5MDQ2Mg==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1613,
+      "original_position" : 5,
+      "original_start_line" : null,
+      "path" : "configure.ac",
+      "position" : 5,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475990462",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475992610"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475992610"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Suggest moving `CheckSig` -> `CheckECDSASignature` rename to a dedicated commit",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T00:18:27Z",
+      "diff_hunk" : "@@ -176,20 +256,22 @@ class GenericTransactionSignatureChecker : public BaseSignatureChecker\n     const PrecomputedTransactionData* txdata;\n \n protected:\n-    virtual bool VerifySignature(const std::vector<unsigned char>& vchSig, const CPubKey& vchPubKey, const uint256& sighash) const;\n+    virtual bool VerifyECDSASignature(const std::vector<unsigned char>& vchSig, const CPubKey& vchPubKey, const uint256& sighash) const;\n+    virtual bool VerifySchnorrSignature(const std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256& sighash) const;\n \n public:\n     GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn) : txTo(txToIn), nIn(nInIn), amount(amountIn), txdata(nullptr) {}\n     GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn, const PrecomputedTransactionData& txdataIn) : txTo(txToIn), nIn(nInIn), amount(amountIn), txdata(&txdataIn) {}\n-    bool CheckSig(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override;\n+    bool CheckECDSASignature(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475992610",
+      "id" : 475992610,
+      "line" : 265,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NTk5MjYxMA==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 265,
+      "original_position" : 155,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.h",
+      "position" : 155,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475992610",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475993339"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475993339"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit: \"is not *exactly* 64 bytes\"",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T00:19:34Z",
+      "diff_hunk" : "@@ -206,6 +206,25 @@ class CPubKey\n     bool Derive(CPubKey& pubkeyChild, ChainCode &ccChild, unsigned int nChild, const ChainCode& cc) const;\n };\n \n+class XOnlyPubKey {\n+private:\n+    uint256 m_keydata;\n+\n+public:\n+    XOnlyPubKey(const uint256& in) : m_keydata(in) {}\n+\n+    /** Verify a 64-byte Schnorr signature.\n+     *\n+     * If the signature is not 64 bytes, or the public key is not fully valid, false is returned.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475993339",
+      "id" : 475993339,
+      "line" : 218,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NTk5MzMzOQ==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 218,
+      "original_position" : 22,
+      "original_start_line" : null,
+      "path" : "src/pubkey.h",
+      "position" : 22,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475993339",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475997847"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475997847"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Suggest moving the size check and uint256 cast into `XOnlyPubKey` construction & `IsValid`, like `CheckECDSASignature` does",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T00:26:13Z",
+      "diff_hunk" : "@@ -1407,12 +1646,33 @@ bool GenericTransactionSignatureChecker<T>::CheckSig(const std::vector<unsigned\n \n     uint256 sighash = SignatureHash(scriptCode, *txTo, nIn, nHashType, amount, sigversion, this->txdata);\n \n-    if (!VerifySignature(vchSig, pubkey, sighash))\n+    if (!VerifyECDSASignature(vchSig, pubkey, sighash))\n         return false;\n \n     return true;\n }\n \n+template <class T>\n+bool GenericTransactionSignatureChecker<T>::CheckSchnorrSignature(const std::vector<unsigned char>& sig_in, const std::vector<unsigned char>& pubkey_in, SigVersion sigversion, const ScriptExecutionData& execdata) const\n+{\n+    std::vector<unsigned char> sig(sig_in);\n+    if (sig.empty()) return false;\n+\n+    if (pubkey_in.size() != 32) return false;\n+    XOnlyPubKey pubkey{uint256(pubkey_in)};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r475997847",
+      "id" : 475997847,
+      "line" : 1662,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NTk5Nzg0Nw==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1662,
+      "original_position" : 491,
+      "original_start_line" : 1661,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 491,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : 1661,
+      "start_side" : "RIGHT",
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/475997847",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476002693"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476002693"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Inaccuracy in previous comment aside, seems like it would be best to correct the new one (with 31 null bytes after E/S)",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T00:34:02Z",
+      "diff_hunk" : "@@ -22,8 +22,9 @@ namespace {\n class CSignatureCache\n {\n private:\n-     //! Entries are SHA256(nonce || signature hash || public key || signature):\n-    CSHA256 m_salted_hasher;\n+     //! Entries are SHA256(nonce || 'E' or 'S' || signature hash || public key || signature):",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476002693",
+      "id" : 476002693,
+      "line" : 25,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NjAwMjY5Mw==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 25,
+      "original_position" : 6,
+      "original_start_line" : null,
+      "path" : "src/script/sigcache.cpp",
+      "position" : 6,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476002693",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476003576"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476003576"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Probable premature optimisation: Copy `m_salted_hasher_ecdsa` before adding the padding?",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T00:35:17Z",
+      "diff_hunk" : "@@ -34,18 +35,30 @@ class CSignatureCache\n         uint256 nonce = GetRandHash();\n         // We want the nonce to be 64 bytes long to force the hasher to process\n         // this chunk, which makes later hash computations more efficient. We\n-        // just write our 32-byte entropy twice to fill the 64 bytes.\n-        m_salted_hasher.Write(nonce.begin(), 32);\n-        m_salted_hasher.Write(nonce.begin(), 32);\n+        // just write our 32-byte entropy, and then pad with 'E' for ECDSA and\n+        // 'S' for Schnorr (followed by 0 bytes).\n+        static const unsigned char PADDING_ECDSA[32] = {'E'};\n+        static const unsigned char PADDING_SCHNORR[32] = {'S'};\n+        m_salted_hasher_ecdsa.Write(nonce.begin(), 32);\n+        m_salted_hasher_ecdsa.Write(PADDING_ECDSA, 32);\n+        m_salted_hasher_schnorr.Write(nonce.begin(), 32);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476003576",
+      "id" : 476003576,
+      "line" : 44,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NjAwMzU3Ng==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 44,
+      "original_position" : 25,
+      "original_start_line" : null,
+      "path" : "src/script/sigcache.cpp",
+      "position" : 25,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476003576",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476142106"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476142106"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Prefer `assert(false);` for unreachable conditions",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T04:08:19Z",
+      "diff_hunk" : "@@ -363,15 +360,76 @@ static bool EvalChecksig(const valtype& vchSig, const valtype& vchPubKey, CScrip\n         //serror is set\n         return false;\n     }\n-    fSuccess = checker.CheckSig(vchSig, vchPubKey, scriptCode, sigversion);\n+    fSuccess = checker.CheckECDSASignature(vchSig, vchPubKey, scriptCode, sigversion);\n \n     if (!fSuccess && (flags & SCRIPT_VERIFY_NULLFAIL) && vchSig.size())\n         return set_error(serror, SCRIPT_ERR_SIG_NULLFAIL);\n \n     return true;\n }\n \n-bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror)\n+static bool EvalChecksigTapscript(const valtype& sig, const valtype& pubkey, ScriptExecutionData& execdata, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& success)\n+{\n+    assert(sigversion == SigVersion::TAPSCRIPT);\n+\n+    /*\n+     *  The following validation sequence is consensus critical. Please note how --\n+     *    upgradable public key versions precede other rules;\n+     *    the script execution fails when using empty signature with invalid public key;\n+     *    the script execution fails when using non-empty invalid signature.\n+     */\n+    success = !sig.empty();\n+    if (success) {\n+        // Implement the sigops/witnesssize ratio test.\n+        // Passing with an upgradable public key version is also counted.\n+        assert(execdata.m_validation_weight_left_init);\n+        execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_SIGOP_PASSED;\n+        if (execdata.m_validation_weight_left < 0) {\n+            return set_error(serror, SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT);\n+        }\n+    }\n+    if (pubkey.size() == 0) {\n+        return set_error(serror, SCRIPT_ERR_PUBKEYTYPE);\n+    } else if (pubkey.size() == 32) {\n+        if (success && !checker.CheckSchnorrSignature(sig, pubkey, sigversion, execdata)) {\n+            return set_error(serror, SCRIPT_ERR_SIG_NULLFAIL);\n+        }\n+    } else {\n+        /*\n+         *  New public key version softforks should be defined before this `else` block.\n+         *  Generally, the new code should not do anything but failing the script execution. To avoid\n+         *  consensus bugs, it should not modify any existing values (including success).\n+         */\n+        if ((flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE) != 0) {\n+            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_PUBKEYTYPE);\n+        }\n+    }\n+\n+    return true;\n+}\n+\n+/** Helper for OP_CHECKSIG, OP_CHECKSIGVERIFY, and (in Tapscript) OP_CHECKSIGADD.\n+ *\n+ * A return value of false means the script fails entirely. When true is returned, the\n+ * fSuccess variable indicates whether the signature check itself succeeded.\n+ */\n+static bool EvalChecksig(const valtype& sig, const valtype& pubkey, CScript::const_iterator pbegincodehash, CScript::const_iterator pend, ScriptExecutionData& execdata, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& success)\n+{\n+    switch (sigversion) {\n+    case SigVersion::BASE:\n+    case SigVersion::WITNESS_V0:\n+        return EvalChecksigPreTapscript(sig, pubkey, pbegincodehash, pend, flags, checker, sigversion, serror, success);\n+    case SigVersion::TAPSCRIPT:\n+        return EvalChecksigTapscript(sig, pubkey, execdata, flags, checker, sigversion, serror, success);\n+    case SigVersion::TAPROOT:\n+        // Key path spending in Taproot has no script, so this is unreachable.\n+        break;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476142106",
+      "id" : 476142106,
+      "line" : 426,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NjE0MjEwNg==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 426,
+      "original_position" : 86,
+      "original_start_line" : 425,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 86,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : 425,
+      "start_side" : "RIGHT",
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476142106",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476154468"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476154468"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "If we ever had a `continue`, this would get skipped. Seems like a code footgun.\r\n\r\nWe could replace `while (pc < pend)` with `for ( ; pc < pend; ++opcode_pos)` perhaps?",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T04:25:43Z",
+      "diff_hunk" : "@@ -1146,6 +1235,8 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript&\n             // Size limits\n             if (stack.size() + altstack.size() > MAX_STACK_SIZE)\n                 return set_error(serror, SCRIPT_ERR_STACK_SIZE);\n+\n+            ++opcode_pos;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476154468",
+      "id" : 476154468,
+      "line" : 1239,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NjE1NDQ2OA==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1239,
+      "original_position" : 201,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 201,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476154468",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476157648"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476157648"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "All existing disabled opcodes trigger `SCRIPT_ERR_DISABLED_OPCODE` unconditionally, even if their branch isn't taken. Do we want to preserve that for CHECKMULTISIG? If not, do we still want to use the same error code?",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T04:30:06Z",
+      "diff_hunk" : "@@ -1029,9 +1095,32 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript&\n                 }\n                 break;\n \n+                case OP_CHECKSIGADD:\n+                {\n+                    // OP_CHECKSIGADD is only available in Tapscript\n+                    if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);\n+\n+                    // (sig num pubkey -- num)\n+                    if (stack.size() < 3) return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);\n+\n+                    const valtype& sig = stacktop(-3);\n+                    const CScriptNum num(stacktop(-2), fRequireMinimal);\n+                    const valtype& pubkey = stacktop(-1);\n+\n+                    bool success = true;\n+                    if (!EvalChecksig(sig, pubkey, pbegincodehash, pend, execdata, flags, checker, sigversion, serror, success)) return false;\n+                    popstack(stack);\n+                    popstack(stack);\n+                    popstack(stack);\n+                    stack.push_back((num + (success ? 1 : 0)).getvch());\n+                }\n+                break;\n+\n                 case OP_CHECKMULTISIG:\n                 case OP_CHECKMULTISIGVERIFY:\n                 {\n+                    if (sigversion == SigVersion::TAPSCRIPT) return set_error(serror, SCRIPT_ERR_DISABLED_OPCODE);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476157648",
+      "id" : 476157648,
+      "line" : 1122,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NjE1NzY0OA==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1122,
+      "original_position" : 182,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 182,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476157648",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476166522"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476166522"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "We should probably policy-reject annex here for now?",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T04:42:21Z",
+      "diff_hunk" : "@@ -237,6 +239,34 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)\n                     return false;\n             }\n         }\n+\n+        // Check MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE policy limit for Taproot spends.\n+        if (witnessversion == 1 && witnessprogram.size() == WITNESS_V1_TAPROOT_SIZE && !p2sh) {\n+            // Taproot spend (non-P2SH-wrapped, version 1, witness program size 32; see BIP 341)\n+            auto stack = MakeSpan(tx.vin[i].scriptWitness.stack);\n+            if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {\n+                // Drop annex",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476166522",
+      "id" : 476166522,
+      "line" : 248,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NjE2NjUyMg==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 248,
+      "original_position" : 35,
+      "original_start_line" : null,
+      "path" : "src/policy/policy.cpp",
+      "position" : 35,
+      "pull_request_review_id" : 473818660,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T04:49:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476166522",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/1095675?v=4",
+         "events_url" : "https://api.github.com/users/luke-jr/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/luke-jr/followers",
+         "following_url" : "https://api.github.com/users/luke-jr/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/luke-jr/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/luke-jr",
+         "id" : 1095675,
+         "login" : "luke-jr",
+         "node_id" : "MDQ6VXNlcjEwOTU2NzU=",
+         "organizations_url" : "https://api.github.com/users/luke-jr/orgs",
+         "received_events_url" : "https://api.github.com/users/luke-jr/received_events",
+         "repos_url" : "https://api.github.com/users/luke-jr/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/luke-jr/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/luke-jr/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/luke-jr"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476264893"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476264893"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "#19601 ",
+      "commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "created_at" : "2020-08-25T08:18:08Z",
+      "diff_hunk" : "@@ -1258,65 +1349,207 @@ class CTransactionSignatureSerializer\n     }\n };\n \n+/** Compute the (single) SHA256 of the concatenation of all prevouts of a tx. */",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17977#discussion_r476264893",
+      "id" : 476264893,
+      "in_reply_to_id" : 475947567,
+      "line" : 1352,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ3NjI2NDg5Mw==",
+      "original_commit_id" : "c18ba5afa6cd6f7a14b0b4aa8c0fc5943f188b67",
+      "original_line" : 1352,
+      "original_position" : 209,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 209,
+      "pull_request_review_id" : 474244041,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17977",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-08-25T08:18:09Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/476264893",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/886523?v=4",
+         "events_url" : "https://api.github.com/users/JeremyRubin/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/JeremyRubin/followers",
+         "following_url" : "https://api.github.com/users/JeremyRubin/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/JeremyRubin/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/JeremyRubin",
+         "id" : 886523,
+         "login" : "JeremyRubin",
+         "node_id" : "MDQ6VXNlcjg4NjUyMw==",
+         "organizations_url" : "https://api.github.com/users/JeremyRubin/orgs",
+         "received_events_url" : "https://api.github.com/users/JeremyRubin/received_events",
+         "repos_url" : "https://api.github.com/users/JeremyRubin/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/JeremyRubin/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/JeremyRubin/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/JeremyRubin"
+      }
    }
 ]
