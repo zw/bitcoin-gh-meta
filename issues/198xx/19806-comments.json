@@ -1393,5 +1393,61 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jamesob"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19806#discussion_r480835783"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19806"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/480835783"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Oh I missed the `max_secs_to_wait_for_headers` :sleeping: ",
+      "commit_id" : "1aa7b9137090d0021298a0e2696871dd21bfdefc",
+      "created_at" : "2020-09-01T05:34:47Z",
+      "diff_hunk" : "@@ -5298,6 +5298,256 @@ static bool ExpectedAssumeutxo(int height, uint256& expected_out)\n     return true;\n }\n \n+bool ChainstateManager::ActivateSnapshot(\n+        CAutoFile* coins_file,\n+        SnapshotMetadata metadata,\n+        bool in_memory)\n+{\n+    uint256 base_blockhash = metadata.m_base_blockhash;\n+\n+    // Can't activate a snapshot more than once.\n+    assert(!this->SnapshotBlockhash());\n+    int64_t current_coinsdb_cache_size{0};\n+    int64_t current_coinstip_cache_size{0};\n+\n+    // Cache percentages to allocate to each chainstate.\n+    constexpr float ibd_cache_perc = 0.01;\n+    constexpr float snapshot_cache_perc = 0.99;\n+\n+    {\n+        LOCK(::cs_main);\n+        // Resize the coins caches to ensure we're not exceeding memory limits.\n+        //\n+        // Allocate the majority of the cache to the incoming snapshot chainstate, since\n+        // (optimistically) getting to its tip will be the top priority. We'll need to call\n+        // `MaybeRebalanceCaches()` once we're done with this function to ensure\n+        // the right allocation (including the possibility that no snapshot was activated\n+        // and that we should restore the active chainstate caches to their original size).\n+        //\n+        current_coinsdb_cache_size = ::ChainstateActive().m_coinsdb_cache_size_bytes;\n+        current_coinstip_cache_size = ::ChainstateActive().m_coinstip_cache_size_bytes;\n+\n+        // Temporarily resize the active coins cache to make room for the newly-created\n+        // snapshot chain.\n+        ::ChainstateActive().ResizeCoinsCaches(\n+            current_coinstip_cache_size * ibd_cache_perc,\n+            current_coinsdb_cache_size * ibd_cache_perc);\n+    }\n+\n+    auto snapshot_chainstate = MakeUnique<CChainState>(m_blockman, base_blockhash);\n+\n+    {\n+        LOCK(::cs_main);\n+        snapshot_chainstate->InitCoinsDB(\n+            current_coinsdb_cache_size * snapshot_cache_perc, in_memory, false, \"chainstate\");\n+        snapshot_chainstate->InitCoinsCache(current_coinstip_cache_size * snapshot_cache_perc);\n+    }\n+\n+    bool snapshot_ok = this->PopulateAndValidateSnapshot(\n+        *snapshot_chainstate, coins_file, metadata);\n+\n+    if (!snapshot_ok) {\n+        WITH_LOCK(::cs_main, MaybeRebalanceCaches());\n+        return false;\n+    }\n+\n+    {\n+        LOCK(::cs_main);\n+        m_snapshot_chainstate.swap(snapshot_chainstate);\n+        assert(m_snapshot_chainstate->LoadChainTip(::Params()));\n+\n+        m_active_chainstate = m_snapshot_chainstate.get();\n+        // Don't rebalance disk or FlushStateToDisk\n+    }\n+    LogPrintf(\"[snapshot] successfully activated snapshot %s\\n\", base_blockhash.ToString());\n+    {\n+        LOCK(::cs_main);\n+        LogPrintf(\"[snapshot] (%.2f MB)\\n\",\n+            m_snapshot_chainstate->CoinsTip().DynamicMemoryUsage() / (1000 * 1000));\n+    }\n+    return true;\n+}\n+\n+bool ChainstateManager::PopulateAndValidateSnapshot(\n+    CChainState& snapshot_chainstate,\n+    CAutoFile* coins_file,\n+    const SnapshotMetadata& metadata)\n+{\n+    LOCK(::cs_main);\n+    CCoinsViewCache& coins_cache = snapshot_chainstate.CoinsTip();\n+    uint256 base_blockhash = metadata.m_base_blockhash;\n+\n+    COutPoint outpoint;\n+    Coin coin;\n+    uint64_t coins_count = metadata.m_coins_count;\n+    uint64_t coins_left = metadata.m_coins_count;\n+\n+    LogPrintf(\"[snapshot] loading coins from snapshot %s\\n\", base_blockhash.ToString());\n+    int64_t flush_now{0};\n+    int64_t coins_processed{0};\n+\n+    while (coins_left > 0) {\n+        *coins_file >> outpoint;\n+        *coins_file >> coin;\n+        coins_cache.cachedCoinsUsage += coin.DynamicMemoryUsage();\n+        coins_cache.cacheCoins.emplace(\n+            std::piecewise_construct,\n+            std::forward_as_tuple(std::move(outpoint)),\n+            std::forward_as_tuple(std::move(coin), CCoinsCacheEntry::DIRTY));\n+        coins_left -= 1;\n+        coins_processed += 1;\n+\n+        if (coins_processed % 1000000 == 0) {\n+            LogPrintf(\"[snapshot] %d coins loaded (%.2f%%, %.2f MB)\\n\",\n+                coins_processed,\n+                (float) coins_processed * 100 / (float) coins_count,\n+                coins_cache.DynamicMemoryUsage() / (1000 * 1000));\n+        }\n+\n+        // Batch write and flush (if we need to) every so often.\n+        //\n+        // If our average Coin size is roughly 41 bytes, checking every 120,000 coins\n+        // means <5MB of memory imprecision.\n+        if (coins_processed % 120000 == 0) {\n+            if (ShutdownRequested()) {\n+                return false;\n+            }\n+            if (snapshot_chainstate.GetCoinsCacheSizeState(&::mempool) >= CoinsCacheSizeState::CRITICAL) {\n+                LogPrintf(\"[snapshot] flushing coins cache (%.2f MB)... \", /* Continued */\n+                    coins_cache.DynamicMemoryUsage() / (1000 * 1000));\n+                flush_now = GetTimeMillis();\n+\n+                // This is a hack - we don't know what the actual best block is, but that\n+                // doesn't matter for the purposes of flushing the cache here. We'll set this\n+                // to its correct value (`base_blockhash`) below after the coins are loaded.\n+                coins_cache.SetBestBlock(GetRandHash());\n+\n+                coins_cache.Flush();\n+                LogPrintf(\"done (%.2fms)\\n\", GetTimeMillis() - flush_now);\n+            }\n+        }\n+    }\n+\n+    // Important that we set this. This and the cacheCoins accesses above are\n+    // sort of a layer violation, but either we reach into the innards of\n+    // CCoinsViewCache here or we have to invert some of the CChainState to\n+    // embed them in a snapshot-activation-specific CCoinsViewCache bulk load\n+    // method.\n+    coins_cache.hashBlock = base_blockhash;\n+\n+    bool out_of_coins{false};\n+    try {\n+        *coins_file >> outpoint;\n+    } catch (const std::ios_base::failure&) {\n+        // We expect an exception since we should be out of coins.\n+        out_of_coins = true;\n+    }\n+    if (!out_of_coins) {\n+        LogPrintf(\"[snapshot] bad snapshot - coins left over after deserializing %d coins\\n\",\n+            coins_count - coins_left);\n+        return false;\n+    }\n+\n+    LogPrintf(\"[snapshot] loaded %d (%.2f MB) coins from snapshot %s\\n\",\n+        coins_count - coins_left,\n+        coins_cache.DynamicMemoryUsage() / (1000 * 1000),\n+        base_blockhash.ToString());\n+\n+    LogPrintf(\"[snapshot] flushing snapshot chainstate to disk\\n\");\n+    // No need to acquire cs_main since this chainstate isn't being used yet.\n+    coins_cache.Flush(); // TODO: if #17487 is merged, add erase=false here for better performance.\n+\n+    assert(coins_cache.GetBestBlock() == base_blockhash);\n+\n+    CCoinsStats stats;\n+    if (!GetUTXOStats(&snapshot_chainstate.CoinsDB(), stats, CoinStatsHashType::HASH_SERIALIZED, [] {})) {\n+        LogPrintf(\"[snapshot] failed to generate coins stats\\n\");\n+        return false;\n+    }\n+\n+    // Ensure that the base blockhash appears in the known chain of valid headers. We're willing to\n+    // wait a bit here because the snapshot may have been loaded on startup, before we've\n+    // received headers from the network.\n+\n+    int max_secs_to_wait_for_headers = 60 * 10;\n+    CBlockIndex* snapshot_start_block = nullptr;\n+\n+    while (max_secs_to_wait_for_headers > 0) {\n+        snapshot_start_block = LookupBlockIndex(base_blockhash);\n+        max_secs_to_wait_for_headers -= 1;\n+\n+        if (!snapshot_start_block) {\n+            std::this_thread::sleep_for(std::chrono::seconds(1));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19806#discussion_r480835783",
+      "id" : 480835783,
+      "in_reply_to_id" : 480281665,
+      "line" : 5479,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ4MDgzNTc4Mw==",
+      "original_commit_id" : "bdf182e81e8e03b4670059a718159e03dd35fbe4",
+      "original_line" : 5479,
+      "original_position" : 183,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 218,
+      "pull_request_review_id" : 479412104,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19806",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-09-01T05:34:47Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/480835783",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
    }
 ]
