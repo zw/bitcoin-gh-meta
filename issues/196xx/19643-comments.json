@@ -6910,7 +6910,7 @@
          }
       },
       "author_association" : "MEMBER",
-      "body" : "@n-thumann Thanks for having a look. I don't plan to make further changes for edge cases unless they can be addressed within the scope of this PR. The net address code is currently being deeply changed for BIP155 `addrv2`, this PR has seen a lot of review and updates, and if we begin gating it on changes in code outside this PR, we'll miss the next feature freeze. This is *very* useable in its current state (if you start using it, good luck doing without it afterward :smiley:) and if merged, I'll be happy to make further improvements based on the state of the codebase at that time.",
+      "body" : "@n-thumann Thanks for having a look. I don't plan to make further changes for edge cases unless they can be addressed within the scope of this PR (but am willing to update if they can be!)\n\nThe net address code is currently being deeply changed for BIP155 `addrv2`. This PR has seen a lot of review and updates, and if we begin gating it on changes in code outside this PR, we'll risk missing the next feature freeze. I think this is *very* useable in its current state--if you start using it, good luck doing without it afterward :smiley:--and if merged, I'll be happy to make further improvements based on the state of the codebase at that time.",
       "commit_id" : "bf1f913c4405cba35c8f99ec07b407940eb955b6",
       "created_at" : "2020-09-04T14:50:19Z",
       "diff_hunk" : "@@ -291,6 +295,211 @@ class GetinfoRequestHandler: public BaseRequestHandler\n     }\n };\n \n+/** Process netinfo requests */\n+class NetinfoRequestHandler : public BaseRequestHandler\n+{\n+private:\n+    bool IsAddrIPv6(const std::string& addr) const\n+    {\n+        return !addr.empty() && addr.front() == '[';\n+    }\n+    bool IsInboundOnion(const std::string& addr_local, int mapped_as) const\n+    {\n+        return mapped_as == 0 && addr_local.find(ONION) != std::string::npos;\n+    }\n+    bool IsOutboundOnion(const std::string& addr, int mapped_as) const\n+    {\n+        const size_t addr_len{addr.size()};\n+        const size_t onion_pos{addr.rfind(ONION)};\n+        return mapped_as == 0 && onion_pos != std::string::npos && addr_len > ONION_LEN &&\n+               (onion_pos == addr_len - ONION_LEN || onion_pos == addr.find_last_of(\":\") - ONION_LEN);\n+    }\n+    uint8_t m_details_level{0}; //!< Optional user-supplied arg to set dashboard details level\n+    bool DetailsRequested() const { return m_details_level > 0 && m_details_level < 5; }\n+    bool IsAddressSelected() const { return m_details_level == 2 || m_details_level == 4; }\n+    bool IsVersionSelected() const { return m_details_level == 3 || m_details_level == 4; }\n+    enum struct NetType {\n+        ipv4,\n+        ipv6,\n+        onion,\n+    };\n+    struct Peer {\n+        int id;\n+        int mapped_as;\n+        int version;\n+        int64_t conn_time;\n+        int64_t last_blck;\n+        int64_t last_recv;\n+        int64_t last_send;\n+        int64_t last_trxn;\n+        double min_ping;\n+        double ping;\n+        std::string addr;\n+        std::string sub_version;\n+        NetType net_type;\n+        bool is_block_relay;\n+        bool is_outbound;\n+        bool operator<(const Peer& rhs) const { return std::tie(is_outbound, min_ping) < std::tie(rhs.is_outbound, rhs.min_ping); }\n+    };\n+    std::string NetTypeEnumToString(NetType t)\n+    {\n+        switch (t) {\n+        case NetType::ipv4: return \"ipv4\";\n+        case NetType::ipv6: return \"ipv6\";\n+        case NetType::onion: return \"onion\";\n+        } // no default case, so the compiler can warn about missing cases\n+        assert(false);\n+    }\n+    std::string ChainToString() const\n+    {\n+        if (gArgs.GetChainName() == CBaseChainParams::TESTNET) return \" testnet\";\n+        if (gArgs.GetChainName() == CBaseChainParams::REGTEST) return \" regtest\";\n+        return \"\";\n+    }\n+public:\n+    const int ID_PEERINFO = 0;\n+    const int ID_NETWORKINFO = 1;\n+\n+    UniValue PrepareRequest(const std::string& method, const std::vector<std::string>& args) override\n+    {\n+        if (!args.empty()) {\n+            uint8_t n{0};\n+            if (ParseUInt8(args.at(0), &n)) {\n+                m_details_level = n;\n+            }\n+        }\n+        UniValue result(UniValue::VARR);\n+        result.push_back(JSONRPCRequestObj(\"getpeerinfo\", NullUniValue, ID_PEERINFO));\n+        result.push_back(JSONRPCRequestObj(\"getnetworkinfo\", NullUniValue, ID_NETWORKINFO));\n+        return result;\n+    }\n+\n+    UniValue ProcessReply(const UniValue& batch_in) override\n+    {\n+        const std::vector<UniValue> batch{JSONRPCProcessBatchReply(batch_in)};\n+        if (!batch[ID_PEERINFO][\"error\"].isNull()) return batch[ID_PEERINFO];\n+        if (!batch[ID_NETWORKINFO][\"error\"].isNull()) return batch[ID_NETWORKINFO];\n+\n+        const UniValue& networkinfo{batch[ID_NETWORKINFO][\"result\"]};\n+        if (networkinfo[\"version\"].get_int() < 209900) {\n+            throw std::runtime_error(\"-netinfo requires bitcoind server to be running v0.21.0 and up\");\n+        }\n+\n+        // Count peer connection totals, and if DetailsRequested(), store peer data in a vector of structs.\n+        const int64_t time_now{GetSystemTimeInSeconds()};\n+        int ipv4_i{0}, ipv6_i{0}, onion_i{0}, block_relay_i{0}, total_i{0}; // inbound conn counters\n+        int ipv4_o{0}, ipv6_o{0}, onion_o{0}, block_relay_o{0}, total_o{0}; // outbound conn counters\n+        size_t max_peer_id_length{2}, max_addr_length{0};\n+        bool is_asmap_on{false};\n+        std::vector<Peer> peers;\n+        const UniValue& getpeerinfo{batch[ID_PEERINFO][\"result\"]};\n+\n+        for (const UniValue& peer : getpeerinfo.getValues()) {\n+            const std::string addr{peer[\"addr\"].get_str()};",
@@ -6930,8 +6930,64 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2020-09-04T14:50:20Z",
+      "updated_at" : "2020-09-04T16:39:20Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/483665018",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19643#discussion_r483718789"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19643"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/483718789"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "@n-thumann In the interim, don't hesitate to use this feature to keep tabs on your node's peer connections and ACK if you find it satisfactory.",
+      "commit_id" : "bf1f913c4405cba35c8f99ec07b407940eb955b6",
+      "created_at" : "2020-09-04T16:11:08Z",
+      "diff_hunk" : "@@ -291,6 +295,211 @@ class GetinfoRequestHandler: public BaseRequestHandler\n     }\n };\n \n+/** Process netinfo requests */\n+class NetinfoRequestHandler : public BaseRequestHandler\n+{\n+private:\n+    bool IsAddrIPv6(const std::string& addr) const\n+    {\n+        return !addr.empty() && addr.front() == '[';\n+    }\n+    bool IsInboundOnion(const std::string& addr_local, int mapped_as) const\n+    {\n+        return mapped_as == 0 && addr_local.find(ONION) != std::string::npos;\n+    }\n+    bool IsOutboundOnion(const std::string& addr, int mapped_as) const\n+    {\n+        const size_t addr_len{addr.size()};\n+        const size_t onion_pos{addr.rfind(ONION)};\n+        return mapped_as == 0 && onion_pos != std::string::npos && addr_len > ONION_LEN &&\n+               (onion_pos == addr_len - ONION_LEN || onion_pos == addr.find_last_of(\":\") - ONION_LEN);\n+    }\n+    uint8_t m_details_level{0}; //!< Optional user-supplied arg to set dashboard details level\n+    bool DetailsRequested() const { return m_details_level > 0 && m_details_level < 5; }\n+    bool IsAddressSelected() const { return m_details_level == 2 || m_details_level == 4; }\n+    bool IsVersionSelected() const { return m_details_level == 3 || m_details_level == 4; }\n+    enum struct NetType {\n+        ipv4,\n+        ipv6,\n+        onion,\n+    };\n+    struct Peer {\n+        int id;\n+        int mapped_as;\n+        int version;\n+        int64_t conn_time;\n+        int64_t last_blck;\n+        int64_t last_recv;\n+        int64_t last_send;\n+        int64_t last_trxn;\n+        double min_ping;\n+        double ping;\n+        std::string addr;\n+        std::string sub_version;\n+        NetType net_type;\n+        bool is_block_relay;\n+        bool is_outbound;\n+        bool operator<(const Peer& rhs) const { return std::tie(is_outbound, min_ping) < std::tie(rhs.is_outbound, rhs.min_ping); }\n+    };\n+    std::string NetTypeEnumToString(NetType t)\n+    {\n+        switch (t) {\n+        case NetType::ipv4: return \"ipv4\";\n+        case NetType::ipv6: return \"ipv6\";\n+        case NetType::onion: return \"onion\";\n+        } // no default case, so the compiler can warn about missing cases\n+        assert(false);\n+    }\n+    std::string ChainToString() const\n+    {\n+        if (gArgs.GetChainName() == CBaseChainParams::TESTNET) return \" testnet\";\n+        if (gArgs.GetChainName() == CBaseChainParams::REGTEST) return \" regtest\";\n+        return \"\";\n+    }\n+public:\n+    const int ID_PEERINFO = 0;\n+    const int ID_NETWORKINFO = 1;\n+\n+    UniValue PrepareRequest(const std::string& method, const std::vector<std::string>& args) override\n+    {\n+        if (!args.empty()) {\n+            uint8_t n{0};\n+            if (ParseUInt8(args.at(0), &n)) {\n+                m_details_level = n;\n+            }\n+        }\n+        UniValue result(UniValue::VARR);\n+        result.push_back(JSONRPCRequestObj(\"getpeerinfo\", NullUniValue, ID_PEERINFO));\n+        result.push_back(JSONRPCRequestObj(\"getnetworkinfo\", NullUniValue, ID_NETWORKINFO));\n+        return result;\n+    }\n+\n+    UniValue ProcessReply(const UniValue& batch_in) override\n+    {\n+        const std::vector<UniValue> batch{JSONRPCProcessBatchReply(batch_in)};\n+        if (!batch[ID_PEERINFO][\"error\"].isNull()) return batch[ID_PEERINFO];\n+        if (!batch[ID_NETWORKINFO][\"error\"].isNull()) return batch[ID_NETWORKINFO];\n+\n+        const UniValue& networkinfo{batch[ID_NETWORKINFO][\"result\"]};\n+        if (networkinfo[\"version\"].get_int() < 209900) {\n+            throw std::runtime_error(\"-netinfo requires bitcoind server to be running v0.21.0 and up\");\n+        }\n+\n+        // Count peer connection totals, and if DetailsRequested(), store peer data in a vector of structs.\n+        const int64_t time_now{GetSystemTimeInSeconds()};\n+        int ipv4_i{0}, ipv6_i{0}, onion_i{0}, block_relay_i{0}, total_i{0}; // inbound conn counters\n+        int ipv4_o{0}, ipv6_o{0}, onion_o{0}, block_relay_o{0}, total_o{0}; // outbound conn counters\n+        size_t max_peer_id_length{2}, max_addr_length{0};\n+        bool is_asmap_on{false};\n+        std::vector<Peer> peers;\n+        const UniValue& getpeerinfo{batch[ID_PEERINFO][\"result\"]};\n+\n+        for (const UniValue& peer : getpeerinfo.getValues()) {\n+            const std::string addr{peer[\"addr\"].get_str()};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19643#discussion_r483718789",
+      "id" : 483718789,
+      "in_reply_to_id" : 483576375,
+      "line" : 398,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ4MzcxODc4OQ==",
+      "original_commit_id" : "bf1f913c4405cba35c8f99ec07b407940eb955b6",
+      "original_line" : 398,
+      "original_position" : 122,
+      "original_start_line" : null,
+      "path" : "src/bitcoin-cli.cpp",
+      "position" : 122,
+      "pull_request_review_id" : 482781481,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19643",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-09-04T16:11:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/483718789",
       "user" : {
          "avatar_url" : "https://avatars1.githubusercontent.com/u/2415484?v=4",
          "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
