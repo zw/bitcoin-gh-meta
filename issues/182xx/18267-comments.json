@@ -17315,5 +17315,225 @@
          "type" : "User",
          "url" : "https://api.github.com/users/dr-orlovsky"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18267#discussion_r491680141"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18267"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/491680141"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "might be good to rename m_valid to has_txs or similar, since the sigcheck validation hasn't been run at this point, so it is unknown whether the txs are valid.",
+      "commit_id" : "8258c4c0076bb5f27efdc117a04b27fcd6dd00b2",
+      "created_at" : "2020-09-20T11:03:29Z",
+      "diff_hunk" : "@@ -0,0 +1,149 @@\n+// Copyright (c) 2019-2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <signet.h>\n+\n+#include <array>\n+#include <cstdint>\n+#include <vector>\n+\n+#include <consensus/merkle.h>\n+#include <consensus/params.h>\n+#include <consensus/validation.h>\n+#include <core_io.h>\n+#include <hash.h>\n+#include <primitives/block.h>\n+#include <primitives/transaction.h>\n+#include <span.h>\n+#include <script/interpreter.h>\n+#include <script/standard.h>\n+#include <streams.h>\n+#include <util/strencodings.h>\n+#include <util/system.h>\n+#include <uint256.h>\n+\n+static constexpr uint8_t SIGNET_HEADER[4] = {0xec, 0xc7, 0xda, 0xa2};\n+\n+static constexpr unsigned int BLOCK_SCRIPT_VERIFY_FLAGS = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_NULLDUMMY;\n+\n+static bool FetchAndClearCommitmentSection(const Span<const uint8_t> header, CScript& witness_commitment, std::vector<uint8_t>& result)\n+{\n+    CScript replacement;\n+    bool found_header = false;\n+    result.clear();\n+\n+    opcodetype opcode;\n+    CScript::const_iterator pc = witness_commitment.begin();\n+    std::vector<uint8_t> pushdata;\n+    while (witness_commitment.GetOp(pc, opcode, pushdata)) {\n+        if (pushdata.size() > 0) {\n+            if (!found_header && pushdata.size() > (size_t) header.size() && Span<const uint8_t>(pushdata.data(), header.size()) == header) {\n+                // pushdata only counts if it has the header _and_ some data\n+                result.insert(result.end(), pushdata.begin() + header.size(), pushdata.end());\n+                pushdata.erase(pushdata.begin() + header.size(), pushdata.end());\n+                found_header = true;\n+            }\n+            replacement << pushdata;\n+        } else {\n+            replacement << opcode;\n+        }\n+    }\n+\n+    if (found_header) witness_commitment = replacement;\n+    return found_header;\n+}\n+\n+static uint256 ComputeModifiedMerkleRoot(const CMutableTransaction& cb, const CBlock& block)\n+{\n+    std::vector<uint256> leaves;\n+    leaves.resize(block.vtx.size());\n+    leaves[0] = cb.GetHash();\n+    for (size_t s = 1; s < block.vtx.size(); ++s) {\n+        leaves[s] = block.vtx[s]->GetHash();\n+    }\n+    return ComputeMerkleRoot(std::move(leaves));\n+}\n+\n+SignetTxs SignetTxs::Create(const CBlock& block, const CScript& challenge)\n+{\n+    CMutableTransaction tx_to_spend;\n+    tx_to_spend.nVersion = 0;\n+    tx_to_spend.nLockTime = 0;\n+    tx_to_spend.vin.emplace_back(COutPoint(), CScript(OP_0), 0);\n+    tx_to_spend.vout.emplace_back(0, challenge);\n+\n+    CMutableTransaction tx_spending;\n+    tx_spending.nVersion = 0;\n+    tx_spending.nLockTime = 0;\n+    tx_spending.vin.emplace_back(COutPoint(), CScript(), 0);\n+    tx_spending.vout.emplace_back(0, CScript(OP_RETURN));\n+\n+    // can't fill any other fields before extracting signet\n+    // responses from block coinbase tx\n+\n+    // find and delete signet signature\n+    if (block.vtx.empty()) return invalid(); // no coinbase tx in block; invalid\n+    CMutableTransaction modified_cb(*block.vtx.at(0));\n+\n+    const int cidx = GetWitnessCommitmentIndex(block);\n+    if (cidx == NO_WITNESS_COMMITMENT) {\n+        return invalid(); // require a witness commitment\n+    }\n+\n+    CScript& witness_commitment = modified_cb.vout.at(cidx).scriptPubKey;\n+\n+    std::vector<uint8_t> signet_solution;\n+    if (!FetchAndClearCommitmentSection(SIGNET_HEADER, witness_commitment, signet_solution)) {\n+        // no signet solution -- allow this to support OP_TRUE as trivial block challenge\n+    } else {\n+        try {\n+            VectorReader v(SER_NETWORK, INIT_PROTO_VERSION, signet_solution, 0);\n+            v >> tx_spending.vin[0].scriptSig;\n+            v >> tx_spending.vin[0].scriptWitness.stack;\n+            if (!v.empty()) return invalid(); // extraneous data encountered\n+        } catch (const std::exception&) {\n+            return invalid(); // parsing error\n+        }\n+    }\n+    uint256 signet_merkle = ComputeModifiedMerkleRoot(modified_cb, block);\n+\n+    std::vector<uint8_t> block_data;\n+    CVectorWriter writer(SER_NETWORK, INIT_PROTO_VERSION, block_data, 0);\n+    writer << block.nVersion;\n+    writer << block.hashPrevBlock;\n+    writer << signet_merkle;\n+    writer << block.nTime;\n+    tx_to_spend.vin[0].scriptSig << block_data;\n+    tx_spending.vin[0].prevout = COutPoint(tx_to_spend.GetHash(), 0);\n+\n+    return {tx_to_spend, tx_spending};\n+}\n+\n+// Signet block solution checker\n+bool CheckSignetBlockSolution(const CBlock& block, const Consensus::Params& consensusParams)\n+{\n+    if (block.GetHash() == consensusParams.hashGenesisBlock) {\n+        // genesis block solution is always valid\n+        return true;\n+    }\n+\n+    const CScript challenge(consensusParams.signet_challenge.begin(), consensusParams.signet_challenge.end());\n+    const SignetTxs signet_txs(block, challenge);\n+\n+    if (!signet_txs.m_valid) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18267#discussion_r491680141",
+      "id" : 491680141,
+      "line" : 134,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5MTY4MDE0MQ==",
+      "original_commit_id" : "404682b7cdb54494e7c98f0ba0cac8b51f379750",
+      "original_line" : 134,
+      "original_position" : 134,
+      "original_start_line" : null,
+      "path" : "src/signet.cpp",
+      "position" : 134,
+      "pull_request_review_id" : 492187976,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18267",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-09-20T11:25:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/491680141",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18267#discussion_r491681013"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18267"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/491681013"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "why is this check needed? This will limit coverage",
+      "commit_id" : "8258c4c0076bb5f27efdc117a04b27fcd6dd00b2",
+      "created_at" : "2020-09-20T11:14:19Z",
+      "diff_hunk" : "@@ -0,0 +1,34 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <consensus/validation.h>\n+#include <primitives/block.h>\n+#include <signet.h>\n+#include <streams.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/util.h>\n+\n+#include <cstdint>\n+#include <optional>\n+#include <vector>\n+\n+void initialize()\n+{\n+    InitializeFuzzingContext(CBaseChainParams::SIGNET);\n+}\n+\n+void test_one_input(const std::vector<uint8_t>& buffer)\n+{\n+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};\n+    const std::optional<CBlock> block = ConsumeDeserializable<CBlock>(fuzzed_data_provider);\n+    if (!block) {\n+        return;\n+    }\n+    (void)CheckSignetBlockSolution(*block, Params().GetConsensus());\n+    if (GetWitnessCommitmentIndex(*block) != NO_WITNESS_COMMITMENT) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18267#discussion_r491681013",
+      "id" : 491681013,
+      "line" : 31,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5MTY4MTAxMw==",
+      "original_commit_id" : "4c189abdc452f08dfa758564b5381bc78c42d481",
+      "original_line" : 31,
+      "original_position" : 31,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/signet.cpp",
+      "position" : 31,
+      "pull_request_review_id" : 492187976,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18267",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-09-20T11:25:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/491681013",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18267#discussion_r491681205"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18267"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/491681205"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "How is this different from just\r\n\r\n```suggestion\r\n        self.nodes[0].generate(1)\r\n```\r\n\r\nIdeally, we could run the tests without wallet",
+      "commit_id" : "8258c4c0076bb5f27efdc117a04b27fcd6dd00b2",
+      "created_at" : "2020-09-20T11:16:45Z",
+      "diff_hunk" : "@@ -0,0 +1,71 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2019-2020 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test basic signet functionality\"\"\"\n+\n+from decimal import Decimal\n+\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import assert_equal\n+\n+signet_blocks = [\n+    '00000020f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000f575c83235984e7dc4afc1f30944c170462e84437ab6f2d52e16878a79e4678bd1914d5fae77031eccf4070001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025151feffffff0200f2052a010000001600149243f727dd5343293eb83174324019ec16c2630f0000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402205e423a8754336ca99dbe16509b877ef1bf98d008836c725005b3c787c41ebe46022047246e4467ad7cc7f1ad98662afcaf14c115e0095a227c7b05c5182591c23e7e01000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020533b53ded9bff4adc94101d32400a144c54edc5ed492a3b26c63b2d686000000b38fef50592017cfafbcab88eb3d9cf50b2c801711cad8299495d26df5e54812e7914d5fae77031ecfdd0b0001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025251feffffff0200f2052a01000000160014fd09839740f0e0b4fc6d5e2527e4022aa9b89dfa0000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa24900473044022031d64a1692cdad1fc0ced69838169fe19ae01be524d831b95fcf5ea4e6541c3c02204f9dea0801df8b4d0cd0857c62ab35c6c25cc47c930630dc7fe723531daa3e9b01000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '000000202960f3752f0bfa8858a3e333294aedc7808025e868c9dc03e71d88bb320000007765fcd3d5b4966beb338bba2675dc2cf2ad28d4ad1d83bdb6f286e7e27ac1f807924d5fae77031e81d60b0001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025351feffffff0200f2052a010000001600141e5fb426042692ae0e87c070e78c39307a5661c20000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402205de93694763a42954865bcf1540cb82958bc62d0ec4eee02070fb7937cd037f4022067f333753bce47b10bc25eb6e1f311482e994c862a7e0b2d41ab1c8679fd1b1101000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020b06443a13ae1d3d50faef5ecad38c6818194dc46abca3e972e2aacdae800000069a5829097e80fee00ac49a56ea9f82d741a6af84d32b3bc455cf31871e2a8ac27924d5fae77031e9c91050001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025451feffffff0200f2052a0100000016001430db2f8225dcf7751361ab38735de08190318cb70000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402200936f5f9872f6df5dd242026ad52241a68423f7f682e79169a8d85a374eab9b802202cd2979c48b321b3453e65e8f92460db3fca93cbea8539b450c959f4fbe630c601000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '000000207ed403758a4f228a1939418a155e2ebd4ae6b26e5ffd0ae433123f7694010000542e80b609c5bc58af5bdf492e26d4f60cd43a3966c2e063c50444c29b3757a636924d5fae77031ee8601d0001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025551feffffff0200f2052a01000000160014edc207e014df34fa3885dff97d1129d356e1186a0000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa24900473044022021a3656609f85a66a2c5672ed9322c2158d57251040d2716ed202a1fe14f0c12022057d68bc6611f7a9424a7e00bbf3e27e6ae6b096f60bac624a094bc97a59aa1ff01000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '000000205bea0a88d1422c3df08d766ad72df95084d0700e6f873b75dd4e986c7703000002b57516d33ed60c2bdd9f93d6d5614083324c837e68e5ba6e04287a7285633585924d5fae77031ed171960001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025651feffffff0200f2052a010000001600143ae612599cf96f2442ce572633e0251116eaa52f0000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa24900473044022059a7c54de76bfdbb1dd44c78ea2dbd2bb4e97f4abad38965f41e76433e56423c022054bf17f04fe17415c0141f60eebd2b839200f574d8ad8d55a0917b92b0eb913401000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020daf3b60d374b19476461f97540498dcfa2eb7016238ec6b1d022f82fb60100007a7ae65b53cb988c2ec92d2384996713821d5645ffe61c9acea60da75cd5edfa1a944d5fae77031e9dbb050001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025751feffffff0200f2052a01000000160014ef2dceae02e35f8137de76768ae3345d99ca68860000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402202b3f946d6447f9bf17d00f3696cede7ee70b785495e5498274ee682a493befd5022045fc0bcf9332243168b5d35507175f9f374a8eba2336873885d12aada67ea5f601000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020457cc5f3c2e1a5655bc20e20e48d33e1b7ea68786c614032b5c518f0b6000000541f36942d82c6e7248275ff15c8933487fbe1819c67a9ecc0f4b70bb7e6cf672a944d5fae77031e8f39860001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025851feffffff0200f2052a0100000016001472a27906947c06d034b38ba2fa13c6391a4832790000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402202d62805ce60cbd60591f97f949b5ea5bd7e2307bcde343e6ea8394da92758e72022053a25370b0aa20da100189b7899a8f8675a0fdc60e38ece6b8a4f98edd94569e01000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020a2eb61eb4f3831baa3a3363e1b42db4462663f756f07423e81ed30322102000077224de7dea0f8d0ec22b1d2e2e255f0a987b96fe7200e1a2e6373f48a2f5b7894954d5fae77031e36867e0001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025951feffffff0200f2052a01000000160014aa0ad9f26801258382e0734dceec03a4a75f60240000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402206fa0d59990eed369bd7375767c9a6c9369fae209152b8674e520da270605528c0220749eed3b12dbe3f583f505d21803e4aef59c8e24c5831951eafa4f15a8f92c4e01000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020a868e8514be5e46dabd6a122132f423f36a43b716a40c394e2a8d063e1010000f4c6c717e99d800c699c25a2006a75a0c5c09f432a936f385e6fce139cdbd1a5e9964d5fae77031e7d026e0001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025a51feffffff0200f2052a01000000160014aaa671c82b138e3b8f510cd801e5f2bd0aa305940000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa24900473044022042309f4c3c7a1a2ac8c24f890f962df1c0086cec10be0868087cfc427520cb2702201dafee8911c269b7e786e242045bb57cef3f5b0f177010c6159abae42f646cc501000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+]\n+\n+class SignetBasicTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.chain = \"signet\"\n+        self.num_nodes = 6\n+        self.setup_clean_chain = True\n+        shared_args1 = [\"-signetchallenge=51\"] # OP_TRUE\n+        shared_args2 = []                         # default challenge\n+        # we use the exact same challenge except we do it as a 2-of-2, which means it should fail\n+        shared_args3 = [\"-signetchallenge=522103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae\"]\n+\n+        self.extra_args = [\n+            shared_args1, shared_args1,\n+            shared_args2, shared_args2,\n+            shared_args3, shared_args3,\n+        ]\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+\n+    def run_test(self):\n+        self.log.info(\"basic tests using OP_TRUE challenge\")\n+\n+        self.log.info('getmininginfo')\n+        mining_info = self.nodes[0].getmininginfo()\n+        assert_equal(mining_info['blocks'], 0)\n+        assert_equal(mining_info['chain'], 'signet')\n+        assert 'currentblocktx' not in mining_info\n+        assert 'currentblockweight' not in mining_info\n+        assert_equal(mining_info['networkhashps'], Decimal('0'))\n+        assert_equal(mining_info['pooledtx'], 0)\n+\n+        self.nodes[0].generatetoaddress(1, self.nodes[0].getnewaddress())",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18267#discussion_r491681205",
+      "id" : 491681205,
+      "line" : 56,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5MTY4MTIwNQ==",
+      "original_commit_id" : "e47ad375bf17557f805bd206e789b8db78c6338a",
+      "original_line" : 56,
+      "original_position" : 56,
+      "original_start_line" : null,
+      "path" : "test/functional/feature_signet.py",
+      "position" : 56,
+      "pull_request_review_id" : 492187976,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18267",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-09-20T11:25:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/491681205",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18267#discussion_r491681291"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18267"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/491681291"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "style nit\r\n\r\n```suggestion\r\n            height += 1\r\n```",
+      "commit_id" : "8258c4c0076bb5f27efdc117a04b27fcd6dd00b2",
+      "created_at" : "2020-09-20T11:17:58Z",
+      "diff_hunk" : "@@ -0,0 +1,71 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2019-2020 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test basic signet functionality\"\"\"\n+\n+from decimal import Decimal\n+\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import assert_equal\n+\n+signet_blocks = [\n+    '00000020f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000f575c83235984e7dc4afc1f30944c170462e84437ab6f2d52e16878a79e4678bd1914d5fae77031eccf4070001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025151feffffff0200f2052a010000001600149243f727dd5343293eb83174324019ec16c2630f0000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402205e423a8754336ca99dbe16509b877ef1bf98d008836c725005b3c787c41ebe46022047246e4467ad7cc7f1ad98662afcaf14c115e0095a227c7b05c5182591c23e7e01000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020533b53ded9bff4adc94101d32400a144c54edc5ed492a3b26c63b2d686000000b38fef50592017cfafbcab88eb3d9cf50b2c801711cad8299495d26df5e54812e7914d5fae77031ecfdd0b0001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025251feffffff0200f2052a01000000160014fd09839740f0e0b4fc6d5e2527e4022aa9b89dfa0000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa24900473044022031d64a1692cdad1fc0ced69838169fe19ae01be524d831b95fcf5ea4e6541c3c02204f9dea0801df8b4d0cd0857c62ab35c6c25cc47c930630dc7fe723531daa3e9b01000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '000000202960f3752f0bfa8858a3e333294aedc7808025e868c9dc03e71d88bb320000007765fcd3d5b4966beb338bba2675dc2cf2ad28d4ad1d83bdb6f286e7e27ac1f807924d5fae77031e81d60b0001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025351feffffff0200f2052a010000001600141e5fb426042692ae0e87c070e78c39307a5661c20000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402205de93694763a42954865bcf1540cb82958bc62d0ec4eee02070fb7937cd037f4022067f333753bce47b10bc25eb6e1f311482e994c862a7e0b2d41ab1c8679fd1b1101000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020b06443a13ae1d3d50faef5ecad38c6818194dc46abca3e972e2aacdae800000069a5829097e80fee00ac49a56ea9f82d741a6af84d32b3bc455cf31871e2a8ac27924d5fae77031e9c91050001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025451feffffff0200f2052a0100000016001430db2f8225dcf7751361ab38735de08190318cb70000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402200936f5f9872f6df5dd242026ad52241a68423f7f682e79169a8d85a374eab9b802202cd2979c48b321b3453e65e8f92460db3fca93cbea8539b450c959f4fbe630c601000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '000000207ed403758a4f228a1939418a155e2ebd4ae6b26e5ffd0ae433123f7694010000542e80b609c5bc58af5bdf492e26d4f60cd43a3966c2e063c50444c29b3757a636924d5fae77031ee8601d0001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025551feffffff0200f2052a01000000160014edc207e014df34fa3885dff97d1129d356e1186a0000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa24900473044022021a3656609f85a66a2c5672ed9322c2158d57251040d2716ed202a1fe14f0c12022057d68bc6611f7a9424a7e00bbf3e27e6ae6b096f60bac624a094bc97a59aa1ff01000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '000000205bea0a88d1422c3df08d766ad72df95084d0700e6f873b75dd4e986c7703000002b57516d33ed60c2bdd9f93d6d5614083324c837e68e5ba6e04287a7285633585924d5fae77031ed171960001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025651feffffff0200f2052a010000001600143ae612599cf96f2442ce572633e0251116eaa52f0000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa24900473044022059a7c54de76bfdbb1dd44c78ea2dbd2bb4e97f4abad38965f41e76433e56423c022054bf17f04fe17415c0141f60eebd2b839200f574d8ad8d55a0917b92b0eb913401000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020daf3b60d374b19476461f97540498dcfa2eb7016238ec6b1d022f82fb60100007a7ae65b53cb988c2ec92d2384996713821d5645ffe61c9acea60da75cd5edfa1a944d5fae77031e9dbb050001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025751feffffff0200f2052a01000000160014ef2dceae02e35f8137de76768ae3345d99ca68860000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402202b3f946d6447f9bf17d00f3696cede7ee70b785495e5498274ee682a493befd5022045fc0bcf9332243168b5d35507175f9f374a8eba2336873885d12aada67ea5f601000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020457cc5f3c2e1a5655bc20e20e48d33e1b7ea68786c614032b5c518f0b6000000541f36942d82c6e7248275ff15c8933487fbe1819c67a9ecc0f4b70bb7e6cf672a944d5fae77031e8f39860001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025851feffffff0200f2052a0100000016001472a27906947c06d034b38ba2fa13c6391a4832790000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402202d62805ce60cbd60591f97f949b5ea5bd7e2307bcde343e6ea8394da92758e72022053a25370b0aa20da100189b7899a8f8675a0fdc60e38ece6b8a4f98edd94569e01000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020a2eb61eb4f3831baa3a3363e1b42db4462663f756f07423e81ed30322102000077224de7dea0f8d0ec22b1d2e2e255f0a987b96fe7200e1a2e6373f48a2f5b7894954d5fae77031e36867e0001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025951feffffff0200f2052a01000000160014aa0ad9f26801258382e0734dceec03a4a75f60240000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402206fa0d59990eed369bd7375767c9a6c9369fae209152b8674e520da270605528c0220749eed3b12dbe3f583f505d21803e4aef59c8e24c5831951eafa4f15a8f92c4e01000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+    '00000020a868e8514be5e46dabd6a122132f423f36a43b716a40c394e2a8d063e1010000f4c6c717e99d800c699c25a2006a75a0c5c09f432a936f385e6fce139cdbd1a5e9964d5fae77031e7d026e0001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025a51feffffff0200f2052a01000000160014aaa671c82b138e3b8f510cd801e5f2bd0aa305940000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa24900473044022042309f4c3c7a1a2ac8c24f890f962df1c0086cec10be0868087cfc427520cb2702201dafee8911c269b7e786e242045bb57cef3f5b0f177010c6159abae42f646cc501000120000000000000000000000000000000000000000000000000000000000000000000000000',\n+]\n+\n+class SignetBasicTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.chain = \"signet\"\n+        self.num_nodes = 6\n+        self.setup_clean_chain = True\n+        shared_args1 = [\"-signetchallenge=51\"] # OP_TRUE\n+        shared_args2 = []                         # default challenge\n+        # we use the exact same challenge except we do it as a 2-of-2, which means it should fail\n+        shared_args3 = [\"-signetchallenge=522103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae\"]\n+\n+        self.extra_args = [\n+            shared_args1, shared_args1,\n+            shared_args2, shared_args2,\n+            shared_args3, shared_args3,\n+        ]\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+\n+    def run_test(self):\n+        self.log.info(\"basic tests using OP_TRUE challenge\")\n+\n+        self.log.info('getmininginfo')\n+        mining_info = self.nodes[0].getmininginfo()\n+        assert_equal(mining_info['blocks'], 0)\n+        assert_equal(mining_info['chain'], 'signet')\n+        assert 'currentblocktx' not in mining_info\n+        assert 'currentblockweight' not in mining_info\n+        assert_equal(mining_info['networkhashps'], Decimal('0'))\n+        assert_equal(mining_info['pooledtx'], 0)\n+\n+        self.nodes[0].generatetoaddress(1, self.nodes[0].getnewaddress())\n+\n+        self.log.info(\"pregenerated signet blocks check\")\n+\n+        height = 0\n+        for block in signet_blocks:\n+            assert_equal(self.nodes[2].submitblock(block), None)\n+            height = height + 1",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18267#discussion_r491681291",
+      "id" : 491681291,
+      "line" : 63,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5MTY4MTI5MQ==",
+      "original_commit_id" : "e47ad375bf17557f805bd206e789b8db78c6338a",
+      "original_line" : 63,
+      "original_position" : 63,
+      "original_start_line" : null,
+      "path" : "test/functional/feature_signet.py",
+      "position" : 63,
+      "pull_request_review_id" : 492187976,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18267",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-09-20T11:25:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/491681291",
+      "user" : {
+         "avatar_url" : "https://avatars0.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
    }
 ]
