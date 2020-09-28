@@ -2797,5 +2797,116 @@
          "type" : "User",
          "url" : "https://api.github.com/users/instagibbs"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r496155450"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/496155450"
+         }
+      },
+      "author_association" : "NONE",
+      "body" : "This line is very compact.\r\n\r\nLooks like those numeric literals are based on SIGHASH_INPUT_MASK. If they are, could they not be constructed from it? It is weird to have logic based partly on the enum, and partly on hard coded numeric literals.\r\n\r\nI think this could be split up into two if's, each returning false. Then, each of those branches could be explaining the situation and the reason for rejection.\r\n\r\nEvery time I see a negation of a boolean operator, I do de-morgan in my head. Either way, if you prefer this with or without the outer negation, I think splitting it up would really be preferable, it would be readable for all kinds of brains.\r\n\r\nThis is not complicated logic, and it is easy to avoid having it look complex. Just my two cents :)",
+      "commit_id" : "80efcba5e7ad84f68f5cd59c05fc87134fc9fb69",
+      "created_at" : "2020-09-28T18:37:15Z",
+      "diff_hunk" : "@@ -1291,35 +1389,176 @@ uint256 GetOutputsSHA256(const T& txTo)\n     return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all amounts spent by a tx. */\n+uint256 GetSpentAmountsSHA256(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.nValue;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+/** Compute the (single) SHA256 of the concatenation of all scriptPubKeys spent by a tx. */\n+uint256 GetSpentScriptsSHA256(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.scriptPubKey;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+\n } // namespace\n \n template <class T>\n-void PrecomputedTransactionData::Init(const T& txTo)\n+void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut> spent_outputs)\n {\n-    assert(!m_ready);\n+    assert(!m_spent_outputs_ready);\n+\n+    m_spent_outputs = std::move(spent_outputs);\n+    if (!m_spent_outputs.empty()) {\n+        assert(m_spent_outputs.size() == txTo.vin.size());\n+        m_spent_outputs_ready = true;\n+    }\n \n-    // Cache is calculated only for transactions with witness\n-    if (txTo.HasWitness()) {\n-        hashPrevouts = SHA256Uint256(GetPrevoutsSHA256(txTo));\n-        hashSequence = SHA256Uint256(GetSequencesSHA256(txTo));\n-        hashOutputs = SHA256Uint256(GetOutputsSHA256(txTo));\n+    // Determine which precomputation-impacting features this transaction uses.\n+    bool uses_bip143_segwit = false;\n+    bool uses_bip341_taproot = false;\n+    for (size_t inpos = 0; inpos < txTo.vin.size(); ++inpos) {\n+        if (!txTo.vin[inpos].scriptWitness.IsNull()) {\n+            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&\n+                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {\n+                // Treat every native witness v1 spend as a Taproot spend. This only works if spent_outputs was\n+                // provided as well, but if it wasn't, actual validation will fail anyway.\n+                uses_bip341_taproot = true;\n+            } else {\n+                // Treat every spend that's not known to native witness v1 as a Witness v0 spend. This branch may\n+                // also be taken for unknown witness versions, but it is harmless, and being precise would require\n+                // P2SH evaluation to find the redeemScript.\n+                uses_bip143_segwit = true;\n+            }\n+        }\n+        if (uses_bip341_taproot && uses_bip143_segwit) break; // No need to scan further if we already need all.\n     }\n \n-    m_ready = true;\n+    if (uses_bip143_segwit || uses_bip341_taproot) {\n+        // Computations shared between both sighash schemes.\n+        m_prevouts_single_hash = GetPrevoutsSHA256(txTo);\n+        m_sequences_single_hash = GetSequencesSHA256(txTo);\n+        m_outputs_single_hash = GetOutputsSHA256(txTo);\n+    }\n+    if (uses_bip143_segwit) {\n+        hashPrevouts = SHA256Uint256(m_prevouts_single_hash);\n+        hashSequence = SHA256Uint256(m_sequences_single_hash);\n+        hashOutputs = SHA256Uint256(m_outputs_single_hash);\n+        m_bip143_segwit_ready = true;\n+    }\n+    if (uses_bip341_taproot) {\n+        m_spent_amounts_single_hash = GetSpentAmountsSHA256(m_spent_outputs);\n+        m_spent_scripts_single_hash = GetSpentScriptsSHA256(m_spent_outputs);\n+        m_bip341_taproot_ready = true;\n+    }\n }\n \n template <class T>\n PrecomputedTransactionData::PrecomputedTransactionData(const T& txTo)\n {\n-    Init(txTo);\n+    Init(txTo, {});\n }\n \n // explicit instantiation\n-template void PrecomputedTransactionData::Init(const CTransaction& txTo);\n-template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo);\n+template void PrecomputedTransactionData::Init(const CTransaction& txTo, std::vector<CTxOut> spent_outputs);\n+template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo, std::vector<CTxOut> spent_outputs);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CTransaction& txTo);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CMutableTransaction& txTo);\n \n+static const CHashWriter HASHER_TAPSIGHASH = TaggedHash(\"TapSighash\");\n+static const CHashWriter HASHER_TAPLEAF = TaggedHash(\"TapLeaf\");\n+static const CHashWriter HASHER_TAPBRANCH = TaggedHash(\"TapBranch\");\n+static const CHashWriter HASHER_TAPTWEAK = TaggedHash(\"TapTweak\");\n+\n+template<typename T>\n+bool SignatureHashSchnorr(uint256& hash_out, const ScriptExecutionData& execdata, const T& tx_to, const uint32_t in_pos, const uint8_t hash_type, const SigVersion sigversion, const uint8_t key_version, const PrecomputedTransactionData& cache)\n+{\n+    uint8_t ext_flag;\n+    switch (sigversion) {\n+    case SigVersion::TAPROOT:\n+        ext_flag = 0;\n+        break;\n+    case SigVersion::TAPSCRIPT:\n+        ext_flag = 1;\n+        break;\n+    default:\n+        assert(false);\n+    }\n+    assert(in_pos < tx_to.vin.size());\n+    assert(cache.m_bip341_taproot_ready && cache.m_spent_outputs_ready);\n+\n+    CHashWriter ss = HASHER_TAPSIGHASH;\n+\n+    // Epoch\n+    static constexpr uint8_t EPOCH = 0;\n+    ss << EPOCH;\n+\n+    // Hash type\n+    const uint8_t output_type = (hash_type == SIGHASH_DEFAULT) ? SIGHASH_ALL : (hash_type & SIGHASH_OUTPUT_MASK); // Default (no sighash byte) is equivalent to SIGHASH_ALL\n+    const uint8_t input_type = hash_type & SIGHASH_INPUT_MASK;\n+    if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83))) return false;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r496155450",
+      "id" : 496155450,
+      "line" : 1508,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5NjE1NTQ1MA==",
+      "original_commit_id" : "80efcba5e7ad84f68f5cd59c05fc87134fc9fb69",
+      "original_line" : 1508,
+      "original_position" : 348,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 348,
+      "pull_request_review_id" : 497796796,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-09-28T18:37:15Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/496155450",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/284023?v=4",
+         "events_url" : "https://api.github.com/users/ysangkok/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ysangkok/followers",
+         "following_url" : "https://api.github.com/users/ysangkok/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ysangkok/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ysangkok",
+         "id" : 284023,
+         "login" : "ysangkok",
+         "node_id" : "MDQ6VXNlcjI4NDAyMw==",
+         "organizations_url" : "https://api.github.com/users/ysangkok/orgs",
+         "received_events_url" : "https://api.github.com/users/ysangkok/received_events",
+         "repos_url" : "https://api.github.com/users/ysangkok/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ysangkok/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ysangkok/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ysangkok"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r496159580"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/496159580"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "That would be incorrect.\r\n\r\nde-morganing it gives you `!(hash_type <= 0x03) && !(hash_type >= 0x81 && hash_type <= 0x83)`, which is a conjunction at the top level. Splitting that up into two separate `if`s would make it a disjunction.",
+      "commit_id" : "80efcba5e7ad84f68f5cd59c05fc87134fc9fb69",
+      "created_at" : "2020-09-28T18:44:59Z",
+      "diff_hunk" : "@@ -1291,35 +1389,176 @@ uint256 GetOutputsSHA256(const T& txTo)\n     return ss.GetSHA256();\n }\n \n+/** Compute the (single) SHA256 of the concatenation of all amounts spent by a tx. */\n+uint256 GetSpentAmountsSHA256(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.nValue;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+/** Compute the (single) SHA256 of the concatenation of all scriptPubKeys spent by a tx. */\n+uint256 GetSpentScriptsSHA256(const std::vector<CTxOut>& outputs_spent)\n+{\n+    CHashWriter ss(SER_GETHASH, 0);\n+    for (const auto& txout : outputs_spent) {\n+        ss << txout.scriptPubKey;\n+    }\n+    return ss.GetSHA256();\n+}\n+\n+\n } // namespace\n \n template <class T>\n-void PrecomputedTransactionData::Init(const T& txTo)\n+void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut> spent_outputs)\n {\n-    assert(!m_ready);\n+    assert(!m_spent_outputs_ready);\n+\n+    m_spent_outputs = std::move(spent_outputs);\n+    if (!m_spent_outputs.empty()) {\n+        assert(m_spent_outputs.size() == txTo.vin.size());\n+        m_spent_outputs_ready = true;\n+    }\n \n-    // Cache is calculated only for transactions with witness\n-    if (txTo.HasWitness()) {\n-        hashPrevouts = SHA256Uint256(GetPrevoutsSHA256(txTo));\n-        hashSequence = SHA256Uint256(GetSequencesSHA256(txTo));\n-        hashOutputs = SHA256Uint256(GetOutputsSHA256(txTo));\n+    // Determine which precomputation-impacting features this transaction uses.\n+    bool uses_bip143_segwit = false;\n+    bool uses_bip341_taproot = false;\n+    for (size_t inpos = 0; inpos < txTo.vin.size(); ++inpos) {\n+        if (!txTo.vin[inpos].scriptWitness.IsNull()) {\n+            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&\n+                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {\n+                // Treat every native witness v1 spend as a Taproot spend. This only works if spent_outputs was\n+                // provided as well, but if it wasn't, actual validation will fail anyway.\n+                uses_bip341_taproot = true;\n+            } else {\n+                // Treat every spend that's not known to native witness v1 as a Witness v0 spend. This branch may\n+                // also be taken for unknown witness versions, but it is harmless, and being precise would require\n+                // P2SH evaluation to find the redeemScript.\n+                uses_bip143_segwit = true;\n+            }\n+        }\n+        if (uses_bip341_taproot && uses_bip143_segwit) break; // No need to scan further if we already need all.\n     }\n \n-    m_ready = true;\n+    if (uses_bip143_segwit || uses_bip341_taproot) {\n+        // Computations shared between both sighash schemes.\n+        m_prevouts_single_hash = GetPrevoutsSHA256(txTo);\n+        m_sequences_single_hash = GetSequencesSHA256(txTo);\n+        m_outputs_single_hash = GetOutputsSHA256(txTo);\n+    }\n+    if (uses_bip143_segwit) {\n+        hashPrevouts = SHA256Uint256(m_prevouts_single_hash);\n+        hashSequence = SHA256Uint256(m_sequences_single_hash);\n+        hashOutputs = SHA256Uint256(m_outputs_single_hash);\n+        m_bip143_segwit_ready = true;\n+    }\n+    if (uses_bip341_taproot) {\n+        m_spent_amounts_single_hash = GetSpentAmountsSHA256(m_spent_outputs);\n+        m_spent_scripts_single_hash = GetSpentScriptsSHA256(m_spent_outputs);\n+        m_bip341_taproot_ready = true;\n+    }\n }\n \n template <class T>\n PrecomputedTransactionData::PrecomputedTransactionData(const T& txTo)\n {\n-    Init(txTo);\n+    Init(txTo, {});\n }\n \n // explicit instantiation\n-template void PrecomputedTransactionData::Init(const CTransaction& txTo);\n-template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo);\n+template void PrecomputedTransactionData::Init(const CTransaction& txTo, std::vector<CTxOut> spent_outputs);\n+template void PrecomputedTransactionData::Init(const CMutableTransaction& txTo, std::vector<CTxOut> spent_outputs);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CTransaction& txTo);\n template PrecomputedTransactionData::PrecomputedTransactionData(const CMutableTransaction& txTo);\n \n+static const CHashWriter HASHER_TAPSIGHASH = TaggedHash(\"TapSighash\");\n+static const CHashWriter HASHER_TAPLEAF = TaggedHash(\"TapLeaf\");\n+static const CHashWriter HASHER_TAPBRANCH = TaggedHash(\"TapBranch\");\n+static const CHashWriter HASHER_TAPTWEAK = TaggedHash(\"TapTweak\");\n+\n+template<typename T>\n+bool SignatureHashSchnorr(uint256& hash_out, const ScriptExecutionData& execdata, const T& tx_to, const uint32_t in_pos, const uint8_t hash_type, const SigVersion sigversion, const uint8_t key_version, const PrecomputedTransactionData& cache)\n+{\n+    uint8_t ext_flag;\n+    switch (sigversion) {\n+    case SigVersion::TAPROOT:\n+        ext_flag = 0;\n+        break;\n+    case SigVersion::TAPSCRIPT:\n+        ext_flag = 1;\n+        break;\n+    default:\n+        assert(false);\n+    }\n+    assert(in_pos < tx_to.vin.size());\n+    assert(cache.m_bip341_taproot_ready && cache.m_spent_outputs_ready);\n+\n+    CHashWriter ss = HASHER_TAPSIGHASH;\n+\n+    // Epoch\n+    static constexpr uint8_t EPOCH = 0;\n+    ss << EPOCH;\n+\n+    // Hash type\n+    const uint8_t output_type = (hash_type == SIGHASH_DEFAULT) ? SIGHASH_ALL : (hash_type & SIGHASH_OUTPUT_MASK); // Default (no sighash byte) is equivalent to SIGHASH_ALL\n+    const uint8_t input_type = hash_type & SIGHASH_INPUT_MASK;\n+    if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83))) return false;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r496159580",
+      "id" : 496159580,
+      "in_reply_to_id" : 496155450,
+      "line" : 1508,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5NjE1OTU4MA==",
+      "original_commit_id" : "80efcba5e7ad84f68f5cd59c05fc87134fc9fb69",
+      "original_line" : 1508,
+      "original_position" : 348,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 348,
+      "pull_request_review_id" : 497802044,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-09-28T18:44:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/496159580",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
    }
 ]
