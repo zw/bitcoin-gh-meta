@@ -6351,5 +6351,61 @@
          "type" : "User",
          "url" : "https://api.github.com/users/sipa"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r496491011"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/496491011"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I think all those cases would just change the distribution between the cases where the \"first\" marker doesn't matter -- ie they're entirely determined by reqtime and preferredness.\r\n\r\nI do think it might improve robustness *somewhere* though...\r\n\r\nAlso, if, in the future, we changed the code to either update current_time less, or to target specific reqtimes (\"anything between t=0.0 and t=0.499 will be requested at t=1.234\"), it might start mattering\r\n\r\n> During the rollout of BIP339, we can expect to see many more transactions fetched from delayed (but possibly preferred) peers, as just one wtxid peer will cause a delay on all announcements from other peers.\r\n\r\nThat's a good point! I've restarted my node since the above numbers, and don't have any logging as to whether any of them were wtxidrelay. However post-restart, I have two inbound wtxidrelay peers, so should already be suffering from BIP339 rollout. And I guess that means all my preferred nodes should be degraded to the same priority as the non-preferred wtxid nodes, which in turn probably explains why I got such a high percentage of non-preferred announcements as the very first request for a txid.\r\n\r\nYeah, collecting `RequestedTx` calls by peerid and whether they were preferred or not gives me:\r\n\r\n *  1049 preferred=0 peer=2717\r\n *  1500 preferred=0 peer=3993\r\n *  3255 preferred=0 peer=3815\r\n *  3270 preferred=1 peer=13\r\n * 14216 preferred=1 peer=15\r\n * 14651 preferred=1 peer=14\r\n * 16918 preferred=1 peer=11\r\n * 18635 preferred=1 peer=2\r\n * 30675 preferred=0 peer=1163\r\n * 37776 preferred=1 peer=1\r\n * 39962 preferred=1 peer=16\r\n * 52112 preferred=1 peer=0\r\n\r\n(ignoring peers with under 1k requests). Which looks to me like the top 9 peers include the 8 outbounds I connected to initially, and a random inbound wtxidrelay peer which connected about 3h after my peer was restarted. That single node accounts for about 2/3rds of the \"18.2% of cases\" by the looks.\r\n\r\nSo I might desable wtxidrelay, and restart my node again, I think, which ironically seems like the easiest way to simulate an all-wtxid-relay world...",
+      "commit_id" : "9e23f6e106a6e79b1ddf8be09b60a4bc4f5b387e",
+      "created_at" : "2020-09-29T07:54:15Z",
+      "diff_hunk" : "@@ -0,0 +1,216 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_TXREQUEST_H\n+#define BITCOIN_TXREQUEST_H\n+\n+#include <primitives/transaction.h>\n+#include <uint256.h>\n+\n+#include <chrono>\n+#include <vector>\n+\n+#include <stdint.h>\n+\n+/** Data structure to keep track of, and schedule, transaction downloads from peers.\n+ *\n+ * === Specification ===\n+ *\n+ * We keep track of which peers have announced which transactions, and use that to determine which requests\n+ * should go to which peer, when, and in what order.\n+ *\n+ * The following information is tracked per peer/tx combination (\"announcement\"):\n+ * - Which peer announced it (through their NodeId)\n+ * - The txid or wtxid of the transaction (collectively called \"txhash\" in what follows)\n+ * - Whether it was a tx or wtx announcement (see BIP339).\n+ * - What the earliest permitted time is that that transaction can be requested from that peer (called \"reqtime\").\n+ * - Whether it's from a \"preferred\" peer or not. Which announcements get this flag is determined by the caller, but\n+ *   this is designed for outbound peers, or other peers that we have a higher level of trust in). Even when the\n+ *   peers' preferredness changes, the preferred flag of existing announcements from that peer won't change.\n+ * - Whether the peer was the \"first\" to announce this txhash within its class (see '\"First\" marker rules').\n+ * - Whether or not the transaction was requested already, and if so, when it times out (called \"expiry\").\n+ * - Whether or not the transaction request failed already (timed out, or NOTFOUND was received).\n+ *\n+ * Transaction requests are then assigned to peers, following these rules:\n+ *\n+ * - No transaction is requested as long as another request for the same txhash is outstanding (it needs to fail\n+ *   first by passing expiry, or a NOTFOUND or invalid transaction has to be received for it).\n+ *\n+ *   Rationale: to avoid wasting bandwidth on multiple copies of the same transaction.\n+ *\n+ * - The same transaction is never requested twice from the same peer, unless the transaction was forgotten in\n+ *   between (see next point), and re-announced.\n+ *\n+ *   Rationale: giving a peer multiple chances to announce a transaction would allow them to bias requests in their\n+ *              favor, worsening invblock attacks. The flip side is that as long as an attacker manages to prevent\n+ *              us from receiving a transaction, failed announcements (including those from honest peers) will\n+ *              linger longer, increasing memory usage somewhat. The impact of this is limited by imposing a cap on\n+ *              the number of tracked announcements per peer.\n+ *              Invblocking is the practice of announcing transactions but not answer requests for them, in order\n+ *              to delay (or prevent) a target learning the transaction. See\n+ *              https://allquantor.at/blockchainbib/pdf/miller2015topology.pdf for more information.\n+ *\n+ * - Announcements are only forgotten about when the peer that announced them went offline, when the transaction\n+ *   was received successfully, or when no candidates for a transaction remain that haven't been tried already.\n+ *\n+ *   Rationale: we need to eventually forget announcements to keep memory bounded, but as long as viable\n+ *              candidate peers remain, we prefer to avoid fetching from failed ones. As every request has a finite\n+ *              timeout and we schedule new request as soon a previous one expired, there is always progress being\n+ *              made towards forgetting a transaction - either successfully or unsuccessfully.\n+ *\n+ * - Transactions are not requested from a peer until its reqtime has passed.\n+ *\n+ *   Rationale: enable net_processing code to define a delay for less-than-ideal peers, so that (presumed) better\n+ *              peers have a chance to give their announcement first.\n+ *\n+ * - If multiple viable candidate peers exist according to the above rules, pick a peer as follows:\n+ *\n+ *   - If any preferred peers are available, non-preferred peers are not considered for what follows.\n+ *\n+ *     Rationale: preferred peers (outbound, whitelisted) are chosen by us, so are less likely to be under attacker\n+ *                control.\n+ *\n+ *   - Among the remaining candidates, choose the first (non-overloaded) peer to have announced the transaction,",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r496491011",
+      "id" : 496491011,
+      "in_reply_to_id" : 496379595,
+      "line" : 74,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5NjQ5MTAxMQ==",
+      "original_commit_id" : "9e23f6e106a6e79b1ddf8be09b60a4bc4f5b387e",
+      "original_line" : 74,
+      "original_position" : 74,
+      "original_start_line" : null,
+      "path" : "src/txrequest.h",
+      "position" : 74,
+      "pull_request_review_id" : 498198212,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-09-29T07:54:15Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/496491011",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
    }
 ]
