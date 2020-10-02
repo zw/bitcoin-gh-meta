@@ -12076,5 +12076,397 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jnewbery"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498916810"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498916810"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Yes, that's exactly the reason.",
+      "commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "created_at" : "2020-10-02T16:12:03Z",
+      "diff_hunk" : "@@ -0,0 +1,685 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of EntryTxHash relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE entry whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED entry already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority entry among all CANDIDATE_READY (and _BEST) ones for that txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED entry. */\n+    REQUESTED,\n+    /** A CANDIDATE entry that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED entry. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+/** An announcement entry. This is the data we track for each txid or wtxid that is announced to us. */\n+struct Entry {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const uint64_t m_peer;\n+    /** What sequence number this announcement has. */\n+    const uint64_t m_sequence : 59;\n+    /** Whether the request is preferred. */\n+    const bool m_preferred : 1;\n+    /** Whether this is a wtxid request. */\n+    const bool m_is_wtxid : 1;\n+\n+    /** What state this announcement is in. This is a uint8_t instead of a State to silence a GCC warning. */\n+    uint8_t m_state : 3;\n+\n+    /** Convert the m_state variable to a State enum. */\n+    State GetState() const { return State(m_state); }\n+    /** Convert a State to a uint8_t and store it in m_state. */\n+    void SetState(State state) { m_state = uint8_t(state); }\n+\n+    /** Whether this entry is selected. There can be at most 1 selected peer per txhash. */\n+    bool IsSelected() const\n+    {\n+        return GetState() == State::CANDIDATE_BEST || GetState() == State::REQUESTED;\n+    }\n+\n+    /** Whether this entry is waiting for a certain time to pass. */\n+    bool IsWaiting() const\n+    {\n+        return GetState() == State::REQUESTED || GetState() == State::CANDIDATE_DELAYED;\n+    }\n+\n+    /** Whether this entry can feasibly be selected if the current IsSelected() one disappears. */\n+    bool IsSelectable() const\n+    {\n+        return GetState() == State::CANDIDATE_READY || GetState() == State::CANDIDATE_BEST;\n+    }\n+\n+    /** Construct a new entry from scratch, initially in CANDIDATE_DELAYED state. */\n+    Entry(const GenTxid& gtxid, uint64_t peer, bool preferred, std::chrono::microseconds reqtime,\n+        uint64_t sequence) :\n+        m_txhash(gtxid.GetHash()), m_time(reqtime), m_peer(peer), m_sequence(sequence), m_preferred(preferred),\n+        m_is_wtxid(gtxid.IsWtxid()), m_state(uint8_t(State::CANDIDATE_DELAYED)) {}\n+};\n+\n+/** A functor with embedded salt that computes priority of an announcement.\n+ *\n+ * Lower priorities are selected first.\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic) :\n+        m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+        m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+    uint64_t operator()(const uint256& txhash, uint64_t peer, bool preferred) const\n+    {\n+        uint64_t low_bits = CSipHasher(m_k0, m_k1).Write(txhash.begin(), txhash.size()).Write(peer).Finalize() >> 1;\n+        return low_bits | uint64_t{!preferred} << 63;\n+    }\n+\n+    uint64_t operator()(const Entry& entry) const\n+    {\n+        return operator()(entry.m_txhash, entry.m_peer, entry.m_preferred);\n+    }\n+};\n+\n+// Definitions for the 3 indexes used in the main data structure.\n+//\n+// Each index has a By* type to identify it, a Entry* data type to represent the view of Entry it is sorted by,\n+// and an Entry*Extractor type to convert an Entry into the Entry* view type.\n+// See https://www.boost.org/doc/libs/1_54_0/libs/multi_index/doc/reference/key_extraction.html#key_extractors\n+// for more information about the key extraction concept.\n+\n+// The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txhash)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498916810",
+      "id" : 498916810,
+      "in_reply_to_id" : 498749661,
+      "line" : 133,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5ODkxNjgxMA==",
+      "original_commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "original_line" : 133,
+      "original_position" : 133,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 133,
+      "pull_request_review_id" : 501268225,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-02T16:12:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498916810",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498925098"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498925098"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "The only reason not to is avoiding a dependency on net.h.",
+      "commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "created_at" : "2020-10-02T16:28:19Z",
+      "diff_hunk" : "@@ -0,0 +1,685 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of EntryTxHash relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE entry whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED entry already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority entry among all CANDIDATE_READY (and _BEST) ones for that txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED entry. */\n+    REQUESTED,\n+    /** A CANDIDATE entry that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED entry. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+/** An announcement entry. This is the data we track for each txid or wtxid that is announced to us. */\n+struct Entry {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const uint64_t m_peer;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498925098",
+      "id" : 498925098,
+      "in_reply_to_id" : 498714760,
+      "line" : 62,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5ODkyNTA5OA==",
+      "original_commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "original_line" : 62,
+      "original_position" : 62,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 62,
+      "pull_request_review_id" : 501279461,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-02T16:28:20Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498925098",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498935631"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498935631"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "You mean in the header file? Could you make the public functions take `int64_t` and use `NodeId` internally in the cpp file (which already includes net.h)?",
+      "commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "created_at" : "2020-10-02T16:49:40Z",
+      "diff_hunk" : "@@ -0,0 +1,685 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of EntryTxHash relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE entry whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED entry already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority entry among all CANDIDATE_READY (and _BEST) ones for that txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED entry. */\n+    REQUESTED,\n+    /** A CANDIDATE entry that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED entry. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+/** An announcement entry. This is the data we track for each txid or wtxid that is announced to us. */\n+struct Entry {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const uint64_t m_peer;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498935631",
+      "id" : 498935631,
+      "in_reply_to_id" : 498714760,
+      "line" : 62,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5ODkzNTYzMQ==",
+      "original_commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "original_line" : 62,
+      "original_position" : 62,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 62,
+      "pull_request_review_id" : 501293510,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-02T16:49:40Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498935631",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498936404"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498936404"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "It may be matter of personal taste.\r\n\r\nIn general I think it still makes sense to have non-exposed classes with private/public fields/members. It's not there to prevent external code from messing with the internals, obviously, but it does still kind of define a layer between what is part of the class's representation and what is its (even just internally) exposed interface.\r\n\r\nIn this case with the pimpl pattern... maybe that's silly, as the glue layer to forward calls on `TxRequestTracker` to `TxRequestTracker::Impl` is super thin, and it's already obvious what the exposed part is.\r\n\r\nHappy to change it if there are strong opinions.",
+      "commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "created_at" : "2020-10-02T16:51:18Z",
+      "diff_hunk" : "@@ -0,0 +1,685 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of EntryTxHash relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE entry whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED entry already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority entry among all CANDIDATE_READY (and _BEST) ones for that txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED entry. */\n+    REQUESTED,\n+    /** A CANDIDATE entry that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED entry. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+/** An announcement entry. This is the data we track for each txid or wtxid that is announced to us. */\n+struct Entry {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const uint64_t m_peer;\n+    /** What sequence number this announcement has. */\n+    const uint64_t m_sequence : 59;\n+    /** Whether the request is preferred. */\n+    const bool m_preferred : 1;\n+    /** Whether this is a wtxid request. */\n+    const bool m_is_wtxid : 1;\n+\n+    /** What state this announcement is in. This is a uint8_t instead of a State to silence a GCC warning. */\n+    uint8_t m_state : 3;\n+\n+    /** Convert the m_state variable to a State enum. */\n+    State GetState() const { return State(m_state); }\n+    /** Convert a State to a uint8_t and store it in m_state. */\n+    void SetState(State state) { m_state = uint8_t(state); }\n+\n+    /** Whether this entry is selected. There can be at most 1 selected peer per txhash. */\n+    bool IsSelected() const\n+    {\n+        return GetState() == State::CANDIDATE_BEST || GetState() == State::REQUESTED;\n+    }\n+\n+    /** Whether this entry is waiting for a certain time to pass. */\n+    bool IsWaiting() const\n+    {\n+        return GetState() == State::REQUESTED || GetState() == State::CANDIDATE_DELAYED;\n+    }\n+\n+    /** Whether this entry can feasibly be selected if the current IsSelected() one disappears. */\n+    bool IsSelectable() const\n+    {\n+        return GetState() == State::CANDIDATE_READY || GetState() == State::CANDIDATE_BEST;\n+    }\n+\n+    /** Construct a new entry from scratch, initially in CANDIDATE_DELAYED state. */\n+    Entry(const GenTxid& gtxid, uint64_t peer, bool preferred, std::chrono::microseconds reqtime,\n+        uint64_t sequence) :\n+        m_txhash(gtxid.GetHash()), m_time(reqtime), m_peer(peer), m_sequence(sequence), m_preferred(preferred),\n+        m_is_wtxid(gtxid.IsWtxid()), m_state(uint8_t(State::CANDIDATE_DELAYED)) {}\n+};\n+\n+/** A functor with embedded salt that computes priority of an announcement.\n+ *\n+ * Lower priorities are selected first.\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic) :\n+        m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+        m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+    uint64_t operator()(const uint256& txhash, uint64_t peer, bool preferred) const\n+    {\n+        uint64_t low_bits = CSipHasher(m_k0, m_k1).Write(txhash.begin(), txhash.size()).Write(peer).Finalize() >> 1;\n+        return low_bits | uint64_t{!preferred} << 63;\n+    }\n+\n+    uint64_t operator()(const Entry& entry) const\n+    {\n+        return operator()(entry.m_txhash, entry.m_peer, entry.m_preferred);\n+    }\n+};\n+\n+// Definitions for the 3 indexes used in the main data structure.\n+//\n+// Each index has a By* type to identify it, a Entry* data type to represent the view of Entry it is sorted by,\n+// and an Entry*Extractor type to convert an Entry into the Entry* view type.\n+// See https://www.boost.org/doc/libs/1_54_0/libs/multi_index/doc/reference/key_extraction.html#key_extractors\n+// for more information about the key extraction concept.\n+\n+// The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txhash)\n+//\n+// Uses:\n+// * Looking up existing entries by peer/txhash, by checking both (peer, false, txhash) and (peer, true, txhash).\n+// * Finding all CANDIDATE_BEST for a given peer in GetRequestable.\n+struct ByPeer {};\n+using EntryPeer = std::tuple<uint64_t, bool, const uint256&>;\n+struct EntryPeerExtractor\n+{\n+    using result_type = EntryPeer;\n+    result_type operator()(const Entry& entry) const\n+    {\n+        return EntryPeer{entry.m_peer, entry.GetState() == State::CANDIDATE_BEST, entry.m_txhash};\n+    }\n+};\n+\n+// The ByTxHash index is sorted by (txhash, state, priority [CANDIDATE_READY]; 0 [otherwise])\n+//\n+// Uses:\n+// * Deleting all Entrys with a given txhash in ForgetTxHash.\n+// * Finding the best CANDIDATE_READY to convert to CANDIDATE_BEST, when no other CANDIDATE_READY or REQUESTED\n+//   Entry exists for that txhash.\n+// * Finding the Entry to store per-txhash flags in.\n+// * Determining when no more non-COMPLETED Entrys for a given txhash exist, so the COMPLETED ones can be deleted.\n+struct ByTxHash {};\n+using EntryTxHash = std::tuple<const uint256&, State, uint64_t>;\n+class EntryTxHashExtractor {\n+    const PriorityComputer& m_computer;\n+public:\n+    EntryTxHashExtractor(const PriorityComputer& computer) : m_computer(computer) {}\n+    using result_type = EntryTxHash;\n+    result_type operator()(const Entry& entry) const\n+    {\n+        const State state = entry.GetState();\n+        const uint64_t prio = (state == State::CANDIDATE_READY) ? m_computer(entry) : 0;\n+        return EntryTxHash{entry.m_txhash, state, prio};\n+    }\n+};\n+\n+// The ByTime index is sorted by (0 [CANDIDATE_DELAYED,REQUESTED]; 1 [COMPLETED];\n+// 2 [CANDIDATE_READY,CANDIDATE_BEST], time)\n+//\n+// Uses:\n+// * Finding CANDIDATE_DELAYED entries whose reqtime has passed, and REQUESTED entries whose expiry has passed.\n+// * Finding CANDIDATE_READY/BEST entries whose reqtime is in the future (when the clock time went backwards).\n+struct ByTime {};\n+using EntryTime = std::pair<int, std::chrono::microseconds>;\n+struct EntryTimeExtractor\n+{\n+    using result_type = EntryTime;\n+    result_type operator()(const Entry& entry) const\n+    {\n+        return EntryTime{entry.IsWaiting() ? 0 : entry.IsSelectable() ? 2 : 1, entry.m_time};\n+    }\n+};\n+\n+/** Data type for the main data structure (Entry objects with ByPeer/ByTxHash/ByTime indexes). */\n+using Index = boost::multi_index_container<\n+    Entry,\n+    boost::multi_index::indexed_by<\n+        boost::multi_index::ordered_unique<boost::multi_index::tag<ByPeer>, EntryPeerExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTxHash>, EntryTxHashExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTime>, EntryTimeExtractor>\n+    >\n+>;\n+\n+/** Helper type to simplify syntax of iterator types. */\n+template<typename Tag>\n+using Iter = typename Index::index<Tag>::type::iterator;\n+\n+/** Per-peer statistics object. */\n+struct PeerInfo {\n+    size_t m_total = 0; //!< Total number of entries for this peer.\n+    size_t m_completed = 0; //!< Number of COMPLETED entries for this peer.\n+    size_t m_requested = 0; //!< Number of REQUESTED entries for this peer.\n+\n+    /** Compare two PeerInfo objects. Only used for sanity checking. */\n+    friend bool operator==(const PeerInfo& a, const PeerInfo& b)\n+    {\n+        return std::tie(a.m_total, a.m_completed, a.m_requested) ==\n+               std::tie(b.m_total, b.m_completed, b.m_requested);\n+    }\n+};\n+\n+/** Per-txhash statistics object. Only used for sanity checking. */\n+struct TxHashInfo\n+{\n+    //! Number of CANDIDATE_DELAYED entries for this txhash.\n+    size_t m_candidate_delayed = 0;\n+    //! Number of CANDIDATE_READY entries for this txhash.\n+    size_t m_candidate_ready = 0;\n+    //! Number of CANDIDATE_BEST entries for this txhash (at most one).\n+    size_t m_candidate_best = 0;\n+    //! Number of REQUESTED entries for this txhash.\n+    size_t m_requested = 0;\n+    //! The priority of the CANDIDATE_BEST entry if one exists, or 0 otherwise.\n+    uint64_t m_priority_candidate_best = 0;\n+    //! The lowest priority of all CANDIDATE_READY entries (or max() if none exist).\n+    uint64_t m_priority_best_candidate_ready = std::numeric_limits<uint64_t>::max();\n+    //! All peers we have an entry for this txhash for.\n+    std::vector<uint64_t> m_peers;\n+};\n+\n+/** (Re)compute the PeerInfo map from the index. Only used for sanity checking. */\n+std::unordered_map<uint64_t, PeerInfo> RecomputePeerInfo(const Index& index)\n+{\n+    std::unordered_map<uint64_t, PeerInfo> ret;\n+    for (const Entry& entry : index) {\n+        PeerInfo& info = ret[entry.m_peer];\n+        ++info.m_total;\n+        info.m_requested += (entry.GetState() == State::REQUESTED);\n+        info.m_completed += (entry.GetState() == State::COMPLETED);\n+    }\n+    return ret;\n+}\n+\n+/** Compute the TxHashInfo map. Only used for sanity checking. */\n+std::map<uint256, TxHashInfo> ComputeTxHashInfo(const Index& index, const PriorityComputer& computer)\n+{\n+    std::map<uint256, TxHashInfo> ret;\n+    for (const Entry& entry : index) {\n+        TxHashInfo& info = ret[entry.m_txhash];\n+        // Classify how many Entrys of each state we have for this txhash.\n+        info.m_candidate_delayed += (entry.GetState() == State::CANDIDATE_DELAYED);\n+        info.m_candidate_ready += (entry.GetState() == State::CANDIDATE_READY);\n+        info.m_candidate_best += (entry.GetState() == State::CANDIDATE_BEST);\n+        info.m_requested += (entry.GetState() == State::REQUESTED);\n+        // And track the priority of the best CANDIDATE_READY/CANDIDATE_BEST entries.\n+        if (entry.GetState() == State::CANDIDATE_BEST) {\n+            info.m_priority_candidate_best = computer(entry);\n+        }\n+        if (entry.GetState() == State::CANDIDATE_READY) {\n+            info.m_priority_best_candidate_ready = std::min(info.m_priority_best_candidate_ready, computer(entry));\n+        }\n+        // Also keep track of which peers this txhash has a Entry for (so we can detect duplicates).\n+        info.m_peers.push_back(entry.m_peer);\n+        // Track preferred/first.\n+    }\n+    return ret;\n+}\n+\n+const uint256 UINT256_ZERO;\n+\n+}  // namespace\n+\n+/** Actual implementation for TxRequestTracker's data structure. */\n+class TxRequestTracker::Impl {\n+    //! The current sequence number. Increases for every announcement. This is used to sort txhashes returned by\n+    //! GetRequestable in announcement order.\n+    uint64_t m_sequence{0};\n+\n+    //! This tracker's priority computer.\n+    const PriorityComputer m_computer;\n+\n+    //! This tracker's main data structure.\n+    Index m_index;\n+\n+    //! Map with this tracker's per-peer statistics.\n+    std::unordered_map<uint64_t, PeerInfo> m_peerinfo;\n+\n+public:",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498936404",
+      "id" : 498936404,
+      "in_reply_to_id" : 498708036,
+      "line" : 293,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5ODkzNjQwNA==",
+      "original_commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "original_line" : 293,
+      "original_position" : 293,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 293,
+      "pull_request_review_id" : 501294597,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-02T16:51:18Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498936404",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498938083"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498938083"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I think the observable \"c++ file dependencies\" are only an approximation for what actually matters in terms of code organization: \"conceptual dependencies between modules\". What you're suggesting is just as much a dependency of txrequest on net in my view - just slightly more hidden.",
+      "commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "created_at" : "2020-10-02T16:54:44Z",
+      "diff_hunk" : "@@ -0,0 +1,685 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of EntryTxHash relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE entry whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED entry already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority entry among all CANDIDATE_READY (and _BEST) ones for that txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED entry. */\n+    REQUESTED,\n+    /** A CANDIDATE entry that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED entry. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+/** An announcement entry. This is the data we track for each txid or wtxid that is announced to us. */\n+struct Entry {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const uint64_t m_peer;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498938083",
+      "id" : 498938083,
+      "in_reply_to_id" : 498714760,
+      "line" : 62,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5ODkzODA4Mw==",
+      "original_commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "original_line" : 62,
+      "original_position" : 62,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 62,
+      "pull_request_review_id" : 501296896,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-02T16:54:45Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498938083",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498941128"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498941128"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "All of this to say: I'd like to avoid a dependency on net, and am therefore using uint64_t as opaque peer identifier rather than NodeId.\r\n\r\nBut if we feel that's not worth the cost, it should be changed to use NodeId everywhere (in both the .h and the .cpp).",
+      "commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "created_at" : "2020-10-02T17:00:54Z",
+      "diff_hunk" : "@@ -0,0 +1,685 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of EntryTxHash relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE entry whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED entry already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority entry among all CANDIDATE_READY (and _BEST) ones for that txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED entry. */\n+    REQUESTED,\n+    /** A CANDIDATE entry that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED entry. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+/** An announcement entry. This is the data we track for each txid or wtxid that is announced to us. */\n+struct Entry {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const uint64_t m_peer;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498941128",
+      "id" : 498941128,
+      "in_reply_to_id" : 498714760,
+      "line" : 62,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5ODk0MTEyOA==",
+      "original_commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "original_line" : 62,
+      "original_position" : 62,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 62,
+      "pull_request_review_id" : 501301051,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-02T17:00:54Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498941128",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498944375"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498944375"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "It wouldn't be too hard to just drop the constraint, and instead specify it as:\r\n* If no announcement with the specified (peer, txhash) exists, or it isn't in CANDIDATE state, the call has no effect.\r\n* The specified announcement is changed from CANDIDATE to REQUESTED.\r\n* If another announcement for the same txhash was already in REQUESTED state, it is marked COMPLETED.\r\n\r\nIt'd be a bit more code, but would make the function fully specified. I've avoided it, as there is really no point for that functionality in practice, but it does make things a bit nicer. WDYT?\r\n\r\nIf we don't do that, I like @ajtowns's way of describing the functionality.",
+      "commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "created_at" : "2020-10-02T17:07:39Z",
+      "diff_hunk" : "@@ -0,0 +1,200 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_TXREQUEST_H\n+#define BITCOIN_TXREQUEST_H\n+\n+#include <primitives/transaction.h>\n+#include <uint256.h>\n+\n+#include <chrono>\n+#include <vector>\n+\n+#include <stdint.h>\n+\n+/** Data structure to keep track of, and schedule, transaction downloads from peers.\n+ *\n+ * === Specification ===\n+ *\n+ * We keep track of which peers have announced which transactions, and use that to determine which requests\n+ * should go to which peer, when, and in what order.\n+ *\n+ * The following information is tracked per peer/tx combination (\"announcement\"):\n+ * - Which peer announced it (through their NodeId)\n+ * - The txid or wtxid of the transaction (collectively called \"txhash\" in what follows)\n+ * - Whether it was a tx or wtx announcement (see BIP339).\n+ * - What the earliest permitted time is that that transaction can be requested from that peer (called \"reqtime\").\n+ * - Whether it's from a \"preferred\" peer or not. Which announcements get this flag is determined by the caller, but\n+ *   this is designed for outbound peers, or other peers that we have a higher level of trust in. Even when the\n+ *   peers' preferredness changes, the preferred flag of existing announcements from that peer won't change.\n+ * - Whether or not the transaction was requested already, and if so, when it times out (called \"expiry\").\n+ * - Whether or not the transaction request failed already (timed out, or NOTFOUND was received).\n+ *\n+ * Transaction requests are then assigned to peers, following these rules:\n+ *\n+ * - No transaction is requested as long as another request for the same txhash is outstanding (it needs to fail\n+ *   first by passing expiry, or a NOTFOUND or invalid transaction has to be received for it).\n+ *\n+ *   Rationale: to avoid wasting bandwidth on multiple copies of the same transaction. Note that this only works\n+ *              per txhash, so if the same transaction is announced both through txid and wtxid, we have no means\n+ *              to prevent fetching both (the caller can however mitigate this by delaying one, see further).\n+ *\n+ * - The same transaction is never requested twice from the same peer, unless the announcement was forgotten in\n+ *   between, and re-announced. Announcements are forgotten only:\n+ *   - If a peer goes offline, all its announcements are forgotten.\n+ *   - If a transaction has been successfully received, or is otherwise no longer needed, the caller can call\n+ *     ForgetTxHash, which removes all announcements across all peers with the specified txhash.\n+ *   - If for a given txhash only already-requested announcements remain, they are all forgotten.\n+ *\n+ *   Rationale: giving a peer multiple chances to announce a transaction would allow them to bias requests in their\n+ *              favor, worsening transaction censoring attacks. The flip side is that as long as an attacker manages\n+ *              to prevent us from receiving a transaction, failed announcements (including those from honest peers)\n+ *              will linger longer, increasing memory usage somewhat. The impact of this is limited by imposing a\n+ *              cap on the number of tracked announcements per peer. As failed requests in response to announcements\n+ *              from honest peers should be rare, this almost solely hinders attackers.\n+ *              Transaction censoring attacks can be done by announcing transactions quickly while not answering\n+ *              requests for them. See https://allquantor.at/blockchainbib/pdf/miller2015topology.pdf for more\n+ *              information.\n+ *\n+ * - Transactions are not requested from a peer until its reqtime has passed.\n+ *\n+ *   Rationale: enable the calling code to define a delay for less-than-ideal peers, so that (presumed) better\n+ *              peers have a chance to give their announcement first.\n+ *\n+ * - If multiple viable candidate peers exist according to the above rules, pick a peer as follows:\n+ *\n+ *   - If any preferred peers are available, non-preferred peers are not considered for what follows.\n+ *\n+ *     Rationale: preferred peers are more trusted by us, so are less likely to be under attacker control.\n+ *\n+ *   - Pick a uniformly random peer among the candidates.\n+ *\n+ *     Rationale: random assignments are hard to influence for attackers.\n+ *\n+ * Together these rules strike a balance between being fast in non-adverserial conditions and minimizing\n+ * susceptibility to censorship attacks. An attacker that races the network:\n+ * - Will be unsuccessful if all preferred connections are honest (and there is at least one preferred connection).\n+ * - If there are P preferred connections of which Ph>=1 are honest, the attacker can delay us from learning\n+ *   about a transaction by k expiration periods, where k ~ 1 + NHG(N=P-1,K=P-Ph-1,r=1), which has mean\n+ *   P/(Ph+1) (where NHG stands for Negative Hypergeometric distribution). The \"1 +\" is due to the fact that the\n+ *   attacker can be the first to announce through a preferred connection in this scenario, which very likely means\n+ *   they get the first request.\n+ * - If all P preferred connections are to the attacker, and there are NP non-preferred connections of which NPh>=1\n+ *   are honest, where we assume that the attacker can disconnect and reconnect those connections, the distribution\n+ *   becomes k ~ P + NB(p=1-NP/NPh,r=1) (where NB stands for Negative Binomial distribution), which has mean\n+ *   P-1+NP/NPh.\n+ *\n+ * Complexity:\n+ * - Memory usage is proportional to the total number of tracked announcements (Size()) plus the number of\n+ *   peers with a nonzero number of tracked announcements.\n+ * - CPU usage is generally logarithmic in the total number of tracked announcements, plus the number of\n+ *   announcements affected by an operation (amortized O(1) per announcement).\n+ */\n+class TxRequestTracker {\n+    // Avoid littering this header file with implementation details.\n+    class Impl;\n+    const std::unique_ptr<Impl> m_impl;\n+\n+public:\n+    //! Construct a TxRequestTracker.\n+    TxRequestTracker(bool deterministic = false);\n+    ~TxRequestTracker();\n+\n+    // Conceptually, the data structure consists of a collection of entries, one for each peer/txhash combination\n+    // (an \"announcement\"):\n+    //\n+    // - CANDIDATE entries represent transactions that were announced by a peer, and that become available for\n+    //   download after their reqtime has passed.\n+    //\n+    // - REQUESTED entries represent transactions that have been requested, and which we're awaiting a response for\n+    //   from that peer. Their expiry value determines when the request times out.\n+    //\n+    // - COMPLETED entries represent transactions that have been requested from a peer, and a NOTFOUND or a\n+    //   transaction was received in response (valid or not), or they timed out. They're only kept around to\n+    //   prevent requesting them again. If only COMPLETED entries for a given txhash remain (so no CANDIDATE or\n+    //   REQUESTED ones), all of them are deleted (this is an invariant, and maintained by all operations below).\n+    //\n+    // The operations below manipulate the data structure.\n+\n+    /** Deletes all entries for a given peer.\n+     *\n+     * It should be called when a peer goes offline.\n+     */\n+    void DisconnectedPeer(uint64_t peer);\n+\n+    /** Deletes all entries for a given txhash (both txid and wtxid ones).\n+     *\n+     * This should be called when a transaction is successfully added to the mempool, seen in a block, or for\n+     * whatever reason we no longer care about it.\n+     */\n+    void ForgetTxHash(const uint256& txhash);\n+\n+    /** Adds a new CANDIDATE announcement.\n+     *\n+     * Does nothing if one already exists for that (txhash, peer) combination (whether it's CANDIDATE, REQUESTED, or\n+     * COMPLETED). Note that the txid/wtxid property is ignored for determining uniqueness, so if an announcement\n+     * is added for a wtxid H, while one for txid H from the same peer already exists, it will be ignored. This is\n+     * harmless as the txhashes being equal implies it is a non-segwit transaction, so it doesn't matter how it is\n+     * fetched. The new announcement is given the specified preferred and reqtime values, and takes it is_wtxid from\n+     * the specified gtxid.\n+     */\n+    void ReceivedInv(uint64_t peer, const GenTxid& gtxid, bool preferred,\n+        std::chrono::microseconds reqtime);\n+\n+    /** Converts the CANDIDATE announcement for the provided peer and gtxid into a REQUESTED one.\n+     *\n+     * Expiry is set to the specified value. This can ONLY be called immediately after GetRequestable was called\n+     * (for the same peer), with only ForgetTx and other RequestedTx calls (both for other txhashes) in\n+     * between. Any other non-const operation removes the ability to call RequestedTx.\n+     */\n+    void RequestedTx(uint64_t peer, const GenTxid& gtxid, std::chrono::microseconds expiry);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r498944375",
+      "id" : 498944375,
+      "in_reply_to_id" : 498734530,
+      "line" : 151,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5ODk0NDM3NQ==",
+      "original_commit_id" : "9c311d0e20192ccd812eb946470de76b41ae8537",
+      "original_line" : 151,
+      "original_position" : 151,
+      "original_start_line" : null,
+      "path" : "src/txrequest.h",
+      "position" : 151,
+      "pull_request_review_id" : 501305482,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-02T17:07:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/498944375",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
    }
 ]
