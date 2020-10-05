@@ -16423,5 +16423,1053 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jnewbery"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499523971"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499523971"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`(txhash, state, priority)` and \"Note, `priority == 0` whenever `state != CANDIDATE_READY`\" below might be clearer.",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T11:19:41Z",
+      "diff_hunk" : "@@ -0,0 +1,577 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of ByTxHashView relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE announcement whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED announcement already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority announcement among all CANDIDATE_READY (and _BEST) ones for that\n+     *  txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED announcement. */\n+    REQUESTED,\n+    /** A CANDIDATE announcement that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED announcement. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+//! Type alias for sequence numbers.\n+using SequenceNumber = uint64_t;\n+\n+/** An announcement. This is the data we track for each txid or wtxid that is announced to us by each peer. */\n+struct Announcement {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const NodeId m_peer;\n+    /** What sequence number this announcement has. */\n+    const SequenceNumber m_sequence : 59;\n+    /** Whether the request is preferred. */\n+    const bool m_preferred : 1;\n+    /** Whether this is a wtxid request. */\n+    const bool m_is_wtxid : 1;\n+\n+    /** What state this announcement is in. This is a uint8_t instead of a State to silence a GCC warning. */\n+    uint8_t m_state : 3;\n+\n+    /** Convert the m_state variable to a State enum. */\n+    State GetState() const { return State(m_state); }\n+    /** Convert a State to a uint8_t and store it in m_state. */\n+    void SetState(State state) { m_state = uint8_t(state); }\n+\n+    /** Whether this announcement is selected. There can be at most 1 selected peer per txhash. */\n+    bool IsSelected() const\n+    {\n+        return GetState() == State::CANDIDATE_BEST || GetState() == State::REQUESTED;\n+    }\n+\n+    /** Whether this announcement is waiting for a certain time to pass. */\n+    bool IsWaiting() const\n+    {\n+        return GetState() == State::REQUESTED || GetState() == State::CANDIDATE_DELAYED;\n+    }\n+\n+    /** Whether this announcement can feasibly be selected if the current IsSelected() one disappears. */\n+    bool IsSelectable() const\n+    {\n+        return GetState() == State::CANDIDATE_READY || GetState() == State::CANDIDATE_BEST;\n+    }\n+\n+    /** Construct a new announcement from scratch, initially in CANDIDATE_DELAYED state. */\n+    Announcement(const GenTxid& gtxid, NodeId peer, bool preferred, std::chrono::microseconds reqtime,\n+        SequenceNumber sequence) :\n+        m_txhash(gtxid.GetHash()), m_time(reqtime), m_peer(peer), m_sequence(sequence), m_preferred(preferred),\n+        m_is_wtxid(gtxid.IsWtxid()), m_state(uint8_t(State::CANDIDATE_DELAYED)) {}\n+};\n+\n+//! Type alias for priorities.\n+using Priority = uint64_t;\n+\n+/** A functor with embedded salt that computes priority of an announcement.\n+ *\n+ * Lower priorities are selected first.\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic) :\n+        m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+        m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+    Priority operator()(const uint256& txhash, NodeId peer, bool preferred) const\n+    {\n+        uint64_t low_bits = CSipHasher(m_k0, m_k1).Write(txhash.begin(), txhash.size()).Write(peer).Finalize() >> 1;\n+        return low_bits | uint64_t{!preferred} << 63;\n+    }\n+\n+    Priority operator()(const Announcement& ann) const\n+    {\n+        return operator()(ann.m_txhash, ann.m_peer, ann.m_preferred);\n+    }\n+};\n+\n+// Definitions for the 3 indexes used in the main data structure.\n+//\n+// Each index has a By* type to identify it, a By*View data type to represent the view of Announcement it is sorted\n+// by, and an By*ViewExtractor type to convert an Announcement into the By*View type.\n+// See https://www.boost.org/doc/libs/1_54_0/libs/multi_index/doc/reference/key_extraction.html#key_extractors\n+// for more information about the key extraction concept.\n+\n+// The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txhash)\n+//\n+// Uses:\n+// * Looking up existing announcements by peer/txhash, by checking both (peer, false, txhash) and\n+//   (peer, true, txhash).\n+// * Finding all CANDIDATE_BEST announcements for a given peer in GetRequestable.\n+struct ByPeer {};\n+using ByPeerView = std::tuple<NodeId, bool, const uint256&>;\n+struct ByPeerViewExtractor\n+{\n+    using result_type = ByPeerView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByPeerView{ann.m_peer, ann.GetState() == State::CANDIDATE_BEST, ann.m_txhash};\n+    }\n+};\n+\n+// The ByTxHash index is sorted by (txhash, state, priority [CANDIDATE_READY]; 0 [otherwise])",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499523971",
+      "id" : 499523971,
+      "line" : 157,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTUyMzk3MQ==",
+      "original_commit_id" : "a60ad12fb9bac2e4a8fe9018754444d48ba817ea",
+      "original_line" : 157,
+      "original_position" : 157,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 157,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499523971",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499532324"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499532324"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`assert(new_state == COMPLETED || new_state == CANDIDATE_DELAYED);` ? The existing `assert(!it->IsSelected());` at the end would also allow `new_state == CANDIDATE_READY` which I don't think would be handled correctly (in that if it were the first READY, it should be assigned BEST but will not be).",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T11:35:22Z",
+      "diff_hunk" : "@@ -0,0 +1,577 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of ByTxHashView relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE announcement whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED announcement already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority announcement among all CANDIDATE_READY (and _BEST) ones for that\n+     *  txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED announcement. */\n+    REQUESTED,\n+    /** A CANDIDATE announcement that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED announcement. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+//! Type alias for sequence numbers.\n+using SequenceNumber = uint64_t;\n+\n+/** An announcement. This is the data we track for each txid or wtxid that is announced to us by each peer. */\n+struct Announcement {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const NodeId m_peer;\n+    /** What sequence number this announcement has. */\n+    const SequenceNumber m_sequence : 59;\n+    /** Whether the request is preferred. */\n+    const bool m_preferred : 1;\n+    /** Whether this is a wtxid request. */\n+    const bool m_is_wtxid : 1;\n+\n+    /** What state this announcement is in. This is a uint8_t instead of a State to silence a GCC warning. */\n+    uint8_t m_state : 3;\n+\n+    /** Convert the m_state variable to a State enum. */\n+    State GetState() const { return State(m_state); }\n+    /** Convert a State to a uint8_t and store it in m_state. */\n+    void SetState(State state) { m_state = uint8_t(state); }\n+\n+    /** Whether this announcement is selected. There can be at most 1 selected peer per txhash. */\n+    bool IsSelected() const\n+    {\n+        return GetState() == State::CANDIDATE_BEST || GetState() == State::REQUESTED;\n+    }\n+\n+    /** Whether this announcement is waiting for a certain time to pass. */\n+    bool IsWaiting() const\n+    {\n+        return GetState() == State::REQUESTED || GetState() == State::CANDIDATE_DELAYED;\n+    }\n+\n+    /** Whether this announcement can feasibly be selected if the current IsSelected() one disappears. */\n+    bool IsSelectable() const\n+    {\n+        return GetState() == State::CANDIDATE_READY || GetState() == State::CANDIDATE_BEST;\n+    }\n+\n+    /** Construct a new announcement from scratch, initially in CANDIDATE_DELAYED state. */\n+    Announcement(const GenTxid& gtxid, NodeId peer, bool preferred, std::chrono::microseconds reqtime,\n+        SequenceNumber sequence) :\n+        m_txhash(gtxid.GetHash()), m_time(reqtime), m_peer(peer), m_sequence(sequence), m_preferred(preferred),\n+        m_is_wtxid(gtxid.IsWtxid()), m_state(uint8_t(State::CANDIDATE_DELAYED)) {}\n+};\n+\n+//! Type alias for priorities.\n+using Priority = uint64_t;\n+\n+/** A functor with embedded salt that computes priority of an announcement.\n+ *\n+ * Lower priorities are selected first.\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic) :\n+        m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+        m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+    Priority operator()(const uint256& txhash, NodeId peer, bool preferred) const\n+    {\n+        uint64_t low_bits = CSipHasher(m_k0, m_k1).Write(txhash.begin(), txhash.size()).Write(peer).Finalize() >> 1;\n+        return low_bits | uint64_t{!preferred} << 63;\n+    }\n+\n+    Priority operator()(const Announcement& ann) const\n+    {\n+        return operator()(ann.m_txhash, ann.m_peer, ann.m_preferred);\n+    }\n+};\n+\n+// Definitions for the 3 indexes used in the main data structure.\n+//\n+// Each index has a By* type to identify it, a By*View data type to represent the view of Announcement it is sorted\n+// by, and an By*ViewExtractor type to convert an Announcement into the By*View type.\n+// See https://www.boost.org/doc/libs/1_54_0/libs/multi_index/doc/reference/key_extraction.html#key_extractors\n+// for more information about the key extraction concept.\n+\n+// The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txhash)\n+//\n+// Uses:\n+// * Looking up existing announcements by peer/txhash, by checking both (peer, false, txhash) and\n+//   (peer, true, txhash).\n+// * Finding all CANDIDATE_BEST announcements for a given peer in GetRequestable.\n+struct ByPeer {};\n+using ByPeerView = std::tuple<NodeId, bool, const uint256&>;\n+struct ByPeerViewExtractor\n+{\n+    using result_type = ByPeerView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByPeerView{ann.m_peer, ann.GetState() == State::CANDIDATE_BEST, ann.m_txhash};\n+    }\n+};\n+\n+// The ByTxHash index is sorted by (txhash, state, priority [CANDIDATE_READY]; 0 [otherwise])\n+//\n+// Uses:\n+// * Deleting all Announcements with a given txhash in ForgetTxHash.\n+// * Finding the best CANDIDATE_READY to convert to CANDIDATE_BEST, when no other CANDIDATE_READY or REQUESTED\n+//   Announcement exists for that txhash.\n+// * Determining when no more non-COMPLETED Announcements for a given txhash exist, so the COMPLETED ones can be\n+//   deleted.\n+struct ByTxHash {};\n+using ByTxHashView = std::tuple<const uint256&, State, Priority>;\n+class ByTxHashViewExtractor {\n+    const PriorityComputer& m_computer;\n+public:\n+    ByTxHashViewExtractor(const PriorityComputer& computer) : m_computer(computer) {}\n+    using result_type = ByTxHashView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        const State state = ann.GetState();\n+        const Priority prio = (state == State::CANDIDATE_READY) ? m_computer(ann) : 0;\n+        return ByTxHashView{ann.m_txhash, state, prio};\n+    }\n+};\n+\n+// The ByTime index is sorted by (0 [CANDIDATE_DELAYED,REQUESTED]; 1 [COMPLETED];\n+// 2 [CANDIDATE_READY,CANDIDATE_BEST], time)\n+//\n+// Uses:\n+// * Finding CANDIDATE_DELAYED announcements whose reqtime has passed, and REQUESTED announcements whose expiry has\n+//   passed.\n+// * Finding CANDIDATE_READY/BEST announcements whose reqtime is in the future (when the clock time went backwards).\n+struct ByTime {};\n+using ByTimeView = std::pair<int, std::chrono::microseconds>;\n+struct ByTimeViewExtractor\n+{\n+    using result_type = ByTimeView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByTimeView{ann.IsWaiting() ? 0 : ann.IsSelectable() ? 2 : 1, ann.m_time};\n+    }\n+};\n+\n+/** Data type for the main data structure (Announcement objects with ByPeer/ByTxHash/ByTime indexes). */\n+using Index = boost::multi_index_container<\n+    Announcement,\n+    boost::multi_index::indexed_by<\n+        boost::multi_index::ordered_unique<boost::multi_index::tag<ByPeer>, ByPeerViewExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTxHash>, ByTxHashViewExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTime>, ByTimeViewExtractor>\n+    >\n+>;\n+\n+/** Helper type to simplify syntax of iterator types. */\n+template<typename Tag>\n+using Iter = typename Index::index<Tag>::type::iterator;\n+\n+/** Per-peer statistics object. */\n+struct PeerInfo {\n+    size_t m_total = 0; //!< Total number of announcements for this peer.\n+    size_t m_completed = 0; //!< Number of COMPLETED announcements for this peer.\n+    size_t m_requested = 0; //!< Number of REQUESTED announcements for this peer.\n+};\n+\n+const uint256 UINT256_ZERO;\n+\n+}  // namespace\n+\n+/** Actual implementation for TxRequestTracker's data structure. */\n+class TxRequestTracker::Impl {\n+    //! The current sequence number. Increases for every announcement. This is used to sort txhashes returned by\n+    //! GetRequestable in announcement order.\n+    SequenceNumber m_current_sequence{0};\n+\n+    //! This tracker's priority computer.\n+    const PriorityComputer m_computer;\n+\n+    //! This tracker's main data structure.\n+    Index m_index;\n+\n+    //! Map with this tracker's per-peer statistics.\n+    std::unordered_map<NodeId, PeerInfo> m_peerinfo;\n+\n+    //! Wrapper around Index::...::erase that keeps m_peerinfo up to date.\n+    template<typename Tag>\n+    Iter<Tag> Erase(Iter<Tag> it)\n+    {\n+        auto peerit = m_peerinfo.find(it->m_peer);\n+        peerit->second.m_completed -= it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested -= it->GetState() == State::REQUESTED;\n+        if (--peerit->second.m_total == 0) m_peerinfo.erase(peerit);\n+        return m_index.get<Tag>().erase(it);\n+    }\n+\n+    //! Wrapper around Index::...::modify that keeps m_peerinfo up to date.\n+    template<typename Tag, typename Modifier>\n+    void Modify(Iter<Tag> it, Modifier modifier)\n+    {\n+        auto peerit = m_peerinfo.find(it->m_peer);\n+        peerit->second.m_completed -= it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested -= it->GetState() == State::REQUESTED;\n+        m_index.get<Tag>().modify(it, std::move(modifier));\n+        peerit->second.m_completed += it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested += it->GetState() == State::REQUESTED;\n+    }\n+\n+    //! Convert a CANDIDATE_DELAYED announcement into a CANDIDATE_READY. If this makes it the new best\n+    //! CANDIDATE_READY (and no REQUESTED exists) and better than the CANDIDATE_BEST (if any), it becomes the new\n+    //! CANDIDATE_BEST.\n+    void PromoteCandidateReady(Iter<ByTxHash> it)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+        assert(it->GetState() == State::CANDIDATE_DELAYED);\n+        // Convert CANDIDATE_DELAYED to CANDIDATE_READY first.\n+        Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_READY); });\n+        // The following code relies on the fact that the ByTxHash is sorted by txhash, and then by state (first\n+        // _DELAYED, then _BEST/REQUESTED, then _READY). Within the _READY announcements, the best one (lowest\n+        // priority) comes first. Thus, if an existing _BEST exists for the same txhash that this announcement may\n+        // be preferred over, it must immediately precede the newly created _READY.\n+        if (it == m_index.get<ByTxHash>().begin() || std::prev(it)->m_txhash != it->m_txhash ||\n+            std::prev(it)->GetState() == State::CANDIDATE_DELAYED) {\n+            // This is the new best CANDIDATE_READY, and there is no IsSelected() announcement for this txhash\n+            // already.\n+            Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+        } else if (std::prev(it)->GetState() == State::CANDIDATE_BEST) {\n+            Priority priority_old = m_computer(*std::prev(it));\n+            Priority priority_new = m_computer(*it);\n+            if (priority_new < priority_old) {\n+                // There is a CANDIDATE_BEST announcement already, but this one is better.\n+                auto new_ready_it = std::prev(it);\n+                Modify<ByTxHash>(new_ready_it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_READY); });\n+                Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+            }\n+        }\n+    }\n+\n+    //! Change the state of an announcement to something non-IsSelected(). If it was IsSelected(), the next best\n+    //! announcement will be marked CANDIDATE_BEST.\n+    void ChangeAndReselect(Iter<ByTxHash> it, State new_state)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499532324",
+      "id" : 499532324,
+      "line" : 416,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTUzMjMyNA==",
+      "original_commit_id" : "a60ad12fb9bac2e4a8fe9018754444d48ba817ea",
+      "original_line" : 295,
+      "original_position" : 295,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 416,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499532324",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499563280"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499563280"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`ByTxHashView` takes the uint256 as the first param, the last one is just a uint64_t Priority, so replacing with `COMPLETED, std::numeric_limits<Priority>::max()` should be straightforward (`1` would also be fine, since COMPLETED means priority is `0`). Seems to pass the fuzz tester okay. Adding a `static constexpr auto PRIORITY_MAX` alias and using it for `m_priority_best_candidate_ready` as well may make sense.\r\n\r\nBut... is this test even useful? `it_last` was needed in order to sanity check the first markers, but with them gone now...",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T12:33:27Z",
+      "diff_hunk" : "@@ -0,0 +1,716 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of ByTxHashView relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE announcement whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED announcement already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority announcement among all CANDIDATE_READY (and _BEST) ones for that\n+     *  txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED announcement. */\n+    REQUESTED,\n+    /** A CANDIDATE announcement that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED announcement. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+//! Type alias for sequence numbers.\n+using SequenceNumber = uint64_t;\n+\n+/** An announcement. This is the data we track for each txid or wtxid that is announced to us by each peer. */\n+struct Announcement {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const NodeId m_peer;\n+    /** What sequence number this announcement has. */\n+    const SequenceNumber m_sequence : 59;\n+    /** Whether the request is preferred. */\n+    const bool m_preferred : 1;\n+    /** Whether this is a wtxid request. */\n+    const bool m_is_wtxid : 1;\n+\n+    /** What state this announcement is in. This is a uint8_t instead of a State to silence a GCC warning. */\n+    uint8_t m_state : 3;\n+\n+    /** Convert the m_state variable to a State enum. */\n+    State GetState() const { return State(m_state); }\n+    /** Convert a State to a uint8_t and store it in m_state. */\n+    void SetState(State state) { m_state = uint8_t(state); }\n+\n+    /** Whether this announcement is selected. There can be at most 1 selected peer per txhash. */\n+    bool IsSelected() const\n+    {\n+        return GetState() == State::CANDIDATE_BEST || GetState() == State::REQUESTED;\n+    }\n+\n+    /** Whether this announcement is waiting for a certain time to pass. */\n+    bool IsWaiting() const\n+    {\n+        return GetState() == State::REQUESTED || GetState() == State::CANDIDATE_DELAYED;\n+    }\n+\n+    /** Whether this announcement can feasibly be selected if the current IsSelected() one disappears. */\n+    bool IsSelectable() const\n+    {\n+        return GetState() == State::CANDIDATE_READY || GetState() == State::CANDIDATE_BEST;\n+    }\n+\n+    /** Construct a new announcement from scratch, initially in CANDIDATE_DELAYED state. */\n+    Announcement(const GenTxid& gtxid, NodeId peer, bool preferred, std::chrono::microseconds reqtime,\n+        SequenceNumber sequence) :\n+        m_txhash(gtxid.GetHash()), m_time(reqtime), m_peer(peer), m_sequence(sequence), m_preferred(preferred),\n+        m_is_wtxid(gtxid.IsWtxid()), m_state(uint8_t(State::CANDIDATE_DELAYED)) {}\n+};\n+\n+//! Type alias for priorities.\n+using Priority = uint64_t;\n+\n+/** A functor with embedded salt that computes priority of an announcement.\n+ *\n+ * Lower priorities are selected first.\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic) :\n+        m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+        m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+    Priority operator()(const uint256& txhash, NodeId peer, bool preferred) const\n+    {\n+        uint64_t low_bits = CSipHasher(m_k0, m_k1).Write(txhash.begin(), txhash.size()).Write(peer).Finalize() >> 1;\n+        return low_bits | uint64_t{!preferred} << 63;\n+    }\n+\n+    Priority operator()(const Announcement& ann) const\n+    {\n+        return operator()(ann.m_txhash, ann.m_peer, ann.m_preferred);\n+    }\n+};\n+\n+// Definitions for the 3 indexes used in the main data structure.\n+//\n+// Each index has a By* type to identify it, a By*View data type to represent the view of Announcement it is sorted\n+// by, and an By*ViewExtractor type to convert an Announcement into the By*View type.\n+// See https://www.boost.org/doc/libs/1_54_0/libs/multi_index/doc/reference/key_extraction.html#key_extractors\n+// for more information about the key extraction concept.\n+\n+// The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txhash)\n+//\n+// Uses:\n+// * Looking up existing announcements by peer/txhash, by checking both (peer, false, txhash) and\n+//   (peer, true, txhash).\n+// * Finding all CANDIDATE_BEST announcements for a given peer in GetRequestable.\n+struct ByPeer {};\n+using ByPeerView = std::tuple<NodeId, bool, const uint256&>;\n+struct ByPeerViewExtractor\n+{\n+    using result_type = ByPeerView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByPeerView{ann.m_peer, ann.GetState() == State::CANDIDATE_BEST, ann.m_txhash};\n+    }\n+};\n+\n+// The ByTxHash index is sorted by (txhash, state, priority [CANDIDATE_READY]; 0 [otherwise])\n+//\n+// Uses:\n+// * Deleting all Announcements with a given txhash in ForgetTxHash.\n+// * Finding the best CANDIDATE_READY to convert to CANDIDATE_BEST, when no other CANDIDATE_READY or REQUESTED\n+//   Announcement exists for that txhash.\n+// * Determining when no more non-COMPLETED Announcements for a given txhash exist, so the COMPLETED ones can be\n+//   deleted.\n+struct ByTxHash {};\n+using ByTxHashView = std::tuple<const uint256&, State, Priority>;\n+class ByTxHashViewExtractor {\n+    const PriorityComputer& m_computer;\n+public:\n+    ByTxHashViewExtractor(const PriorityComputer& computer) : m_computer(computer) {}\n+    using result_type = ByTxHashView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        const State state = ann.GetState();\n+        const Priority prio = (state == State::CANDIDATE_READY) ? m_computer(ann) : 0;\n+        return ByTxHashView{ann.m_txhash, state, prio};\n+    }\n+};\n+\n+// The ByTime index is sorted by (0 [CANDIDATE_DELAYED,REQUESTED]; 1 [COMPLETED];\n+// 2 [CANDIDATE_READY,CANDIDATE_BEST], time)\n+//\n+// Uses:\n+// * Finding CANDIDATE_DELAYED announcements whose reqtime has passed, and REQUESTED announcements whose expiry has\n+//   passed.\n+// * Finding CANDIDATE_READY/BEST announcements whose reqtime is in the future (when the clock time went backwards).\n+struct ByTime {};\n+using ByTimeView = std::pair<int, std::chrono::microseconds>;\n+struct ByTimeViewExtractor\n+{\n+    using result_type = ByTimeView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByTimeView{ann.IsWaiting() ? 0 : ann.IsSelectable() ? 2 : 1, ann.m_time};\n+    }\n+};\n+\n+/** Data type for the main data structure (Announcement objects with ByPeer/ByTxHash/ByTime indexes). */\n+using Index = boost::multi_index_container<\n+    Announcement,\n+    boost::multi_index::indexed_by<\n+        boost::multi_index::ordered_unique<boost::multi_index::tag<ByPeer>, ByPeerViewExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTxHash>, ByTxHashViewExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTime>, ByTimeViewExtractor>\n+    >\n+>;\n+\n+/** Helper type to simplify syntax of iterator types. */\n+template<typename Tag>\n+using Iter = typename Index::index<Tag>::type::iterator;\n+\n+/** Per-peer statistics object. */\n+struct PeerInfo {\n+    size_t m_total = 0; //!< Total number of announcements for this peer.\n+    size_t m_completed = 0; //!< Number of COMPLETED announcements for this peer.\n+    size_t m_requested = 0; //!< Number of REQUESTED announcements for this peer.\n+};\n+\n+/** Per-txhash statistics object. Only used for sanity checking. */\n+struct TxHashInfo\n+{\n+    //! Number of CANDIDATE_DELAYED entries for this txhash.\n+    size_t m_candidate_delayed = 0;\n+    //! Number of CANDIDATE_READY entries for this txhash.\n+    size_t m_candidate_ready = 0;\n+    //! Number of CANDIDATE_BEST entries for this txhash (at most one).\n+    size_t m_candidate_best = 0;\n+    //! Number of REQUESTED entries for this txhash.\n+    size_t m_requested = 0;\n+    //! The priority of the CANDIDATE_BEST announcement if one exists, or 0 otherwise.\n+    uint64_t m_priority_candidate_best = 0;\n+    //! The lowest priority of all CANDIDATE_READY entries (or max() if none exist).\n+    uint64_t m_priority_best_candidate_ready = std::numeric_limits<uint64_t>::max();\n+    //! All peers we have an announcement for this txhash for.\n+    std::vector<uint64_t> m_peers;\n+};\n+\n+/** Compare two PeerInfo objects. Only used for sanity checking. */\n+bool operator==(const PeerInfo& a, const PeerInfo& b)\n+{\n+    return std::tie(a.m_total, a.m_completed, a.m_requested) ==\n+           std::tie(b.m_total, b.m_completed, b.m_requested);\n+};\n+\n+/** (Re)compute the PeerInfo map from the index. Only used for sanity checking. */\n+std::unordered_map<NodeId, PeerInfo> RecomputePeerInfo(const Index& index)\n+{\n+    std::unordered_map<NodeId, PeerInfo> ret;\n+    for (const Announcement& ann : index) {\n+        PeerInfo& info = ret[ann.m_peer];\n+        ++info.m_total;\n+        info.m_requested += (ann.GetState() == State::REQUESTED);\n+        info.m_completed += (ann.GetState() == State::COMPLETED);\n+    }\n+    return ret;\n+}\n+\n+/** Compute the TxHashInfo map. Only used for sanity checking. */\n+std::map<uint256, TxHashInfo> ComputeTxHashInfo(const Index& index, const PriorityComputer& computer)\n+{\n+    std::map<uint256, TxHashInfo> ret;\n+    for (const Announcement& ann : index) {\n+        TxHashInfo& info = ret[ann.m_txhash];\n+        // Classify how many Entrys of each state we have for this txhash.\n+        info.m_candidate_delayed += (ann.GetState() == State::CANDIDATE_DELAYED);\n+        info.m_candidate_ready += (ann.GetState() == State::CANDIDATE_READY);\n+        info.m_candidate_best += (ann.GetState() == State::CANDIDATE_BEST);\n+        info.m_requested += (ann.GetState() == State::REQUESTED);\n+        // And track the priority of the best CANDIDATE_READY/CANDIDATE_BEST entries.\n+        if (ann.GetState() == State::CANDIDATE_BEST) {\n+            info.m_priority_candidate_best = computer(ann);\n+        }\n+        if (ann.GetState() == State::CANDIDATE_READY) {\n+            info.m_priority_best_candidate_ready = std::min(info.m_priority_best_candidate_ready, computer(ann));\n+        }\n+        // Also keep track of which peers this txhash has a Entry for (so we can detect duplicates).\n+        info.m_peers.push_back(ann.m_peer);\n+        // Track preferred/first.\n+    }\n+    return ret;\n+}\n+\n+const uint256 UINT256_ZERO;\n+\n+}  // namespace\n+\n+/** Actual implementation for TxRequestTracker's data structure. */\n+class TxRequestTracker::Impl {\n+    //! The current sequence number. Increases for every announcement. This is used to sort txhashes returned by\n+    //! GetRequestable in announcement order.\n+    SequenceNumber m_current_sequence{0};\n+\n+    //! This tracker's priority computer.\n+    const PriorityComputer m_computer;\n+\n+    //! This tracker's main data structure. See SanityCheck() for the invariants that apply to it.\n+    Index m_index;\n+\n+    //! Map with this tracker's per-peer statistics.\n+    std::unordered_map<NodeId, PeerInfo> m_peerinfo;\n+\n+public:\n+    void SanityCheck() const\n+    {\n+        // Recompute m_peerdata from m_index. This verifies the data in it as it should just be caching statistics\n+        // on m_index. It also verifies the invariant that no PeerInfo entries exist with m_total==0 exist.\n+        assert(m_peerinfo == RecomputePeerInfo(m_index));\n+\n+        // Calculate per-txhash statistics from m_index, and validate invariants.\n+        for (auto& item : ComputeTxHashInfo(m_index, m_computer)) {\n+            TxHashInfo& info = item.second;\n+\n+            // Cannot have only COMPLETED peer (txhash should have been forgotten already)\n+            assert(info.m_candidate_delayed + info.m_candidate_ready + info.m_candidate_best + info.m_requested > 0);\n+\n+            // Can have at most 1 CANDIDATE_BEST/REQUESTED peer\n+            assert(info.m_candidate_best + info.m_requested <= 1);\n+\n+            // If there are any CANDIDATE_READY entries, there must be exactly one CANDIDATE_BEST or REQUESTED\n+            // announcement.\n+            if (info.m_candidate_ready > 0) {\n+                assert(info.m_candidate_best + info.m_requested == 1);\n+            }\n+\n+            // If there is both a CANDIDATE_READY and a CANDIDATE_BEST announcement, the CANDIDATE_BEST one must be\n+            // at least as good (equal or lower priority) as the best CANDIDATE_READY.\n+            if (info.m_candidate_ready && info.m_candidate_best) {\n+                assert(info.m_priority_candidate_best <= info.m_priority_best_candidate_ready);\n+            }\n+\n+            // No txhash can have been announced by the same peer twice.\n+            std::sort(info.m_peers.begin(), info.m_peers.end());\n+            assert(std::adjacent_find(info.m_peers.begin(), info.m_peers.end()) == info.m_peers.end());\n+\n+            // Looking up the last ByTxHash announcement with the given txhash must return an Announcement with that\n+            // txhash or the multi_index is very bad.\n+            auto it_last = std::prev(m_index.get<ByTxHash>().lower_bound(\n+                ByTxHashView{item.first, State::TOO_LARGE, 0}));\n+            assert(it_last != m_index.get<ByTxHash>().end() && it_last->m_txhash == item.first);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499563280",
+      "id" : 499563280,
+      "in_reply_to_id" : 499493545,
+      "line" : 339,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTU2MzI4MA==",
+      "original_commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "original_line" : 339,
+      "original_position" : 339,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 339,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499563280",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499567299"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499567299"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I think the constraints on the ordering here are:\r\n * COMPLETED comes last, so that looping `it = Erase<ByTxHash>(it)` starting from the only non-completed entry for a txhash will erase all the entries for that txhash\r\n * BEST and REQUESTED are next to each other so that it's easy to enforce the \"only one best or requestable per txhash\"\r\n * BEST/REQUESTED comes immediately before/after READY so that it's easy to compare a new best READY with the existing BEST\r\n\r\nBut I think there's no longer anything preventing changing the ordering to match the expected transitions, ie `DELAYED, READY, BEST, REQUESTED, COMPLETED` (and changing the best priority to be the highest value rather than the lowest). I'm presuming that's due to no longer doing first markers, but maybe I've missed something?",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T12:40:18Z",
+      "diff_hunk" : "@@ -0,0 +1,577 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of ByTxHashView relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE announcement whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED announcement already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority announcement among all CANDIDATE_READY (and _BEST) ones for that\n+     *  txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED announcement. */\n+    REQUESTED,\n+    /** A CANDIDATE announcement that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED announcement. */\n+    COMPLETED,",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499567299",
+      "id" : 499567299,
+      "line" : 50,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTU2NzI5OQ==",
+      "original_commit_id" : "a60ad12fb9bac2e4a8fe9018754444d48ba817ea",
+      "original_line" : 50,
+      "original_position" : 50,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 50,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499567299",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499581088"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499581088"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Maybe\r\n\r\n```c++\r\nenum class WaitState {\r\n    WAITING,\r\n    COMPLETED,\r\n    SELECTABLE,\r\n};\r\nstatic inline WaitState GetWaitState(const Announcement& ann) {\r\n    return (ann.IsWaiting() ? WaitState::WAITING : ann.IsSelectable() ? WaitState::SELECTABLE, WaitState::COMPLETED);\r\n}\r\n```\r\n\r\nand say `sorted by (wait_state, time)`, and describe it is easy to find all the WAITING announcements prior to a time point (for when the event they were waiting for has happened), and all the SELECTABLE announcements after a time point (for when time goes backwards)? (Alternatively, FUTURE_EVENT, NO_EVENT, and PAST_EVENT would be more generic wait states)",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T13:02:21Z",
+      "diff_hunk" : "@@ -0,0 +1,577 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of ByTxHashView relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE announcement whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED announcement already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority announcement among all CANDIDATE_READY (and _BEST) ones for that\n+     *  txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED announcement. */\n+    REQUESTED,\n+    /** A CANDIDATE announcement that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED announcement. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+//! Type alias for sequence numbers.\n+using SequenceNumber = uint64_t;\n+\n+/** An announcement. This is the data we track for each txid or wtxid that is announced to us by each peer. */\n+struct Announcement {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const NodeId m_peer;\n+    /** What sequence number this announcement has. */\n+    const SequenceNumber m_sequence : 59;\n+    /** Whether the request is preferred. */\n+    const bool m_preferred : 1;\n+    /** Whether this is a wtxid request. */\n+    const bool m_is_wtxid : 1;\n+\n+    /** What state this announcement is in. This is a uint8_t instead of a State to silence a GCC warning. */\n+    uint8_t m_state : 3;\n+\n+    /** Convert the m_state variable to a State enum. */\n+    State GetState() const { return State(m_state); }\n+    /** Convert a State to a uint8_t and store it in m_state. */\n+    void SetState(State state) { m_state = uint8_t(state); }\n+\n+    /** Whether this announcement is selected. There can be at most 1 selected peer per txhash. */\n+    bool IsSelected() const\n+    {\n+        return GetState() == State::CANDIDATE_BEST || GetState() == State::REQUESTED;\n+    }\n+\n+    /** Whether this announcement is waiting for a certain time to pass. */\n+    bool IsWaiting() const\n+    {\n+        return GetState() == State::REQUESTED || GetState() == State::CANDIDATE_DELAYED;\n+    }\n+\n+    /** Whether this announcement can feasibly be selected if the current IsSelected() one disappears. */\n+    bool IsSelectable() const\n+    {\n+        return GetState() == State::CANDIDATE_READY || GetState() == State::CANDIDATE_BEST;\n+    }\n+\n+    /** Construct a new announcement from scratch, initially in CANDIDATE_DELAYED state. */\n+    Announcement(const GenTxid& gtxid, NodeId peer, bool preferred, std::chrono::microseconds reqtime,\n+        SequenceNumber sequence) :\n+        m_txhash(gtxid.GetHash()), m_time(reqtime), m_peer(peer), m_sequence(sequence), m_preferred(preferred),\n+        m_is_wtxid(gtxid.IsWtxid()), m_state(uint8_t(State::CANDIDATE_DELAYED)) {}\n+};\n+\n+//! Type alias for priorities.\n+using Priority = uint64_t;\n+\n+/** A functor with embedded salt that computes priority of an announcement.\n+ *\n+ * Lower priorities are selected first.\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic) :\n+        m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+        m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+    Priority operator()(const uint256& txhash, NodeId peer, bool preferred) const\n+    {\n+        uint64_t low_bits = CSipHasher(m_k0, m_k1).Write(txhash.begin(), txhash.size()).Write(peer).Finalize() >> 1;\n+        return low_bits | uint64_t{!preferred} << 63;\n+    }\n+\n+    Priority operator()(const Announcement& ann) const\n+    {\n+        return operator()(ann.m_txhash, ann.m_peer, ann.m_preferred);\n+    }\n+};\n+\n+// Definitions for the 3 indexes used in the main data structure.\n+//\n+// Each index has a By* type to identify it, a By*View data type to represent the view of Announcement it is sorted\n+// by, and an By*ViewExtractor type to convert an Announcement into the By*View type.\n+// See https://www.boost.org/doc/libs/1_54_0/libs/multi_index/doc/reference/key_extraction.html#key_extractors\n+// for more information about the key extraction concept.\n+\n+// The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txhash)\n+//\n+// Uses:\n+// * Looking up existing announcements by peer/txhash, by checking both (peer, false, txhash) and\n+//   (peer, true, txhash).\n+// * Finding all CANDIDATE_BEST announcements for a given peer in GetRequestable.\n+struct ByPeer {};\n+using ByPeerView = std::tuple<NodeId, bool, const uint256&>;\n+struct ByPeerViewExtractor\n+{\n+    using result_type = ByPeerView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByPeerView{ann.m_peer, ann.GetState() == State::CANDIDATE_BEST, ann.m_txhash};\n+    }\n+};\n+\n+// The ByTxHash index is sorted by (txhash, state, priority [CANDIDATE_READY]; 0 [otherwise])\n+//\n+// Uses:\n+// * Deleting all Announcements with a given txhash in ForgetTxHash.\n+// * Finding the best CANDIDATE_READY to convert to CANDIDATE_BEST, when no other CANDIDATE_READY or REQUESTED\n+//   Announcement exists for that txhash.\n+// * Determining when no more non-COMPLETED Announcements for a given txhash exist, so the COMPLETED ones can be\n+//   deleted.\n+struct ByTxHash {};\n+using ByTxHashView = std::tuple<const uint256&, State, Priority>;\n+class ByTxHashViewExtractor {\n+    const PriorityComputer& m_computer;\n+public:\n+    ByTxHashViewExtractor(const PriorityComputer& computer) : m_computer(computer) {}\n+    using result_type = ByTxHashView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        const State state = ann.GetState();\n+        const Priority prio = (state == State::CANDIDATE_READY) ? m_computer(ann) : 0;\n+        return ByTxHashView{ann.m_txhash, state, prio};\n+    }\n+};\n+\n+// The ByTime index is sorted by (0 [CANDIDATE_DELAYED,REQUESTED]; 1 [COMPLETED];\n+// 2 [CANDIDATE_READY,CANDIDATE_BEST], time)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499581088",
+      "id" : 499581088,
+      "line" : 181,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTU4MTA4OA==",
+      "original_commit_id" : "a60ad12fb9bac2e4a8fe9018754444d48ba817ea",
+      "original_line" : 181,
+      "original_position" : 181,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 181,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499581088",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499591256"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499591256"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "At some point in the future it would probably be good to expose expiring requests somehow -- peers might want to deprioritise those peers or disconnect them, eg.",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T13:18:27Z",
+      "diff_hunk" : "@@ -0,0 +1,577 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of ByTxHashView relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE announcement whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED announcement already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority announcement among all CANDIDATE_READY (and _BEST) ones for that\n+     *  txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED announcement. */\n+    REQUESTED,\n+    /** A CANDIDATE announcement that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED announcement. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+//! Type alias for sequence numbers.\n+using SequenceNumber = uint64_t;\n+\n+/** An announcement. This is the data we track for each txid or wtxid that is announced to us by each peer. */\n+struct Announcement {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const NodeId m_peer;\n+    /** What sequence number this announcement has. */\n+    const SequenceNumber m_sequence : 59;\n+    /** Whether the request is preferred. */\n+    const bool m_preferred : 1;\n+    /** Whether this is a wtxid request. */\n+    const bool m_is_wtxid : 1;\n+\n+    /** What state this announcement is in. This is a uint8_t instead of a State to silence a GCC warning. */\n+    uint8_t m_state : 3;\n+\n+    /** Convert the m_state variable to a State enum. */\n+    State GetState() const { return State(m_state); }\n+    /** Convert a State to a uint8_t and store it in m_state. */\n+    void SetState(State state) { m_state = uint8_t(state); }\n+\n+    /** Whether this announcement is selected. There can be at most 1 selected peer per txhash. */\n+    bool IsSelected() const\n+    {\n+        return GetState() == State::CANDIDATE_BEST || GetState() == State::REQUESTED;\n+    }\n+\n+    /** Whether this announcement is waiting for a certain time to pass. */\n+    bool IsWaiting() const\n+    {\n+        return GetState() == State::REQUESTED || GetState() == State::CANDIDATE_DELAYED;\n+    }\n+\n+    /** Whether this announcement can feasibly be selected if the current IsSelected() one disappears. */\n+    bool IsSelectable() const\n+    {\n+        return GetState() == State::CANDIDATE_READY || GetState() == State::CANDIDATE_BEST;\n+    }\n+\n+    /** Construct a new announcement from scratch, initially in CANDIDATE_DELAYED state. */\n+    Announcement(const GenTxid& gtxid, NodeId peer, bool preferred, std::chrono::microseconds reqtime,\n+        SequenceNumber sequence) :\n+        m_txhash(gtxid.GetHash()), m_time(reqtime), m_peer(peer), m_sequence(sequence), m_preferred(preferred),\n+        m_is_wtxid(gtxid.IsWtxid()), m_state(uint8_t(State::CANDIDATE_DELAYED)) {}\n+};\n+\n+//! Type alias for priorities.\n+using Priority = uint64_t;\n+\n+/** A functor with embedded salt that computes priority of an announcement.\n+ *\n+ * Lower priorities are selected first.\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic) :\n+        m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+        m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+    Priority operator()(const uint256& txhash, NodeId peer, bool preferred) const\n+    {\n+        uint64_t low_bits = CSipHasher(m_k0, m_k1).Write(txhash.begin(), txhash.size()).Write(peer).Finalize() >> 1;\n+        return low_bits | uint64_t{!preferred} << 63;\n+    }\n+\n+    Priority operator()(const Announcement& ann) const\n+    {\n+        return operator()(ann.m_txhash, ann.m_peer, ann.m_preferred);\n+    }\n+};\n+\n+// Definitions for the 3 indexes used in the main data structure.\n+//\n+// Each index has a By* type to identify it, a By*View data type to represent the view of Announcement it is sorted\n+// by, and an By*ViewExtractor type to convert an Announcement into the By*View type.\n+// See https://www.boost.org/doc/libs/1_54_0/libs/multi_index/doc/reference/key_extraction.html#key_extractors\n+// for more information about the key extraction concept.\n+\n+// The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txhash)\n+//\n+// Uses:\n+// * Looking up existing announcements by peer/txhash, by checking both (peer, false, txhash) and\n+//   (peer, true, txhash).\n+// * Finding all CANDIDATE_BEST announcements for a given peer in GetRequestable.\n+struct ByPeer {};\n+using ByPeerView = std::tuple<NodeId, bool, const uint256&>;\n+struct ByPeerViewExtractor\n+{\n+    using result_type = ByPeerView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByPeerView{ann.m_peer, ann.GetState() == State::CANDIDATE_BEST, ann.m_txhash};\n+    }\n+};\n+\n+// The ByTxHash index is sorted by (txhash, state, priority [CANDIDATE_READY]; 0 [otherwise])\n+//\n+// Uses:\n+// * Deleting all Announcements with a given txhash in ForgetTxHash.\n+// * Finding the best CANDIDATE_READY to convert to CANDIDATE_BEST, when no other CANDIDATE_READY or REQUESTED\n+//   Announcement exists for that txhash.\n+// * Determining when no more non-COMPLETED Announcements for a given txhash exist, so the COMPLETED ones can be\n+//   deleted.\n+struct ByTxHash {};\n+using ByTxHashView = std::tuple<const uint256&, State, Priority>;\n+class ByTxHashViewExtractor {\n+    const PriorityComputer& m_computer;\n+public:\n+    ByTxHashViewExtractor(const PriorityComputer& computer) : m_computer(computer) {}\n+    using result_type = ByTxHashView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        const State state = ann.GetState();\n+        const Priority prio = (state == State::CANDIDATE_READY) ? m_computer(ann) : 0;\n+        return ByTxHashView{ann.m_txhash, state, prio};\n+    }\n+};\n+\n+// The ByTime index is sorted by (0 [CANDIDATE_DELAYED,REQUESTED]; 1 [COMPLETED];\n+// 2 [CANDIDATE_READY,CANDIDATE_BEST], time)\n+//\n+// Uses:\n+// * Finding CANDIDATE_DELAYED announcements whose reqtime has passed, and REQUESTED announcements whose expiry has\n+//   passed.\n+// * Finding CANDIDATE_READY/BEST announcements whose reqtime is in the future (when the clock time went backwards).\n+struct ByTime {};\n+using ByTimeView = std::pair<int, std::chrono::microseconds>;\n+struct ByTimeViewExtractor\n+{\n+    using result_type = ByTimeView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByTimeView{ann.IsWaiting() ? 0 : ann.IsSelectable() ? 2 : 1, ann.m_time};\n+    }\n+};\n+\n+/** Data type for the main data structure (Announcement objects with ByPeer/ByTxHash/ByTime indexes). */\n+using Index = boost::multi_index_container<\n+    Announcement,\n+    boost::multi_index::indexed_by<\n+        boost::multi_index::ordered_unique<boost::multi_index::tag<ByPeer>, ByPeerViewExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTxHash>, ByTxHashViewExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTime>, ByTimeViewExtractor>\n+    >\n+>;\n+\n+/** Helper type to simplify syntax of iterator types. */\n+template<typename Tag>\n+using Iter = typename Index::index<Tag>::type::iterator;\n+\n+/** Per-peer statistics object. */\n+struct PeerInfo {\n+    size_t m_total = 0; //!< Total number of announcements for this peer.\n+    size_t m_completed = 0; //!< Number of COMPLETED announcements for this peer.\n+    size_t m_requested = 0; //!< Number of REQUESTED announcements for this peer.\n+};\n+\n+const uint256 UINT256_ZERO;\n+\n+}  // namespace\n+\n+/** Actual implementation for TxRequestTracker's data structure. */\n+class TxRequestTracker::Impl {\n+    //! The current sequence number. Increases for every announcement. This is used to sort txhashes returned by\n+    //! GetRequestable in announcement order.\n+    SequenceNumber m_current_sequence{0};\n+\n+    //! This tracker's priority computer.\n+    const PriorityComputer m_computer;\n+\n+    //! This tracker's main data structure.\n+    Index m_index;\n+\n+    //! Map with this tracker's per-peer statistics.\n+    std::unordered_map<NodeId, PeerInfo> m_peerinfo;\n+\n+    //! Wrapper around Index::...::erase that keeps m_peerinfo up to date.\n+    template<typename Tag>\n+    Iter<Tag> Erase(Iter<Tag> it)\n+    {\n+        auto peerit = m_peerinfo.find(it->m_peer);\n+        peerit->second.m_completed -= it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested -= it->GetState() == State::REQUESTED;\n+        if (--peerit->second.m_total == 0) m_peerinfo.erase(peerit);\n+        return m_index.get<Tag>().erase(it);\n+    }\n+\n+    //! Wrapper around Index::...::modify that keeps m_peerinfo up to date.\n+    template<typename Tag, typename Modifier>\n+    void Modify(Iter<Tag> it, Modifier modifier)\n+    {\n+        auto peerit = m_peerinfo.find(it->m_peer);\n+        peerit->second.m_completed -= it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested -= it->GetState() == State::REQUESTED;\n+        m_index.get<Tag>().modify(it, std::move(modifier));\n+        peerit->second.m_completed += it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested += it->GetState() == State::REQUESTED;\n+    }\n+\n+    //! Convert a CANDIDATE_DELAYED announcement into a CANDIDATE_READY. If this makes it the new best\n+    //! CANDIDATE_READY (and no REQUESTED exists) and better than the CANDIDATE_BEST (if any), it becomes the new\n+    //! CANDIDATE_BEST.\n+    void PromoteCandidateReady(Iter<ByTxHash> it)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+        assert(it->GetState() == State::CANDIDATE_DELAYED);\n+        // Convert CANDIDATE_DELAYED to CANDIDATE_READY first.\n+        Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_READY); });\n+        // The following code relies on the fact that the ByTxHash is sorted by txhash, and then by state (first\n+        // _DELAYED, then _BEST/REQUESTED, then _READY). Within the _READY announcements, the best one (lowest\n+        // priority) comes first. Thus, if an existing _BEST exists for the same txhash that this announcement may\n+        // be preferred over, it must immediately precede the newly created _READY.\n+        if (it == m_index.get<ByTxHash>().begin() || std::prev(it)->m_txhash != it->m_txhash ||\n+            std::prev(it)->GetState() == State::CANDIDATE_DELAYED) {\n+            // This is the new best CANDIDATE_READY, and there is no IsSelected() announcement for this txhash\n+            // already.\n+            Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+        } else if (std::prev(it)->GetState() == State::CANDIDATE_BEST) {\n+            Priority priority_old = m_computer(*std::prev(it));\n+            Priority priority_new = m_computer(*it);\n+            if (priority_new < priority_old) {\n+                // There is a CANDIDATE_BEST announcement already, but this one is better.\n+                auto new_ready_it = std::prev(it);\n+                Modify<ByTxHash>(new_ready_it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_READY); });\n+                Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+            }\n+        }\n+    }\n+\n+    //! Change the state of an announcement to something non-IsSelected(). If it was IsSelected(), the next best\n+    //! announcement will be marked CANDIDATE_BEST.\n+    void ChangeAndReselect(Iter<ByTxHash> it, State new_state)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+        if (it->IsSelected()) {\n+            auto it_next = std::next(it);\n+            // The next best CANDIDATE_READY, if any, immediately follows the REQUESTED or CANDIDATE_BEST\n+            // announcement in the ByTxHash index.\n+            if (it_next != m_index.get<ByTxHash>().end() && it_next->m_txhash == it->m_txhash &&\n+                it_next->GetState() == State::CANDIDATE_READY) {\n+                // If one such CANDIDATE_READY exists (for this txhash), convert it to CANDIDATE_BEST.\n+                Modify<ByTxHash>(it_next, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+            }\n+        }\n+        Modify<ByTxHash>(it, [new_state](Announcement& ann){ ann.SetState(new_state); });\n+        assert(!it->IsSelected());\n+    }\n+\n+    //! Check if 'it' is the only Announcement for a given txhash that isn't COMPLETED.\n+    bool IsOnlyNonCompleted(Iter<ByTxHash> it)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+        assert(it->GetState() != State::COMPLETED); // Not allowed to call this on COMPLETED announcements.\n+\n+        // If this Announcement's predecessor exists, and belongs to the same txhash, it can't be COMPLETED either.\n+        if (it != m_index.get<ByTxHash>().begin() && std::prev(it)->m_txhash == it->m_txhash) return false;\n+\n+        // If this Announcement's successor exists, belongs to the same txhash, and isn't COMPLETED, fail.\n+        if (std::next(it) != m_index.get<ByTxHash>().end() && std::next(it)->m_txhash == it->m_txhash &&\n+            std::next(it)->GetState() != State::COMPLETED) return false;\n+\n+        return true;\n+    }\n+\n+    /** Convert any announcement to a COMPLETED one. If there are no non-COMPLETED announcements left for this\n+     *  txhash, they are deleted. If this was a REQUESTED announcement, and there are other CANDIDATEs left, the\n+     *  best one is made CANDIDATE_BEST. Returns whether the Announcement still exists. */\n+    bool MakeCompleted(Iter<ByTxHash> it)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+\n+        // Nothing to be done if it's already COMPLETED.\n+        if (it->GetState() == State::COMPLETED) return true;\n+\n+        if (IsOnlyNonCompleted(it)) {\n+            // This is the last non-COMPLETED announcement for this txhash. Delete all.\n+            uint256 txhash = it->m_txhash;\n+            do {\n+                it = Erase<ByTxHash>(it);\n+            } while (it != m_index.get<ByTxHash>().end() && it->m_txhash == txhash);\n+            return false;\n+        }\n+\n+        // Mark the announcement COMPLETED, and select the next best announcement (the first CANDIDATE_READY) if\n+        // needed.\n+        ChangeAndReselect(it, State::COMPLETED);\n+\n+        return true;\n+    }\n+\n+    //! Make the data structure consistent with a given point in time:\n+    //! - REQUESTED annoucements with expiry <= now are turned into COMPLETED.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499591256",
+      "id" : 499591256,
+      "line" : 474,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTU5MTI1Ng==",
+      "original_commit_id" : "a60ad12fb9bac2e4a8fe9018754444d48ba817ea",
+      "original_line" : 353,
+      "original_position" : 353,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 474,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499591256",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499605596"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499605596"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`ret.reserve(selected.size())` ?",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T13:39:07Z",
+      "diff_hunk" : "@@ -0,0 +1,577 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of ByTxHashView relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE announcement whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED announcement already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority announcement among all CANDIDATE_READY (and _BEST) ones for that\n+     *  txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED announcement. */\n+    REQUESTED,\n+    /** A CANDIDATE announcement that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED announcement. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+//! Type alias for sequence numbers.\n+using SequenceNumber = uint64_t;\n+\n+/** An announcement. This is the data we track for each txid or wtxid that is announced to us by each peer. */\n+struct Announcement {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const NodeId m_peer;\n+    /** What sequence number this announcement has. */\n+    const SequenceNumber m_sequence : 59;\n+    /** Whether the request is preferred. */\n+    const bool m_preferred : 1;\n+    /** Whether this is a wtxid request. */\n+    const bool m_is_wtxid : 1;\n+\n+    /** What state this announcement is in. This is a uint8_t instead of a State to silence a GCC warning. */\n+    uint8_t m_state : 3;\n+\n+    /** Convert the m_state variable to a State enum. */\n+    State GetState() const { return State(m_state); }\n+    /** Convert a State to a uint8_t and store it in m_state. */\n+    void SetState(State state) { m_state = uint8_t(state); }\n+\n+    /** Whether this announcement is selected. There can be at most 1 selected peer per txhash. */\n+    bool IsSelected() const\n+    {\n+        return GetState() == State::CANDIDATE_BEST || GetState() == State::REQUESTED;\n+    }\n+\n+    /** Whether this announcement is waiting for a certain time to pass. */\n+    bool IsWaiting() const\n+    {\n+        return GetState() == State::REQUESTED || GetState() == State::CANDIDATE_DELAYED;\n+    }\n+\n+    /** Whether this announcement can feasibly be selected if the current IsSelected() one disappears. */\n+    bool IsSelectable() const\n+    {\n+        return GetState() == State::CANDIDATE_READY || GetState() == State::CANDIDATE_BEST;\n+    }\n+\n+    /** Construct a new announcement from scratch, initially in CANDIDATE_DELAYED state. */\n+    Announcement(const GenTxid& gtxid, NodeId peer, bool preferred, std::chrono::microseconds reqtime,\n+        SequenceNumber sequence) :\n+        m_txhash(gtxid.GetHash()), m_time(reqtime), m_peer(peer), m_sequence(sequence), m_preferred(preferred),\n+        m_is_wtxid(gtxid.IsWtxid()), m_state(uint8_t(State::CANDIDATE_DELAYED)) {}\n+};\n+\n+//! Type alias for priorities.\n+using Priority = uint64_t;\n+\n+/** A functor with embedded salt that computes priority of an announcement.\n+ *\n+ * Lower priorities are selected first.\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic) :\n+        m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+        m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+    Priority operator()(const uint256& txhash, NodeId peer, bool preferred) const\n+    {\n+        uint64_t low_bits = CSipHasher(m_k0, m_k1).Write(txhash.begin(), txhash.size()).Write(peer).Finalize() >> 1;\n+        return low_bits | uint64_t{!preferred} << 63;\n+    }\n+\n+    Priority operator()(const Announcement& ann) const\n+    {\n+        return operator()(ann.m_txhash, ann.m_peer, ann.m_preferred);\n+    }\n+};\n+\n+// Definitions for the 3 indexes used in the main data structure.\n+//\n+// Each index has a By* type to identify it, a By*View data type to represent the view of Announcement it is sorted\n+// by, and an By*ViewExtractor type to convert an Announcement into the By*View type.\n+// See https://www.boost.org/doc/libs/1_54_0/libs/multi_index/doc/reference/key_extraction.html#key_extractors\n+// for more information about the key extraction concept.\n+\n+// The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txhash)\n+//\n+// Uses:\n+// * Looking up existing announcements by peer/txhash, by checking both (peer, false, txhash) and\n+//   (peer, true, txhash).\n+// * Finding all CANDIDATE_BEST announcements for a given peer in GetRequestable.\n+struct ByPeer {};\n+using ByPeerView = std::tuple<NodeId, bool, const uint256&>;\n+struct ByPeerViewExtractor\n+{\n+    using result_type = ByPeerView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByPeerView{ann.m_peer, ann.GetState() == State::CANDIDATE_BEST, ann.m_txhash};\n+    }\n+};\n+\n+// The ByTxHash index is sorted by (txhash, state, priority [CANDIDATE_READY]; 0 [otherwise])\n+//\n+// Uses:\n+// * Deleting all Announcements with a given txhash in ForgetTxHash.\n+// * Finding the best CANDIDATE_READY to convert to CANDIDATE_BEST, when no other CANDIDATE_READY or REQUESTED\n+//   Announcement exists for that txhash.\n+// * Determining when no more non-COMPLETED Announcements for a given txhash exist, so the COMPLETED ones can be\n+//   deleted.\n+struct ByTxHash {};\n+using ByTxHashView = std::tuple<const uint256&, State, Priority>;\n+class ByTxHashViewExtractor {\n+    const PriorityComputer& m_computer;\n+public:\n+    ByTxHashViewExtractor(const PriorityComputer& computer) : m_computer(computer) {}\n+    using result_type = ByTxHashView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        const State state = ann.GetState();\n+        const Priority prio = (state == State::CANDIDATE_READY) ? m_computer(ann) : 0;\n+        return ByTxHashView{ann.m_txhash, state, prio};\n+    }\n+};\n+\n+// The ByTime index is sorted by (0 [CANDIDATE_DELAYED,REQUESTED]; 1 [COMPLETED];\n+// 2 [CANDIDATE_READY,CANDIDATE_BEST], time)\n+//\n+// Uses:\n+// * Finding CANDIDATE_DELAYED announcements whose reqtime has passed, and REQUESTED announcements whose expiry has\n+//   passed.\n+// * Finding CANDIDATE_READY/BEST announcements whose reqtime is in the future (when the clock time went backwards).\n+struct ByTime {};\n+using ByTimeView = std::pair<int, std::chrono::microseconds>;\n+struct ByTimeViewExtractor\n+{\n+    using result_type = ByTimeView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByTimeView{ann.IsWaiting() ? 0 : ann.IsSelectable() ? 2 : 1, ann.m_time};\n+    }\n+};\n+\n+/** Data type for the main data structure (Announcement objects with ByPeer/ByTxHash/ByTime indexes). */\n+using Index = boost::multi_index_container<\n+    Announcement,\n+    boost::multi_index::indexed_by<\n+        boost::multi_index::ordered_unique<boost::multi_index::tag<ByPeer>, ByPeerViewExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTxHash>, ByTxHashViewExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTime>, ByTimeViewExtractor>\n+    >\n+>;\n+\n+/** Helper type to simplify syntax of iterator types. */\n+template<typename Tag>\n+using Iter = typename Index::index<Tag>::type::iterator;\n+\n+/** Per-peer statistics object. */\n+struct PeerInfo {\n+    size_t m_total = 0; //!< Total number of announcements for this peer.\n+    size_t m_completed = 0; //!< Number of COMPLETED announcements for this peer.\n+    size_t m_requested = 0; //!< Number of REQUESTED announcements for this peer.\n+};\n+\n+const uint256 UINT256_ZERO;\n+\n+}  // namespace\n+\n+/** Actual implementation for TxRequestTracker's data structure. */\n+class TxRequestTracker::Impl {\n+    //! The current sequence number. Increases for every announcement. This is used to sort txhashes returned by\n+    //! GetRequestable in announcement order.\n+    SequenceNumber m_current_sequence{0};\n+\n+    //! This tracker's priority computer.\n+    const PriorityComputer m_computer;\n+\n+    //! This tracker's main data structure.\n+    Index m_index;\n+\n+    //! Map with this tracker's per-peer statistics.\n+    std::unordered_map<NodeId, PeerInfo> m_peerinfo;\n+\n+    //! Wrapper around Index::...::erase that keeps m_peerinfo up to date.\n+    template<typename Tag>\n+    Iter<Tag> Erase(Iter<Tag> it)\n+    {\n+        auto peerit = m_peerinfo.find(it->m_peer);\n+        peerit->second.m_completed -= it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested -= it->GetState() == State::REQUESTED;\n+        if (--peerit->second.m_total == 0) m_peerinfo.erase(peerit);\n+        return m_index.get<Tag>().erase(it);\n+    }\n+\n+    //! Wrapper around Index::...::modify that keeps m_peerinfo up to date.\n+    template<typename Tag, typename Modifier>\n+    void Modify(Iter<Tag> it, Modifier modifier)\n+    {\n+        auto peerit = m_peerinfo.find(it->m_peer);\n+        peerit->second.m_completed -= it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested -= it->GetState() == State::REQUESTED;\n+        m_index.get<Tag>().modify(it, std::move(modifier));\n+        peerit->second.m_completed += it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested += it->GetState() == State::REQUESTED;\n+    }\n+\n+    //! Convert a CANDIDATE_DELAYED announcement into a CANDIDATE_READY. If this makes it the new best\n+    //! CANDIDATE_READY (and no REQUESTED exists) and better than the CANDIDATE_BEST (if any), it becomes the new\n+    //! CANDIDATE_BEST.\n+    void PromoteCandidateReady(Iter<ByTxHash> it)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+        assert(it->GetState() == State::CANDIDATE_DELAYED);\n+        // Convert CANDIDATE_DELAYED to CANDIDATE_READY first.\n+        Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_READY); });\n+        // The following code relies on the fact that the ByTxHash is sorted by txhash, and then by state (first\n+        // _DELAYED, then _BEST/REQUESTED, then _READY). Within the _READY announcements, the best one (lowest\n+        // priority) comes first. Thus, if an existing _BEST exists for the same txhash that this announcement may\n+        // be preferred over, it must immediately precede the newly created _READY.\n+        if (it == m_index.get<ByTxHash>().begin() || std::prev(it)->m_txhash != it->m_txhash ||\n+            std::prev(it)->GetState() == State::CANDIDATE_DELAYED) {\n+            // This is the new best CANDIDATE_READY, and there is no IsSelected() announcement for this txhash\n+            // already.\n+            Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+        } else if (std::prev(it)->GetState() == State::CANDIDATE_BEST) {\n+            Priority priority_old = m_computer(*std::prev(it));\n+            Priority priority_new = m_computer(*it);\n+            if (priority_new < priority_old) {\n+                // There is a CANDIDATE_BEST announcement already, but this one is better.\n+                auto new_ready_it = std::prev(it);\n+                Modify<ByTxHash>(new_ready_it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_READY); });\n+                Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+            }\n+        }\n+    }\n+\n+    //! Change the state of an announcement to something non-IsSelected(). If it was IsSelected(), the next best\n+    //! announcement will be marked CANDIDATE_BEST.\n+    void ChangeAndReselect(Iter<ByTxHash> it, State new_state)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+        if (it->IsSelected()) {\n+            auto it_next = std::next(it);\n+            // The next best CANDIDATE_READY, if any, immediately follows the REQUESTED or CANDIDATE_BEST\n+            // announcement in the ByTxHash index.\n+            if (it_next != m_index.get<ByTxHash>().end() && it_next->m_txhash == it->m_txhash &&\n+                it_next->GetState() == State::CANDIDATE_READY) {\n+                // If one such CANDIDATE_READY exists (for this txhash), convert it to CANDIDATE_BEST.\n+                Modify<ByTxHash>(it_next, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+            }\n+        }\n+        Modify<ByTxHash>(it, [new_state](Announcement& ann){ ann.SetState(new_state); });\n+        assert(!it->IsSelected());\n+    }\n+\n+    //! Check if 'it' is the only Announcement for a given txhash that isn't COMPLETED.\n+    bool IsOnlyNonCompleted(Iter<ByTxHash> it)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+        assert(it->GetState() != State::COMPLETED); // Not allowed to call this on COMPLETED announcements.\n+\n+        // If this Announcement's predecessor exists, and belongs to the same txhash, it can't be COMPLETED either.\n+        if (it != m_index.get<ByTxHash>().begin() && std::prev(it)->m_txhash == it->m_txhash) return false;\n+\n+        // If this Announcement's successor exists, belongs to the same txhash, and isn't COMPLETED, fail.\n+        if (std::next(it) != m_index.get<ByTxHash>().end() && std::next(it)->m_txhash == it->m_txhash &&\n+            std::next(it)->GetState() != State::COMPLETED) return false;\n+\n+        return true;\n+    }\n+\n+    /** Convert any announcement to a COMPLETED one. If there are no non-COMPLETED announcements left for this\n+     *  txhash, they are deleted. If this was a REQUESTED announcement, and there are other CANDIDATEs left, the\n+     *  best one is made CANDIDATE_BEST. Returns whether the Announcement still exists. */\n+    bool MakeCompleted(Iter<ByTxHash> it)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+\n+        // Nothing to be done if it's already COMPLETED.\n+        if (it->GetState() == State::COMPLETED) return true;\n+\n+        if (IsOnlyNonCompleted(it)) {\n+            // This is the last non-COMPLETED announcement for this txhash. Delete all.\n+            uint256 txhash = it->m_txhash;\n+            do {\n+                it = Erase<ByTxHash>(it);\n+            } while (it != m_index.get<ByTxHash>().end() && it->m_txhash == txhash);\n+            return false;\n+        }\n+\n+        // Mark the announcement COMPLETED, and select the next best announcement (the first CANDIDATE_READY) if\n+        // needed.\n+        ChangeAndReselect(it, State::COMPLETED);\n+\n+        return true;\n+    }\n+\n+    //! Make the data structure consistent with a given point in time:\n+    //! - REQUESTED annoucements with expiry <= now are turned into COMPLETED.\n+    //! - CANDIDATE_DELAYED announcements with reqtime <= now are turned into CANDIDATE_{READY,BEST}.\n+    //! - CANDIDATE_{READY,BEST} announcements with reqtime > now are turned into CANDIDATE_DELAYED.\n+    void SetTimePoint(std::chrono::microseconds now)\n+    {\n+        // Iterate over all CANDIDATE_DELAYED and REQUESTED from old to new, as long as they're in the past,\n+        // and convert them to CANDIDATE_READY and COMPLETED respectively.\n+        while (!m_index.empty()) {\n+            auto it = m_index.get<ByTime>().begin();\n+            if (it->GetState() == State::CANDIDATE_DELAYED && it->m_time <= now) {\n+                PromoteCandidateReady(m_index.project<ByTxHash>(it));\n+            } else if (it->GetState() == State::REQUESTED && it->m_time <= now) {\n+                MakeCompleted(m_index.project<ByTxHash>(it));\n+            } else {\n+                break;\n+            }\n+        }\n+\n+        while (!m_index.empty()) {\n+            // If time went backwards, we may need to demote CANDIDATE_BEST and CANDIDATE_READY announcements back\n+            // to CANDIDATE_DELAYED. This is an unusual edge case, and unlikely to matter in production. However,\n+            // it makes it much easier to specify and test TxRequestTracker::Impl's behaviour.\n+            auto it = std::prev(m_index.get<ByTime>().end());\n+            if (it->IsSelectable() && it->m_time > now) {\n+                ChangeAndReselect(m_index.project<ByTxHash>(it), State::CANDIDATE_DELAYED);\n+            } else {\n+                break;\n+            }\n+        }\n+    }\n+\n+public:\n+    Impl(bool deterministic) :\n+        m_computer(deterministic),\n+        // Explicitly initialize m_index as we need to pass a reference to m_computer to ByTxHashViewExtractor.\n+        m_index(boost::make_tuple(\n+            boost::make_tuple(ByPeerViewExtractor(), std::less<ByPeerView>()),\n+            boost::make_tuple(ByTxHashViewExtractor(m_computer), std::less<ByTxHashView>()),\n+            boost::make_tuple(ByTimeViewExtractor(), std::less<ByTimeView>())\n+        )) {}\n+\n+    // Disable copying and assigning (a default copy won't work due the stateful ByTxHashViewExtractor).\n+    Impl(const Impl&) = delete;\n+    Impl& operator=(const Impl&) = delete;\n+\n+    void DisconnectedPeer(NodeId peer)\n+    {\n+        auto& index = m_index.get<ByPeer>();\n+        auto it = index.lower_bound(ByPeerView{peer, false, UINT256_ZERO});\n+        while (it != index.end() && it->m_peer == peer) {\n+            // Check what to continue with after this iteration. Note that 'it' may change position, and\n+            // std::next(it) may be deleted in the process, so this needs to be decided beforehand.\n+            auto it_next = (std::next(it) == index.end() || std::next(it)->m_peer != peer) ?\n+                index.end() : std::next(it);\n+            // If the announcement isn't already COMPLETED, first make it COMPLETED (which will mark other\n+            // CANDIDATEs as CANDIDATE_BEST, or delete all of a txhash's announcements if no non-COMPLETED ones are\n+            // left).\n+            if (MakeCompleted(m_index.project<ByTxHash>(it))) {\n+                // Then actually delete the announcement (unless it was already deleted by MakeCompleted).\n+                Erase<ByPeer>(it);\n+            }\n+            it = it_next;\n+        }\n+    }\n+\n+    void ForgetTxHash(const uint256& txhash)\n+    {\n+        auto it = m_index.get<ByTxHash>().lower_bound(ByTxHashView{txhash, State::CANDIDATE_DELAYED, 0});\n+        while (it != m_index.get<ByTxHash>().end() && it->m_txhash == txhash) {\n+            it = Erase<ByTxHash>(it);\n+        }\n+    }\n+\n+    void ReceivedInv(NodeId peer, const GenTxid& gtxid, bool preferred,\n+        std::chrono::microseconds reqtime)\n+    {\n+        // Bail out if we already have a CANDIDATE_BEST announcement for this (txhash, peer) combination. The case\n+        // where there is a non-CANDIDATE_BEST announcement already will be caught by the uniqueness property of the\n+        // ByPeer index when we try to emplace the new object below.\n+        if (m_index.get<ByPeer>().count(ByPeerView{peer, true, gtxid.GetHash()})) return;\n+\n+        // Try creating the announcement with CANDIDATE_DELAYED state (which will fail due to the uniqueness\n+        // of the ByPeer index if a non-CANDIDATE_BEST announcement already exists with the same txhash and peer).\n+        // Bail out in that case.\n+        auto ret = m_index.get<ByPeer>().emplace(gtxid, peer, preferred, reqtime, m_current_sequence);\n+        if (!ret.second) return;\n+\n+        // Update accounting metadata.\n+        ++m_peerinfo[peer].m_total;\n+        ++m_current_sequence;\n+    }\n+\n+    //! Find the GenTxids to request now from peer.\n+    std::vector<GenTxid> GetRequestable(NodeId peer, std::chrono::microseconds now)\n+    {\n+        // Move time.\n+        SetTimePoint(now);\n+\n+        // Find all CANDIDATE_BEST announcements for this peer.\n+        std::vector<std::pair<SequenceNumber, const Announcement*>> selected;\n+        auto it_peer = m_index.get<ByPeer>().lower_bound(ByPeerView{peer, true, UINT256_ZERO});\n+        while (it_peer != m_index.get<ByPeer>().end() && it_peer->m_peer == peer &&\n+            it_peer->GetState() == State::CANDIDATE_BEST) {\n+            selected.emplace_back(it_peer->m_sequence, &*it_peer);\n+            ++it_peer;\n+        }\n+\n+        // Return them, sorted by sequence number.\n+        std::sort(selected.begin(), selected.end());\n+        std::vector<GenTxid> ret;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499605596",
+      "id" : 499605596,
+      "line" : 583,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTYwNTU5Ng==",
+      "original_commit_id" : "a60ad12fb9bac2e4a8fe9018754444d48ba817ea",
+      "original_line" : 462,
+      "original_position" : 462,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 583,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499605596",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499627889"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499627889"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "In future, might be useful to return `it->GetState() == REQUESTED ? it->m_time : min()` here to allow the caller to estimate relay latency for a peer, in case they wanted to use that info to adjust that peer's expiry delay.",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T14:10:51Z",
+      "diff_hunk" : "@@ -0,0 +1,577 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txrequest.h>\n+\n+#include <crypto/siphash.h>\n+#include <net.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <uint256.h>\n+#include <util/memory.h>\n+\n+#include <boost/multi_index_container.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+\n+#include <chrono>\n+#include <unordered_map>\n+#include <utility>\n+\n+#include <assert.h>\n+\n+namespace {\n+\n+/** The various states a (txhash,peer) pair can be in.\n+ *\n+ * Note that CANDIDATE is split up into 3 substates (DELAYED, BEST, READY), allowing more efficient implementation.\n+ * Also note that the sorting order of ByTxHashView relies on the specific order of values in this enum.\n+ *\n+ * Expected behaviour is:\n+ *   - When first announced by a peer, the state is CANDIDATE_DELAYED until reqtime is reached.\n+ *   - Announcemnets that have reached their reqtime but not been requested will be either CANDIDATE_READY or\n+ *     CANDIDATE_BEST\n+ *   - When requested, an announcement will be in state REQUESTED until expiry is reached.\n+ *   - If expiry is reached, or the peer replies to the request (either with NOTFOUND or the tx), the state becomes\n+ *     COMPLETED\n+ */\n+enum class State : uint8_t {\n+    /** A CANDIDATE announcement whose reqtime is in the future. */\n+    CANDIDATE_DELAYED,\n+    /** The best CANDIDATE for a given txhash; only if there is no REQUESTED announcement already for that txhash.\n+     *  The CANDIDATE_BEST is the lowest-priority announcement among all CANDIDATE_READY (and _BEST) ones for that\n+     *  txhash. */\n+    CANDIDATE_BEST,\n+    /** A REQUESTED announcement. */\n+    REQUESTED,\n+    /** A CANDIDATE announcement that's not CANDIDATE_DELAYED or CANDIDATE_BEST. */\n+    CANDIDATE_READY,\n+    /** A COMPLETED announcement. */\n+    COMPLETED,\n+\n+    /** An invalid State value that's larger than all valid ones. */\n+    TOO_LARGE,\n+};\n+\n+//! Type alias for sequence numbers.\n+using SequenceNumber = uint64_t;\n+\n+/** An announcement. This is the data we track for each txid or wtxid that is announced to us by each peer. */\n+struct Announcement {\n+    /** Txid or wtxid that was announced. */\n+    const uint256 m_txhash;\n+    /** For CANDIDATE_{DELAYED,BEST,READY} the reqtime; for REQUESTED the expiry. */\n+    std::chrono::microseconds m_time;\n+    /** What peer the request was from. */\n+    const NodeId m_peer;\n+    /** What sequence number this announcement has. */\n+    const SequenceNumber m_sequence : 59;\n+    /** Whether the request is preferred. */\n+    const bool m_preferred : 1;\n+    /** Whether this is a wtxid request. */\n+    const bool m_is_wtxid : 1;\n+\n+    /** What state this announcement is in. This is a uint8_t instead of a State to silence a GCC warning. */\n+    uint8_t m_state : 3;\n+\n+    /** Convert the m_state variable to a State enum. */\n+    State GetState() const { return State(m_state); }\n+    /** Convert a State to a uint8_t and store it in m_state. */\n+    void SetState(State state) { m_state = uint8_t(state); }\n+\n+    /** Whether this announcement is selected. There can be at most 1 selected peer per txhash. */\n+    bool IsSelected() const\n+    {\n+        return GetState() == State::CANDIDATE_BEST || GetState() == State::REQUESTED;\n+    }\n+\n+    /** Whether this announcement is waiting for a certain time to pass. */\n+    bool IsWaiting() const\n+    {\n+        return GetState() == State::REQUESTED || GetState() == State::CANDIDATE_DELAYED;\n+    }\n+\n+    /** Whether this announcement can feasibly be selected if the current IsSelected() one disappears. */\n+    bool IsSelectable() const\n+    {\n+        return GetState() == State::CANDIDATE_READY || GetState() == State::CANDIDATE_BEST;\n+    }\n+\n+    /** Construct a new announcement from scratch, initially in CANDIDATE_DELAYED state. */\n+    Announcement(const GenTxid& gtxid, NodeId peer, bool preferred, std::chrono::microseconds reqtime,\n+        SequenceNumber sequence) :\n+        m_txhash(gtxid.GetHash()), m_time(reqtime), m_peer(peer), m_sequence(sequence), m_preferred(preferred),\n+        m_is_wtxid(gtxid.IsWtxid()), m_state(uint8_t(State::CANDIDATE_DELAYED)) {}\n+};\n+\n+//! Type alias for priorities.\n+using Priority = uint64_t;\n+\n+/** A functor with embedded salt that computes priority of an announcement.\n+ *\n+ * Lower priorities are selected first.\n+ */\n+class PriorityComputer {\n+    const uint64_t m_k0, m_k1;\n+public:\n+    explicit PriorityComputer(bool deterministic) :\n+        m_k0{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)},\n+        m_k1{deterministic ? 0 : GetRand(0xFFFFFFFFFFFFFFFF)} {}\n+\n+    Priority operator()(const uint256& txhash, NodeId peer, bool preferred) const\n+    {\n+        uint64_t low_bits = CSipHasher(m_k0, m_k1).Write(txhash.begin(), txhash.size()).Write(peer).Finalize() >> 1;\n+        return low_bits | uint64_t{!preferred} << 63;\n+    }\n+\n+    Priority operator()(const Announcement& ann) const\n+    {\n+        return operator()(ann.m_txhash, ann.m_peer, ann.m_preferred);\n+    }\n+};\n+\n+// Definitions for the 3 indexes used in the main data structure.\n+//\n+// Each index has a By* type to identify it, a By*View data type to represent the view of Announcement it is sorted\n+// by, and an By*ViewExtractor type to convert an Announcement into the By*View type.\n+// See https://www.boost.org/doc/libs/1_54_0/libs/multi_index/doc/reference/key_extraction.html#key_extractors\n+// for more information about the key extraction concept.\n+\n+// The ByPeer index is sorted by (peer, state == CANDIDATE_BEST, txhash)\n+//\n+// Uses:\n+// * Looking up existing announcements by peer/txhash, by checking both (peer, false, txhash) and\n+//   (peer, true, txhash).\n+// * Finding all CANDIDATE_BEST announcements for a given peer in GetRequestable.\n+struct ByPeer {};\n+using ByPeerView = std::tuple<NodeId, bool, const uint256&>;\n+struct ByPeerViewExtractor\n+{\n+    using result_type = ByPeerView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByPeerView{ann.m_peer, ann.GetState() == State::CANDIDATE_BEST, ann.m_txhash};\n+    }\n+};\n+\n+// The ByTxHash index is sorted by (txhash, state, priority [CANDIDATE_READY]; 0 [otherwise])\n+//\n+// Uses:\n+// * Deleting all Announcements with a given txhash in ForgetTxHash.\n+// * Finding the best CANDIDATE_READY to convert to CANDIDATE_BEST, when no other CANDIDATE_READY or REQUESTED\n+//   Announcement exists for that txhash.\n+// * Determining when no more non-COMPLETED Announcements for a given txhash exist, so the COMPLETED ones can be\n+//   deleted.\n+struct ByTxHash {};\n+using ByTxHashView = std::tuple<const uint256&, State, Priority>;\n+class ByTxHashViewExtractor {\n+    const PriorityComputer& m_computer;\n+public:\n+    ByTxHashViewExtractor(const PriorityComputer& computer) : m_computer(computer) {}\n+    using result_type = ByTxHashView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        const State state = ann.GetState();\n+        const Priority prio = (state == State::CANDIDATE_READY) ? m_computer(ann) : 0;\n+        return ByTxHashView{ann.m_txhash, state, prio};\n+    }\n+};\n+\n+// The ByTime index is sorted by (0 [CANDIDATE_DELAYED,REQUESTED]; 1 [COMPLETED];\n+// 2 [CANDIDATE_READY,CANDIDATE_BEST], time)\n+//\n+// Uses:\n+// * Finding CANDIDATE_DELAYED announcements whose reqtime has passed, and REQUESTED announcements whose expiry has\n+//   passed.\n+// * Finding CANDIDATE_READY/BEST announcements whose reqtime is in the future (when the clock time went backwards).\n+struct ByTime {};\n+using ByTimeView = std::pair<int, std::chrono::microseconds>;\n+struct ByTimeViewExtractor\n+{\n+    using result_type = ByTimeView;\n+    result_type operator()(const Announcement& ann) const\n+    {\n+        return ByTimeView{ann.IsWaiting() ? 0 : ann.IsSelectable() ? 2 : 1, ann.m_time};\n+    }\n+};\n+\n+/** Data type for the main data structure (Announcement objects with ByPeer/ByTxHash/ByTime indexes). */\n+using Index = boost::multi_index_container<\n+    Announcement,\n+    boost::multi_index::indexed_by<\n+        boost::multi_index::ordered_unique<boost::multi_index::tag<ByPeer>, ByPeerViewExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTxHash>, ByTxHashViewExtractor>,\n+        boost::multi_index::ordered_non_unique<boost::multi_index::tag<ByTime>, ByTimeViewExtractor>\n+    >\n+>;\n+\n+/** Helper type to simplify syntax of iterator types. */\n+template<typename Tag>\n+using Iter = typename Index::index<Tag>::type::iterator;\n+\n+/** Per-peer statistics object. */\n+struct PeerInfo {\n+    size_t m_total = 0; //!< Total number of announcements for this peer.\n+    size_t m_completed = 0; //!< Number of COMPLETED announcements for this peer.\n+    size_t m_requested = 0; //!< Number of REQUESTED announcements for this peer.\n+};\n+\n+const uint256 UINT256_ZERO;\n+\n+}  // namespace\n+\n+/** Actual implementation for TxRequestTracker's data structure. */\n+class TxRequestTracker::Impl {\n+    //! The current sequence number. Increases for every announcement. This is used to sort txhashes returned by\n+    //! GetRequestable in announcement order.\n+    SequenceNumber m_current_sequence{0};\n+\n+    //! This tracker's priority computer.\n+    const PriorityComputer m_computer;\n+\n+    //! This tracker's main data structure.\n+    Index m_index;\n+\n+    //! Map with this tracker's per-peer statistics.\n+    std::unordered_map<NodeId, PeerInfo> m_peerinfo;\n+\n+    //! Wrapper around Index::...::erase that keeps m_peerinfo up to date.\n+    template<typename Tag>\n+    Iter<Tag> Erase(Iter<Tag> it)\n+    {\n+        auto peerit = m_peerinfo.find(it->m_peer);\n+        peerit->second.m_completed -= it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested -= it->GetState() == State::REQUESTED;\n+        if (--peerit->second.m_total == 0) m_peerinfo.erase(peerit);\n+        return m_index.get<Tag>().erase(it);\n+    }\n+\n+    //! Wrapper around Index::...::modify that keeps m_peerinfo up to date.\n+    template<typename Tag, typename Modifier>\n+    void Modify(Iter<Tag> it, Modifier modifier)\n+    {\n+        auto peerit = m_peerinfo.find(it->m_peer);\n+        peerit->second.m_completed -= it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested -= it->GetState() == State::REQUESTED;\n+        m_index.get<Tag>().modify(it, std::move(modifier));\n+        peerit->second.m_completed += it->GetState() == State::COMPLETED;\n+        peerit->second.m_requested += it->GetState() == State::REQUESTED;\n+    }\n+\n+    //! Convert a CANDIDATE_DELAYED announcement into a CANDIDATE_READY. If this makes it the new best\n+    //! CANDIDATE_READY (and no REQUESTED exists) and better than the CANDIDATE_BEST (if any), it becomes the new\n+    //! CANDIDATE_BEST.\n+    void PromoteCandidateReady(Iter<ByTxHash> it)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+        assert(it->GetState() == State::CANDIDATE_DELAYED);\n+        // Convert CANDIDATE_DELAYED to CANDIDATE_READY first.\n+        Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_READY); });\n+        // The following code relies on the fact that the ByTxHash is sorted by txhash, and then by state (first\n+        // _DELAYED, then _BEST/REQUESTED, then _READY). Within the _READY announcements, the best one (lowest\n+        // priority) comes first. Thus, if an existing _BEST exists for the same txhash that this announcement may\n+        // be preferred over, it must immediately precede the newly created _READY.\n+        if (it == m_index.get<ByTxHash>().begin() || std::prev(it)->m_txhash != it->m_txhash ||\n+            std::prev(it)->GetState() == State::CANDIDATE_DELAYED) {\n+            // This is the new best CANDIDATE_READY, and there is no IsSelected() announcement for this txhash\n+            // already.\n+            Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+        } else if (std::prev(it)->GetState() == State::CANDIDATE_BEST) {\n+            Priority priority_old = m_computer(*std::prev(it));\n+            Priority priority_new = m_computer(*it);\n+            if (priority_new < priority_old) {\n+                // There is a CANDIDATE_BEST announcement already, but this one is better.\n+                auto new_ready_it = std::prev(it);\n+                Modify<ByTxHash>(new_ready_it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_READY); });\n+                Modify<ByTxHash>(it, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+            }\n+        }\n+    }\n+\n+    //! Change the state of an announcement to something non-IsSelected(). If it was IsSelected(), the next best\n+    //! announcement will be marked CANDIDATE_BEST.\n+    void ChangeAndReselect(Iter<ByTxHash> it, State new_state)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+        if (it->IsSelected()) {\n+            auto it_next = std::next(it);\n+            // The next best CANDIDATE_READY, if any, immediately follows the REQUESTED or CANDIDATE_BEST\n+            // announcement in the ByTxHash index.\n+            if (it_next != m_index.get<ByTxHash>().end() && it_next->m_txhash == it->m_txhash &&\n+                it_next->GetState() == State::CANDIDATE_READY) {\n+                // If one such CANDIDATE_READY exists (for this txhash), convert it to CANDIDATE_BEST.\n+                Modify<ByTxHash>(it_next, [](Announcement& ann){ ann.SetState(State::CANDIDATE_BEST); });\n+            }\n+        }\n+        Modify<ByTxHash>(it, [new_state](Announcement& ann){ ann.SetState(new_state); });\n+        assert(!it->IsSelected());\n+    }\n+\n+    //! Check if 'it' is the only Announcement for a given txhash that isn't COMPLETED.\n+    bool IsOnlyNonCompleted(Iter<ByTxHash> it)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+        assert(it->GetState() != State::COMPLETED); // Not allowed to call this on COMPLETED announcements.\n+\n+        // If this Announcement's predecessor exists, and belongs to the same txhash, it can't be COMPLETED either.\n+        if (it != m_index.get<ByTxHash>().begin() && std::prev(it)->m_txhash == it->m_txhash) return false;\n+\n+        // If this Announcement's successor exists, belongs to the same txhash, and isn't COMPLETED, fail.\n+        if (std::next(it) != m_index.get<ByTxHash>().end() && std::next(it)->m_txhash == it->m_txhash &&\n+            std::next(it)->GetState() != State::COMPLETED) return false;\n+\n+        return true;\n+    }\n+\n+    /** Convert any announcement to a COMPLETED one. If there are no non-COMPLETED announcements left for this\n+     *  txhash, they are deleted. If this was a REQUESTED announcement, and there are other CANDIDATEs left, the\n+     *  best one is made CANDIDATE_BEST. Returns whether the Announcement still exists. */\n+    bool MakeCompleted(Iter<ByTxHash> it)\n+    {\n+        assert(it != m_index.get<ByTxHash>().end());\n+\n+        // Nothing to be done if it's already COMPLETED.\n+        if (it->GetState() == State::COMPLETED) return true;\n+\n+        if (IsOnlyNonCompleted(it)) {\n+            // This is the last non-COMPLETED announcement for this txhash. Delete all.\n+            uint256 txhash = it->m_txhash;\n+            do {\n+                it = Erase<ByTxHash>(it);\n+            } while (it != m_index.get<ByTxHash>().end() && it->m_txhash == txhash);\n+            return false;\n+        }\n+\n+        // Mark the announcement COMPLETED, and select the next best announcement (the first CANDIDATE_READY) if\n+        // needed.\n+        ChangeAndReselect(it, State::COMPLETED);\n+\n+        return true;\n+    }\n+\n+    //! Make the data structure consistent with a given point in time:\n+    //! - REQUESTED annoucements with expiry <= now are turned into COMPLETED.\n+    //! - CANDIDATE_DELAYED announcements with reqtime <= now are turned into CANDIDATE_{READY,BEST}.\n+    //! - CANDIDATE_{READY,BEST} announcements with reqtime > now are turned into CANDIDATE_DELAYED.\n+    void SetTimePoint(std::chrono::microseconds now)\n+    {\n+        // Iterate over all CANDIDATE_DELAYED and REQUESTED from old to new, as long as they're in the past,\n+        // and convert them to CANDIDATE_READY and COMPLETED respectively.\n+        while (!m_index.empty()) {\n+            auto it = m_index.get<ByTime>().begin();\n+            if (it->GetState() == State::CANDIDATE_DELAYED && it->m_time <= now) {\n+                PromoteCandidateReady(m_index.project<ByTxHash>(it));\n+            } else if (it->GetState() == State::REQUESTED && it->m_time <= now) {\n+                MakeCompleted(m_index.project<ByTxHash>(it));\n+            } else {\n+                break;\n+            }\n+        }\n+\n+        while (!m_index.empty()) {\n+            // If time went backwards, we may need to demote CANDIDATE_BEST and CANDIDATE_READY announcements back\n+            // to CANDIDATE_DELAYED. This is an unusual edge case, and unlikely to matter in production. However,\n+            // it makes it much easier to specify and test TxRequestTracker::Impl's behaviour.\n+            auto it = std::prev(m_index.get<ByTime>().end());\n+            if (it->IsSelectable() && it->m_time > now) {\n+                ChangeAndReselect(m_index.project<ByTxHash>(it), State::CANDIDATE_DELAYED);\n+            } else {\n+                break;\n+            }\n+        }\n+    }\n+\n+public:\n+    Impl(bool deterministic) :\n+        m_computer(deterministic),\n+        // Explicitly initialize m_index as we need to pass a reference to m_computer to ByTxHashViewExtractor.\n+        m_index(boost::make_tuple(\n+            boost::make_tuple(ByPeerViewExtractor(), std::less<ByPeerView>()),\n+            boost::make_tuple(ByTxHashViewExtractor(m_computer), std::less<ByTxHashView>()),\n+            boost::make_tuple(ByTimeViewExtractor(), std::less<ByTimeView>())\n+        )) {}\n+\n+    // Disable copying and assigning (a default copy won't work due the stateful ByTxHashViewExtractor).\n+    Impl(const Impl&) = delete;\n+    Impl& operator=(const Impl&) = delete;\n+\n+    void DisconnectedPeer(NodeId peer)\n+    {\n+        auto& index = m_index.get<ByPeer>();\n+        auto it = index.lower_bound(ByPeerView{peer, false, UINT256_ZERO});\n+        while (it != index.end() && it->m_peer == peer) {\n+            // Check what to continue with after this iteration. Note that 'it' may change position, and\n+            // std::next(it) may be deleted in the process, so this needs to be decided beforehand.\n+            auto it_next = (std::next(it) == index.end() || std::next(it)->m_peer != peer) ?\n+                index.end() : std::next(it);\n+            // If the announcement isn't already COMPLETED, first make it COMPLETED (which will mark other\n+            // CANDIDATEs as CANDIDATE_BEST, or delete all of a txhash's announcements if no non-COMPLETED ones are\n+            // left).\n+            if (MakeCompleted(m_index.project<ByTxHash>(it))) {\n+                // Then actually delete the announcement (unless it was already deleted by MakeCompleted).\n+                Erase<ByPeer>(it);\n+            }\n+            it = it_next;\n+        }\n+    }\n+\n+    void ForgetTxHash(const uint256& txhash)\n+    {\n+        auto it = m_index.get<ByTxHash>().lower_bound(ByTxHashView{txhash, State::CANDIDATE_DELAYED, 0});\n+        while (it != m_index.get<ByTxHash>().end() && it->m_txhash == txhash) {\n+            it = Erase<ByTxHash>(it);\n+        }\n+    }\n+\n+    void ReceivedInv(NodeId peer, const GenTxid& gtxid, bool preferred,\n+        std::chrono::microseconds reqtime)\n+    {\n+        // Bail out if we already have a CANDIDATE_BEST announcement for this (txhash, peer) combination. The case\n+        // where there is a non-CANDIDATE_BEST announcement already will be caught by the uniqueness property of the\n+        // ByPeer index when we try to emplace the new object below.\n+        if (m_index.get<ByPeer>().count(ByPeerView{peer, true, gtxid.GetHash()})) return;\n+\n+        // Try creating the announcement with CANDIDATE_DELAYED state (which will fail due to the uniqueness\n+        // of the ByPeer index if a non-CANDIDATE_BEST announcement already exists with the same txhash and peer).\n+        // Bail out in that case.\n+        auto ret = m_index.get<ByPeer>().emplace(gtxid, peer, preferred, reqtime, m_current_sequence);\n+        if (!ret.second) return;\n+\n+        // Update accounting metadata.\n+        ++m_peerinfo[peer].m_total;\n+        ++m_current_sequence;\n+    }\n+\n+    //! Find the GenTxids to request now from peer.\n+    std::vector<GenTxid> GetRequestable(NodeId peer, std::chrono::microseconds now)\n+    {\n+        // Move time.\n+        SetTimePoint(now);\n+\n+        // Find all CANDIDATE_BEST announcements for this peer.\n+        std::vector<std::pair<SequenceNumber, const Announcement*>> selected;\n+        auto it_peer = m_index.get<ByPeer>().lower_bound(ByPeerView{peer, true, UINT256_ZERO});\n+        while (it_peer != m_index.get<ByPeer>().end() && it_peer->m_peer == peer &&\n+            it_peer->GetState() == State::CANDIDATE_BEST) {\n+            selected.emplace_back(it_peer->m_sequence, &*it_peer);\n+            ++it_peer;\n+        }\n+\n+        // Return them, sorted by sequence number.\n+        std::sort(selected.begin(), selected.end());\n+        std::vector<GenTxid> ret;\n+        for (const auto& item : selected) {\n+            ret.emplace_back(item.second->m_is_wtxid, item.second->m_txhash);\n+        }\n+        return ret;\n+    }\n+\n+    void RequestedTx(NodeId peer, const uint256& txhash, std::chrono::microseconds expiry)\n+    {\n+        auto it = m_index.get<ByPeer>().find(ByPeerView{peer, true, txhash});\n+        if (it == m_index.get<ByPeer>().end()) {\n+            // There is no CANDIDATE_BEST announcement, look for a _READY or _DELAYED instead. If the caller only\n+            // ever invokes RequestedTx with the values returned by GetRequestable, and no other non-const functions\n+            // other than ForgetTxHash and GetRequestable in between, this branch will never execute (as txhashes\n+            // returned by GetRequestable always correspond to CANDIDATE_BEST announcements).\n+\n+            it = m_index.get<ByPeer>().find(ByPeerView{peer, false, txhash});\n+            if (it == m_index.get<ByPeer>().end() || (it->GetState() != State::CANDIDATE_DELAYED &&\n+                it->GetState() != State::CANDIDATE_READY)) {\n+                // The txhash was not tracked for this peer, so we have nothing to do. The caller should have called\n+                // ReceivedInv first.\n+                return;\n+            }\n+\n+            // Look for an existing CANDIDATE_BEST or REQUESTED.\n+            auto it_old = m_index.get<ByTxHash>().lower_bound(ByTxHashView{txhash, State::CANDIDATE_BEST, 0});\n+            if (it_old != m_index.get<ByTxHash>().end() && it_old->m_txhash == txhash) {\n+                if (it_old->GetState() == State::CANDIDATE_BEST) {\n+                    // The data structure's invariants require that there can be at most one CANDIDATE_BEST or one\n+                    // REQUESTED announcement per txhash (but not both simultaneously), so we have to convert any\n+                    // existing CANDIDATE_BEST to another CANDIDATE_* when constructing another REQUESTED.\n+                    // It doesn't matter whether we pick CANDIDATE_READY or _DELAYED here, as SetTimePoint()\n+                    // will correct it at GetRequestable() time. If time only goes forward, it will always be\n+                    // _READY, so pick that to avoid extra work in SetTimePoint().\n+                    Modify<ByTxHash>(it_old, [](Announcement& ann) { ann.SetState(State::CANDIDATE_READY); });\n+                } else if (it_old->GetState() == State::REQUESTED) {\n+                    // As we're no longer waiting for a response to the previous REQUESTED announcement, convert it\n+                    // to COMPLETED. This also helps guaranteeing progress.\n+                    Modify<ByTxHash>(it_old, [](Announcement& ann) { ann.SetState(State::COMPLETED); });\n+                }\n+            }\n+        }\n+\n+        Modify<ByPeer>(it, [expiry](Announcement& ann) {\n+            ann.SetState(State::REQUESTED);\n+            ann.m_time = expiry;\n+        });\n+    }\n+\n+    void ReceivedResponse(NodeId peer, const uint256& txhash)\n+    {\n+        // We need to search the ByPeer index for both (peer, false, txhash) and (peer, true, txhash).\n+        auto it = m_index.get<ByPeer>().find(ByPeerView{peer, false, txhash});\n+        if (it == m_index.get<ByPeer>().end()) {\n+            it = m_index.get<ByPeer>().find(ByPeerView{peer, true, txhash});\n+        }\n+        if (it != m_index.get<ByPeer>().end()) MakeCompleted(m_index.project<ByTxHash>(it));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499627889",
+      "id" : 499627889,
+      "line" : 639,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTYyNzg4OQ==",
+      "original_commit_id" : "a60ad12fb9bac2e4a8fe9018754444d48ba817ea",
+      "original_line" : 518,
+      "original_position" : 518,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 639,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499627889",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499629695"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499629695"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Should be \"already-failed\" not \"already-requested\" per the terminology above (\"Whether or not the transaction request failed already (timed out, or NOTFOUND was received)\")",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T14:13:34Z",
+      "diff_hunk" : "@@ -0,0 +1,193 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_TXREQUEST_H\n+#define BITCOIN_TXREQUEST_H\n+\n+#include <primitives/transaction.h>\n+#include <net.h> // For NodeId\n+#include <uint256.h>\n+\n+#include <chrono>\n+#include <vector>\n+\n+#include <stdint.h>\n+\n+/** Data structure to keep track of, and schedule, transaction downloads from peers.\n+ *\n+ * === Specification ===\n+ *\n+ * We keep track of which peers have announced which transactions, and use that to determine which requests\n+ * should go to which peer, when, and in what order.\n+ *\n+ * The following information is tracked per peer/tx combination (\"announcement\"):\n+ * - Which peer announced it (through their NodeId)\n+ * - The txid or wtxid of the transaction (collectively called \"txhash\" in what follows)\n+ * - Whether it was a tx or wtx announcement (see BIP339).\n+ * - What the earliest permitted time is that that transaction can be requested from that peer (called \"reqtime\").\n+ * - Whether it's from a \"preferred\" peer or not. Which announcements get this flag is determined by the caller, but\n+ *   this is designed for outbound peers, or other peers that we have a higher level of trust in. Even when the\n+ *   peers' preferredness changes, the preferred flag of existing announcements from that peer won't change.\n+ * - Whether or not the transaction was requested already, and if so, when it times out (called \"expiry\").\n+ * - Whether or not the transaction request failed already (timed out, or NOTFOUND was received).\n+ *\n+ * Transaction requests are then assigned to peers, following these rules:\n+ *\n+ * - No transaction is requested as long as another request for the same txhash is outstanding (it needs to fail\n+ *   first by passing expiry, or a NOTFOUND or invalid transaction has to be received for it).\n+ *\n+ *   Rationale: to avoid wasting bandwidth on multiple copies of the same transaction. Note that this only works\n+ *              per txhash, so if the same transaction is announced both through txid and wtxid, we have no means\n+ *              to prevent fetching both (the caller can however mitigate this by delaying one, see further).\n+ *\n+ * - The same transaction is never requested twice from the same peer, unless the announcement was forgotten in\n+ *   between, and re-announced. Announcements are forgotten only:\n+ *   - If a peer goes offline, all its announcements are forgotten.\n+ *   - If a transaction has been successfully received, or is otherwise no longer needed, the caller can call\n+ *     ForgetTxHash, which removes all announcements across all peers with the specified txhash.\n+ *   - If for a given txhash only already-requested announcements remain, they are all forgotten.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499629695",
+      "id" : 499629695,
+      "line" : 49,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTYyOTY5NQ==",
+      "original_commit_id" : "a60ad12fb9bac2e4a8fe9018754444d48ba817ea",
+      "original_line" : 49,
+      "original_position" : 49,
+      "original_start_line" : null,
+      "path" : "src/txrequest.h",
+      "position" : 49,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499629695",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499661041"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499661041"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Maybe `RandomTime_15s()` and `RandomTime_1y()` (assuming I've done the math right for bits=23 and bits=44 which are the only ways this is called) ?",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T14:55:01Z",
+      "diff_hunk" : "@@ -0,0 +1,558 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+\n+#include <txrequest.h>\n+#include <uint256.h>\n+\n+#include <test/util/setup_common.h>\n+\n+#include <algorithm>\n+#include <functional>\n+#include <vector>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+BOOST_FIXTURE_TEST_SUITE(txrequest_tests, BasicTestingSetup)\n+\n+namespace {\n+\n+constexpr std::chrono::microseconds MIN_TIME = std::chrono::microseconds::min();\n+constexpr std::chrono::microseconds MAX_TIME = std::chrono::microseconds::max();\n+constexpr std::chrono::microseconds MICROSECOND = std::chrono::microseconds{1};\n+constexpr std::chrono::microseconds NO_TIME = std::chrono::microseconds{0};\n+\n+/** An Action is a function to call at a particular (simulated) timestamp. */\n+using Action = std::pair<std::chrono::microseconds, std::function<void()>>;\n+\n+/** Object that stores actions from multiple interleaved scenarios, and data shared across them.\n+ *\n+ * The Scenario below is used to fill this.\n+ */\n+struct Runner\n+{\n+    /** The TxRequestTracker being tested. */\n+    TxRequestTracker txrequest;\n+\n+    /** List of actions to be executed (in order of increasing timestamp). */\n+    std::vector<Action> actions;\n+\n+    /** Which node ids have been assigned already (to prevent reuse). */\n+    std::set<NodeId> peerset;\n+\n+    /** Which txhashes have been assigned already (to prevent reuse). */\n+    std::set<uint256> txhashset;\n+};\n+\n+std::chrono::microseconds RandomTime(int bits=23) { return std::chrono::microseconds{1 + InsecureRandBits(bits)}; }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499661041",
+      "id" : 499661041,
+      "line" : 48,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTY2MTA0MQ==",
+      "original_commit_id" : "744eb10ecfa133a4a2de468aeb701255438e4427",
+      "original_line" : 48,
+      "original_position" : 48,
+      "original_start_line" : null,
+      "path" : "src/test/txrequest_tests.cpp",
+      "position" : 48,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499661041",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499662302"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499662302"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I'm not really following the unit testing strategy here; in particular what all the interleaving ends up doing, and what cases are really covered, and what the effect of doing some things exhaustively and other things randomly is . Feels like there's a lot of novel scaffolding hiding what's actual tested.\r\n\r\nIt might be good to create some template magic for the Action/Runner/Scenario pattern, and use that more consistently? At the very least the versionbits tests feel to me like they suffer a bit from the same sort of problem?\r\n\r\nI think this test setup only simulates a monotonic clock (vs txrequest.cpp's note that supporting time going backwards \"makes it much easier to specify and test TxRequestTracker::Impl's behaviour\")",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T14:56:44Z",
+      "diff_hunk" : "@@ -0,0 +1,558 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+\n+#include <txrequest.h>\n+#include <uint256.h>\n+\n+#include <test/util/setup_common.h>\n+\n+#include <algorithm>\n+#include <functional>\n+#include <vector>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+BOOST_FIXTURE_TEST_SUITE(txrequest_tests, BasicTestingSetup)\n+\n+namespace {\n+\n+constexpr std::chrono::microseconds MIN_TIME = std::chrono::microseconds::min();\n+constexpr std::chrono::microseconds MAX_TIME = std::chrono::microseconds::max();\n+constexpr std::chrono::microseconds MICROSECOND = std::chrono::microseconds{1};\n+constexpr std::chrono::microseconds NO_TIME = std::chrono::microseconds{0};\n+\n+/** An Action is a function to call at a particular (simulated) timestamp. */\n+using Action = std::pair<std::chrono::microseconds, std::function<void()>>;\n+\n+/** Object that stores actions from multiple interleaved scenarios, and data shared across them.\n+ *\n+ * The Scenario below is used to fill this.\n+ */\n+struct Runner\n+{\n+    /** The TxRequestTracker being tested. */\n+    TxRequestTracker txrequest;\n+\n+    /** List of actions to be executed (in order of increasing timestamp). */\n+    std::vector<Action> actions;\n+\n+    /** Which node ids have been assigned already (to prevent reuse). */\n+    std::set<NodeId> peerset;\n+\n+    /** Which txhashes have been assigned already (to prevent reuse). */\n+    std::set<uint256> txhashset;\n+};\n+\n+std::chrono::microseconds RandomTime(int bits=23) { return std::chrono::microseconds{1 + InsecureRandBits(bits)}; }\n+\n+/** A proxy for a Runner that helps build a sequence of consecutive test actions on a TxRequestTracker.\n+ *\n+ * Multiple Scenarios are used with a single Runner, resulting in interleaved actions.\n+ */\n+class Scenario",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499662302",
+      "id" : 499662302,
+      "line" : 54,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTY2MjMwMg==",
+      "original_commit_id" : "744eb10ecfa133a4a2de468aeb701255438e4427",
+      "original_line" : 54,
+      "original_position" : 54,
+      "original_start_line" : null,
+      "path" : "src/test/txrequest_tests.cpp",
+      "position" : 54,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499662302",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499672470"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499672470"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`NodeId` and `Priority` instead of `uint64_t` and `::min()` instead of `m_priority_candidate_best = 0`?",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T15:10:51Z",
+      "diff_hunk" : "@@ -216,6 +216,70 @@ struct PeerInfo {\n     size_t m_requested = 0; //!< Number of REQUESTED announcements for this peer.\n };\n \n+/** Per-txhash statistics object. Only used for sanity checking. */\n+struct TxHashInfo\n+{\n+    //! Number of CANDIDATE_DELAYED entries for this txhash.\n+    size_t m_candidate_delayed = 0;\n+    //! Number of CANDIDATE_READY entries for this txhash.\n+    size_t m_candidate_ready = 0;\n+    //! Number of CANDIDATE_BEST entries for this txhash (at most one).\n+    size_t m_candidate_best = 0;\n+    //! Number of REQUESTED entries for this txhash.\n+    size_t m_requested = 0;\n+    //! The priority of the CANDIDATE_BEST announcement if one exists, or 0 otherwise.\n+    uint64_t m_priority_candidate_best = 0;\n+    //! The lowest priority of all CANDIDATE_READY entries (or max() if none exist).\n+    uint64_t m_priority_best_candidate_ready = std::numeric_limits<uint64_t>::max();\n+    //! All peers we have an announcement for this txhash for.\n+    std::vector<uint64_t> m_peers;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499672470",
+      "id" : 499672470,
+      "line" : 235,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTY3MjQ3MA==",
+      "original_commit_id" : "744eb10ecfa133a4a2de468aeb701255438e4427",
+      "original_line" : 235,
+      "original_position" : 20,
+      "original_start_line" : null,
+      "path" : "src/txrequest.cpp",
+      "position" : 235,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499672470",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499680741"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499680741"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`244466666` (pronounced \"one 2, three 4, five 6\")  or `1123581321` are also amusing. Super helpful review comments 'r us!",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T15:22:25Z",
+      "diff_hunk" : "@@ -0,0 +1,361 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <txrequest.h>\n+#include <test/fuzz/fuzz.h>\n+#include <crypto/common.h>\n+#include <crypto/siphash.h>\n+\n+#include <bitset>\n+#include <cstdint>\n+#include <queue>\n+#include <vector>\n+\n+namespace {\n+\n+constexpr int MAX_TXHASHES = 16;\n+constexpr int MAX_PEERS = 16;\n+\n+//! Randomly generated GenTxids used in this test (length is MAX_TX).\n+uint256 TXHASHES[MAX_TXHASHES];\n+\n+/** Precomputed random durations (positive and negative, each ~exponentially distributed). */\n+std::chrono::microseconds DELAYS[256];\n+\n+struct Initializer\n+{\n+    Initializer()\n+    {\n+        // Use deterministic RNG to fill in txids and delays.\n+        // Non-determinism hurts fuzzing.\n+        FastRandomContext rng(true);\n+        for (int txhash = 0; txhash < MAX_TXHASHES; txhash += 1) {\n+            do {\n+                TXHASHES[txhash] = rng.rand256();\n+            } while (*(TXHASHES[txhash].begin() + 31) != txhash || *(TXHASHES[txhash].begin()) != txhash);\n+        }\n+        for (int i = 0; i < 16; ++i) {\n+            DELAYS[i] = std::chrono::microseconds{i};\n+        }\n+        for (int i = 16; i < 128; ++i) {\n+            DELAYS[i] = DELAYS[i - 1] + std::chrono::microseconds{1 + rng.randbits(((i - 10) * 2) / 9)};\n+        }\n+        for (int i = 128; i < 256; ++i) {\n+            DELAYS[i] = -DELAYS[255 - i];\n+        }\n+    }\n+} g_initializer;\n+\n+/** Tester class for TxRequestTracker\n+ *\n+ * It includes a naive reimplementation of its behavior, for a limited set\n+ * of MAX_TXHASHES distinct txids, and MAX_PEERS peer identifiers.\n+ *\n+ * All of the public member functions perform the same operation on\n+ * an actual TxRequestTracker and on the state of the reimplementation.\n+ * The output of GetRequestable is compared with the expected value\n+ * as well.\n+ *\n+ * Check() calls the TxRequestTracker's sanity check, plus compares the\n+ * output of the constant accessors (Size(), CountLoad(), CountTracked())\n+ * with expected values.\n+ */\n+class Tester\n+{\n+    //! TxRequestTracker object being tested.\n+    TxRequestTracker m_tracker;\n+\n+    //! States for txid/peer combinations in the naive data structure.\n+    enum class State {\n+        NOTHING, //!< Absence of this txid/peer combination\n+\n+        // Note that this implementation does not distinguish between BEST/NEW/OTHER variants of CANDIDATE.\n+        CANDIDATE,\n+        REQUESTED,\n+        COMPLETED,\n+    };\n+\n+    //! Sequence numbers, incremented whenever a new CANDIDATE is added.\n+    uint64_t m_current_sequence{0};\n+\n+    //! List of future 'events' (all inserted reqtimes/exptimes). This is used to implement AdvanceToEvent.\n+    std::priority_queue<std::chrono::microseconds, std::vector<std::chrono::microseconds>, std::greater<std::chrono::microseconds>> m_events;\n+\n+    //! Information about a txhash/peer combination.\n+    struct Announcement\n+    {\n+        std::chrono::microseconds m_time;\n+        uint64_t m_sequence;\n+        State m_state{State::NOTHING};\n+        bool m_preferred;\n+        bool m_is_wtxid;\n+        uint64_t m_priority; //!< Precomputed priority.\n+    };\n+\n+    //! Information about all txhash/peer combination.\n+    Announcement m_announcements[MAX_TXHASHES][MAX_PEERS];\n+\n+    //! The current time; can move forward and backward.\n+    std::chrono::microseconds m_now{112223333};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499680741",
+      "id" : 499680741,
+      "line" : 102,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTY4MDc0MQ==",
+      "original_commit_id" : "9fb42eeb59246479e3c7ec7e3575b3835a9fd27b",
+      "original_line" : 102,
+      "original_position" : 102,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/txrequest.cpp",
+      "position" : 102,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499680741",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499684028"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499684028"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Maybe:\r\n\r\n```\r\nif (ann.m_state != NOTHING) {\r\n    if (ann.m_state != COMPLETED) return;\r\n    all_nothing = false;\r\n}\r\n```\r\n\r\nHad to double take to realise that not being CANDIDATE, REQUESTED or NOTHING here meant it was definitely COMPLETED. No big deal.",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T15:27:10Z",
+      "diff_hunk" : "@@ -0,0 +1,361 @@\n+// Copyright (c) 2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <txrequest.h>\n+#include <test/fuzz/fuzz.h>\n+#include <crypto/common.h>\n+#include <crypto/siphash.h>\n+\n+#include <bitset>\n+#include <cstdint>\n+#include <queue>\n+#include <vector>\n+\n+namespace {\n+\n+constexpr int MAX_TXHASHES = 16;\n+constexpr int MAX_PEERS = 16;\n+\n+//! Randomly generated GenTxids used in this test (length is MAX_TX).\n+uint256 TXHASHES[MAX_TXHASHES];\n+\n+/** Precomputed random durations (positive and negative, each ~exponentially distributed). */\n+std::chrono::microseconds DELAYS[256];\n+\n+struct Initializer\n+{\n+    Initializer()\n+    {\n+        // Use deterministic RNG to fill in txids and delays.\n+        // Non-determinism hurts fuzzing.\n+        FastRandomContext rng(true);\n+        for (int txhash = 0; txhash < MAX_TXHASHES; txhash += 1) {\n+            do {\n+                TXHASHES[txhash] = rng.rand256();\n+            } while (*(TXHASHES[txhash].begin() + 31) != txhash || *(TXHASHES[txhash].begin()) != txhash);\n+        }\n+        for (int i = 0; i < 16; ++i) {\n+            DELAYS[i] = std::chrono::microseconds{i};\n+        }\n+        for (int i = 16; i < 128; ++i) {\n+            DELAYS[i] = DELAYS[i - 1] + std::chrono::microseconds{1 + rng.randbits(((i - 10) * 2) / 9)};\n+        }\n+        for (int i = 128; i < 256; ++i) {\n+            DELAYS[i] = -DELAYS[255 - i];\n+        }\n+    }\n+} g_initializer;\n+\n+/** Tester class for TxRequestTracker\n+ *\n+ * It includes a naive reimplementation of its behavior, for a limited set\n+ * of MAX_TXHASHES distinct txids, and MAX_PEERS peer identifiers.\n+ *\n+ * All of the public member functions perform the same operation on\n+ * an actual TxRequestTracker and on the state of the reimplementation.\n+ * The output of GetRequestable is compared with the expected value\n+ * as well.\n+ *\n+ * Check() calls the TxRequestTracker's sanity check, plus compares the\n+ * output of the constant accessors (Size(), CountLoad(), CountTracked())\n+ * with expected values.\n+ */\n+class Tester\n+{\n+    //! TxRequestTracker object being tested.\n+    TxRequestTracker m_tracker;\n+\n+    //! States for txid/peer combinations in the naive data structure.\n+    enum class State {\n+        NOTHING, //!< Absence of this txid/peer combination\n+\n+        // Note that this implementation does not distinguish between BEST/NEW/OTHER variants of CANDIDATE.\n+        CANDIDATE,\n+        REQUESTED,\n+        COMPLETED,\n+    };\n+\n+    //! Sequence numbers, incremented whenever a new CANDIDATE is added.\n+    uint64_t m_current_sequence{0};\n+\n+    //! List of future 'events' (all inserted reqtimes/exptimes). This is used to implement AdvanceToEvent.\n+    std::priority_queue<std::chrono::microseconds, std::vector<std::chrono::microseconds>, std::greater<std::chrono::microseconds>> m_events;\n+\n+    //! Information about a txhash/peer combination.\n+    struct Announcement\n+    {\n+        std::chrono::microseconds m_time;\n+        uint64_t m_sequence;\n+        State m_state{State::NOTHING};\n+        bool m_preferred;\n+        bool m_is_wtxid;\n+        uint64_t m_priority; //!< Precomputed priority.\n+    };\n+\n+    //! Information about all txhash/peer combination.\n+    Announcement m_announcements[MAX_TXHASHES][MAX_PEERS];\n+\n+    //! The current time; can move forward and backward.\n+    std::chrono::microseconds m_now{112223333};\n+\n+    //! Delete txhashes whose only announcements are COMPLETED.\n+    void Cleanup(int txhash)\n+    {\n+        bool all_nothing = true;\n+        for (int peer = 0; peer < MAX_PEERS; ++peer) {\n+            const Announcement& ann = m_announcements[txhash][peer];\n+            if (ann.m_state == State::CANDIDATE || ann.m_state == State::REQUESTED) return;\n+            if (ann.m_state != State::NOTHING) all_nothing = false;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499684028",
+      "id" : 499684028,
+      "line" : 111,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTY4NDAyOA==",
+      "original_commit_id" : "9fb42eeb59246479e3c7ec7e3575b3835a9fd27b",
+      "original_line" : 111,
+      "original_position" : 111,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/txrequest.cpp",
+      "position" : 111,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499684028",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499724149"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499724149"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`auto* state =` ? Was wondering if we were returning a reference and making an unnecessary copy.",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T16:27:25Z",
+      "diff_hunk" : "@@ -816,73 +747,34 @@ static void FindNextBlocksToDownload(NodeId nodeid, unsigned int count, std::vec\n     }\n }\n \n-void EraseTxRequest(const GenTxid& gtxid) EXCLUSIVE_LOCKS_REQUIRED(cs_main)\n-{\n-    g_already_asked_for.erase(gtxid.GetHash());\n-}\n-\n-std::chrono::microseconds GetTxRequestTime(const GenTxid& gtxid) EXCLUSIVE_LOCKS_REQUIRED(cs_main)\n-{\n-    auto it = g_already_asked_for.find(gtxid.GetHash());\n-    if (it != g_already_asked_for.end()) {\n-        return it->second;\n-    }\n-    return {};\n-}\n-\n-void UpdateTxRequestTime(const GenTxid& gtxid, std::chrono::microseconds request_time) EXCLUSIVE_LOCKS_REQUIRED(cs_main)\n-{\n-    auto it = g_already_asked_for.find(gtxid.GetHash());\n-    if (it == g_already_asked_for.end()) {\n-        g_already_asked_for.insert(std::make_pair(gtxid.GetHash(), request_time));\n-    } else {\n-        g_already_asked_for.update(it, request_time);\n-    }\n-}\n-\n-std::chrono::microseconds CalculateTxGetDataTime(const GenTxid& gtxid, std::chrono::microseconds current_time, bool use_inbound_delay, bool use_txid_delay) EXCLUSIVE_LOCKS_REQUIRED(cs_main)\n-{\n-    std::chrono::microseconds process_time;\n-    const auto last_request_time = GetTxRequestTime(gtxid);\n-    // First time requesting this tx\n-    if (last_request_time.count() == 0) {\n-        process_time = current_time;\n-    } else {\n-        // Randomize the delay to avoid biasing some peers over others (such as due to\n-        // fixed ordering of peer processing in ThreadMessageHandler)\n-        process_time = last_request_time + GETDATA_TX_INTERVAL + GetRandMicros(MAX_GETDATA_RANDOM_DELAY);\n-    }\n-\n-    // We delay processing announcements from inbound peers\n-    if (use_inbound_delay) process_time += INBOUND_PEER_TX_DELAY;\n-\n-    // We delay processing announcements from peers that use txid-relay (instead of wtxid)\n-    if (use_txid_delay) process_time += TXID_RELAY_DELAY;\n-\n-    return process_time;\n-}\n+} // namespace\n \n-void RequestTx(CNodeState* state, const GenTxid& gtxid, std::chrono::microseconds current_time) EXCLUSIVE_LOCKS_REQUIRED(cs_main)\n+void PeerManager::RequestTx(const CNode& node, const GenTxid& gtxid, std::chrono::microseconds current_time)\n {\n-    CNodeState::TxDownloadState& peer_download_state = state->m_tx_download;\n-    if (peer_download_state.m_tx_announced.size() >= MAX_PEER_TX_ANNOUNCEMENTS ||\n-            peer_download_state.m_tx_process_time.size() >= MAX_PEER_TX_ANNOUNCEMENTS ||\n-            peer_download_state.m_tx_announced.count(gtxid.GetHash())) {\n-        // Too many queued announcements from this peer, or we already have\n-        // this announcement\n+    AssertLockHeld(cs_main); // For m_txrequest\n+    NodeId nodeid = node.GetId();\n+    if (m_txrequest.Count(nodeid) >= MAX_PEER_TX_ANNOUNCEMENTS) {\n+        // Too many queued announcements from this peer\n         return;\n     }\n-    peer_download_state.m_tx_announced.insert(gtxid.GetHash());\n-\n-    // Calculate the time to try requesting this transaction. Use\n-    // fPreferredDownload as a proxy for outbound peers.\n-    const auto process_time = CalculateTxGetDataTime(gtxid, current_time, !state->fPreferredDownload, !state->m_wtxid_relay && g_wtxid_relay_peers > 0);\n-\n-    peer_download_state.m_tx_process_time.emplace(process_time, gtxid);\n+    auto state = State(nodeid);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499724149",
+      "id" : 499724149,
+      "line" : 763,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTcyNDE0OQ==",
+      "original_commit_id" : "89a01b891284f584bbf341f25b587614e417b564",
+      "original_line" : 760,
+      "original_position" : 183,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : 206,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499724149",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499728201"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499728201"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`if (tx.HasWitness()) ReceivedResponse(wtxid);` ? Or is the idea that txrequest is so cheap it's better to let it check if the extra call is redundant?",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T16:34:22Z",
+      "diff_hunk" : "@@ -3004,11 +2897,8 @@ void PeerManager::ProcessMessage(CNode& pfrom, const std::string& msg_type, CDat\n \n         TxValidationState state;\n \n-        for (const GenTxid& gtxid : {GenTxid(false, txid), GenTxid(true, wtxid)}) {\n-            nodestate->m_tx_download.m_tx_announced.erase(gtxid.GetHash());\n-            nodestate->m_tx_download.m_tx_in_flight.erase(gtxid.GetHash());\n-            EraseTxRequest(gtxid);\n-        }\n+        m_txrequest.ReceivedResponse(pfrom.GetId(), txid);\n+        m_txrequest.ReceivedResponse(pfrom.GetId(), wtxid);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499728201",
+      "id" : 499728201,
+      "line" : 2912,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTcyODIwMQ==",
+      "original_commit_id" : "89a01b891284f584bbf341f25b587614e417b564",
+      "original_line" : 2901,
+      "original_position" : 233,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : 280,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499728201",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499731414"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499731414"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Might be worth adding some sort of sanity check to see that there aren't any code paths where we fail to call `DisconnectedPeer` and end up leaving `CANDIDATE_BEST` entries in the tracker that will never get cleared?",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T16:39:58Z",
+      "diff_hunk" : "@@ -956,6 +848,7 @@ void PeerManager::FinalizeNode(NodeId nodeid, bool& fUpdateConnectionTime) {\n         mapBlocksInFlight.erase(entry.hash);\n     }\n     EraseOrphansFor(nodeid);\n+    m_txrequest.DisconnectedPeer(nodeid);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499731414",
+      "id" : 499731414,
+      "line" : 854,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTczMTQxNA==",
+      "original_commit_id" : "89a01b891284f584bbf341f25b587614e417b564",
+      "original_line" : 851,
+      "original_position" : 210,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : 233,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499731414",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499747735"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499747735"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Could just send 44 NOTFOUND messages with 116 entries instead of one with 5016 for almost exactly the same overhead; and they should be plenty fast anyway, I think, especially compared to looking up the UTXO database when we receive a transaction. Since we've increased the in flight limit, I think it makes sense to increase the notfound limit correspondingly.",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T17:08:34Z",
+      "diff_hunk" : "@@ -3772,22 +3685,14 @@ void PeerManager::ProcessMessage(CNode& pfrom, const std::string& msg_type, CDat\n     if (msg_type == NetMsgType::NOTFOUND) {\n         // Remove the NOTFOUND transactions from the peer\n         LOCK(cs_main);\n-        CNodeState *state = State(pfrom.GetId());\n         std::vector<CInv> vInv;\n         vRecv >> vInv;\n-        if (vInv.size() <= MAX_PEER_TX_IN_FLIGHT + MAX_BLOCKS_IN_TRANSIT_PER_PEER) {\n+        if (vInv.size() <= MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499747735",
+      "id" : 499747735,
+      "in_reply_to_id" : 499511223,
+      "line" : 3690,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTc0NzczNQ==",
+      "original_commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "original_line" : 3690,
+      "original_position" : 353,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : 353,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499747735",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499749174"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499749174"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Commit for this change says \"orphan fetches\" but it's really \"fetches of orphan's parents\"...",
+      "commit_id" : "6fa4512fb450d709006fd6b242975fd3ce2f5340",
+      "created_at" : "2020-10-05T17:11:23Z",
+      "diff_hunk" : "@@ -806,73 +740,35 @@ static void FindNextBlocksToDownload(NodeId nodeid, unsigned int count, std::vec\n     }\n }\n \n-void EraseTxRequest(const GenTxid& gtxid) EXCLUSIVE_LOCKS_REQUIRED(cs_main)\n-{\n-    g_already_asked_for.erase(gtxid.GetHash());\n-}\n-\n-std::chrono::microseconds GetTxRequestTime(const GenTxid& gtxid) EXCLUSIVE_LOCKS_REQUIRED(cs_main)\n-{\n-    auto it = g_already_asked_for.find(gtxid.GetHash());\n-    if (it != g_already_asked_for.end()) {\n-        return it->second;\n-    }\n-    return {};\n-}\n-\n-void UpdateTxRequestTime(const GenTxid& gtxid, std::chrono::microseconds request_time) EXCLUSIVE_LOCKS_REQUIRED(cs_main)\n-{\n-    auto it = g_already_asked_for.find(gtxid.GetHash());\n-    if (it == g_already_asked_for.end()) {\n-        g_already_asked_for.insert(std::make_pair(gtxid.GetHash(), request_time));\n-    } else {\n-        g_already_asked_for.update(it, request_time);\n-    }\n-}\n-\n-std::chrono::microseconds CalculateTxGetDataTime(const GenTxid& gtxid, std::chrono::microseconds current_time, bool use_inbound_delay, bool use_txid_delay) EXCLUSIVE_LOCKS_REQUIRED(cs_main)\n-{\n-    std::chrono::microseconds process_time;\n-    const auto last_request_time = GetTxRequestTime(gtxid);\n-    // First time requesting this tx\n-    if (last_request_time.count() == 0) {\n-        process_time = current_time;\n-    } else {\n-        // Randomize the delay to avoid biasing some peers over others (such as due to\n-        // fixed ordering of peer processing in ThreadMessageHandler)\n-        process_time = last_request_time + GETDATA_TX_INTERVAL + GetRandMicros(MAX_GETDATA_RANDOM_DELAY);\n-    }\n-\n-    // We delay processing announcements from inbound peers\n-    if (use_inbound_delay) process_time += INBOUND_PEER_TX_DELAY;\n-\n-    // We delay processing announcements from peers that use txid-relay (instead of wtxid)\n-    if (use_txid_delay) process_time += TXID_RELAY_DELAY;\n-\n-    return process_time;\n-}\n+} // namespace\n \n-void RequestTx(CNodeState* state, const GenTxid& gtxid, std::chrono::microseconds current_time) EXCLUSIVE_LOCKS_REQUIRED(cs_main)\n+void PeerManager::RequestTx(const CNode& node, const GenTxid& gtxid, std::chrono::microseconds current_time)\n {\n-    CNodeState::TxDownloadState& peer_download_state = state->m_tx_download;\n-    if (peer_download_state.m_tx_announced.size() >= MAX_PEER_TX_ANNOUNCEMENTS ||\n-            peer_download_state.m_tx_process_time.size() >= MAX_PEER_TX_ANNOUNCEMENTS ||\n-            peer_download_state.m_tx_announced.count(gtxid.GetHash())) {\n-        // Too many queued announcements from this peer, or we already have\n-        // this announcement\n+    AssertLockHeld(cs_main); // For m_txrequest\n+    NodeId nodeid = node.GetId();\n+    if (!node.HasPermission(PF_RELAY) && m_txrequest.Count(nodeid) >= MAX_PEER_TX_ANNOUNCEMENTS) {\n+        // Too many queued announcements from this peer\n         return;\n     }\n-    peer_download_state.m_tx_announced.insert(gtxid.GetHash());\n-\n-    // Calculate the time to try requesting this transaction. Use\n-    // fPreferredDownload as a proxy for outbound peers.\n-    const auto process_time = CalculateTxGetDataTime(gtxid, current_time, !state->fPreferredDownload, !state->m_wtxid_relay && g_wtxid_relay_peers > 0);\n-\n-    peer_download_state.m_tx_process_time.emplace(process_time, gtxid);\n+    auto state = State(nodeid);\n+\n+    // Decide the TxRequestTracker parameters for this announcement:\n+    // - \"overloaded\": if at least MAX_PEER_TX_IN_FLIGHT requests are in flight (and no PF_RELAY).\n+    // - \"preferred\": if fPreferredDownload is set (= outbound, or PF_NOBAN permission)\n+    // - \"reqtime\": immediately if none of the penalties below apply, otherwise current time plus:\n+    //   - INBOUND_PEER_TX_DELAY for announcements from non-preferred connections\n+    //   - TXID_RELAY_DELAY for announcements from txid peers while wtxid peers are available\n+    //   - OVERLOADED_PEER_TX_DELAY for announcements from overloaded peers\n+    auto delay = std::chrono::microseconds{0};\n+    bool preferred = state->fPreferredDownload;\n+    bool overloaded = !node.HasPermission(PF_RELAY) && m_txrequest.CountInFlight(nodeid) >= MAX_PEER_TX_IN_FLIGHT;\n+    if (!preferred) delay += INBOUND_PEER_TX_DELAY;\n+    if (!gtxid.IsWtxid() && g_wtxid_relay_peers > 0) delay += TXID_RELAY_DELAY;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19988#discussion_r499749174",
+      "id" : 499749174,
+      "in_reply_to_id" : 497863468,
+      "line" : 776,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDQ5OTc0OTE3NA==",
+      "original_commit_id" : "ee3a74a4e5d29257405f0a0919030996727d5f80",
+      "original_line" : 776,
+      "original_position" : 216,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : 219,
+      "pull_request_review_id" : 501954745,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19988",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-05T17:22:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/499749174",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
    }
 ]
