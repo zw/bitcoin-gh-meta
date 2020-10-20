@@ -8485,5 +8485,335 @@
          "type" : "User",
          "url" : "https://api.github.com/users/fanquake"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508128183"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508128183"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I'm not sure how to read this description compared to  the effective return. `tweak` is returned in 4th position, after internal `pubkey` in 2nd and the negation flag in 3rd. Further it seems `leaves` are sorted on `(script, version, merklebranch)` and doesn't rely on `negation flag`/ `innerkey`.",
+      "commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "created_at" : "2020-10-19T23:54:53Z",
+      "diff_hunk" : "@@ -738,3 +741,113 @@ def test_cscriptnum_encoding(self):\n         values = [0, 1, -1, -2, 127, 128, -255, 256, (1 << 15) - 1, -(1 << 16), (1 << 24) - 1, (1 << 31), 1 - (1 << 32), 1 << 40, 1500, -1500]\n         for value in values:\n             self.assertEqual(CScriptNum.decode(CScriptNum.encode(CScriptNum(value))), value)\n+\n+def TaprootSignatureHash(txTo, spent_utxos, hash_type, input_index = 0, scriptpath = False, script = CScript(), codeseparator_pos = -1, annex = None, leaf_ver = LEAF_VERSION_TAPSCRIPT):\n+    assert (len(txTo.vin) == len(spent_utxos))\n+    assert (input_index < len(txTo.vin))\n+    out_type = SIGHASH_ALL if hash_type == 0 else hash_type & 3\n+    in_type = hash_type & SIGHASH_ANYONECANPAY\n+    spk = spent_utxos[input_index].scriptPubKey\n+    ss = bytes([0, hash_type]) # epoch, hash_type\n+    ss += struct.pack(\"<i\", txTo.nVersion)\n+    ss += struct.pack(\"<I\", txTo.nLockTime)\n+    if in_type != SIGHASH_ANYONECANPAY:\n+        ss += sha256(b\"\".join(i.prevout.serialize() for i in txTo.vin))\n+        ss += sha256(b\"\".join(struct.pack(\"<q\", u.nValue) for u in spent_utxos))\n+        ss += sha256(b\"\".join(ser_string(u.scriptPubKey) for u in spent_utxos))\n+        ss += sha256(b\"\".join(struct.pack(\"<I\", i.nSequence) for i in txTo.vin))\n+    if out_type == SIGHASH_ALL:\n+        ss += sha256(b\"\".join(o.serialize() for o in txTo.vout))\n+    spend_type = 0\n+    if annex is not None:\n+        spend_type |= 1\n+    if (scriptpath):\n+        spend_type |= 2\n+    ss += bytes([spend_type])\n+    if in_type == SIGHASH_ANYONECANPAY:\n+        ss += txTo.vin[input_index].prevout.serialize()\n+        ss += struct.pack(\"<q\", spent_utxos[input_index].nValue)\n+        ss += ser_string(spk)\n+        ss += struct.pack(\"<I\", txTo.vin[input_index].nSequence)\n+    else:\n+        ss += struct.pack(\"<I\", input_index)\n+    if (spend_type & 1):\n+        ss += sha256(ser_string(annex))\n+    if out_type == SIGHASH_SINGLE:\n+        if input_index < len(txTo.vout):\n+            ss += sha256(txTo.vout[input_index].serialize())\n+        else:\n+            ss += bytes(0 for _ in range(32))\n+    if (scriptpath):\n+        ss += TaggedHash(\"TapLeaf\", bytes([leaf_ver]) + ser_string(script))\n+        ss += bytes([0])\n+        ss += struct.pack(\"<i\", codeseparator_pos)\n+    assert len(ss) ==  175 - (in_type == SIGHASH_ANYONECANPAY) * 49 - (out_type != SIGHASH_ALL and out_type != SIGHASH_SINGLE) * 32 + (annex is not None) * 32 + scriptpath * 37\n+    return TaggedHash(\"TapSighash\", ss)\n+\n+def taproot_tree_helper(scripts):\n+    if len(scripts) == 0:\n+        return ([], bytes(0 for _ in range(32)))\n+    if len(scripts) == 1:\n+        # One entry: treat as a leaf\n+        script = scripts[0]\n+        assert(not callable(script))\n+        if isinstance(script, list):\n+            return taproot_tree_helper(script)\n+        assert(isinstance(script, tuple))\n+        version = LEAF_VERSION_TAPSCRIPT\n+        name = script[0]\n+        code = script[1]\n+        if len(script) == 3:\n+            version = script[2]\n+        assert version & 1 == 0\n+        assert isinstance(code, bytes)\n+        h = TaggedHash(\"TapLeaf\", bytes([version]) + ser_string(code))\n+        if name is None:\n+            return ([], h)\n+        return ([(name, version, code, bytes())], h)\n+    elif len(scripts) == 2 and callable(scripts[1]):\n+        # Two entries, and the right one is a function\n+        left, left_h = taproot_tree_helper(scripts[0:1])\n+        right_h = scripts[1](left_h)\n+        left = [(name, version, script, control + right_h) for name, version, script, control in left]\n+        right = []\n+    else:\n+        # Two or more entries: descend into each side\n+        split_pos = len(scripts) // 2\n+        left, left_h = taproot_tree_helper(scripts[0:split_pos])\n+        right, right_h = taproot_tree_helper(scripts[split_pos:])\n+        left = [(name, version, script, control + right_h) for name, version, script, control in left]\n+        right = [(name, version, script, control + left_h) for name, version, script, control in right]\n+    if right_h < left_h:\n+        right_h, left_h = left_h, right_h\n+    h = TaggedHash(\"TapBranch\", left_h + right_h)\n+    return (left + right, h)\n+\n+TaprootInfo = namedtuple(\"TaprootInfo\", \"scriptPubKey,inner_pubkey,negflag,tweak,leaves\")\n+TaprootLeafInfo = namedtuple(\"TaprootLeafInfo\", \"script,version,merklebranch\")\n+\n+def taproot_construct(pubkey, scripts=None):\n+    \"\"\"Construct a tree of Taproot spending conditions\n+\n+    pubkey: an ECPubKey object for the internal pubkey\n+    scripts: a list of items; each item is either:\n+             - a (name, CScript) tuple\n+             - a (name, CScript, leaf version) tuple\n+             - another list of items (with the same structure)\n+             - a function, which specifies how to compute the hashing partner\n+               in function of the hash of whatever it is combined with\n+\n+    Returns: script (sPK or redeemScript), tweak, {name:(script, leaf version, negation flag, innerkey, merklepath), ...}",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508128183",
+      "id" : 508128183,
+      "line" : 841,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwODEyODE4Mw==",
+      "original_commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "original_line" : 841,
+      "original_position" : 173,
+      "original_start_line" : null,
+      "path" : "test/functional/test_framework/script.py",
+      "position" : 173,
+      "pull_request_review_id" : 512238027,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-20T01:31:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508128183",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508131987"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508131987"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit: `need_vin_vout_mismatch` isn't commented",
+      "commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "created_at" : "2020-10-20T00:07:45Z",
+      "diff_hunk" : "@@ -0,0 +1,1458 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2019-2020 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+# Test Taproot softfork (BIPs 340-342)\n+\n+from test_framework.blocktools import (\n+    create_coinbase,\n+    create_block,\n+    add_witness_commitment,\n+    MAX_BLOCK_SIGOPS_WEIGHT,\n+    WITNESS_SCALE_FACTOR,\n+)\n+from test_framework.messages import (\n+    COutPoint,\n+    CTransaction,\n+    CTxIn,\n+    CTxInWitness,\n+    CTxOut,\n+    ToHex,\n+)\n+from test_framework.script import (\n+    ANNEX_TAG,\n+    CScript,\n+    CScriptNum,\n+    CScriptOp,\n+    LEAF_VERSION_TAPSCRIPT,\n+    LegacySignatureHash,\n+    LOCKTIME_THRESHOLD,\n+    MAX_SCRIPT_ELEMENT_SIZE,\n+    OP_0,\n+    OP_1,\n+    OP_2,\n+    OP_3,\n+    OP_4,\n+    OP_5,\n+    OP_6,\n+    OP_7,\n+    OP_8,\n+    OP_9,\n+    OP_10,\n+    OP_11,\n+    OP_12,\n+    OP_16,\n+    OP_2DROP,\n+    OP_2DUP,\n+    OP_CHECKMULTISIG,\n+    OP_CHECKMULTISIGVERIFY,\n+    OP_CHECKSIG,\n+    OP_CHECKSIGADD,\n+    OP_CHECKSIGVERIFY,\n+    OP_CODESEPARATOR,\n+    OP_DROP,\n+    OP_DUP,\n+    OP_ELSE,\n+    OP_ENDIF,\n+    OP_EQUAL,\n+    OP_EQUALVERIFY,\n+    OP_HASH160,\n+    OP_IF,\n+    OP_NOP,\n+    OP_NOT,\n+    OP_NOTIF,\n+    OP_PUSHDATA1,\n+    OP_RETURN,\n+    OP_SWAP,\n+    OP_VERIFY,\n+    SIGHASH_DEFAULT,\n+    SIGHASH_ALL,\n+    SIGHASH_NONE,\n+    SIGHASH_SINGLE,\n+    SIGHASH_ANYONECANPAY,\n+    SegwitV0SignatureHash,\n+    TaprootSignatureHash,\n+    is_op_success,\n+    taproot_construct,\n+)\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import assert_raises_rpc_error, assert_equal\n+from test_framework.key import generate_privkey, compute_xonly_pubkey, sign_schnorr, tweak_add_privkey, ECKey\n+from test_framework.address import (\n+    hash160,\n+    sha256,\n+)\n+from collections import OrderedDict, namedtuple\n+from io import BytesIO\n+import json\n+import hashlib\n+import os\n+import random\n+\n+# === Framework for building spending transactions. ===\n+#\n+# The computation is represented as a \"context\" dict, whose entries store potentially-unevaluated expressions that\n+# refer to lower-level ones. By overwriting these expression, many aspects - both high and low level - of the signing\n+# process can be overridden.\n+#\n+# Specifically, a context object is a dict that maps names to compositions of:\n+# - values\n+# - lists of values\n+# - callables which, when fed the context object as argument, produce any of these\n+#\n+# The DEFAULT_CONTEXT object specifies a standard signing process, with many overridable knobs.\n+#\n+# The get(ctx, name) function can evaluate a name, and cache its result in the context.\n+# getter(name) can be used to construct a callable that evaluates name. For example:\n+#\n+#   ctx1 = {**DEFAULT_CONTEXT, inputs=[getter(\"sign\"), b'\\x01']}\n+#\n+# creates a context where the script inputs are a signature plus the bytes 0x01.\n+#\n+# override(expr, name1=expr1, name2=expr2, ...) can be used to cause an expression to be evaluated in a selectively\n+# modified context. For example:\n+#\n+#   ctx2 = {**DEFAULT_CONTEXT, sighash=override(default_sighash, hashtype=SIGHASH_DEFAULT)}\n+#\n+# creates a context ctx2 where the sighash is modified to use hashtype=SIGHASH_DEFAULT. This differs from\n+#\n+#   ctx3 = {**DEFAULT_CONTEXT, hashtype=SIGHASH_DEFAULT}\n+#\n+# in that ctx3 will globally use hashtype=SIGHASH_DEFAULT (including in the hashtype byte appended to the signature)\n+# while ctx2 only uses the modified hashtype inside the sighash calculation.\n+\n+def deep_eval(ctx, expr):\n+    \"\"\"Recursively replace any callables c in expr (including inside lists) with c(ctx).\"\"\"\n+    while callable(expr):\n+        expr = expr(ctx)\n+    if isinstance(expr, list):\n+        expr = [deep_eval(ctx, x) for x in expr]\n+    return expr\n+\n+# Data type to represent fully-evaluated expressions in a context dict (so we can avoid reevaluating them).\n+Final = namedtuple(\"Final\", \"value\")\n+\n+def get(ctx, name):\n+    \"\"\"Evaluate name in context ctx.\"\"\"\n+    assert name in ctx, \"Missing '%s' in context\" % name\n+    expr = ctx[name]\n+    if not isinstance(expr, Final):\n+        # Evaluate and cache the result.\n+        expr = Final(deep_eval(ctx, expr))\n+        ctx[name] = expr\n+    return expr.value\n+\n+def getter(name):\n+    \"\"\"Return a callable that evaluates name in its passed context.\"\"\"\n+    return lambda ctx: get(ctx, name)\n+\n+def override(expr, **kwargs):\n+    \"\"\"Return a callable that evaluates expr in a modified context.\"\"\"\n+    return lambda ctx: deep_eval({**ctx, **kwargs}, expr)\n+\n+# === Implementations for the various default expressions in DEFAULT_CONTEXT ===\n+\n+def default_hashtype(ctx):\n+    \"\"\"Default expression for \"hashtype\": SIGHASH_DEFAULT for taproot, SIGHASH_ALL otherwise.\"\"\"\n+    mode = get(ctx, \"mode\")\n+    if mode == \"taproot\":\n+        return SIGHASH_DEFAULT\n+    else:\n+        return SIGHASH_ALL\n+\n+def default_tapleaf(ctx):\n+    \"\"\"Default expression for \"tapleaf\": looking up leaf in tap[2].\"\"\"\n+    return get(ctx, \"tap\").leaves[get(ctx, \"leaf\")]\n+\n+def default_script_taproot(ctx):\n+    \"\"\"Default expression for \"script_taproot\": tapleaf.script.\"\"\"\n+    return get(ctx, \"tapleaf\").script\n+\n+def default_leafversion(ctx):\n+    \"\"\"Default expression for \"leafversion\": tapleaf.version\"\"\"\n+    return get(ctx, \"tapleaf\").version\n+\n+def default_negflag(ctx):\n+    \"\"\"Default expression for \"negflag\": tap.negflag.\"\"\"\n+    return get(ctx, \"tap\").negflag\n+\n+def default_pubkey_inner(ctx):\n+    \"\"\"Default expression for \"pubkey_inner\": tap.inner_pubkey.\"\"\"\n+    return get(ctx, \"tap\").inner_pubkey\n+\n+def default_merklebranch(ctx):\n+    \"\"\"Default expression for \"merklebranch\": tapleaf.merklebranch.\"\"\"\n+    return get(ctx, \"tapleaf\").merklebranch\n+\n+def default_controlblock(ctx):\n+    \"\"\"Default expression for \"controlblock\": combine leafversion, negflag, pubkey_inner, merklebranch.\"\"\"\n+    return bytes([get(ctx, \"leafversion\") + get(ctx, \"negflag\")]) + get(ctx, \"pubkey_inner\") + get(ctx, \"merklebranch\")\n+\n+def default_sighash(ctx):\n+    \"\"\"Default expression for \"sighash\": depending on mode, compute BIP341, BIP143, or legacy sighash.\"\"\"\n+    tx = get(ctx, \"tx\")\n+    idx = get(ctx, \"idx\")\n+    hashtype = get(ctx, \"hashtype_actual\")\n+    mode = get(ctx, \"mode\")\n+    if mode == \"taproot\":\n+        # BIP341 signature hash\n+        utxos = get(ctx, \"utxos\")\n+        annex = get(ctx, \"annex\")\n+        if get(ctx, \"leaf\") is not None:\n+            codeseppos = get(ctx, \"codeseppos\")\n+            leaf_ver = get(ctx, \"leafversion\")\n+            script = get(ctx, \"script_taproot\")\n+            return TaprootSignatureHash(tx, utxos, hashtype, idx, scriptpath=True, script=script, leaf_ver=leaf_ver, codeseparator_pos=codeseppos, annex=annex)\n+        else:\n+            return TaprootSignatureHash(tx, utxos, hashtype, idx, scriptpath=False, annex=annex)\n+    elif mode == \"witv0\":\n+        # BIP143 signature hash\n+        scriptcode = get(ctx, \"scriptcode\")\n+        utxos = get(ctx, \"utxos\")\n+        return SegwitV0SignatureHash(scriptcode, tx, idx, hashtype, utxos[idx].nValue)\n+    else:\n+        # Pre-segwit signature hash\n+        scriptcode = get(ctx, \"scriptcode\")\n+        return LegacySignatureHash(scriptcode, tx, idx, hashtype)[0]\n+\n+def default_tweak(ctx):\n+    \"\"\"Default expression for \"tweak\": None if a leaf is specified, tap[0] otherwise.\"\"\"\n+    if get(ctx, \"leaf\") is None:\n+        return get(ctx, \"tap\").tweak\n+    return None\n+\n+def default_key_tweaked(ctx):\n+    \"\"\"Default expression for \"key_tweaked\": key if tweak is None, tweaked with it otherwise.\"\"\"\n+    key = get(ctx, \"key\")\n+    tweak = get(ctx, \"tweak\")\n+    if tweak is None:\n+        return key\n+    else:\n+        return tweak_add_privkey(key, tweak)\n+\n+def default_signature(ctx):\n+    \"\"\"Default expression for \"signature\": BIP340 signature or ECDSA signature depending on mode.\"\"\"\n+    sighash = get(ctx, \"sighash\")\n+    if get(ctx, \"mode\") == \"taproot\":\n+        key = get(ctx, \"key_tweaked\")\n+        flip_r = get(ctx, \"flag_flip_r\")\n+        flip_p = get(ctx, \"flag_flip_p\")\n+        return sign_schnorr(key, sighash, flip_r=flip_r, flip_p=flip_p)\n+    else:\n+        key = get(ctx, \"key\")\n+        return key.sign_ecdsa(sighash)\n+\n+def default_hashtype_actual(ctx):\n+    \"\"\"Default expression for \"hashtype_actual\": hashtype, unless mismatching SIGHASH_SINGLE in taproot.\"\"\"\n+    hashtype = get(ctx, \"hashtype\")\n+    mode = get(ctx, \"mode\")\n+    if mode != \"taproot\":\n+        return hashtype\n+    idx = get(ctx, \"idx\")\n+    tx = get(ctx, \"tx\")\n+    if hashtype & 3 == SIGHASH_SINGLE and idx >= len(tx.vout):\n+        return (hashtype & ~3) | SIGHASH_NONE\n+    return hashtype\n+\n+def default_bytes_hashtype(ctx):\n+    \"\"\"Default expression for \"bytes_hashtype\": bytes([hashtype_actual]) if not 0, b\"\" otherwise.\"\"\"\n+    return bytes([x for x in [get(ctx, \"hashtype_actual\")] if x != 0])\n+\n+def default_sign(ctx):\n+    \"\"\"Default expression for \"sign\": concatenation of signature and bytes_hashtype.\"\"\"\n+    return get(ctx, \"signature\") + get(ctx, \"bytes_hashtype\")\n+\n+def default_inputs_keypath(ctx):\n+    \"\"\"Default expression for \"inputs_keypath\": a signature.\"\"\"\n+    return [get(ctx, \"sign\")]\n+\n+def default_witness_taproot(ctx):\n+    \"\"\"Default expression for \"witness_taproot\", consisting of inputs, script, control block, and annex as needed.\"\"\"\n+    annex = get(ctx, \"annex\")\n+    suffix_annex = []\n+    if annex is not None:\n+        suffix_annex = [annex]\n+    if get(ctx, \"leaf\") is None:\n+        return get(ctx, \"inputs_keypath\") + suffix_annex\n+    else:\n+        return get(ctx, \"inputs\") + [bytes(get(ctx, \"script_taproot\")), get(ctx, \"controlblock\")] + suffix_annex\n+\n+def default_witness_witv0(ctx):\n+    \"\"\"Default expression for \"witness_witv0\", consisting of inputs and witness script, as needed.\"\"\"\n+    script = get(ctx, \"script_witv0\")\n+    inputs = get(ctx, \"inputs\")\n+    if script is None:\n+        return inputs\n+    else:\n+        return inputs + [script]\n+\n+def default_witness(ctx):\n+    \"\"\"Default expression for \"witness\", delegating to \"witness_taproot\" or \"witness_witv0\" as needed.\"\"\"\n+    mode = get(ctx, \"mode\")\n+    if mode == \"taproot\":\n+        return get(ctx, \"witness_taproot\")\n+    elif mode == \"witv0\":\n+        return get(ctx, \"witness_witv0\")\n+    else:\n+        return []\n+\n+def default_scriptsig(ctx):\n+    \"\"\"Default expression for \"scriptsig\", consisting of inputs and redeemscript, as needed.\"\"\"\n+    scriptsig = []\n+    mode = get(ctx, \"mode\")\n+    if mode == \"legacy\":\n+        scriptsig = get(ctx, \"inputs\")\n+    redeemscript = get(ctx, \"script_p2sh\")\n+    if redeemscript is not None:\n+        scriptsig += [bytes(redeemscript)]\n+    return scriptsig\n+\n+# The default context object.\n+DEFAULT_CONTEXT = {\n+    # == The main expressions to evaluate. Only override these for unusual or invalid spends. ==\n+    # The overall witness stack, as a list of bytes objects.\n+    \"witness\": default_witness,\n+    # The overall scriptsig, as a list of CScript objects (to be concatenated) and bytes objects (to be pushed)\n+    \"scriptsig\": default_scriptsig,\n+\n+    # == Expressions you'll generally only override for intentionally invalid spends. ==\n+    # The witness stack for spending a taproot output.\n+    \"witness_taproot\": default_witness_taproot,\n+    # The witness stack for spending a P2WPKH/P2WSH output.\n+    \"witness_witv0\": default_witness_witv0,\n+    # The script inputs for a taproot key path spend.\n+    \"inputs_keypath\": default_inputs_keypath,\n+    # The actual hashtype to use (usually equal to hashtype, but in taproot SIGHASH_SINGLE is not always allowed).\n+    \"hashtype_actual\": default_hashtype_actual,\n+    # The bytes object for a full signature (including hashtype byte, if needed).\n+    \"bytes_hashtype\": default_bytes_hashtype,\n+    # A full script signature (bytes including hashtype, if needed)\n+    \"sign\": default_sign,\n+    # An ECDSA or Schnorr signature (excluding hashtype byte).\n+    \"signature\": default_signature,\n+    # The 32-byte tweaked key (equal to key for script path spends, or key+tweak for key path spends).\n+    \"key_tweaked\": default_key_tweaked,\n+    # The tweak to use (None for script path spends, the actual tweak for key path spends).\n+    \"tweak\": default_tweak,\n+    # The sighash value (32 bytes)\n+    \"sighash\": default_sighash,\n+    # The information about the chosen script path spend (TaprootLeafInfo object).\n+    \"tapleaf\": default_tapleaf,\n+    # The script to push, and include in the sighash, for a taproot script path spend.\n+    \"script_taproot\": default_script_taproot,\n+    # The inner pubkey for a taproot script path spend (32 bytes).\n+    \"pubkey_inner\": default_pubkey_inner,\n+    # The negation flag of the inner pubkey for a taproot script path spend.\n+    \"negflag\": default_negflag,\n+    # The leaf version to include in the sighash (this does not affect the one in the control block).\n+    \"leafversion\": default_leafversion,\n+    # The Merkle path to include in the control block for a script path spend.\n+    \"merklebranch\": default_merklebranch,\n+    # The control block to push for a taproot script path spend.\n+    \"controlblock\": default_controlblock,\n+    # Whether to produce signatures with invalid P sign (Schnorr signatures only).\n+    \"flag_flip_p\": False,\n+    # Whether to produce signatures with invalid R sign (Schnorr signatures only).\n+    \"flag_flip_r\": False,\n+\n+    # == Parameters that can be changed without invalidating, but do have a default: ==\n+    # The hashtype (as an integer).\n+    \"hashtype\": default_hashtype,\n+    # The annex (only when mode==\"taproot\").\n+    \"annex\": None,\n+    # The codeseparator position (only when mode==\"taproot\").\n+    \"codeseppos\": -1,\n+    # The redeemscript to add to the scriptSig (if P2SH; None implies not P2SH).\n+    \"script_p2sh\": None,\n+    # The script to add to the witness in (if P2WSH; None implies P2WPKH)\n+    \"script_witv0\": None,\n+    # The leaf to use in taproot spends (if script path spend; None implies key path spend).\n+    \"leaf\": None,\n+    # The input arguments to provide to the executed script\n+    \"inputs\": [],\n+\n+    # == Parameters to be set before evaluation: ==\n+    # - mode: what spending style to use (\"taproot\", \"witv0\", or \"legacy\").\n+    # - key: the (untweaked) private key to sign with (ECKey object for ECDSA, 32 bytes for Schnorr).\n+    # - tap: the TaprootInfo object (see taproot_construct; needed in mode==\"taproot\").\n+    # - tx: the transaction to sign.\n+    # - utxos: the UTXOs being spent (needed in mode==\"witv0\" and mode==\"taproot\").\n+    # - idx: the input position being signed.\n+    # - scriptcode: the scriptcode to include in legacy and witv0 sighashes.\n+}\n+\n+def flatten(lst):\n+    ret = []\n+    for elem in lst:\n+        if isinstance(elem, list):\n+            ret += flatten(elem)\n+        else:\n+            ret.append(elem)\n+    return ret\n+\n+def spend(tx, idx, utxos, **kwargs):\n+    \"\"\"Sign transaction input idx of tx, provided utxos is the list of outputs being spent.\n+\n+    Additional arguments may be provided that override any aspect of the signing process.\n+    See DEFAULT_CONTEXT above for what can be overridden, and what must be provided.\n+    \"\"\"\n+\n+    ctx = {**DEFAULT_CONTEXT, \"tx\":tx, \"idx\":idx, \"utxos\":utxos, **kwargs}\n+\n+    def to_script(elem):\n+        \"\"\"If fed a CScript, return it; if fed bytes, return a CScript that pushes it.\"\"\"\n+        if isinstance(elem, CScript):\n+            return elem\n+        else:\n+            return CScript([elem])\n+\n+    scriptsig_list = flatten(get(ctx, \"scriptsig\"))\n+    scriptsig = CScript(b\"\".join(bytes(to_script(elem)) for elem in scriptsig_list))\n+    witness_stack = flatten(get(ctx, \"witness\"))\n+    return (scriptsig, witness_stack)\n+\n+\n+# === Spender objects ===\n+#\n+# Each spender is a tuple of:\n+# - A scriptPubKey which is to be spent from (CScript)\n+# - A comment describing the test (string)\n+# - Whether the spending (on itself) is expected to be standard (bool)\n+# - A tx-signing lambda returning (scriptsig, witness_stack), taking as inputs:\n+#   - A transaction to sign (CTransaction)\n+#   - An input position (int)\n+#   - The spent UTXOs by this transaction (list of CTxOut)\n+#   - Whether to produce a valid spend (bool)\n+# - A string with an expected error message for failure case if known\n+# - The (pre-taproot) sigops weight consumed by a successful spend\n+# - Whether this spend cannot fail\n+# - Whether this test demands being placed in a txin with no corresponding txout (for testing SIGHASH_SINGLE behavior)\n+\n+Spender = namedtuple(\"Spender\", \"script,comment,is_standard,sat_function,err_msg,sigops_weight,no_fail,need_vin_vout_mismatch\")\n+\n+def make_spender(comment, *, tap=None, witv0=False, script=None, pkh=None, p2sh=False, spk_mutate_pre_p2sh=None, failure=None, standard=True, err_msg=None, sigops_weight=0, need_vin_vout_mismatch=False, **kwargs):\n+    \"\"\"Helper for constructing Spender objects using the context signing framework.\n+\n+    * tap: a TaprootInfo object (see taproot_construct), for Taproot spends (cannot be combined with pkh, witv0, or script)\n+    * witv0: boolean indicating the use of witness v0 spending (needs one of script or pkh)\n+    * script: the actual script executed (for bare/P2WSH/P2SH spending)\n+    * pkh: the public key for P2PKH or P2WPKH spending\n+    * p2sh: whether the output is P2SH wrapper (this is supported even for Taproot, where it makes the output unencumbered)\n+    * spk_mutate_pre_psh: a callable to be applied to the script (before potentially P2SH-wrapping it)\n+    * failure: a dict of entries to override in the context when intentionally failing to spend (if None, no_fail will be set)\n+    * standard: whether the (valid version of) spending is expected to be standard\n+    * err_msg: a string with an expected error message for failure (or None, if not cared about)\n+    * sigops_weight: the pre-taproot sigops weight consumed by a successful spend",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508131987",
+      "id" : 508131987,
+      "line" : 445,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwODEzMTk4Nw==",
+      "original_commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "original_line" : 445,
+      "original_position" : 445,
+      "original_start_line" : null,
+      "path" : "test/functional/feature_taproot.py",
+      "position" : 445,
+      "pull_request_review_id" : 512238027,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-20T01:31:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508131987",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508149564"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508149564"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "A code comment to hint about the `+1` would be great. Like \"Exclude parity bit from internal pubkey\"",
+      "commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "created_at" : "2020-10-20T01:10:31Z",
+      "diff_hunk" : "@@ -1504,58 +1791,144 @@ bool GenericTransactionSignatureChecker<T>::CheckSequence(const CScriptNum& nSeq\n template class GenericTransactionSignatureChecker<CTransaction>;\n template class GenericTransactionSignatureChecker<CMutableTransaction>;\n \n-static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CScript& scriptPubKey, unsigned int flags, SigVersion sigversion, const BaseSignatureChecker& checker, ScriptError* serror)\n+static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CScript& scriptPubKey, unsigned int flags, SigVersion sigversion, const BaseSignatureChecker& checker, ScriptExecutionData& execdata, ScriptError* serror)\n {\n     std::vector<valtype> stack{stack_span.begin(), stack_span.end()};\n \n+    if (sigversion == SigVersion::TAPSCRIPT) {\n+        // OP_SUCCESSx processing overrides everything, including stack element size limits\n+        CScript::const_iterator pc = scriptPubKey.begin();\n+        while (pc < scriptPubKey.end()) {\n+            opcodetype opcode;\n+            if (!scriptPubKey.GetOp(pc, opcode)) {\n+                // Note how this condition would not be reached if an unknown OP_SUCCESSx was found\n+                return set_error(serror, SCRIPT_ERR_BAD_OPCODE);\n+            }\n+            // New opcodes will be listed here. May use a different sigversion to modify existing opcodes.\n+            if (IsOpSuccess(opcode)) {\n+                if (flags & SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS) {\n+                    return set_error(serror, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);\n+                }\n+                return set_success(serror);\n+            }\n+        }\n+\n+        // Tapscript enforces initial stack size limits (altstack is empty here)\n+        if (stack.size() > MAX_STACK_SIZE) return set_error(serror, SCRIPT_ERR_STACK_SIZE);\n+    }\n+\n     // Disallow stack item size > MAX_SCRIPT_ELEMENT_SIZE in witness stack\n     for (const valtype& elem : stack) {\n         if (elem.size() > MAX_SCRIPT_ELEMENT_SIZE) return set_error(serror, SCRIPT_ERR_PUSH_SIZE);\n     }\n \n     // Run the script interpreter.\n-    if (!EvalScript(stack, scriptPubKey, flags, checker, sigversion, serror)) return false;\n+    if (!EvalScript(stack, scriptPubKey, flags, checker, sigversion, execdata, serror)) return false;\n \n     // Scripts inside witness implicitly require cleanstack behaviour\n     if (stack.size() != 1) return set_error(serror, SCRIPT_ERR_CLEANSTACK);\n     if (!CastToBool(stack.back())) return set_error(serror, SCRIPT_ERR_EVAL_FALSE);\n     return true;\n }\n \n-static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, const std::vector<unsigned char>& program, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror)\n+static bool VerifyTaprootCommitment(const std::vector<unsigned char>& control, const std::vector<unsigned char>& program, const CScript& script, uint256& tapleaf_hash)\n {\n-    CScript scriptPubKey;\n+    const int path_len = (control.size() - TAPROOT_CONTROL_BASE_SIZE) / TAPROOT_CONTROL_NODE_SIZE;\n+    const XOnlyPubKey p{uint256(std::vector<unsigned char>(control.begin() + 1, control.begin() + TAPROOT_CONTROL_BASE_SIZE))};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508149564",
+      "id" : 508149564,
+      "line" : 1837,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwODE0OTU2NA==",
+      "original_commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "original_line" : 1837,
+      "original_position" : 550,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 550,
+      "pull_request_review_id" : 512238027,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-20T01:31:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508149564",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508152499"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508152499"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "As a side-note, it could be worthy to document what is meaned here by \"syntactic correctness\" if it's consensus criticial. AFAICT, pubkey must be superior to 0 ?",
+      "commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "created_at" : "2020-10-20T01:21:09Z",
+      "diff_hunk" : "@@ -169,7 +170,7 @@ class CPubKey\n     /*\n      * Check syntactic correctness.\n      *\n-     * Note that this is consensus critical as CheckSig() calls it!\n+     * Note that this is consensus critical as CheckECDSASignature() calls it!",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508152499",
+      "id" : 508152499,
+      "line" : 173,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwODE1MjQ5OQ==",
+      "original_commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "original_line" : 173,
+      "original_position" : 13,
+      "original_start_line" : null,
+      "path" : "src/pubkey.h",
+      "position" : 13,
+      "pull_request_review_id" : 512238027,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-20T01:31:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508152499",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508153060"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508153060"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Can future upgradable public key define their own sigops rules without branching inside the `if (success)` branch ?",
+      "commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "created_at" : "2020-10-20T01:23:25Z",
+      "diff_hunk" : "@@ -363,15 +360,75 @@ static bool EvalChecksig(const valtype& vchSig, const valtype& vchPubKey, CScrip\n         //serror is set\n         return false;\n     }\n-    fSuccess = checker.CheckSig(vchSig, vchPubKey, scriptCode, sigversion);\n+    fSuccess = checker.CheckECDSASignature(vchSig, vchPubKey, scriptCode, sigversion);\n \n     if (!fSuccess && (flags & SCRIPT_VERIFY_NULLFAIL) && vchSig.size())\n         return set_error(serror, SCRIPT_ERR_SIG_NULLFAIL);\n \n     return true;\n }\n \n-bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror)\n+static bool EvalChecksigTapscript(const valtype& sig, const valtype& pubkey, ScriptExecutionData& execdata, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& success)\n+{\n+    assert(sigversion == SigVersion::TAPSCRIPT);\n+\n+    /*\n+     *  The following validation sequence is consensus critical. Please note how --\n+     *    upgradable public key versions precede other rules;\n+     *    the script execution fails when using empty signature with invalid public key;\n+     *    the script execution fails when using non-empty invalid signature.\n+     */\n+    success = !sig.empty();\n+    if (success) {\n+        // Implement the sigops/witnesssize ratio test.\n+        // Passing with an upgradable public key version is also counted.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508153060",
+      "id" : 508153060,
+      "line" : 384,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwODE1MzA2MA==",
+      "original_commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "original_line" : 384,
+      "original_position" : 44,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 44,
+      "pull_request_review_id" : 512238027,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-20T01:31:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508153060",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508153422"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508153422"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Can we enforce this assign-once property with either some cpp magic or compiler option ? I've no idea.",
+      "commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "created_at" : "2020-10-20T01:24:41Z",
+      "diff_hunk" : "@@ -363,15 +360,75 @@ static bool EvalChecksig(const valtype& vchSig, const valtype& vchPubKey, CScrip\n         //serror is set\n         return false;\n     }\n-    fSuccess = checker.CheckSig(vchSig, vchPubKey, scriptCode, sigversion);\n+    fSuccess = checker.CheckECDSASignature(vchSig, vchPubKey, scriptCode, sigversion);\n \n     if (!fSuccess && (flags & SCRIPT_VERIFY_NULLFAIL) && vchSig.size())\n         return set_error(serror, SCRIPT_ERR_SIG_NULLFAIL);\n \n     return true;\n }\n \n-bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror)\n+static bool EvalChecksigTapscript(const valtype& sig, const valtype& pubkey, ScriptExecutionData& execdata, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& success)\n+{\n+    assert(sigversion == SigVersion::TAPSCRIPT);\n+\n+    /*\n+     *  The following validation sequence is consensus critical. Please note how --\n+     *    upgradable public key versions precede other rules;\n+     *    the script execution fails when using empty signature with invalid public key;\n+     *    the script execution fails when using non-empty invalid signature.\n+     */\n+    success = !sig.empty();\n+    if (success) {\n+        // Implement the sigops/witnesssize ratio test.\n+        // Passing with an upgradable public key version is also counted.\n+        assert(execdata.m_validation_weight_left_init);\n+        execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_SIGOP_PASSED;\n+        if (execdata.m_validation_weight_left < 0) {\n+            return set_error(serror, SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT);\n+        }\n+    }\n+    if (pubkey.size() == 0) {\n+        return set_error(serror, SCRIPT_ERR_PUBKEYTYPE);\n+    } else if (pubkey.size() == 32) {\n+        if (success && !checker.CheckSchnorrSignature(sig, pubkey, sigversion, execdata, serror)) {\n+            return false; // serror is set\n+        }\n+    } else {\n+        /*\n+         *  New public key version softforks should be defined before this `else` block.\n+         *  Generally, the new code should not do anything but failing the script execution. To avoid\n+         *  consensus bugs, it should not modify any existing values (including `success`).",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19953#discussion_r508153422",
+      "id" : 508153422,
+      "line" : 401,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwODE1MzQyMg==",
+      "original_commit_id" : "0e2a5e448f426219a6464b9aaadcc715534114e6",
+      "original_line" : 401,
+      "original_position" : 61,
+      "original_start_line" : null,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 61,
+      "pull_request_review_id" : 512238027,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19953",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-20T01:31:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/508153422",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
    }
 ]
