@@ -8931,5 +8931,556 @@
          "type" : "User",
          "url" : "https://api.github.com/users/fjahr"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509130310"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509130310"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This function name is slightly confusing. This isn't returning whether the number has overflown the range that can be expressed in a Num3072. It's returning whether the number d is greater than the group order g and can therefore be reduced to a congruent value < g. I'd suggest renaming the function to `IsReduceable()` or `CanReduce()`, and commenting what the function is doing.",
+      "commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "created_at" : "2020-10-21T09:29:38Z",
+      "diff_hunk" : "@@ -0,0 +1,303 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <crypto/muhash.h>\n+\n+#include <crypto/chacha20.h>\n+#include <crypto/common.h>\n+\n+#include <cassert>\n+#include <cstdio>\n+#include <limits>\n+\n+namespace {\n+\n+/** 2^3072 - 1103717, the largest 3072-bit safe prime number, is used as the order of the group. */\n+constexpr Num3072::limb_t MAX_PRIME_DIFF = 1103717;\n+\n+constexpr size_t INPUT_SIZE = 32;\n+constexpr size_t OUTPUT_SIZE = 384;\n+\n+using limb_t = Num3072::limb_t;\n+using double_limb_t = Num3072::double_limb_t;\n+constexpr int LIMB_SIZE = Num3072::LIMB_SIZE;\n+constexpr int LIMBS = Num3072::LIMBS;\n+\n+// Sanity check for Num3072 constants\n+static_assert(LIMB_SIZE * LIMBS == 3072, \"Num3072 isn't 3072 bits\");\n+static_assert(sizeof(double_limb_t) == sizeof(limb_t) * 2, \"bad size for double_limb_t\");\n+static_assert(sizeof(limb_t) * 8 == LIMB_SIZE, \"LIMB_SIZE is incorrect\");\n+\n+// Hard coded values in MuHash3072 constructor and Finalize\n+static_assert(sizeof(limb_t) == 4 || sizeof(limb_t) == 8, \"bad size for limb_t\");\n+\n+/** Extract the lowest limb of [c0,c1,c2] into n, and left shift the number by 1 limb. */\n+inline void extract3(limb_t& c0, limb_t& c1, limb_t& c2, limb_t& n)\n+{\n+    n = c0;\n+    c0 = c1;\n+    c1 = c2;\n+    c2 = 0;\n+}\n+\n+/** Extract the lowest limb of [c0,c1] into n, and left shift the number by 1 limb. */\n+inline void extract2(limb_t& c0, limb_t& c1, limb_t& n)\n+{\n+    n = c0;\n+    c0 = c1;\n+    c1 = 0;\n+}\n+\n+/** [c0,c1] = a * b */\n+inline void mul(limb_t& c0, limb_t& c1, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    c1 = t >> LIMB_SIZE;\n+    c0 = t;\n+}\n+\n+/* [c0,c1,c2] += n * [d0,d1,d2]. c2 is 0 initially */\n+inline void mulnadd3(limb_t& c0, limb_t& c1, limb_t& c2, limb_t& d0, limb_t& d1, limb_t& d2, const limb_t& n)\n+{\n+    double_limb_t t = (double_limb_t)d0 * n + c0;\n+    c0 = t;\n+    t >>= LIMB_SIZE;\n+    t += (double_limb_t)d1 * n + c1;\n+    c1 = t;\n+    t >>= LIMB_SIZE;\n+    c2 = t + d2 * n;\n+}\n+\n+/* [c0,c1] *= n */\n+inline void muln2(limb_t& c0, limb_t& c1, const limb_t& n)\n+{\n+    double_limb_t t = (double_limb_t)c0 * n;\n+    c0 = t;\n+    t >>= LIMB_SIZE;\n+    t += (double_limb_t)c1 * n;\n+    c1 = t;\n+}\n+\n+/** [c0,c1,c2] += a * b */\n+inline void muladd3(limb_t& c0, limb_t& c1, limb_t& c2, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    limb_t th = t >> LIMB_SIZE;\n+    limb_t tl = t;\n+\n+    c0 += tl;\n+    th += (c0 < tl) ? 1 : 0;\n+    c1 += th;\n+    c2 += (c1 < th) ? 1 : 0;\n+}\n+\n+/** [c0,c1,c2] += 2 * a * b */\n+inline void muldbladd3(limb_t& c0, limb_t& c1, limb_t& c2, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    limb_t th = t >> LIMB_SIZE;\n+    limb_t tl = t;\n+\n+    c0 += tl;\n+    limb_t tt = th + ((c0 < tl) ? 1 : 0);\n+    c1 += tt;\n+    c2 += (c1 < tt) ? 1 : 0;\n+    c0 += tl;\n+    th += (c0 < tl) ? 1 : 0;\n+    c1 += th;\n+    c2 += (c1 < th) ? 1 : 0;\n+}\n+\n+/** [c0,c1] += a */\n+inline void add2(limb_t& c0, limb_t& c1, const limb_t& a)\n+{\n+    c0 += a;\n+    c1 += (c0 < a) ? 1 : 0;\n+}\n+\n+bool IsOverflow(const Num3072& d)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509130310",
+      "id" : 509130310,
+      "line" : 119,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwOTEzMDMxMA==",
+      "original_commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "original_line" : 119,
+      "original_position" : 119,
+      "original_start_line" : null,
+      "path" : "src/crypto/muhash.cpp",
+      "position" : 119,
+      "pull_request_review_id" : 513482761,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-21T10:23:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509130310",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509142040"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509142040"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This could also use a comment. We call this function in two places:\r\n\r\n1. After `IsOverflow` where `x â [g, MAX_NUM3072)`. In this case`FullReduce(x)` adds `MAX_PRIME_DIFF` to `x` and overflows Num3072, so `FullReduce(x) = x + MAX_PRIME_DIFF - MAX_NUM3072 = x - g`, which is congruent to x and is in `[0, g)`\r\n\r\n2. After `if (c0)` i.e. where x has overflown and `x = MAX_NUM3072 + d`. In this case `FullReduce(d)` adds `MAX_PRIME_DIFF` to `d`, so `x = MAX_NUM3072 + FullReduce(d) - MAX_PRIME_DIFF`, which means that `FullReduce(d)` and `x` are congruent. I think there _may_ be a bug here if `d â [g, MAX_NUM3072)`, i.e. if the `FullReduce()` function overflows. That would make `x = MAX_NUM3072 + FullReduce(d) - MAX_PRIME_DIFF + MAX_NUM3072` so `x` and `FullReduce(d)` are not congruent.",
+      "commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "created_at" : "2020-10-21T09:47:33Z",
+      "diff_hunk" : "@@ -0,0 +1,303 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <crypto/muhash.h>\n+\n+#include <crypto/chacha20.h>\n+#include <crypto/common.h>\n+\n+#include <cassert>\n+#include <cstdio>\n+#include <limits>\n+\n+namespace {\n+\n+/** 2^3072 - 1103717, the largest 3072-bit safe prime number, is used as the order of the group. */\n+constexpr Num3072::limb_t MAX_PRIME_DIFF = 1103717;\n+\n+constexpr size_t INPUT_SIZE = 32;\n+constexpr size_t OUTPUT_SIZE = 384;\n+\n+using limb_t = Num3072::limb_t;\n+using double_limb_t = Num3072::double_limb_t;\n+constexpr int LIMB_SIZE = Num3072::LIMB_SIZE;\n+constexpr int LIMBS = Num3072::LIMBS;\n+\n+// Sanity check for Num3072 constants\n+static_assert(LIMB_SIZE * LIMBS == 3072, \"Num3072 isn't 3072 bits\");\n+static_assert(sizeof(double_limb_t) == sizeof(limb_t) * 2, \"bad size for double_limb_t\");\n+static_assert(sizeof(limb_t) * 8 == LIMB_SIZE, \"LIMB_SIZE is incorrect\");\n+\n+// Hard coded values in MuHash3072 constructor and Finalize\n+static_assert(sizeof(limb_t) == 4 || sizeof(limb_t) == 8, \"bad size for limb_t\");\n+\n+/** Extract the lowest limb of [c0,c1,c2] into n, and left shift the number by 1 limb. */\n+inline void extract3(limb_t& c0, limb_t& c1, limb_t& c2, limb_t& n)\n+{\n+    n = c0;\n+    c0 = c1;\n+    c1 = c2;\n+    c2 = 0;\n+}\n+\n+/** Extract the lowest limb of [c0,c1] into n, and left shift the number by 1 limb. */\n+inline void extract2(limb_t& c0, limb_t& c1, limb_t& n)\n+{\n+    n = c0;\n+    c0 = c1;\n+    c1 = 0;\n+}\n+\n+/** [c0,c1] = a * b */\n+inline void mul(limb_t& c0, limb_t& c1, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    c1 = t >> LIMB_SIZE;\n+    c0 = t;\n+}\n+\n+/* [c0,c1,c2] += n * [d0,d1,d2]. c2 is 0 initially */\n+inline void mulnadd3(limb_t& c0, limb_t& c1, limb_t& c2, limb_t& d0, limb_t& d1, limb_t& d2, const limb_t& n)\n+{\n+    double_limb_t t = (double_limb_t)d0 * n + c0;\n+    c0 = t;\n+    t >>= LIMB_SIZE;\n+    t += (double_limb_t)d1 * n + c1;\n+    c1 = t;\n+    t >>= LIMB_SIZE;\n+    c2 = t + d2 * n;\n+}\n+\n+/* [c0,c1] *= n */\n+inline void muln2(limb_t& c0, limb_t& c1, const limb_t& n)\n+{\n+    double_limb_t t = (double_limb_t)c0 * n;\n+    c0 = t;\n+    t >>= LIMB_SIZE;\n+    t += (double_limb_t)c1 * n;\n+    c1 = t;\n+}\n+\n+/** [c0,c1,c2] += a * b */\n+inline void muladd3(limb_t& c0, limb_t& c1, limb_t& c2, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    limb_t th = t >> LIMB_SIZE;\n+    limb_t tl = t;\n+\n+    c0 += tl;\n+    th += (c0 < tl) ? 1 : 0;\n+    c1 += th;\n+    c2 += (c1 < th) ? 1 : 0;\n+}\n+\n+/** [c0,c1,c2] += 2 * a * b */\n+inline void muldbladd3(limb_t& c0, limb_t& c1, limb_t& c2, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    limb_t th = t >> LIMB_SIZE;\n+    limb_t tl = t;\n+\n+    c0 += tl;\n+    limb_t tt = th + ((c0 < tl) ? 1 : 0);\n+    c1 += tt;\n+    c2 += (c1 < tt) ? 1 : 0;\n+    c0 += tl;\n+    th += (c0 < tl) ? 1 : 0;\n+    c1 += th;\n+    c2 += (c1 < th) ? 1 : 0;\n+}\n+\n+/** [c0,c1] += a */\n+inline void add2(limb_t& c0, limb_t& c1, const limb_t& a)\n+{\n+    c0 += a;\n+    c1 += (c0 < a) ? 1 : 0;\n+}\n+\n+bool IsOverflow(const Num3072& d)\n+{\n+    if (d.limbs[0] <= std::numeric_limits<limb_t>::max() - MAX_PRIME_DIFF) return false;\n+    for (int i = 1; i < LIMBS; ++i) {\n+        if (d.limbs[i] != std::numeric_limits<limb_t>::max()) return false;\n+    }\n+    return true;\n+}\n+\n+void FullReduce(Num3072& d)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509142040",
+      "id" : 509142040,
+      "line" : 128,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwOTE0MjA0MA==",
+      "original_commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "original_line" : 128,
+      "original_position" : 128,
+      "original_start_line" : null,
+      "path" : "src/crypto/muhash.cpp",
+      "position" : 128,
+      "pull_request_review_id" : 513482761,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-21T10:23:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509142040",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509144274"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509144274"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "slightly confusing to have `c0` and `c1` declared at the top of the function, and `c2` declared both in the for block above here and again here. Perhaps move this declaration to the top too and reuse the variable. `c2` is always zero after `extract3()`, but you could assert that here to be clear.",
+      "commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "created_at" : "2020-10-21T09:51:11Z",
+      "diff_hunk" : "@@ -0,0 +1,303 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <crypto/muhash.h>\n+\n+#include <crypto/chacha20.h>\n+#include <crypto/common.h>\n+\n+#include <cassert>\n+#include <cstdio>\n+#include <limits>\n+\n+namespace {\n+\n+/** 2^3072 - 1103717, the largest 3072-bit safe prime number, is used as the order of the group. */\n+constexpr Num3072::limb_t MAX_PRIME_DIFF = 1103717;\n+\n+constexpr size_t INPUT_SIZE = 32;\n+constexpr size_t OUTPUT_SIZE = 384;\n+\n+using limb_t = Num3072::limb_t;\n+using double_limb_t = Num3072::double_limb_t;\n+constexpr int LIMB_SIZE = Num3072::LIMB_SIZE;\n+constexpr int LIMBS = Num3072::LIMBS;\n+\n+// Sanity check for Num3072 constants\n+static_assert(LIMB_SIZE * LIMBS == 3072, \"Num3072 isn't 3072 bits\");\n+static_assert(sizeof(double_limb_t) == sizeof(limb_t) * 2, \"bad size for double_limb_t\");\n+static_assert(sizeof(limb_t) * 8 == LIMB_SIZE, \"LIMB_SIZE is incorrect\");\n+\n+// Hard coded values in MuHash3072 constructor and Finalize\n+static_assert(sizeof(limb_t) == 4 || sizeof(limb_t) == 8, \"bad size for limb_t\");\n+\n+/** Extract the lowest limb of [c0,c1,c2] into n, and left shift the number by 1 limb. */\n+inline void extract3(limb_t& c0, limb_t& c1, limb_t& c2, limb_t& n)\n+{\n+    n = c0;\n+    c0 = c1;\n+    c1 = c2;\n+    c2 = 0;\n+}\n+\n+/** Extract the lowest limb of [c0,c1] into n, and left shift the number by 1 limb. */\n+inline void extract2(limb_t& c0, limb_t& c1, limb_t& n)\n+{\n+    n = c0;\n+    c0 = c1;\n+    c1 = 0;\n+}\n+\n+/** [c0,c1] = a * b */\n+inline void mul(limb_t& c0, limb_t& c1, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    c1 = t >> LIMB_SIZE;\n+    c0 = t;\n+}\n+\n+/* [c0,c1,c2] += n * [d0,d1,d2]. c2 is 0 initially */\n+inline void mulnadd3(limb_t& c0, limb_t& c1, limb_t& c2, limb_t& d0, limb_t& d1, limb_t& d2, const limb_t& n)\n+{\n+    double_limb_t t = (double_limb_t)d0 * n + c0;\n+    c0 = t;\n+    t >>= LIMB_SIZE;\n+    t += (double_limb_t)d1 * n + c1;\n+    c1 = t;\n+    t >>= LIMB_SIZE;\n+    c2 = t + d2 * n;\n+}\n+\n+/* [c0,c1] *= n */\n+inline void muln2(limb_t& c0, limb_t& c1, const limb_t& n)\n+{\n+    double_limb_t t = (double_limb_t)c0 * n;\n+    c0 = t;\n+    t >>= LIMB_SIZE;\n+    t += (double_limb_t)c1 * n;\n+    c1 = t;\n+}\n+\n+/** [c0,c1,c2] += a * b */\n+inline void muladd3(limb_t& c0, limb_t& c1, limb_t& c2, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    limb_t th = t >> LIMB_SIZE;\n+    limb_t tl = t;\n+\n+    c0 += tl;\n+    th += (c0 < tl) ? 1 : 0;\n+    c1 += th;\n+    c2 += (c1 < th) ? 1 : 0;\n+}\n+\n+/** [c0,c1,c2] += 2 * a * b */\n+inline void muldbladd3(limb_t& c0, limb_t& c1, limb_t& c2, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    limb_t th = t >> LIMB_SIZE;\n+    limb_t tl = t;\n+\n+    c0 += tl;\n+    limb_t tt = th + ((c0 < tl) ? 1 : 0);\n+    c1 += tt;\n+    c2 += (c1 < tt) ? 1 : 0;\n+    c0 += tl;\n+    th += (c0 < tl) ? 1 : 0;\n+    c1 += th;\n+    c2 += (c1 < th) ? 1 : 0;\n+}\n+\n+/** [c0,c1] += a */\n+inline void add2(limb_t& c0, limb_t& c1, const limb_t& a)\n+{\n+    c0 += a;\n+    c1 += (c0 < a) ? 1 : 0;\n+}\n+\n+bool IsOverflow(const Num3072& d)\n+{\n+    if (d.limbs[0] <= std::numeric_limits<limb_t>::max() - MAX_PRIME_DIFF) return false;\n+    for (int i = 1; i < LIMBS; ++i) {\n+        if (d.limbs[i] != std::numeric_limits<limb_t>::max()) return false;\n+    }\n+    return true;\n+}\n+\n+void FullReduce(Num3072& d)\n+{\n+    limb_t c0 = MAX_PRIME_DIFF;\n+    for (int i = 0; i < LIMBS; ++i) {\n+        limb_t c1 = 0;\n+        add2(c0, c1, d.limbs[i]);\n+        extract2(c0, c1, d.limbs[i]);\n+    }\n+}\n+\n+void Multiply(Num3072& in_out, const Num3072& a)\n+{\n+    limb_t c0 = 0, c1 = 0;\n+    Num3072 tmp;\n+\n+    /* Compute limbs 0..N-2 of in_out*a into tmp, including one reduction. */\n+    for (int j = 0; j < LIMBS - 1; ++j) {\n+        limb_t d0 = 0, d1 = 0, d2 = 0, c2 = 0;\n+        mul(d0, d1, in_out.limbs[1 + j], a.limbs[LIMBS + j - (1 + j)]);\n+        for (int i = 2 + j; i < LIMBS; ++i) muladd3(d0, d1, d2, in_out.limbs[i], a.limbs[LIMBS + j - i]);\n+        mulnadd3(c0, c1, c2, d0, d1, d2, MAX_PRIME_DIFF);\n+        for (int i = 0; i < j + 1; ++i) muladd3(c0, c1, c2, in_out.limbs[i], a.limbs[j - i]);\n+        extract3(c0, c1, c2, tmp.limbs[j]);\n+    }\n+\n+    /* Compute limb N-1 of a*b into tmp. */\n+    limb_t c2 = 0;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509144274",
+      "id" : 509144274,
+      "line" : 154,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwOTE0NDI3NA==",
+      "original_commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "original_line" : 154,
+      "original_position" : 154,
+      "original_start_line" : null,
+      "path" : "src/crypto/muhash.cpp",
+      "position" : 154,
+      "pull_request_review_id" : 513482761,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-21T10:23:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509144274",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509145379"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509145379"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Same as above. Any reason not to declare this `c2` at the top and reuse the variable?",
+      "commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "created_at" : "2020-10-21T09:52:49Z",
+      "diff_hunk" : "@@ -0,0 +1,303 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <crypto/muhash.h>\n+\n+#include <crypto/chacha20.h>\n+#include <crypto/common.h>\n+\n+#include <cassert>\n+#include <cstdio>\n+#include <limits>\n+\n+namespace {\n+\n+/** 2^3072 - 1103717, the largest 3072-bit safe prime number, is used as the order of the group. */\n+constexpr Num3072::limb_t MAX_PRIME_DIFF = 1103717;\n+\n+constexpr size_t INPUT_SIZE = 32;\n+constexpr size_t OUTPUT_SIZE = 384;\n+\n+using limb_t = Num3072::limb_t;\n+using double_limb_t = Num3072::double_limb_t;\n+constexpr int LIMB_SIZE = Num3072::LIMB_SIZE;\n+constexpr int LIMBS = Num3072::LIMBS;\n+\n+// Sanity check for Num3072 constants\n+static_assert(LIMB_SIZE * LIMBS == 3072, \"Num3072 isn't 3072 bits\");\n+static_assert(sizeof(double_limb_t) == sizeof(limb_t) * 2, \"bad size for double_limb_t\");\n+static_assert(sizeof(limb_t) * 8 == LIMB_SIZE, \"LIMB_SIZE is incorrect\");\n+\n+// Hard coded values in MuHash3072 constructor and Finalize\n+static_assert(sizeof(limb_t) == 4 || sizeof(limb_t) == 8, \"bad size for limb_t\");\n+\n+/** Extract the lowest limb of [c0,c1,c2] into n, and left shift the number by 1 limb. */\n+inline void extract3(limb_t& c0, limb_t& c1, limb_t& c2, limb_t& n)\n+{\n+    n = c0;\n+    c0 = c1;\n+    c1 = c2;\n+    c2 = 0;\n+}\n+\n+/** Extract the lowest limb of [c0,c1] into n, and left shift the number by 1 limb. */\n+inline void extract2(limb_t& c0, limb_t& c1, limb_t& n)\n+{\n+    n = c0;\n+    c0 = c1;\n+    c1 = 0;\n+}\n+\n+/** [c0,c1] = a * b */\n+inline void mul(limb_t& c0, limb_t& c1, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    c1 = t >> LIMB_SIZE;\n+    c0 = t;\n+}\n+\n+/* [c0,c1,c2] += n * [d0,d1,d2]. c2 is 0 initially */\n+inline void mulnadd3(limb_t& c0, limb_t& c1, limb_t& c2, limb_t& d0, limb_t& d1, limb_t& d2, const limb_t& n)\n+{\n+    double_limb_t t = (double_limb_t)d0 * n + c0;\n+    c0 = t;\n+    t >>= LIMB_SIZE;\n+    t += (double_limb_t)d1 * n + c1;\n+    c1 = t;\n+    t >>= LIMB_SIZE;\n+    c2 = t + d2 * n;\n+}\n+\n+/* [c0,c1] *= n */\n+inline void muln2(limb_t& c0, limb_t& c1, const limb_t& n)\n+{\n+    double_limb_t t = (double_limb_t)c0 * n;\n+    c0 = t;\n+    t >>= LIMB_SIZE;\n+    t += (double_limb_t)c1 * n;\n+    c1 = t;\n+}\n+\n+/** [c0,c1,c2] += a * b */\n+inline void muladd3(limb_t& c0, limb_t& c1, limb_t& c2, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    limb_t th = t >> LIMB_SIZE;\n+    limb_t tl = t;\n+\n+    c0 += tl;\n+    th += (c0 < tl) ? 1 : 0;\n+    c1 += th;\n+    c2 += (c1 < th) ? 1 : 0;\n+}\n+\n+/** [c0,c1,c2] += 2 * a * b */\n+inline void muldbladd3(limb_t& c0, limb_t& c1, limb_t& c2, const limb_t& a, const limb_t& b)\n+{\n+    double_limb_t t = (double_limb_t)a * b;\n+    limb_t th = t >> LIMB_SIZE;\n+    limb_t tl = t;\n+\n+    c0 += tl;\n+    limb_t tt = th + ((c0 < tl) ? 1 : 0);\n+    c1 += tt;\n+    c2 += (c1 < tt) ? 1 : 0;\n+    c0 += tl;\n+    th += (c0 < tl) ? 1 : 0;\n+    c1 += th;\n+    c2 += (c1 < th) ? 1 : 0;\n+}\n+\n+/** [c0,c1] += a */\n+inline void add2(limb_t& c0, limb_t& c1, const limb_t& a)\n+{\n+    c0 += a;\n+    c1 += (c0 < a) ? 1 : 0;\n+}\n+\n+bool IsOverflow(const Num3072& d)\n+{\n+    if (d.limbs[0] <= std::numeric_limits<limb_t>::max() - MAX_PRIME_DIFF) return false;\n+    for (int i = 1; i < LIMBS; ++i) {\n+        if (d.limbs[i] != std::numeric_limits<limb_t>::max()) return false;\n+    }\n+    return true;\n+}\n+\n+void FullReduce(Num3072& d)\n+{\n+    limb_t c0 = MAX_PRIME_DIFF;\n+    for (int i = 0; i < LIMBS; ++i) {\n+        limb_t c1 = 0;\n+        add2(c0, c1, d.limbs[i]);\n+        extract2(c0, c1, d.limbs[i]);\n+    }\n+}\n+\n+void Multiply(Num3072& in_out, const Num3072& a)\n+{\n+    limb_t c0 = 0, c1 = 0;\n+    Num3072 tmp;\n+\n+    /* Compute limbs 0..N-2 of in_out*a into tmp, including one reduction. */\n+    for (int j = 0; j < LIMBS - 1; ++j) {\n+        limb_t d0 = 0, d1 = 0, d2 = 0, c2 = 0;\n+        mul(d0, d1, in_out.limbs[1 + j], a.limbs[LIMBS + j - (1 + j)]);\n+        for (int i = 2 + j; i < LIMBS; ++i) muladd3(d0, d1, d2, in_out.limbs[i], a.limbs[LIMBS + j - i]);\n+        mulnadd3(c0, c1, c2, d0, d1, d2, MAX_PRIME_DIFF);\n+        for (int i = 0; i < j + 1; ++i) muladd3(c0, c1, c2, in_out.limbs[i], a.limbs[j - i]);\n+        extract3(c0, c1, c2, tmp.limbs[j]);\n+    }\n+\n+    /* Compute limb N-1 of a*b into tmp. */\n+    limb_t c2 = 0;\n+    for (int i = 0; i < LIMBS; ++i) muladd3(c0, c1, c2, in_out.limbs[i], a.limbs[LIMBS - 1 - i]);\n+    extract3(c0, c1, c2, tmp.limbs[LIMBS - 1]);\n+\n+    /* Perform a second reduction. */\n+    muln2(c0, c1, MAX_PRIME_DIFF);\n+    for (int j = 0; j < LIMBS; ++j) {\n+        add2(c0, c1, tmp.limbs[j]);\n+        extract2(c0, c1, in_out.limbs[j]);\n+    }\n+\n+    assert(c1 == 0);\n+    assert(c0 == 0 || c0 == 1);\n+\n+    /* Perform a potential third reduction. */\n+    if (c0) FullReduce(in_out);\n+}\n+\n+void Square(Num3072& in_out)\n+{\n+    limb_t c0 = 0, c1 = 0;\n+    Num3072 tmp;\n+\n+    /* Compute limbs 0..N-2 of in_out*in_out into tmp, including one reduction. */\n+    for (int j = 0; j < LIMBS - 1; ++j) {\n+        limb_t d0 = 0, d1 = 0, d2 = 0, c2 = 0;\n+        for (int i = 0; i < (LIMBS - 1 - j) / 2; ++i) muldbladd3(d0, d1, d2, in_out.limbs[i + j + 1], in_out.limbs[LIMBS - 1 - i]);\n+        if ((j + 1) & 1) muladd3(d0, d1, d2, in_out.limbs[(LIMBS - 1 - j) / 2 + j + 1], in_out.limbs[LIMBS - 1 - (LIMBS - 1 - j) / 2]);\n+        mulnadd3(c0, c1, c2, d0, d1, d2, MAX_PRIME_DIFF);\n+        for (int i = 0; i < (j + 1) / 2; ++i) muldbladd3(c0, c1, c2, in_out.limbs[i], in_out.limbs[j - i]);\n+        if ((j + 1) & 1) muladd3(c0, c1, c2, in_out.limbs[(j + 1) / 2], in_out.limbs[j - (j + 1) / 2]);\n+        extract3(c0, c1, c2, tmp.limbs[j]);\n+    }\n+\n+    limb_t c2 = 0;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509145379",
+      "id" : 509145379,
+      "line" : 188,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwOTE0NTM3OQ==",
+      "original_commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "original_line" : 188,
+      "original_position" : 188,
+      "original_start_line" : null,
+      "path" : "src/crypto/muhash.cpp",
+      "position" : 188,
+      "pull_request_review_id" : 513482761,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-21T10:23:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509145379",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509149688"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509149688"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "That's almost exactly a 4x speedup for add and >5x speedup for div. Seems worthwhile!",
+      "commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "created_at" : "2020-10-21T09:59:37Z",
+      "diff_hunk" : "@@ -0,0 +1,97 @@\n+// Copyright (c) 2017 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_CRYPTO_MUHASH_H\n+#define BITCOIN_CRYPTO_MUHASH_H\n+\n+#if defined(HAVE_CONFIG_H)\n+#include <config/bitcoin-config.h>\n+#endif\n+\n+#include <serialize.h>\n+\n+#include <stdint.h>\n+\n+struct Num3072 {\n+#ifdef HAVE___INT128",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509149688",
+      "id" : 509149688,
+      "in_reply_to_id" : 507173583,
+      "line" : 17,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwOTE0OTY4OA==",
+      "original_commit_id" : "e19e50013478c6b7066aa2c9f7e0d0ee7219e837",
+      "original_line" : 17,
+      "original_position" : 17,
+      "original_start_line" : null,
+      "path" : "src/crypto/muhash.h",
+      "position" : 17,
+      "pull_request_review_id" : 513482761,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-21T10:23:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509149688",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509153295"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509153295"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Change this to `MuHashMul()`?",
+      "commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "created_at" : "2020-10-21T10:05:12Z",
+      "diff_hunk" : "@@ -105,6 +106,70 @@ static void FastRandom_1bit(benchmark::Bench& bench)\n     });\n }\n \n+static void MuHash(benchmark::Bench& bench)\n+{\n+    FastRandomContext rng(true);\n+    MuHash3072 acc;\n+    unsigned char key[32] = {0};\n+    int i = 0;\n+    bench.run([&] {\n+        key[0] = ++i;\n+        acc *= MuHash3072(key);\n+    });\n+}\n+\n+static void MuHashAdd(benchmark::Bench& bench)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509153295",
+      "id" : 509153295,
+      "line" : 121,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwOTE1MzI5NQ==",
+      "original_commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "original_line" : 121,
+      "original_position" : 24,
+      "original_start_line" : null,
+      "path" : "src/bench/crypto_hash.cpp",
+      "position" : 24,
+      "pull_request_review_id" : 513482761,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-21T10:23:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509153295",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509153543"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509153543"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "`rng` is unused. Remove it.",
+      "commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "created_at" : "2020-10-21T10:05:37Z",
+      "diff_hunk" : "@@ -105,6 +106,70 @@ static void FastRandom_1bit(benchmark::Bench& bench)\n     });\n }\n \n+static void MuHash(benchmark::Bench& bench)\n+{\n+    FastRandomContext rng(true);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509153543",
+      "id" : 509153543,
+      "line" : 111,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwOTE1MzU0Mw==",
+      "original_commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "original_line" : 111,
+      "original_position" : 14,
+      "original_start_line" : null,
+      "path" : "src/bench/crypto_hash.cpp",
+      "position" : 14,
+      "pull_request_review_id" : 513482761,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-10-21T10:23:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509153543",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509155449"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509155449"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I don't think this is needed. There's nothing wrong with dividing by elements that aren't in the muhash.",
+      "commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "created_at" : "2020-10-21T10:08:51Z",
+      "diff_hunk" : "@@ -105,6 +106,70 @@ static void FastRandom_1bit(benchmark::Bench& bench)\n     });\n }\n \n+static void MuHash(benchmark::Bench& bench)\n+{\n+    FastRandomContext rng(true);\n+    MuHash3072 acc;\n+    unsigned char key[32] = {0};\n+    int i = 0;\n+    bench.run([&] {\n+        key[0] = ++i;\n+        acc *= MuHash3072(key);\n+    });\n+}\n+\n+static void MuHashAdd(benchmark::Bench& bench)\n+{\n+    FastRandomContext rng(true);\n+    MuHash3072 acc;\n+    unsigned char key[32];\n+    std::vector<unsigned char> randkey = rng.randbytes(32);\n+    for (size_t i = 0; i < randkey.size(); ++i) {\n+        key[i] = randkey[i];\n+    }\n+\n+    MuHash3072 muhash = MuHash3072(key);\n+    bench.run([&] {\n+        acc *= muhash;\n+    });\n+}\n+\n+static void MuHashDiv(benchmark::Bench& bench)\n+{\n+    FastRandomContext rng(true);\n+    MuHash3072 acc;\n+    unsigned char key[32];\n+    std::vector<unsigned char> randkey = rng.randbytes(32);\n+    for (size_t i = 0; i < randkey.size(); ++i) {\n+        key[i] = randkey[i];\n+    }\n+\n+    MuHash3072 muhash = MuHash3072(key);\n+\n+    for (size_t i = 0; i < bench.epochIterations(); ++i) {\n+        acc *= muhash;\n+    }\n+",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509155449",
+      "id" : 509155449,
+      "line" : 152,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwOTE1NTQ0OQ==",
+      "original_commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "original_line" : 152,
+      "original_position" : 55,
+      "original_start_line" : 149,
+      "path" : "src/bench/crypto_hash.cpp",
+      "position" : 55,
+      "pull_request_review_id" : 513482761,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055",
+      "side" : "RIGHT",
+      "start_line" : 149,
+      "start_side" : "RIGHT",
+      "updated_at" : "2020-10-21T10:23:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509155449",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509161865"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509161865"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "The temporary array and vector variables are unnecessary here. The MuHash constructor takes a span, so we can just call it directly with the rvalue vector from randbytes().\r\n\r\n```suggestion\r\n    MuHash3072 acc;\r\n    FastRandomContext rng(true);\r\n    MuHash3072 muhash{rng.randbytes(32)};\r\n\r\n```\r\n\r\nSame in the other functions below.\r\n",
+      "commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "created_at" : "2020-10-21T10:19:32Z",
+      "diff_hunk" : "@@ -105,6 +106,70 @@ static void FastRandom_1bit(benchmark::Bench& bench)\n     });\n }\n \n+static void MuHash(benchmark::Bench& bench)\n+{\n+    FastRandomContext rng(true);\n+    MuHash3072 acc;\n+    unsigned char key[32] = {0};\n+    int i = 0;\n+    bench.run([&] {\n+        key[0] = ++i;\n+        acc *= MuHash3072(key);\n+    });\n+}\n+\n+static void MuHashAdd(benchmark::Bench& bench)\n+{\n+    FastRandomContext rng(true);\n+    MuHash3072 acc;\n+    unsigned char key[32];\n+    std::vector<unsigned char> randkey = rng.randbytes(32);\n+    for (size_t i = 0; i < randkey.size(); ++i) {\n+        key[i] = randkey[i];\n+    }\n+\n+    MuHash3072 muhash = MuHash3072(key);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509161865",
+      "id" : 509161865,
+      "line" : 131,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwOTE2MTg2NQ==",
+      "original_commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "original_line" : 131,
+      "original_position" : 34,
+      "original_start_line" : 123,
+      "path" : "src/bench/crypto_hash.cpp",
+      "position" : 34,
+      "pull_request_review_id" : 513482761,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055",
+      "side" : "RIGHT",
+      "start_line" : 123,
+      "start_side" : "RIGHT",
+      "updated_at" : "2020-10-21T10:23:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509161865",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509163922"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509163922"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Again, this isn't actually overflowing the data type in MuHash. It's simply reducing a number greater than the group order into its least residue. Consider renaming this function/class.",
+      "commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "created_at" : "2020-10-21T10:23:00Z",
+      "diff_hunk" : "@@ -857,4 +859,88 @@ BOOST_AUTO_TEST_CASE(sha3_256_tests)\n     TestSHA3_256(\"72c57c359e10684d0517e46653a02d18d29eff803eb009e4d5eb9e95add9ad1a4ac1f38a70296f3a369a16985ca3c957de2084cdc9bdd8994eb59b8815e0debad4ec1f001feac089820db8becdaf896aaf95721e8674e5d476b43bd2b873a7d135cd685f545b438210f9319e4dcd55986c85303c1ddf18dc746fe63a409df0a998ed376eb683e16c09e6e9018504152b3e7628ef350659fb716e058a5263a18823d2f2f6ee6a8091945a48ae1c5cb1694cf2c1fe76ef9177953afe8899cfa2b7fe0603bfa3180937dadfb66fbbdd119bbf8063338aa4a699075a3bfdbae8db7e5211d0917e9665a702fc9b0a0a901d08bea97654162d82a9f05622b060b634244779c33427eb7a29353a5f48b07cbefa72f3622ac5900bef77b71d6b314296f304c8426f451f32049b1f6af156a9dab702e8907d3cd72bb2c50493f4d593e731b285b70c803b74825b3524cda3205a8897106615260ac93c01c5ec14f5b11127783989d1824527e99e04f6a340e827b559f24db9292fcdd354838f9339a5fa1d7f6b2087f04835828b13463dd40927866f16ae33ed501ec0e6c4e63948768c5aeea3e4f6754985954bea7d61088c44430204ef491b74a64bde1358cecb2cad28ee6a3de5b752ff6a051104d88478653339457ac45ba44cbb65f54d1969d047cda746931d5e6a8b48e211416aefd5729f3d60b56b54e7f85aa2f42de3cb69419240c24e67139a11790a709edef2ac52cf35dd0a08af45926ebe9761f498ff83bfe263d6897ee97943a4b982fe3404ef0b4a45e06113c60340e0664f14799bf59cb4b3934b465fabefd87155905ee5309ba41e9e402973311831ea600b16437f71df39ee77130490c4d0227e5d1757fdc66af3ae6b9953053ed9aafca0160209858a7d4dd38fe10e0cb153672d08633ed6c54977aa0a6e67f9ff2f8c9d22dd7b21de08192960fd0e0da68d77c8d810db11dcaa61c725cd4092cbff76c8e1debd8d0361bb3f2e607911d45716f53067bdc0d89dd4889177765166a424e9fc0cb711201099dda213355e6639ac7eb86eca2ae0ab38b7f674f37ef8a6fcca1a6f52f55d9e1dcd631d2c3c82bba129172feb991d5af51afecd9d61a88b6832e4107480e392aed61a8644f551665ebff6b20953b635737a4f895e429fddcfe801f606fbda74b3bf6f5767d0fac14907fcfd0aa1d4c11b9e91b01d68052399b51a29f1ae6acd965109977c14a555cbcbd21ad8cb9f8853506d4bc21c01e62d61d7b21be1b923be54914e6b0a7ca84dd11f1159193e1184568a6134a6bbadf5b4df986edcf2019390ae841cfaa44435e28ce877d3dae4177992fa5d4e5c005876dbe3d1e63bec7dcc0942762b48b1ecc6c1a918409a8a72812a1e245c0c67be6e729c2b49bc6ee4d24a8f63e78e75db45655c26a9a78aff36fcd67117f26b8f654dca664b9f0e30681874cb749e1a692720078856286c2560b0292cc837933423147569350955c9571bf8941ba128fd339cb4268f46b94bc6ee203eb7026813706ea51c4f24c91866fc23a724bf2501327e6ae89c29f8db315dc28d2c7c719514036367e018f4835f63fdecd71f9bdced7132b6c4f8b13c69a517026fcd3622d67cb632320d5e7308f78f4b7cea11f6291b137851dc6cd6366f2785c71c3f237f81a7658b2a8d512b61e0ad5a4710b7b124151689fcb2116063fbff7e9115fed7b93de834970b838e49f8f8ba5f1f874c354078b5810a55ae289a56da563f1da6cd80a3757d6073fa55e016e45ac6cec1f69d871c92fd0ae9670c74249045e6b464787f9504128736309fed205f8df4d90e332908581298d9c75a3fa36ab0c3c9272e62de53ab290c803d67b696fd615c260a47bffad16746f18ba1a10a061bacbea9369693b3c042eec36bed289d7d12e52bca8aa1c2dff88ca7816498d25626d0f1e106ebb0b4a12138e00f3df5b1c2f49d98b1756e69b641b7c6353d99dbff050f4d76842c6cf1c2a4b062fc8e6336fa689b7c9d5c6b4ab8c15a5c20e514ff070a602d85ae52fa7810c22f8eeffd34a095b93342144f7a98d024216b3d68ed7bea047517bfcd83ec83febd1ba0e5858e2bdc1d8b1f7b0f89e90ccc432a3f930cb8209462e64556c5054c56ca2a85f16b32eb83a10459d13516faa4d23302b7607b9bd38dab2239ac9e9440c314433fdfb3ceadab4b4f87415ed6f240e017221f3b5f7ac196cdf54957bec42fe6893994b46de3d27dc7fb58ca88feb5b9e79cf20053d12530ac524337b22a3629bea52f40b06d3e2128f32060f9105847daed81d35f20e2002817434659baff64494c5b5c7f9216bfda38412a0f70511159dc73bb6bae1f8eaa0ef08d99bcb31f94f6be12c29c83df45926430b366c99fca3270c15fc4056398fdf3135b7779e3066a006961d1ac0ad1c83179ce39e87a96b722ec23aabc065badf3e188347a360772ca6a447abac7e6a44f0d4632d52926332e44a0a86bff5ce699fd063bdda3ffd4c41b53ded49fecec67f40599b934e16e3fd1bc063ad7026f8d71bfd4cbaf56599586774723194b692036f1b6bb242e2ffb9c600b5215b412764599476ce475c9e5b396fbcebd6be323dcf4d0048077400aac7500db41dc95fc7f7edbe7c9c2ec5ea89943fe13b42217eef530bbd023671509e12dfce4e1c1c82955d965e6a68aa66f6967dba48feda572db1f099d9a6dc4bc8edade852b5e824a06890dc48a6a6510ecaf8cf7620d757290e3166d431abecc624fa9ac2234d2eb783308ead45544910c633a94964b2ef5fbc409cb8835ac4147d384e12e0a5e13951f7de0ee13eafcb0ca0c04946d7804040c0a3cd088352424b097adb7aad1ca4495952f3e6c0158c02d2bcec33bfda69301434a84d9027ce02c0b9725dad118\", \"d894b86261436362e64241e61f6b3e6589daf64dc641f60570c4c0bf3b1f2ca3\");\n }\n \n+static MuHash3072 FromInt(unsigned char i) {\n+    unsigned char tmp[32] = {i, 0};\n+    return MuHash3072(tmp);\n+}\n+\n+BOOST_AUTO_TEST_CASE(muhash_tests)\n+{\n+    unsigned char out[384];\n+\n+    for (int iter = 0; iter < 10; ++iter) {\n+        unsigned char res[384];\n+        int table[4];\n+        for (int i = 0; i < 4; ++i) {\n+            table[i] = g_insecure_rand_ctx.randbits(3);\n+        }\n+        for (int order = 0; order < 4; ++order) {\n+            MuHash3072 acc;\n+            for (int i = 0; i < 4; ++i) {\n+                int t = table[i ^ order];\n+                if (t & 4) {\n+                    acc /= FromInt(t & 3);\n+                } else {\n+                    acc *= FromInt(t & 3);\n+                }\n+            }\n+            acc.Finalize(out);\n+            if (order == 0) {\n+                memcpy(res, out, 384);\n+            } else {\n+                BOOST_CHECK(memcmp(res, out, 384) == 0);\n+            }\n+        }\n+\n+        MuHash3072 x = FromInt(g_insecure_rand_ctx.randbits(4)); // x=X\n+        MuHash3072 y = FromInt(g_insecure_rand_ctx.randbits(4)); // x=X, y=Y\n+        MuHash3072 z; // x=X, y=Y, z=1\n+        z *= x; // x=X, y=Y, z=X\n+        z *= y; // x=X, y=Y, z=X*Y\n+        y *= x; // x=X, y=Y*X, z=X*Y\n+        z /= y; // x=X, y=Y*X, z=1\n+        z.Finalize(out);\n+        for (int i = 0; i < 384; ++i) {\n+            BOOST_CHECK_EQUAL(out[i], i == 0);\n+        }\n+    }\n+\n+    MuHash3072 acc = FromInt(0);\n+    acc *= FromInt(1);\n+    acc /= FromInt(2);\n+    acc.Finalize(out);\n+    uint256 x = (CHashWriter(SER_DISK, 0) << out).GetSHA256();\n+    BOOST_CHECK(x == uint256S(\"a44e16d5e34d259b349af21c06e65d653915d2e208e4e03f389af750dc0bfdc3\"));\n+\n+    // Test MuHash3072 serialization\n+    MuHash3072 serchk = FromInt(1); serchk *= FromInt(2);\n+    std::string ser_exp = \"ad5d5a19c789b21f95f9c2a09f264f8aab4ef29ca30824f7330a8c3f4c61c25a6035bc27476ade3a38f2f2bc576bfbeabdf69641a91b99631ef904d37103eff744129842b1fd83158db6466ab4b752278f04add175a7a41ab8ea1305f66855068730dd3baf1ad29d6e13c7ba3350864a8f96e2e9e5c1ca65e11ab3e361184213a3fb395ac5c86efe3997c671cc5d46df3e1b2f00bf09120ae252a0e985b2452be64d5f626c0bc03747355d91ff2aa31ea4087797b91c80af5003d4b3a2ba5c34cd4a8785712897cd2331bac1b749e4fe9d17a5bb68395e2571d1759dceb5609dfae38ec6186e8c2eb22ffeb9bb8330083ee15d4b816e117e6bc1399c707b3e9d01ae74d2f589d6eb8e9e58c572088476e0444e3dbc05c95867acdb7c18be551e0eb2189d3c39dd86dbc844dc70ac33f9328be9e3b0d792bb359498f5fb385e2d8a8e3a5cde7e3e4e8ba123d3e1eda0b859d3a56e548dd6d23a03ce82e01493f96a67abd3109f9f4315c966f8cba311d71899c04a7fd9618ed028580ffcd21263\";\n+    CDataStream ss_chk(SER_DISK, PROTOCOL_VERSION);\n+    ss_chk << serchk;\n+    BOOST_CHECK_EQUAL(ser_exp, HexStr(ss_chk.str()));\n+\n+    // Test MuHash3072 deserialization\n+    MuHash3072 deserchk;\n+    ss_chk >> deserchk;\n+    unsigned char out2[384];\n+    serchk.Finalize(out);\n+    deserchk.Finalize(out2);\n+    BOOST_CHECK_EQUAL(HexStr(out), HexStr(out2));\n+\n+    // Test MuHash3072 overflow\n+    class MuHashOverflow : public MuHash3072 {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19055#discussion_r509163922",
+      "id" : 509163922,
+      "line" : 931,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUwOTE2MzkyMg==",
+      "original_commit_id" : "96a8d80f7ba43fd608984543d6bc6905f696529f",
+      "original_line" : 931,
+      "original_position" : 83,
+      "original_start_line" : 930,
+      "path" : "src/test/crypto_tests.cpp",
+      "position" : 83,
+      "pull_request_review_id" : 513482761,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19055",
+      "side" : "RIGHT",
+      "start_line" : 930,
+      "start_side" : "RIGHT",
+      "updated_at" : "2020-10-21T10:23:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/509163922",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
    }
 ]
