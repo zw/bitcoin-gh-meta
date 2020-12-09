@@ -2237,5 +2237,172 @@
          "type" : "User",
          "url" : "https://api.github.com/users/MarcoFalke"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20477#discussion_r539574518"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20477"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/539574518"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I'm a HUGE supporter of the early return pattern (AKA bouncer pattern) that you're using here.  However, maybe this alternative is a little easier to parse.\r\n\r\n(Maybe not in this annoyingly narrow GitHub window though...)\r\n\r\n```suggestion\r\n            if (number_of_nodes < GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE) {\r\n            \t// Verify correctness of GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW\r\n            \tif (number_of_nodes <= GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW) {\r\n            \t\t// At this number of nodes, we're guaranteed to never evict any of them\r\n                \tBOOST_CHECK(!SelectNodeToEvict(GetRandomNodeEvictionCandidates(number_of_nodes, random_context)));\r\n                }\r\n            \t// There is no need to run the sub-tests for fewer than the number of nodes guaranteed for eviction\r\n            \t// ^ FWIW I don't agree with this, see below\r\n            \tcontinue;\r\n            }\r\n            // number_of_nodes >= GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE\r\n            // Verify correctness of GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE\r\n            BOOST_CHECK(SelectNodeToEvict(GetRandomNodeEvictionCandidates(number_of_nodes, random_context)));  \r\n```\r\n\r\nHonestly though, I think it's just the similarity between the names of `GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE` and `GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW` that is making this so difficult.  Maybe (maybe...) `EVICTION_THRESHOLD` and `NON_EVICTION_THRESHOLD` and put the fact that it's inclusive on both ends in the comments?  Or follow the half-open convention of \"lower bounds are inclusive, upper bounds are exclusive\". Popular in Python, not sure about C++.\r\n\r\nAll of this said, why have the early return at all?  All of the tests below check for non-eviction.  Can't we run them regardless of the number of nodes?\r\n\r\n(Feel free to reword my code comments)",
+      "commit_id" : "cadd93f35d1bbf662e348a0dee172cdf4af6a903",
+      "created_at" : "2020-12-09T19:12:08Z",
+      "diff_hunk" : "@@ -771,4 +773,128 @@ BOOST_AUTO_TEST_CASE(PoissonNextSend)\n     g_mock_deterministic_tests = false;\n }\n \n+std::vector<NodeEvictionCandidate> GetRandomNodeEvictionCandidates(const int n_candidates, FastRandomContext& random_context)\n+{\n+    std::vector<NodeEvictionCandidate> candidates;\n+    for (int id = 0; id < n_candidates; ++id) {\n+        candidates.push_back({/* id */ id,\n+                              /* nTimeConnected */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* nMinPingUsecTime */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* nLastBlockTime */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* nLastTXTime */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* fRelevantServices */ random_context.randbool(),\n+                              /* fRelayTxes */ random_context.randbool(),\n+                              /* fBloomFilter */ random_context.randbool(),\n+                              /* nKeyedNetGroup */ random_context.randrange(100),\n+                              /* prefer_evict */ random_context.randbool(),\n+                              /* m_is_local */ random_context.randbool()});\n+    }\n+    return candidates;\n+}\n+\n+// Returns true if any of the node ids in node_ids are selected for eviction.\n+bool IsEvicted(std::vector<NodeEvictionCandidate> candidates, const std::vector<NodeId> node_ids, FastRandomContext& random_context)\n+{\n+    Shuffle(candidates.begin(), candidates.end(), random_context);\n+    const Optional<NodeId> evicted_node_id = SelectNodeToEvict(std::move(candidates));\n+    if (!evicted_node_id) {\n+        return false;\n+    }\n+    return std::find(node_ids.begin(), node_ids.end(), *evicted_node_id) != node_ids.end();\n+}\n+\n+// Create number_of_nodes random nodes, apply setup function candidate_setup_fn,\n+// apply eviction logic and then return true if any of the node ids in node_ids\n+// are selected for eviction.\n+bool IsEvicted(const int number_of_nodes, std::function<void(NodeEvictionCandidate&)> candidate_setup_fn, const std::vector<NodeId> node_ids, FastRandomContext& random_context)\n+{\n+    std::vector<NodeEvictionCandidate> candidates = GetRandomNodeEvictionCandidates(number_of_nodes, random_context);\n+    for (size_t i = 0; i < candidates.size(); ++i) {\n+        candidate_setup_fn(candidates[i]);\n+    }\n+    return IsEvicted(candidates, node_ids, random_context);\n+}\n+\n+namespace {\n+// The number of eviction candidates at (or above) which we are guaranteed that\n+// the current eviction logic will find a node to evict no matter what eviction\n+// candidates it is given. This constant may need to be adjusted if the eviction\n+// logic changes.\n+constexpr int GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE{29};\n+\n+// The number of eviction candidates at (or below) which we are guaranteed that\n+// the current eviction logic won't find a node to evict no matter what eviction\n+// candidates it is given. This constant may need to be adjusted if the eviction\n+// logic changes.\n+constexpr int GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW{20};\n+\n+constexpr int NODE_EVICTION_TEST_ROUNDS{10};\n+\n+constexpr int NODE_EVICTION_TEST_UP_TO_N_NODES{200};\n+} // namespace\n+\n+static_assert(GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE > GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW);\n+\n+BOOST_AUTO_TEST_CASE(node_eviction_test)\n+{\n+    FastRandomContext random_context{true};\n+\n+    for (int i = 0; i < NODE_EVICTION_TEST_ROUNDS; ++i) {\n+        for (int number_of_nodes = 0; number_of_nodes < NODE_EVICTION_TEST_UP_TO_N_NODES; ++number_of_nodes) {\n+            // Verify correctness of GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE\n+            // and GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW.\n+            if (number_of_nodes <= GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW) {\n+                BOOST_CHECK(!SelectNodeToEvict(GetRandomNodeEvictionCandidates(number_of_nodes, random_context)));\n+            }\n+            if (number_of_nodes >= GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE) {\n+                BOOST_CHECK(SelectNodeToEvict(GetRandomNodeEvictionCandidates(number_of_nodes, random_context)));\n+            } else {\n+                continue;\n+            }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20477#discussion_r539574518",
+      "id" : 539574518,
+      "line" : 853,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUzOTU3NDUxOA==",
+      "original_commit_id" : "cadd93f35d1bbf662e348a0dee172cdf4af6a903",
+      "original_line" : 853,
+      "original_position" : 97,
+      "original_start_line" : 844,
+      "path" : "src/test/net_tests.cpp",
+      "position" : 97,
+      "pull_request_review_id" : 548523190,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20477",
+      "side" : "RIGHT",
+      "start_line" : 844,
+      "start_side" : "RIGHT",
+      "updated_at" : "2020-12-09T19:27:14Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/539574518",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/5553787?v=4",
+         "events_url" : "https://api.github.com/users/troygiorshev/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/troygiorshev/followers",
+         "following_url" : "https://api.github.com/users/troygiorshev/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/troygiorshev/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/troygiorshev",
+         "id" : 5553787,
+         "login" : "troygiorshev",
+         "node_id" : "MDQ6VXNlcjU1NTM3ODc=",
+         "organizations_url" : "https://api.github.com/users/troygiorshev/orgs",
+         "received_events_url" : "https://api.github.com/users/troygiorshev/received_events",
+         "repos_url" : "https://api.github.com/users/troygiorshev/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/troygiorshev/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/troygiorshev/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/troygiorshev"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20477#discussion_r539575650"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20477"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/539575650"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I've proposed an alternative that might be easier to parse.\r\nhttps://github.com/bitcoin/bitcoin/pull/20477/files#r539574518",
+      "commit_id" : "cadd93f35d1bbf662e348a0dee172cdf4af6a903",
+      "created_at" : "2020-12-09T19:13:56Z",
+      "diff_hunk" : "@@ -771,4 +773,128 @@ BOOST_AUTO_TEST_CASE(PoissonNextSend)\n     g_mock_deterministic_tests = false;\n }\n \n+std::vector<NodeEvictionCandidate> GetRandomNodeEvictionCandidates(const int n_candidates, FastRandomContext& random_context)\n+{\n+    std::vector<NodeEvictionCandidate> candidates;\n+    for (int id = 0; id < n_candidates; ++id) {\n+        candidates.push_back({/* id */ id,\n+                              /* nTimeConnected */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* nMinPingUsecTime */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* nLastBlockTime */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* nLastTXTime */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* fRelevantServices */ random_context.randbool(),\n+                              /* fRelayTxes */ random_context.randbool(),\n+                              /* fBloomFilter */ random_context.randbool(),\n+                              /* nKeyedNetGroup */ random_context.randrange(100),\n+                              /* prefer_evict */ random_context.randbool(),\n+                              /* m_is_local */ random_context.randbool()});\n+    }\n+    return candidates;\n+}\n+\n+// Returns true if any of the node ids in node_ids are selected for eviction.\n+bool IsEvicted(std::vector<NodeEvictionCandidate> candidates, const std::vector<NodeId> node_ids, FastRandomContext& random_context)\n+{\n+    Shuffle(candidates.begin(), candidates.end(), random_context);\n+    const Optional<NodeId> evicted_node_id = SelectNodeToEvict(std::move(candidates));\n+    if (!evicted_node_id) {\n+        return false;\n+    }\n+    return std::find(node_ids.begin(), node_ids.end(), *evicted_node_id) != node_ids.end();\n+}\n+\n+// Create number_of_nodes random nodes, apply setup function candidate_setup_fn,\n+// apply eviction logic and then return true if any of the node ids in node_ids\n+// are selected for eviction.\n+bool IsEvicted(const int number_of_nodes, std::function<void(NodeEvictionCandidate&)> candidate_setup_fn, const std::vector<NodeId> node_ids, FastRandomContext& random_context)\n+{\n+    std::vector<NodeEvictionCandidate> candidates = GetRandomNodeEvictionCandidates(number_of_nodes, random_context);\n+    for (size_t i = 0; i < candidates.size(); ++i) {\n+        candidate_setup_fn(candidates[i]);\n+    }\n+    return IsEvicted(candidates, node_ids, random_context);\n+}\n+\n+namespace {\n+// The number of eviction candidates at (or above) which we are guaranteed that\n+// the current eviction logic will find a node to evict no matter what eviction\n+// candidates it is given. This constant may need to be adjusted if the eviction\n+// logic changes.\n+constexpr int GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE{29};\n+\n+// The number of eviction candidates at (or below) which we are guaranteed that\n+// the current eviction logic won't find a node to evict no matter what eviction\n+// candidates it is given. This constant may need to be adjusted if the eviction\n+// logic changes.\n+constexpr int GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW{20};\n+\n+constexpr int NODE_EVICTION_TEST_ROUNDS{10};\n+\n+constexpr int NODE_EVICTION_TEST_UP_TO_N_NODES{200};\n+} // namespace\n+\n+static_assert(GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE > GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW);\n+\n+BOOST_AUTO_TEST_CASE(node_eviction_test)\n+{\n+    FastRandomContext random_context{true};\n+\n+    for (int i = 0; i < NODE_EVICTION_TEST_ROUNDS; ++i) {\n+        for (int number_of_nodes = 0; number_of_nodes < NODE_EVICTION_TEST_UP_TO_N_NODES; ++number_of_nodes) {\n+            // Verify correctness of GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE\n+            // and GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW.\n+            if (number_of_nodes <= GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW) {\n+                BOOST_CHECK(!SelectNodeToEvict(GetRandomNodeEvictionCandidates(number_of_nodes, random_context)));\n+            }\n+            if (number_of_nodes >= GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE) {\n+                BOOST_CHECK(SelectNodeToEvict(GetRandomNodeEvictionCandidates(number_of_nodes, random_context)));\n+            } else {\n+                continue;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20477#discussion_r539575650",
+      "id" : 539575650,
+      "in_reply_to_id" : 539501185,
+      "line" : 852,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUzOTU3NTY1MA==",
+      "original_commit_id" : "cadd93f35d1bbf662e348a0dee172cdf4af6a903",
+      "original_line" : 852,
+      "original_position" : 96,
+      "original_start_line" : null,
+      "path" : "src/test/net_tests.cpp",
+      "position" : 96,
+      "pull_request_review_id" : 548524518,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20477",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-12-09T19:13:57Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/539575650",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/5553787?v=4",
+         "events_url" : "https://api.github.com/users/troygiorshev/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/troygiorshev/followers",
+         "following_url" : "https://api.github.com/users/troygiorshev/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/troygiorshev/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/troygiorshev",
+         "id" : 5553787,
+         "login" : "troygiorshev",
+         "node_id" : "MDQ6VXNlcjU1NTM3ODc=",
+         "organizations_url" : "https://api.github.com/users/troygiorshev/orgs",
+         "received_events_url" : "https://api.github.com/users/troygiorshev/received_events",
+         "repos_url" : "https://api.github.com/users/troygiorshev/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/troygiorshev/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/troygiorshev/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/troygiorshev"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20477#discussion_r539588477"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20477"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/539588477"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "It's \"don't run the checks if the number of nodes is less than the max\".  But, I'm not sure why we would do this...",
+      "commit_id" : "cadd93f35d1bbf662e348a0dee172cdf4af6a903",
+      "created_at" : "2020-12-09T19:33:27Z",
+      "diff_hunk" : "@@ -771,4 +773,128 @@ BOOST_AUTO_TEST_CASE(PoissonNextSend)\n     g_mock_deterministic_tests = false;\n }\n \n+std::vector<NodeEvictionCandidate> GetRandomNodeEvictionCandidates(const int n_candidates, FastRandomContext& random_context)\n+{\n+    std::vector<NodeEvictionCandidate> candidates;\n+    for (int id = 0; id < n_candidates; ++id) {\n+        candidates.push_back({/* id */ id,\n+                              /* nTimeConnected */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* nMinPingUsecTime */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* nLastBlockTime */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* nLastTXTime */ static_cast<int64_t>(random_context.randrange(100)),\n+                              /* fRelevantServices */ random_context.randbool(),\n+                              /* fRelayTxes */ random_context.randbool(),\n+                              /* fBloomFilter */ random_context.randbool(),\n+                              /* nKeyedNetGroup */ random_context.randrange(100),\n+                              /* prefer_evict */ random_context.randbool(),\n+                              /* m_is_local */ random_context.randbool()});\n+    }\n+    return candidates;\n+}\n+\n+// Returns true if any of the node ids in node_ids are selected for eviction.\n+bool IsEvicted(std::vector<NodeEvictionCandidate> candidates, const std::vector<NodeId> node_ids, FastRandomContext& random_context)\n+{\n+    Shuffle(candidates.begin(), candidates.end(), random_context);\n+    const Optional<NodeId> evicted_node_id = SelectNodeToEvict(std::move(candidates));\n+    if (!evicted_node_id) {\n+        return false;\n+    }\n+    return std::find(node_ids.begin(), node_ids.end(), *evicted_node_id) != node_ids.end();\n+}\n+\n+// Create number_of_nodes random nodes, apply setup function candidate_setup_fn,\n+// apply eviction logic and then return true if any of the node ids in node_ids\n+// are selected for eviction.\n+bool IsEvicted(const int number_of_nodes, std::function<void(NodeEvictionCandidate&)> candidate_setup_fn, const std::vector<NodeId> node_ids, FastRandomContext& random_context)\n+{\n+    std::vector<NodeEvictionCandidate> candidates = GetRandomNodeEvictionCandidates(number_of_nodes, random_context);\n+    for (size_t i = 0; i < candidates.size(); ++i) {\n+        candidate_setup_fn(candidates[i]);\n+    }\n+    return IsEvicted(candidates, node_ids, random_context);\n+}\n+\n+namespace {\n+// The number of eviction candidates at (or above) which we are guaranteed that\n+// the current eviction logic will find a node to evict no matter what eviction\n+// candidates it is given. This constant may need to be adjusted if the eviction\n+// logic changes.\n+constexpr int GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE{29};\n+\n+// The number of eviction candidates at (or below) which we are guaranteed that\n+// the current eviction logic won't find a node to evict no matter what eviction\n+// candidates it is given. This constant may need to be adjusted if the eviction\n+// logic changes.\n+constexpr int GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW{20};\n+\n+constexpr int NODE_EVICTION_TEST_ROUNDS{10};\n+\n+constexpr int NODE_EVICTION_TEST_UP_TO_N_NODES{200};\n+} // namespace\n+\n+static_assert(GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE > GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW);\n+\n+BOOST_AUTO_TEST_CASE(node_eviction_test)\n+{\n+    FastRandomContext random_context{true};\n+\n+    for (int i = 0; i < NODE_EVICTION_TEST_ROUNDS; ++i) {\n+        for (int number_of_nodes = 0; number_of_nodes < NODE_EVICTION_TEST_UP_TO_N_NODES; ++number_of_nodes) {\n+            // Verify correctness of GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE\n+            // and GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW.\n+            if (number_of_nodes <= GUARANTEED_NON_EVICTION_AT_N_CANDIDATES_OR_BELOW) {\n+                BOOST_CHECK(!SelectNodeToEvict(GetRandomNodeEvictionCandidates(number_of_nodes, random_context)));\n+            }\n+            if (number_of_nodes >= GUARANTEED_EVICTION_AT_N_CANDIDATES_OR_ABOVE) {\n+                BOOST_CHECK(SelectNodeToEvict(GetRandomNodeEvictionCandidates(number_of_nodes, random_context)));\n+            } else {\n+                continue;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20477#discussion_r539588477",
+      "id" : 539588477,
+      "in_reply_to_id" : 539501185,
+      "line" : 852,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDUzOTU4ODQ3Nw==",
+      "original_commit_id" : "cadd93f35d1bbf662e348a0dee172cdf4af6a903",
+      "original_line" : 852,
+      "original_position" : 96,
+      "original_start_line" : null,
+      "path" : "src/test/net_tests.cpp",
+      "position" : 96,
+      "pull_request_review_id" : 548539426,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20477",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-12-09T19:33:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/539588477",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/5553787?v=4",
+         "events_url" : "https://api.github.com/users/troygiorshev/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/troygiorshev/followers",
+         "following_url" : "https://api.github.com/users/troygiorshev/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/troygiorshev/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/troygiorshev",
+         "id" : 5553787,
+         "login" : "troygiorshev",
+         "node_id" : "MDQ6VXNlcjU1NTM3ODc=",
+         "organizations_url" : "https://api.github.com/users/troygiorshev/orgs",
+         "received_events_url" : "https://api.github.com/users/troygiorshev/received_events",
+         "repos_url" : "https://api.github.com/users/troygiorshev/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/troygiorshev/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/troygiorshev/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/troygiorshev"
+      }
    }
 ]
