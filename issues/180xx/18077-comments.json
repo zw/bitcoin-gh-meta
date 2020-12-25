@@ -8687,5 +8687,61 @@
          "type" : "User",
          "url" : "https://api.github.com/users/vasild"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/18077#discussion_r548844201"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18077"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/548844201"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "> IMO the nat-pmp implementation overriding the desired external port is fine as long as we advertise the overriden one instead of the desired one (I guess we do).\r\n\r\nYes, we do:\r\nhttps://github.com/bitcoin/bitcoin/blob/890e59c64d62fd39778ede620a70fe6bc60d9993/src/mapport.cpp#L97-L102\r\n\r\n> I guess something like that happens with UPnP too if the desired port is already used?\r\n\r\nhttps://github.com/bitcoin/bitcoin/blob/890e59c64d62fd39778ede620a70fe6bc60d9993/src/mapport.cpp#L173-L186",
+      "commit_id" : "890e59c64d62fd39778ede620a70fe6bc60d9993",
+      "created_at" : "2020-12-25T09:37:09Z",
+      "diff_hunk" : "@@ -0,0 +1,342 @@\n+// Copyright (c) 2011-2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#if defined(HAVE_CONFIG_H)\n+#include <config/bitcoin-config.h>\n+#endif\n+\n+#include <mapport.h>\n+\n+#include <clientversion.h>\n+#include <logging.h>\n+#include <net.h>\n+#include <netaddress.h>\n+#include <netbase.h>\n+#include <threadinterrupt.h>\n+#include <util/system.h>\n+\n+#ifdef USE_NATPMP\n+#include <natpmp.h>\n+#ifdef WIN32\n+#include <winsock2.h>\n+#else\n+#include <netinet/in.h>\n+#endif // #ifdef WIN32\n+#endif // #ifdef USE_NATPMP\n+\n+#ifdef USE_UPNP\n+#include <miniupnpc/miniupnpc.h>\n+#include <miniupnpc/upnpcommands.h>\n+#include <miniupnpc/upnperrors.h>\n+// The minimum supported miniUPnPc API version is set to 10. This keeps compatibility\n+// with Ubuntu 16.04 LTS and Debian 8 libminiupnpc-dev packages.\n+static_assert(MINIUPNPC_API_VERSION >= 10, \"miniUPnPc API version >= 10 assumed\");\n+#endif // #ifdef USE_UPNP\n+\n+#include <atomic>\n+#include <cassert>\n+#include <chrono>\n+#include <functional>\n+#include <string>\n+#include <thread>\n+\n+#if defined(USE_NATPMP) || defined(USE_UPNP)\n+static CThreadInterrupt g_mapport_interrupt;\n+static std::thread g_mapport_thread;\n+static std::atomic_uint g_mapport_enabled_protos{MapPortProtoFlag::NONE};\n+static std::atomic<MapPortProtoFlag> g_mapport_current_proto{MapPortProtoFlag::NONE};\n+static constexpr auto PORT_MAPPING_REANNOUNCE_PERIOD = std::chrono::minutes(20);\n+static constexpr auto PORT_MAPPING_RETRY_PERIOD = std::chrono::minutes(5);\n+\n+#ifdef USE_NATPMP\n+static uint16_t g_mapport_external_port = 0;\n+static bool NatpmpInit(natpmp_t* natpmp)\n+{\n+    const int r_init = initnatpmp(natpmp, /* detect gateway automatically */ 0, /* forced gateway - NOT APPLIED*/ 0);\n+    if (r_init == 0) return true;\n+    LogPrintf(\"natpmp: initnatpmp() failed with %d error.\\n\", r_init);\n+    return false;\n+}\n+\n+static bool NatpmpDiscover(natpmp_t* natpmp, struct in_addr& external_ipv4_addr)\n+{\n+    const int r_send = sendpublicaddressrequest(natpmp);\n+    if (r_send == 2 /* OK */) {\n+        int r_read;\n+        natpmpresp_t response;\n+        do {\n+            r_read = readnatpmpresponseorretry(natpmp, &response);\n+        } while (r_read == NATPMP_TRYAGAIN);\n+\n+        if (r_read == 0) {\n+            external_ipv4_addr = response.pnu.publicaddress.addr;\n+            return true;\n+        } else if (r_read == NATPMP_ERR_NOGATEWAYSUPPORT) {\n+            LogPrintf(\"natpmp: The gateway does not support NAT-PMP.\\n\");\n+        } else {\n+            LogPrintf(\"natpmp: readnatpmpresponseorretry() for public address failed with %d error.\\n\", r_read);\n+        }\n+\n+    } else {\n+        LogPrintf(\"natpmp: sendpublicaddressrequest() failed with %d error.\\n\", r_send);\n+    }\n+\n+    return false;\n+}\n+\n+static bool NatpmpMapping(natpmp_t* natpmp, const struct in_addr& external_ipv4_addr, uint16_t private_port, bool& external_ip_discovered)\n+{\n+    const uint16_t suggested_external_port = g_mapport_external_port ? g_mapport_external_port : private_port;\n+    const int r_send = sendnewportmappingrequest(natpmp, NATPMP_PROTOCOL_TCP, private_port, suggested_external_port, 3600 /*seconds*/);\n+    if (r_send == 12 /* OK */) {\n+        int r_read;\n+        natpmpresp_t response;\n+        do {\n+            r_read = readnatpmpresponseorretry(natpmp, &response);\n+        } while (r_read == NATPMP_TRYAGAIN);\n+\n+        if (r_read == 0) {\n+            auto pm = response.pnu.newportmapping;\n+            if (private_port == pm.privateport && pm.lifetime > 0) {\n+                g_mapport_external_port = pm.mappedpublicport;\n+                const CService external{external_ipv4_addr, pm.mappedpublicport};\n+                if (!external_ip_discovered && fDiscover) {\n+                    AddLocal(external, LOCAL_MAPPED);\n+                    external_ip_discovered = true;\n+                }\n+\n+                LogPrintf(\"natpmp: Port mapping successful. External address = %s\\n\", external.ToString());\n+                return true;\n+            } else {\n+                LogPrintf(\"natpmp: Port mapping failed.\\n\");\n+            }\n+\n+        } else if (r_read == NATPMP_ERR_NOGATEWAYSUPPORT) {\n+            LogPrintf(\"natpmp: The gateway does not support NAT-PMP.\\n\");\n+        } else {\n+            LogPrintf(\"natpmp: readnatpmpresponseorretry() for port mapping failed with %d error.\\n\", r_read);\n+        }\n+\n+    } else {\n+        LogPrintf(\"natpmp: sendnewportmappingrequest() failed with %d error.\\n\", r_send);\n+    }\n+\n+    return false;\n+}\n+\n+static bool ProcessNatpmp()\n+{\n+    bool ret = false;\n+    natpmp_t natpmp;\n+    struct in_addr external_ipv4_addr;\n+    if (NatpmpInit(&natpmp) && NatpmpDiscover(&natpmp, external_ipv4_addr)) {\n+        bool external_ip_discovered = false;\n+        const uint16_t private_port = GetListenPort();\n+        do {\n+            ret = NatpmpMapping(&natpmp, external_ipv4_addr, private_port, external_ip_discovered);\n+        } while (ret && g_mapport_interrupt.sleep_for(PORT_MAPPING_REANNOUNCE_PERIOD));\n+        g_mapport_interrupt.reset();\n+\n+        const int r_send = sendnewportmappingrequest(&natpmp, NATPMP_PROTOCOL_TCP, private_port, g_mapport_external_port, /* remove a port mapping */ 0);\n+        g_mapport_external_port = 0;\n+        if (r_send == 12 /* OK */) {\n+            LogPrintf(\"natpmp: Port mapping removed successfully.\\n\");\n+        } else {\n+            LogPrintf(\"natpmp: sendnewportmappingrequest(0) failed with %d error.\\n\", r_send);\n+        }\n+    }\n+\n+    closenatpmp(&natpmp);\n+    return ret;\n+}\n+#endif // #ifdef USE_NATPMP\n+\n+#ifdef USE_UPNP\n+static bool ProcessUpnp()\n+{\n+    bool ret = false;\n+    std::string port = strprintf(\"%u\", GetListenPort());\n+    const char * multicastif = nullptr;\n+    const char * minissdpdpath = nullptr;\n+    struct UPNPDev * devlist = nullptr;\n+    char lanaddr[64];\n+\n+    int error = 0;\n+#if MINIUPNPC_API_VERSION < 14\n+    devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0, 0, &error);\n+#else\n+    devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0, 0, 2, &error);\n+#endif\n+\n+    struct UPNPUrls urls;\n+    struct IGDdatas data;\n+    int r;\n+\n+    r = UPNP_GetValidIGD(devlist, &urls, &data, lanaddr, sizeof(lanaddr));\n+    if (r == 1)\n+    {\n+        if (fDiscover) {\n+            char externalIPAddress[40];\n+            r = UPNP_GetExternalIPAddress(urls.controlURL, data.first.servicetype, externalIPAddress);\n+            if (r != UPNPCOMMAND_SUCCESS) {\n+                LogPrintf(\"UPnP: GetExternalIPAddress() returned %d\\n\", r);\n+            } else {\n+                if (externalIPAddress[0]) {\n+                    CNetAddr resolved;\n+                    if (LookupHost(externalIPAddress, resolved, false)) {\n+                        LogPrintf(\"UPnP: ExternalIPAddress = %s\\n\", resolved.ToString());\n+                        AddLocal(resolved, LOCAL_MAPPED);\n+                    }\n+                } else {\n+                    LogPrintf(\"UPnP: GetExternalIPAddress failed.\\n\");\n+                }\n+            }\n+        }\n+\n+        std::string strDesc = PACKAGE_NAME \" \" + FormatFullVersion();\n+\n+        do {\n+            r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr, strDesc.c_str(), \"TCP\", 0, \"0\");\n+\n+            if (r != UPNPCOMMAND_SUCCESS) {\n+                ret = false;\n+                LogPrintf(\"AddPortMapping(%s, %s, %s) failed with code %d (%s)\\n\", port, port, lanaddr, r, strupnperror(r));\n+                break;\n+            } else {\n+                ret = true;\n+                LogPrintf(\"UPnP Port Mapping successful.\\n\");\n+            }\n+        } while (g_mapport_interrupt.sleep_for(PORT_MAPPING_REANNOUNCE_PERIOD));\n+        g_mapport_interrupt.reset();\n+\n+        r = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype, port.c_str(), \"TCP\", 0);\n+        LogPrintf(\"UPNP_DeletePortMapping() returned: %d\\n\", r);\n+        freeUPNPDevlist(devlist); devlist = nullptr;\n+        FreeUPNPUrls(&urls);\n+    } else {\n+        LogPrintf(\"No valid UPnP IGDs found\\n\");\n+        freeUPNPDevlist(devlist); devlist = nullptr;\n+        if (r != 0)\n+            FreeUPNPUrls(&urls);\n+    }\n+\n+    return ret;\n+}\n+#endif // #ifdef USE_UPNP\n+\n+static void ThreadMapPort()\n+{\n+    bool ok;\n+    do {\n+        ok = false;\n+\n+#ifdef USE_UPNP\n+        // High priority protocol.\n+        if (g_mapport_enabled_protos & MapPortProtoFlag::UPNP) {\n+            g_mapport_current_proto = MapPortProtoFlag::UPNP;\n+            ok = ProcessUpnp();\n+            if (ok) continue;\n+        }\n+#endif // #ifdef USE_UPNP\n+\n+#ifdef USE_NATPMP\n+        // Low priority protocol.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/18077#discussion_r548844201",
+      "id" : 548844201,
+      "in_reply_to_id" : 545078633,
+      "line" : 236,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU0ODg0NDIwMQ==",
+      "original_commit_id" : "93ff21a929ba3036d6cd5d822f300cf036ff939f",
+      "original_line" : 236,
+      "original_position" : 244,
+      "original_start_line" : null,
+      "path" : "src/mapport.cpp",
+      "position" : 236,
+      "pull_request_review_id" : 558794397,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/18077",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2020-12-25T09:37:09Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/548844201",
+      "user" : {
+         "avatar_url" : "https://avatars1.githubusercontent.com/u/32963518?v=4",
+         "events_url" : "https://api.github.com/users/hebasto/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/hebasto/followers",
+         "following_url" : "https://api.github.com/users/hebasto/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/hebasto/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/hebasto",
+         "id" : 32963518,
+         "login" : "hebasto",
+         "node_id" : "MDQ6VXNlcjMyOTYzNTE4",
+         "organizations_url" : "https://api.github.com/users/hebasto/orgs",
+         "received_events_url" : "https://api.github.com/users/hebasto/received_events",
+         "repos_url" : "https://api.github.com/users/hebasto/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/hebasto/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/hebasto/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/hebasto"
+      }
    }
 ]
