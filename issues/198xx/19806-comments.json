@@ -9116,5 +9116,171 @@
          "type" : "User",
          "url" : "https://api.github.com/users/fjahr"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19806#discussion_r554544030"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19806"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/554544030"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Remove use of `Optional` wrapper.",
+      "commit_id" : "a56b71054f9ba4f13cea9938826032f9359a39d4",
+      "created_at" : "2021-01-10T10:10:42Z",
+      "diff_hunk" : "@@ -5183,6 +5185,294 @@ CChainState& ChainstateManager::InitializeChainstate(CTxMemPool& mempool, const\n     return *to_modify;\n }\n \n+std::optional<std::reference_wrapper<const AssumeutxoData>> ExpectedAssumeutxo(\n+    const int height, const CChainParams& chainparams)\n+{\n+    const MapAssumeutxo& valid_assumeutxos_map = chainparams.Assumeutxo();\n+    const auto assumeutxo_found = valid_assumeutxos_map.find(height);\n+\n+    if (assumeutxo_found != valid_assumeutxos_map.end()) {\n+        return std::ref(assumeutxo_found->second);\n+    }\n+    return std::nullopt;\n+}\n+\n+bool ChainstateManager::ActivateSnapshot(\n+        CAutoFile& coins_file,\n+        const SnapshotMetadata& metadata,\n+        bool in_memory)\n+{\n+    uint256 base_blockhash = metadata.m_base_blockhash;\n+\n+    if (this->SnapshotBlockhash()) {\n+        LogPrintf(\"[snapshot] can't activate a snapshot-based chainstate more than once\\n\");\n+        return false;\n+    }\n+\n+    int64_t current_coinsdb_cache_size{0};\n+    int64_t current_coinstip_cache_size{0};\n+\n+    // Cache percentages to allocate to each chainstate.\n+    //\n+    // These particular percentages don't matter so much since they will only be\n+    // relevant during snapshot activation; caches are rebalanced at the conclusion of\n+    // this function. We want to give (essentially) all available cache capacity to the\n+    // snapshot to aid the bulk load later in this function.\n+    static constexpr double IBD_CACHE_PERC = 0.01;\n+    static constexpr double SNAPSHOT_CACHE_PERC = 0.99;\n+\n+    {\n+        LOCK(::cs_main);\n+        // Resize the coins caches to ensure we're not exceeding memory limits.\n+        //\n+        // Allocate the majority of the cache to the incoming snapshot chainstate, since\n+        // (optimistically) getting to its tip will be the top priority. We'll need to call\n+        // `MaybeRebalanceCaches()` once we're done with this function to ensure\n+        // the right allocation (including the possibility that no snapshot was activated\n+        // and that we should restore the active chainstate caches to their original size).\n+        //\n+        current_coinsdb_cache_size = this->ActiveChainstate().m_coinsdb_cache_size_bytes;\n+        current_coinstip_cache_size = this->ActiveChainstate().m_coinstip_cache_size_bytes;\n+\n+        // Temporarily resize the active coins cache to make room for the newly-created\n+        // snapshot chain.\n+        this->ActiveChainstate().ResizeCoinsCaches(\n+            static_cast<size_t>(current_coinstip_cache_size * IBD_CACHE_PERC),\n+            static_cast<size_t>(current_coinsdb_cache_size * IBD_CACHE_PERC));\n+    }\n+\n+    auto snapshot_chainstate = WITH_LOCK(::cs_main, return MakeUnique<CChainState>(\n+            this->ActiveChainstate().m_mempool, m_blockman, base_blockhash));\n+\n+    {\n+        LOCK(::cs_main);\n+        snapshot_chainstate->InitCoinsDB(\n+            static_cast<size_t>(current_coinsdb_cache_size * SNAPSHOT_CACHE_PERC),\n+            in_memory, false, \"chainstate\");\n+        snapshot_chainstate->InitCoinsCache(\n+            static_cast<size_t>(current_coinstip_cache_size * SNAPSHOT_CACHE_PERC));\n+    }\n+\n+    const bool snapshot_ok = this->PopulateAndValidateSnapshot(\n+        *snapshot_chainstate, coins_file, metadata);\n+\n+    if (!snapshot_ok) {\n+        WITH_LOCK(::cs_main, this->MaybeRebalanceCaches());\n+        return false;\n+    }\n+\n+    {\n+        LOCK(::cs_main);\n+        assert(!m_snapshot_chainstate);\n+        m_snapshot_chainstate.swap(snapshot_chainstate);\n+        const bool chaintip_loaded = m_snapshot_chainstate->LoadChainTip(::Params());\n+        assert(chaintip_loaded);\n+\n+        m_active_chainstate = m_snapshot_chainstate.get();\n+\n+        LogPrintf(\"[snapshot] successfully activated snapshot %s\\n\", base_blockhash.ToString());\n+        LogPrintf(\"[snapshot] (%.2f MB)\\n\",\n+            m_snapshot_chainstate->CoinsTip().DynamicMemoryUsage() / (1000 * 1000));\n+\n+        this->MaybeRebalanceCaches();\n+    }\n+    return true;\n+}\n+\n+bool ChainstateManager::PopulateAndValidateSnapshot(\n+    CChainState& snapshot_chainstate,\n+    CAutoFile& coins_file,\n+    const SnapshotMetadata& metadata)\n+{\n+    // It's okay to release cs_main before we're done using `coins_cache` because we know\n+    // that nothing else will be referencing the newly created snapshot_chainstate yet.\n+    CCoinsViewCache& coins_cache = *WITH_LOCK(::cs_main, return &snapshot_chainstate.CoinsTip());\n+\n+    uint256 base_blockhash = metadata.m_base_blockhash;\n+\n+    COutPoint outpoint;\n+    Coin coin;\n+    uint64_t coins_count = metadata.m_coins_count;\n+    uint64_t coins_left = metadata.m_coins_count;\n+\n+    LogPrintf(\"[snapshot] loading coins from snapshot %s\\n\", base_blockhash.ToString());\n+    int64_t flush_now{0};\n+    int64_t coins_processed{0};\n+\n+    while (coins_left > 0) {\n+        try {\n+            coins_file >> outpoint;\n+        } catch (const std::ios_base::failure&) {\n+            LogPrintf(\"[snapshot] bad snapshot - no coins left after deserializing %d coins\\n\",\n+                coins_count - coins_left);\n+            return false;\n+        }\n+        coins_file >> coin;\n+        coins_cache.EmplaceCoinInternalDANGER(std::move(outpoint), std::move(coin));\n+\n+        --coins_left;\n+        ++coins_processed;\n+\n+        if (coins_processed % 1000000 == 0) {\n+            LogPrintf(\"[snapshot] %d coins loaded (%.2f%%, %.2f MB)\\n\",\n+                coins_processed,\n+                static_cast<float>(coins_processed) * 100 / static_cast<float>(coins_count),\n+                coins_cache.DynamicMemoryUsage() / (1000 * 1000));\n+        }\n+\n+        // Batch write and flush (if we need to) every so often.\n+        //\n+        // If our average Coin size is roughly 41 bytes, checking every 120,000 coins\n+        // means <5MB of memory imprecision.\n+        if (coins_processed % 120000 == 0) {\n+            if (ShutdownRequested()) {\n+                return false;\n+            }\n+\n+            const auto snapshot_cache_state = WITH_LOCK(::cs_main,\n+                return snapshot_chainstate.GetCoinsCacheSizeState(&snapshot_chainstate.m_mempool));\n+\n+            if (snapshot_cache_state >=\n+                    CoinsCacheSizeState::CRITICAL) {\n+                LogPrintf(\"[snapshot] flushing coins cache (%.2f MB)... \", /* Continued */\n+                    coins_cache.DynamicMemoryUsage() / (1000 * 1000));\n+                flush_now = GetTimeMillis();\n+\n+                // This is a hack - we don't know what the actual best block is, but that\n+                // doesn't matter for the purposes of flushing the cache here. We'll set this\n+                // to its correct value (`base_blockhash`) below after the coins are loaded.\n+                coins_cache.SetBestBlock(GetRandHash());\n+\n+                coins_cache.Flush();\n+                LogPrintf(\"done (%.2fms)\\n\", GetTimeMillis() - flush_now);\n+            }\n+        }\n+    }\n+\n+    // Important that we set this. This and the coins_cache accesses above are\n+    // sort of a layer violation, but either we reach into the innards of\n+    // CCoinsViewCache here or we have to invert some of the CChainState to\n+    // embed them in a snapshot-activation-specific CCoinsViewCache bulk load\n+    // method.\n+    coins_cache.SetBestBlock(base_blockhash);\n+\n+    bool out_of_coins{false};\n+    try {\n+        coins_file >> outpoint;\n+    } catch (const std::ios_base::failure&) {\n+        // We expect an exception since we should be out of coins.\n+        out_of_coins = true;\n+    }\n+    if (!out_of_coins) {\n+        LogPrintf(\"[snapshot] bad snapshot - coins left over after deserializing %d coins\\n\",\n+            coins_count);\n+        return false;\n+    }\n+\n+    LogPrintf(\"[snapshot] loaded %d (%.2f MB) coins from snapshot %s\\n\",\n+        coins_count,\n+        coins_cache.DynamicMemoryUsage() / (1000 * 1000),\n+        base_blockhash.ToString());\n+\n+    LogPrintf(\"[snapshot] flushing snapshot chainstate to disk\\n\");\n+    // No need to acquire cs_main since this chainstate isn't being used yet.\n+    coins_cache.Flush(); // TODO: if #17487 is merged, add erase=false here for better performance.\n+\n+    assert(coins_cache.GetBestBlock() == base_blockhash);\n+\n+    CCoinsStats stats;\n+    auto breakpoint_fnc = [] { /* TODO insert breakpoint here? */ };\n+\n+    // As above, okay to immediately release cs_main here since no other context knows\n+    // about the snapshot_chainstate.\n+    CCoinsViewDB* snapshot_coinsdb = WITH_LOCK(::cs_main, return &snapshot_chainstate.CoinsDB());\n+\n+    if (!GetUTXOStats(snapshot_coinsdb, stats, CoinStatsHashType::HASH_SERIALIZED, breakpoint_fnc)) {\n+        LogPrintf(\"[snapshot] failed to generate coins stats\\n\");\n+        return false;\n+    }\n+\n+    // Ensure that the base blockhash appears in the known chain of valid headers. We're willing to\n+    // wait a bit here because the snapshot may have been loaded on startup, before we've\n+    // received headers from the network.\n+\n+    int max_secs_to_wait_for_headers = 60 * 10;\n+    CBlockIndex* snapshot_start_block = nullptr;\n+\n+    while (max_secs_to_wait_for_headers > 0) {\n+        snapshot_start_block = WITH_LOCK(::cs_main, return LookupBlockIndex(base_blockhash));\n+        --max_secs_to_wait_for_headers;\n+\n+        if (!snapshot_start_block) {\n+            std::this_thread::sleep_for(std::chrono::seconds(1));\n+        } else {\n+            break;\n+        }\n+    }\n+\n+    if (snapshot_start_block == nullptr) {\n+        LogPrintf(\"[snapshot] timed out waiting for snapshot start blockheader %s\\n\",\n+            base_blockhash.ToString());\n+        return false;\n+    }\n+\n+    // Assert that the deserialized chainstate contents match the expected assumeutxo value.\n+\n+    int base_height = snapshot_start_block->nHeight;\n+    Optional<AssumeutxoData> maybe_au_data = ExpectedAssumeutxo(base_height, ::Params());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19806#discussion_r554544030",
+      "id" : 554544030,
+      "line" : 5422,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU1NDU0NDAzMA==",
+      "original_commit_id" : "a56b71054f9ba4f13cea9938826032f9359a39d4",
+      "original_line" : 5422,
+      "original_position" : 256,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 256,
+      "pull_request_review_id" : 564848436,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19806",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-01-10T11:29:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/554544030",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19806#discussion_r554544120"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19806"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/554544120"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "unused import",
+      "commit_id" : "a56b71054f9ba4f13cea9938826032f9359a39d4",
+      "created_at" : "2021-01-10T10:11:44Z",
+      "diff_hunk" : "@@ -4,13 +4,19 @@\n //\n #include <chainparams.h>\n #include <consensus/validation.h>\n+#include <node/utxo_snapshot.h>\n #include <random.h>\n+#include <rpc/blockchain.h>\n #include <sync.h>\n #include <test/util/setup_common.h>\n+#include <optional.h>",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19806#discussion_r554544120",
+      "id" : 554544120,
+      "line" : 12,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU1NDU0NDEyMA==",
+      "original_commit_id" : "a56b71054f9ba4f13cea9938826032f9359a39d4",
+      "original_line" : 12,
+      "original_position" : 9,
+      "original_start_line" : null,
+      "path" : "src/test/validation_chainstatemanager_tests.cpp",
+      "position" : 9,
+      "pull_request_review_id" : 564848436,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19806",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-01-10T11:29:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/554544120",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19806#discussion_r554553327"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19806"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/554553327"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I believe sipa's point was that you could avoid a copy by returning a `std::optional<std::reference_wrapper<T>>`. However, you're using that return to copy into a `std::optional<T>` in the only place that this is called:\r\n\r\nhttps://github.com/bitcoin/bitcoin/pull/19806/files#diff-97c3a52bc5fad452d82670a7fd291800bae20c7bc35bb82686c2c0a4ea7b5b98R5422\r\n\r\nso you're not actually saving a copy at all.\r\n\r\nIn any case, a copy of `AssumeutxoData` isn't expensive (32 byte hash + 4 byte int) and this is an infrequent operation, so there's really not problem just returning a `std::optional<AssumeutxoData>` (or indeed a `const AssumeutxoData*>` - returning a pointer with `nullptr` as a notfound sentinel is a common pattern).\r\n\r\nAlternatively, if you want to avoid the copy, just don't assign to `std::optional<AssumeUtxoData>` at the call site:\r\n\r\n```diff\r\ndiff --git a/src/validation.cpp b/src/validation.cpp\r\nindex b4206025be..8c95a837f8 100644\r\n--- a/src/validation.cpp\r\n+++ b/src/validation.cpp\r\n@@ -5419,7 +5419,7 @@ bool ChainstateManager::PopulateAndValidateSnapshot(\r\n     // Assert that the deserialized chainstate contents match the expected assumeutxo value.\r\n \r\n     int base_height = snapshot_start_block->nHeight;\r\n-    Optional<AssumeutxoData> maybe_au_data = ExpectedAssumeutxo(base_height, ::Params());\r\n+    auto maybe_au_data = ExpectedAssumeutxo(base_height, ::Params());\r\n \r\n     if (!maybe_au_data) {\r\n         LogPrintf(\"[snapshot] assumeutxo height in snapshot metadata not recognized \" /* Continued */\r\n@@ -5427,7 +5427,7 @@ bool ChainstateManager::PopulateAndValidateSnapshot(\r\n         return false;\r\n     }\r\n \r\n-    const AssumeutxoData& au_data = maybe_au_data.value();\r\n+    const AssumeutxoData& au_data = maybe_au_data.value().get();\r\n```\r\n\r\nI personally find the `value().get()` for fishing the reference out a bit ugly.",
+      "commit_id" : "a56b71054f9ba4f13cea9938826032f9359a39d4",
+      "created_at" : "2021-01-10T11:29:36Z",
+      "diff_hunk" : "@@ -5183,6 +5185,294 @@ CChainState& ChainstateManager::InitializeChainstate(CTxMemPool& mempool, const\n     return *to_modify;\n }\n \n+Optional<std::reference_wrapper<const AssumeutxoData>> ExpectedAssumeutxo(",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19806#discussion_r554553327",
+      "id" : 554553327,
+      "in_reply_to_id" : 554160596,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU1NDU1MzMyNw==",
+      "original_commit_id" : "38b07a0a7399a8d5721e2fea157752e253246fd7",
+      "original_line" : 5188,
+      "original_position" : 22,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : null,
+      "pull_request_review_id" : 564848436,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19806",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-01-10T11:29:36Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/554553327",
+      "user" : {
+         "avatar_url" : "https://avatars3.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
    }
 ]
