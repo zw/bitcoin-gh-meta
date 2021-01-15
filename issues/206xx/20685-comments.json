@@ -1611,5 +1611,117 @@
          "type" : "User",
          "url" : "https://api.github.com/users/lontivero"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20685#discussion_r558233662"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20685"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/558233662"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "You mean the incremental wait time or just this line?",
+      "commit_id" : "1cced46791ed781c906ca94444eae146fef17549",
+      "created_at" : "2021-01-15T11:02:14Z",
+      "diff_hunk" : "@@ -0,0 +1,432 @@\n+// Copyright (c) 2020-2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <compat.h>\n+#include <compat/endian.h>\n+#include <crypto/sha256.h>\n+#include <fs.h>\n+#include <i2p.h>\n+#include <logging.h>\n+#include <netaddress.h>\n+#include <netbase.h>\n+#include <random.h>\n+#include <util/strencodings.h>\n+#include <tinyformat.h>\n+#include <util/readwritefile.h>\n+#include <util/spanparsing.h>\n+#include <util/system.h>\n+\n+#include <chrono>\n+#include <stdexcept>\n+#include <string>\n+\n+namespace i2p {\n+\n+/**\n+ * Swap Standard Base64 <-> I2P Base64.\n+ * Standard Base64 uses `+` and `/` as last two characters of its alphabet.\n+ * I2P Base64 uses `-` and `~` respectively.\n+ * So it is easy to detect in which one is the input and convert to the other.\n+ * @param[in] from Input to convert.\n+ * @return converted `from`\n+ */\n+static std::string SwapBase64(const std::string& from)\n+{\n+    std::string to;\n+    to.resize(from.size());\n+    for (size_t i = 0; i < from.size(); ++i) {\n+        switch (from[i]) {\n+        case '-':\n+            to[i] = '+';\n+            break;\n+        case '~':\n+            to[i] = '/';\n+            break;\n+        case '+':\n+            to[i] = '-';\n+            break;\n+        case '/':\n+            to[i] = '~';\n+            break;\n+        default:\n+            to[i] = from[i];\n+            break;\n+        }\n+    }\n+    return to;\n+}\n+\n+/**\n+ * Decode an I2P-style Base64 string.\n+ * @param[in] i2p_b64 I2P-style Base64 string.\n+ * @return decoded `i2p_b64`\n+ * @throw std::runtime_error if decoding fails\n+ */\n+static Binary DecodeI2PBase64(const std::string& i2p_b64)\n+{\n+    const std::string& std_b64 = SwapBase64(i2p_b64);\n+    bool invalid;\n+    Binary decoded = DecodeBase64(std_b64.c_str(), &invalid);\n+    if (invalid) {\n+        throw std::runtime_error(strprintf(\"Cannot decode Base64: '%s'\", i2p_b64));\n+    }\n+    return decoded;\n+}\n+\n+/**\n+ * Derive the .b32.i2p address of an I2P destination (binary).\n+ * @param[in] dest I2P destination.\n+ * @return the address that corresponds to `dest`\n+ * @throw std::runtime_error if conversion fails\n+ */\n+static CNetAddr DestBinToAddr(const Binary& dest)\n+{\n+    CSHA256 hasher;\n+    hasher.Write(dest.data(), dest.size());\n+    unsigned char hash[CSHA256::OUTPUT_SIZE];\n+    hasher.Finalize(hash);\n+\n+    CNetAddr addr;\n+    const std::string addr_str = EncodeBase32(hash, false) + \".b32.i2p\";\n+    if (!addr.SetSpecial(addr_str)) {\n+        throw std::runtime_error(strprintf(\"Cannot parse I2P address: '%s'\", addr_str));\n+    }\n+\n+    return addr;\n+}\n+\n+/**\n+ * Derive the .b32.i2p address of an I2P destination (I2P-style Base64).\n+ * @param[in] dest I2P destination.\n+ * @return the address that corresponds to `dest`\n+ * @throw std::runtime_error if conversion fails\n+ */\n+static CNetAddr DestB64ToAddr(const std::string& dest)\n+{\n+    const Binary& decoded = DecodeI2PBase64(dest);\n+    return DestBinToAddr(decoded);\n+}\n+\n+namespace sam {\n+\n+Sock::Sock() : m_socket(INVALID_SOCKET) {}\n+\n+Sock::Sock(SOCKET s) : m_socket(s) {}\n+\n+Sock::Sock(Sock&& other)\n+{\n+    Reset();\n+    m_socket = other.m_socket;\n+    other.m_socket = INVALID_SOCKET;\n+}\n+\n+Sock::~Sock() { Reset(); }\n+\n+Sock& Sock::operator=(Sock&& other)\n+{\n+    Reset();\n+    m_socket = other.m_socket;\n+    other.m_socket = INVALID_SOCKET;\n+    return *this;\n+}\n+\n+SOCKET Sock::Get() const { return m_socket; }\n+\n+SOCKET Sock::Release()\n+{\n+    const SOCKET s = m_socket;\n+    m_socket = INVALID_SOCKET;\n+    return s;\n+}\n+\n+void Sock::Reset() { CloseSocket(m_socket); }\n+\n+Session::Session(const fs::path& private_key_file,\n+                 const CService& control_host,\n+                 CThreadInterrupt* interrupt)\n+    : m_private_key_file(private_key_file), m_control_host(control_host), m_interrupt(interrupt),\n+      m_control_sock(INVALID_SOCKET)\n+{\n+}\n+\n+Session::~Session()\n+{\n+    Disconnect();\n+}\n+\n+bool Session::Accept(Connection& accepted)\n+{\n+    static constexpr auto err_wait_begin = 1s;\n+    static constexpr auto err_wait_cap = 1min;\n+    auto err_wait = err_wait_begin;\n+\n+    while (!*m_interrupt) {\n+        try {\n+            Sock sock;\n+\n+            {\n+                LOCK(m_mutex);\n+                CreateIfNotCreatedAlready();\n+                accepted.me = m_my_addr;\n+                sock = StreamAccept();\n+            }\n+\n+            while (!*m_interrupt) {\n+                Sockets sockets;\n+                sockets.recv.insert({sock.Get()});\n+                sockets.err.insert({sock.Get()});\n+\n+                SocketEvents(sockets, MAX_WAIT_FOR_IO, *m_interrupt);\n+\n+                if (sockets.recv.count(sock.Get()) == 0 && sockets.err.count(sock.Get()) == 0) {\n+                    // No incoming connections within MAX_WAIT_FOR_IO.\n+                    continue;\n+                }\n+\n+                const std::string& peer_dest =\n+                    RecvUntilTerminator(sock.Get(), '\\n', MAX_WAIT_FOR_IO, *m_interrupt);\n+\n+                accepted.peer = CService(DestB64ToAddr(peer_dest), Params().GetDefaultPort());\n+                accepted.socket = sock.Release();\n+\n+                err_wait = err_wait_begin;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20685#discussion_r558233662",
+      "id" : 558233662,
+      "in_reply_to_id" : 556654746,
+      "line" : 194,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU1ODIzMzY2Mg==",
+      "original_commit_id" : "1da3155d6e0cb72d4b43623d0a91e84309e2fdae",
+      "original_line" : 194,
+      "original_position" : 194,
+      "original_start_line" : null,
+      "path" : "src/i2p.cpp",
+      "position" : 194,
+      "pull_request_review_id" : 569162831,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20685",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-01-15T11:02:14Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/558233662",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20685#discussion_r558236009"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20685"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/558236009"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Then we will get an exception which is properly handled. Do you see any problems?",
+      "commit_id" : "1cced46791ed781c906ca94444eae146fef17549",
+      "created_at" : "2021-01-15T11:06:35Z",
+      "diff_hunk" : "@@ -0,0 +1,432 @@\n+// Copyright (c) 2020-2020 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <compat.h>\n+#include <compat/endian.h>\n+#include <crypto/sha256.h>\n+#include <fs.h>\n+#include <i2p.h>\n+#include <logging.h>\n+#include <netaddress.h>\n+#include <netbase.h>\n+#include <random.h>\n+#include <util/strencodings.h>\n+#include <tinyformat.h>\n+#include <util/readwritefile.h>\n+#include <util/spanparsing.h>\n+#include <util/system.h>\n+\n+#include <chrono>\n+#include <stdexcept>\n+#include <string>\n+\n+namespace i2p {\n+\n+/**\n+ * Swap Standard Base64 <-> I2P Base64.\n+ * Standard Base64 uses `+` and `/` as last two characters of its alphabet.\n+ * I2P Base64 uses `-` and `~` respectively.\n+ * So it is easy to detect in which one is the input and convert to the other.\n+ * @param[in] from Input to convert.\n+ * @return converted `from`\n+ */\n+static std::string SwapBase64(const std::string& from)\n+{\n+    std::string to;\n+    to.resize(from.size());\n+    for (size_t i = 0; i < from.size(); ++i) {\n+        switch (from[i]) {\n+        case '-':\n+            to[i] = '+';\n+            break;\n+        case '~':\n+            to[i] = '/';\n+            break;\n+        case '+':\n+            to[i] = '-';\n+            break;\n+        case '/':\n+            to[i] = '~';\n+            break;\n+        default:\n+            to[i] = from[i];\n+            break;\n+        }\n+    }\n+    return to;\n+}\n+\n+/**\n+ * Decode an I2P-style Base64 string.\n+ * @param[in] i2p_b64 I2P-style Base64 string.\n+ * @return decoded `i2p_b64`\n+ * @throw std::runtime_error if decoding fails\n+ */\n+static Binary DecodeI2PBase64(const std::string& i2p_b64)\n+{\n+    const std::string& std_b64 = SwapBase64(i2p_b64);\n+    bool invalid;\n+    Binary decoded = DecodeBase64(std_b64.c_str(), &invalid);\n+    if (invalid) {\n+        throw std::runtime_error(strprintf(\"Cannot decode Base64: '%s'\", i2p_b64));\n+    }\n+    return decoded;\n+}\n+\n+/**\n+ * Derive the .b32.i2p address of an I2P destination (binary).\n+ * @param[in] dest I2P destination.\n+ * @return the address that corresponds to `dest`\n+ * @throw std::runtime_error if conversion fails\n+ */\n+static CNetAddr DestBinToAddr(const Binary& dest)\n+{\n+    CSHA256 hasher;\n+    hasher.Write(dest.data(), dest.size());\n+    unsigned char hash[CSHA256::OUTPUT_SIZE];\n+    hasher.Finalize(hash);\n+\n+    CNetAddr addr;\n+    const std::string addr_str = EncodeBase32(hash, false) + \".b32.i2p\";\n+    if (!addr.SetSpecial(addr_str)) {\n+        throw std::runtime_error(strprintf(\"Cannot parse I2P address: '%s'\", addr_str));\n+    }\n+\n+    return addr;\n+}\n+\n+/**\n+ * Derive the .b32.i2p address of an I2P destination (I2P-style Base64).\n+ * @param[in] dest I2P destination.\n+ * @return the address that corresponds to `dest`\n+ * @throw std::runtime_error if conversion fails\n+ */\n+static CNetAddr DestB64ToAddr(const std::string& dest)\n+{\n+    const Binary& decoded = DecodeI2PBase64(dest);\n+    return DestBinToAddr(decoded);\n+}\n+\n+namespace sam {\n+\n+Sock::Sock() : m_socket(INVALID_SOCKET) {}\n+\n+Sock::Sock(SOCKET s) : m_socket(s) {}\n+\n+Sock::Sock(Sock&& other)\n+{\n+    Reset();\n+    m_socket = other.m_socket;\n+    other.m_socket = INVALID_SOCKET;\n+}\n+\n+Sock::~Sock() { Reset(); }\n+\n+Sock& Sock::operator=(Sock&& other)\n+{\n+    Reset();\n+    m_socket = other.m_socket;\n+    other.m_socket = INVALID_SOCKET;\n+    return *this;\n+}\n+\n+SOCKET Sock::Get() const { return m_socket; }\n+\n+SOCKET Sock::Release()\n+{\n+    const SOCKET s = m_socket;\n+    m_socket = INVALID_SOCKET;\n+    return s;\n+}\n+\n+void Sock::Reset() { CloseSocket(m_socket); }\n+\n+Session::Session(const fs::path& private_key_file,\n+                 const CService& control_host,\n+                 CThreadInterrupt* interrupt)\n+    : m_private_key_file(private_key_file), m_control_host(control_host), m_interrupt(interrupt),\n+      m_control_sock(INVALID_SOCKET)\n+{\n+}\n+\n+Session::~Session()\n+{\n+    Disconnect();\n+}\n+\n+bool Session::Accept(Connection& accepted)\n+{\n+    static constexpr auto err_wait_begin = 1s;\n+    static constexpr auto err_wait_cap = 1min;\n+    auto err_wait = err_wait_begin;\n+\n+    while (!*m_interrupt) {\n+        try {\n+            Sock sock;\n+\n+            {\n+                LOCK(m_mutex);\n+                CreateIfNotCreatedAlready();\n+                accepted.me = m_my_addr;\n+                sock = StreamAccept();\n+            }\n+\n+            while (!*m_interrupt) {\n+                Sockets sockets;\n+                sockets.recv.insert({sock.Get()});\n+                sockets.err.insert({sock.Get()});\n+\n+                SocketEvents(sockets, MAX_WAIT_FOR_IO, *m_interrupt);\n+\n+                if (sockets.recv.count(sock.Get()) == 0 && sockets.err.count(sock.Get()) == 0) {\n+                    // No incoming connections within MAX_WAIT_FOR_IO.\n+                    continue;\n+                }\n+\n+                const std::string& peer_dest =\n+                    RecvUntilTerminator(sock.Get(), '\\n', MAX_WAIT_FOR_IO, *m_interrupt);\n+\n+                accepted.peer = CService(DestB64ToAddr(peer_dest), Params().GetDefaultPort());\n+                accepted.socket = sock.Release();\n+\n+                err_wait = err_wait_begin;\n+\n+                return true;\n+            }\n+        } catch (const std::runtime_error& e) {\n+            Log(\"Error accepting: %s\", e.what());\n+            m_interrupt->sleep_for(err_wait);\n+            if (err_wait < err_wait_cap) {\n+                err_wait *= 2;\n+            }\n+        }\n+    }\n+    return false;\n+}\n+\n+bool Session::Connect(const CService& to, Connection& conn, bool& proxy_error)\n+{\n+    proxy_error = true;\n+\n+    std::string session_id;\n+    Sock sock;\n+    conn.peer = to;\n+\n+    try {\n+        {\n+            LOCK(m_mutex);\n+            CreateIfNotCreatedAlready();\n+            session_id = m_session_id;\n+            conn.me = m_my_addr;\n+            sock = Hello();\n+        }\n+\n+        const Reply& lookup_reply =\n+            SendRequestAndGetReply(sock, strprintf(\"NAMING LOOKUP NAME=%s\", to.ToStringIP()));\n+\n+        const std::string& dest = lookup_reply.Get(\"VALUE\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20685#discussion_r558236009",
+      "id" : 558236009,
+      "in_reply_to_id" : 556661171,
+      "line" : 229,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU1ODIzNjAwOQ==",
+      "original_commit_id" : "1da3155d6e0cb72d4b43623d0a91e84309e2fdae",
+      "original_line" : 229,
+      "original_position" : 229,
+      "original_start_line" : null,
+      "path" : "src/i2p.cpp",
+      "position" : 229,
+      "pull_request_review_id" : 569165674,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20685",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-01-15T11:06:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/558236009",
+      "user" : {
+         "avatar_url" : "https://avatars2.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
    }
 ]
