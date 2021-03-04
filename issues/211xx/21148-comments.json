@@ -2530,5 +2530,225 @@
          "type" : "User",
          "url" : "https://api.github.com/users/laanwj"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21148#discussion_r587522262"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21148"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/587522262"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Let's say an attacker sends an invalid orphan Z to Alice. Such orphan will be stored\r\nin `m_orphans` until expiration time, random eviction or parent reception. Another honest\r\npeer Bob announce Z's parent and Z through txid-relay to Alice. Announcement for Z from Bob\r\nwon't be scheduled for request by `AddTxAnnouncement()` as it'll be bounced off before\r\ndue to a positive `AlreadyHaveTx()`.\r\n\r\nIf Bob sends a valid Z's parent, it should be accepted but Alice's version of Z will be\r\nrejected as invalid. Assuming Bob is initial broadcaster of Z and same trick is repeated\r\nagainst all his tx-relay peers, Z won't propagate until next Bob rebroadcast.\r\n\r\nIs the following description correct ? If yes, I don't think that's concerning, assuming Bob\r\nrebroadcast frequency is pretty high (which is the case for time-sensitive Bitcoin\r\napplications).\r\n\r\nThough not introduced by this PR.",
+      "commit_id" : "5e50e2d1b95e7ca7709a9671ab21f1164b8d0cb8",
+      "created_at" : "2021-03-04T14:37:28Z",
+      "diff_hunk" : "@@ -0,0 +1,202 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txorphanage.h>\n+\n+#include <consensus/validation.h>\n+#include <logging.h>\n+#include <policy/policy.h>\n+\n+#include <cassert>\n+\n+/** Expiration time for orphan transactions in seconds */\n+static constexpr int64_t ORPHAN_TX_EXPIRE_TIME = 20 * 60;\n+/** Minimum time between orphan transactions expire time checks in seconds */\n+static constexpr int64_t ORPHAN_TX_EXPIRE_INTERVAL = 5 * 60;\n+\n+RecursiveMutex g_cs_orphans;\n+\n+bool TxOrphanage::AddTx(const CTransactionRef& tx, NodeId peer)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+\n+    const uint256& hash = tx->GetHash();\n+    if (m_orphans.count(hash))\n+        return false;\n+\n+    // Ignore big transactions, to avoid a\n+    // send-big-orphans memory exhaustion attack. If a peer has a legitimate\n+    // large transaction with a missing parent then we assume\n+    // it will rebroadcast it later, after the parent transaction(s)\n+    // have been mined or received.\n+    // 100 orphans, each of which is at most 100,000 bytes big is\n+    // at most 10 megabytes of orphans and somewhat more byprev index (in the worst case):\n+    unsigned int sz = GetTransactionWeight(*tx);\n+    if (sz > MAX_STANDARD_TX_WEIGHT)\n+    {\n+        LogPrint(BCLog::MEMPOOL, \"ignoring large orphan tx (size: %u, hash: %s)\\n\", sz, hash.ToString());\n+        return false;\n+    }\n+\n+    auto ret = m_orphans.emplace(hash, OrphanTx{tx, peer, GetTime() + ORPHAN_TX_EXPIRE_TIME, m_orphan_list.size()});\n+    assert(ret.second);\n+    m_orphan_list.push_back(ret.first);\n+    // Allow for lookups in the orphan pool by wtxid, as well as txid\n+    m_wtxid_to_orphan_it.emplace(tx->GetWitnessHash(), ret.first);\n+    for (const CTxIn& txin : tx->vin) {\n+        m_outpoint_to_orphan_it[txin.prevout].insert(ret.first);\n+    }\n+\n+    LogPrint(BCLog::MEMPOOL, \"stored orphan tx %s (mapsz %u outsz %u)\\n\", hash.ToString(),\n+             m_orphans.size(), m_outpoint_to_orphan_it.size());\n+    return true;\n+}\n+\n+int TxOrphanage::EraseTx(const uint256& txid)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+    std::map<uint256, OrphanTx>::iterator it = m_orphans.find(txid);\n+    if (it == m_orphans.end())\n+        return 0;\n+    for (const CTxIn& txin : it->second.tx->vin)\n+    {\n+        auto itPrev = m_outpoint_to_orphan_it.find(txin.prevout);\n+        if (itPrev == m_outpoint_to_orphan_it.end())\n+            continue;\n+        itPrev->second.erase(it);\n+        if (itPrev->second.empty())\n+            m_outpoint_to_orphan_it.erase(itPrev);\n+    }\n+\n+    size_t old_pos = it->second.list_pos;\n+    assert(m_orphan_list[old_pos] == it);\n+    if (old_pos + 1 != m_orphan_list.size()) {\n+        // Unless we're deleting the last entry in m_orphan_list, move the last\n+        // entry to the position we're deleting.\n+        auto it_last = m_orphan_list.back();\n+        m_orphan_list[old_pos] = it_last;\n+        it_last->second.list_pos = old_pos;\n+    }\n+    m_orphan_list.pop_back();\n+    m_wtxid_to_orphan_it.erase(it->second.tx->GetWitnessHash());\n+\n+    m_orphans.erase(it);\n+    return 1;\n+}\n+\n+void TxOrphanage::EraseForPeer(NodeId peer)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+\n+    int nErased = 0;\n+    std::map<uint256, OrphanTx>::iterator iter = m_orphans.begin();\n+    while (iter != m_orphans.end())\n+    {\n+        std::map<uint256, OrphanTx>::iterator maybeErase = iter++; // increment to avoid iterator becoming invalid\n+        if (maybeErase->second.fromPeer == peer)\n+        {\n+            nErased += EraseTx(maybeErase->second.tx->GetHash());\n+        }\n+    }\n+    if (nErased > 0) LogPrint(BCLog::MEMPOOL, \"Erased %d orphan tx from peer=%d\\n\", nErased, peer);\n+}\n+\n+unsigned int TxOrphanage::LimitOrphans(unsigned int max_orphans)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+\n+    unsigned int nEvicted = 0;\n+    static int64_t nNextSweep;\n+    int64_t nNow = GetTime();\n+    if (nNextSweep <= nNow) {\n+        // Sweep out expired orphan pool entries:\n+        int nErased = 0;\n+        int64_t nMinExpTime = nNow + ORPHAN_TX_EXPIRE_TIME - ORPHAN_TX_EXPIRE_INTERVAL;\n+        std::map<uint256, OrphanTx>::iterator iter = m_orphans.begin();\n+        while (iter != m_orphans.end())\n+        {\n+            std::map<uint256, OrphanTx>::iterator maybeErase = iter++;\n+            if (maybeErase->second.nTimeExpire <= nNow) {\n+                nErased += EraseTx(maybeErase->second.tx->GetHash());\n+            } else {\n+                nMinExpTime = std::min(maybeErase->second.nTimeExpire, nMinExpTime);\n+            }\n+        }\n+        // Sweep again 5 minutes after the next entry that expires in order to batch the linear scan.\n+        nNextSweep = nMinExpTime + ORPHAN_TX_EXPIRE_INTERVAL;\n+        if (nErased > 0) LogPrint(BCLog::MEMPOOL, \"Erased %d orphan tx due to expiration\\n\", nErased);\n+    }\n+    FastRandomContext rng;\n+    while (m_orphans.size() > max_orphans)\n+    {\n+        // Evict a random orphan:\n+        size_t randompos = rng.randrange(m_orphan_list.size());\n+        EraseTx(m_orphan_list[randompos]->first);\n+        ++nEvicted;\n+    }\n+    return nEvicted;\n+}\n+\n+void TxOrphanage::AddChildrenToWorkSet(const CTransaction& tx, std::set<uint256>& orphan_work_set) const\n+{\n+    AssertLockHeld(g_cs_orphans);\n+    for (unsigned int i = 0; i < tx.vout.size(); i++) {\n+        const auto it_by_prev = m_outpoint_to_orphan_it.find(COutPoint(tx.GetHash(), i));\n+        if (it_by_prev != m_outpoint_to_orphan_it.end()) {\n+            for (const auto& elem : it_by_prev->second) {\n+                orphan_work_set.insert(elem->first);\n+            }\n+        }\n+    }\n+}\n+\n+bool TxOrphanage::HaveTx(const GenTxid& gtxid) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21148#discussion_r587522262",
+      "id" : 587522262,
+      "line" : 154,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU4NzUyMjI2Mg==",
+      "original_commit_id" : "5e50e2d1b95e7ca7709a9671ab21f1164b8d0cb8",
+      "original_line" : 154,
+      "original_position" : 154,
+      "original_start_line" : null,
+      "path" : "src/txorphanage.cpp",
+      "position" : 154,
+      "pull_request_review_id" : 604169093,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21148",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-03-04T15:21:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/587522262",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21148#discussion_r587536050"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21148"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/587536050"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Couldn't the \"orphanage overflow\" log L3131 in net_processing be moved here instead of returning `nEvicted` ? And change the message to dissociate clearly expiration-from-eviction.",
+      "commit_id" : "5e50e2d1b95e7ca7709a9671ab21f1164b8d0cb8",
+      "created_at" : "2021-03-04T14:54:04Z",
+      "diff_hunk" : "@@ -0,0 +1,202 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txorphanage.h>\n+\n+#include <consensus/validation.h>\n+#include <logging.h>\n+#include <policy/policy.h>\n+\n+#include <cassert>\n+\n+/** Expiration time for orphan transactions in seconds */\n+static constexpr int64_t ORPHAN_TX_EXPIRE_TIME = 20 * 60;\n+/** Minimum time between orphan transactions expire time checks in seconds */\n+static constexpr int64_t ORPHAN_TX_EXPIRE_INTERVAL = 5 * 60;\n+\n+RecursiveMutex g_cs_orphans;\n+\n+bool TxOrphanage::AddTx(const CTransactionRef& tx, NodeId peer)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+\n+    const uint256& hash = tx->GetHash();\n+    if (m_orphans.count(hash))\n+        return false;\n+\n+    // Ignore big transactions, to avoid a\n+    // send-big-orphans memory exhaustion attack. If a peer has a legitimate\n+    // large transaction with a missing parent then we assume\n+    // it will rebroadcast it later, after the parent transaction(s)\n+    // have been mined or received.\n+    // 100 orphans, each of which is at most 100,000 bytes big is\n+    // at most 10 megabytes of orphans and somewhat more byprev index (in the worst case):\n+    unsigned int sz = GetTransactionWeight(*tx);\n+    if (sz > MAX_STANDARD_TX_WEIGHT)\n+    {\n+        LogPrint(BCLog::MEMPOOL, \"ignoring large orphan tx (size: %u, hash: %s)\\n\", sz, hash.ToString());\n+        return false;\n+    }\n+\n+    auto ret = m_orphans.emplace(hash, OrphanTx{tx, peer, GetTime() + ORPHAN_TX_EXPIRE_TIME, m_orphan_list.size()});\n+    assert(ret.second);\n+    m_orphan_list.push_back(ret.first);\n+    // Allow for lookups in the orphan pool by wtxid, as well as txid\n+    m_wtxid_to_orphan_it.emplace(tx->GetWitnessHash(), ret.first);\n+    for (const CTxIn& txin : tx->vin) {\n+        m_outpoint_to_orphan_it[txin.prevout].insert(ret.first);\n+    }\n+\n+    LogPrint(BCLog::MEMPOOL, \"stored orphan tx %s (mapsz %u outsz %u)\\n\", hash.ToString(),\n+             m_orphans.size(), m_outpoint_to_orphan_it.size());\n+    return true;\n+}\n+\n+int TxOrphanage::EraseTx(const uint256& txid)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+    std::map<uint256, OrphanTx>::iterator it = m_orphans.find(txid);\n+    if (it == m_orphans.end())\n+        return 0;\n+    for (const CTxIn& txin : it->second.tx->vin)\n+    {\n+        auto itPrev = m_outpoint_to_orphan_it.find(txin.prevout);\n+        if (itPrev == m_outpoint_to_orphan_it.end())\n+            continue;\n+        itPrev->second.erase(it);\n+        if (itPrev->second.empty())\n+            m_outpoint_to_orphan_it.erase(itPrev);\n+    }\n+\n+    size_t old_pos = it->second.list_pos;\n+    assert(m_orphan_list[old_pos] == it);\n+    if (old_pos + 1 != m_orphan_list.size()) {\n+        // Unless we're deleting the last entry in m_orphan_list, move the last\n+        // entry to the position we're deleting.\n+        auto it_last = m_orphan_list.back();\n+        m_orphan_list[old_pos] = it_last;\n+        it_last->second.list_pos = old_pos;\n+    }\n+    m_orphan_list.pop_back();\n+    m_wtxid_to_orphan_it.erase(it->second.tx->GetWitnessHash());\n+\n+    m_orphans.erase(it);\n+    return 1;\n+}\n+\n+void TxOrphanage::EraseForPeer(NodeId peer)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+\n+    int nErased = 0;\n+    std::map<uint256, OrphanTx>::iterator iter = m_orphans.begin();\n+    while (iter != m_orphans.end())\n+    {\n+        std::map<uint256, OrphanTx>::iterator maybeErase = iter++; // increment to avoid iterator becoming invalid\n+        if (maybeErase->second.fromPeer == peer)\n+        {\n+            nErased += EraseTx(maybeErase->second.tx->GetHash());\n+        }\n+    }\n+    if (nErased > 0) LogPrint(BCLog::MEMPOOL, \"Erased %d orphan tx from peer=%d\\n\", nErased, peer);\n+}\n+\n+unsigned int TxOrphanage::LimitOrphans(unsigned int max_orphans)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+\n+    unsigned int nEvicted = 0;\n+    static int64_t nNextSweep;\n+    int64_t nNow = GetTime();\n+    if (nNextSweep <= nNow) {\n+        // Sweep out expired orphan pool entries:\n+        int nErased = 0;\n+        int64_t nMinExpTime = nNow + ORPHAN_TX_EXPIRE_TIME - ORPHAN_TX_EXPIRE_INTERVAL;\n+        std::map<uint256, OrphanTx>::iterator iter = m_orphans.begin();\n+        while (iter != m_orphans.end())\n+        {\n+            std::map<uint256, OrphanTx>::iterator maybeErase = iter++;\n+            if (maybeErase->second.nTimeExpire <= nNow) {\n+                nErased += EraseTx(maybeErase->second.tx->GetHash());\n+            } else {\n+                nMinExpTime = std::min(maybeErase->second.nTimeExpire, nMinExpTime);\n+            }\n+        }\n+        // Sweep again 5 minutes after the next entry that expires in order to batch the linear scan.\n+        nNextSweep = nMinExpTime + ORPHAN_TX_EXPIRE_INTERVAL;\n+        if (nErased > 0) LogPrint(BCLog::MEMPOOL, \"Erased %d orphan tx due to expiration\\n\", nErased);\n+    }\n+    FastRandomContext rng;\n+    while (m_orphans.size() > max_orphans)\n+    {\n+        // Evict a random orphan:\n+        size_t randompos = rng.randrange(m_orphan_list.size());\n+        EraseTx(m_orphan_list[randompos]->first);\n+        ++nEvicted;\n+    }\n+    return nEvicted;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21148#discussion_r587536050",
+      "id" : 587536050,
+      "line" : 138,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU4NzUzNjA1MA==",
+      "original_commit_id" : "5e50e2d1b95e7ca7709a9671ab21f1164b8d0cb8",
+      "original_line" : 138,
+      "original_position" : 138,
+      "original_start_line" : null,
+      "path" : "src/txorphanage.cpp",
+      "position" : 138,
+      "pull_request_review_id" : 604169093,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21148",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-03-04T15:21:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/587536050",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21148#discussion_r587547275"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21148"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/587547275"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "If we had a `std::map<uint256, OrphanMap::iterator> m_parentid_to_orphan_it` index we could update each peer's `orphan_work_set` in function of the parent received through this block. \r\n\r\nOtherwise, I think you might have stalling valid orphans never re-processed. Any ulterior parent announcement should be bounce off by `m_recent_confirmed_transactions`. Though rare enough to not be worthy of the complexity...",
+      "commit_id" : "5e50e2d1b95e7ca7709a9671ab21f1164b8d0cb8",
+      "created_at" : "2021-03-04T15:06:40Z",
+      "diff_hunk" : "@@ -0,0 +1,202 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <txorphanage.h>\n+\n+#include <consensus/validation.h>\n+#include <logging.h>\n+#include <policy/policy.h>\n+\n+#include <cassert>\n+\n+/** Expiration time for orphan transactions in seconds */\n+static constexpr int64_t ORPHAN_TX_EXPIRE_TIME = 20 * 60;\n+/** Minimum time between orphan transactions expire time checks in seconds */\n+static constexpr int64_t ORPHAN_TX_EXPIRE_INTERVAL = 5 * 60;\n+\n+RecursiveMutex g_cs_orphans;\n+\n+bool TxOrphanage::AddTx(const CTransactionRef& tx, NodeId peer)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+\n+    const uint256& hash = tx->GetHash();\n+    if (m_orphans.count(hash))\n+        return false;\n+\n+    // Ignore big transactions, to avoid a\n+    // send-big-orphans memory exhaustion attack. If a peer has a legitimate\n+    // large transaction with a missing parent then we assume\n+    // it will rebroadcast it later, after the parent transaction(s)\n+    // have been mined or received.\n+    // 100 orphans, each of which is at most 100,000 bytes big is\n+    // at most 10 megabytes of orphans and somewhat more byprev index (in the worst case):\n+    unsigned int sz = GetTransactionWeight(*tx);\n+    if (sz > MAX_STANDARD_TX_WEIGHT)\n+    {\n+        LogPrint(BCLog::MEMPOOL, \"ignoring large orphan tx (size: %u, hash: %s)\\n\", sz, hash.ToString());\n+        return false;\n+    }\n+\n+    auto ret = m_orphans.emplace(hash, OrphanTx{tx, peer, GetTime() + ORPHAN_TX_EXPIRE_TIME, m_orphan_list.size()});\n+    assert(ret.second);\n+    m_orphan_list.push_back(ret.first);\n+    // Allow for lookups in the orphan pool by wtxid, as well as txid\n+    m_wtxid_to_orphan_it.emplace(tx->GetWitnessHash(), ret.first);\n+    for (const CTxIn& txin : tx->vin) {\n+        m_outpoint_to_orphan_it[txin.prevout].insert(ret.first);\n+    }\n+\n+    LogPrint(BCLog::MEMPOOL, \"stored orphan tx %s (mapsz %u outsz %u)\\n\", hash.ToString(),\n+             m_orphans.size(), m_outpoint_to_orphan_it.size());\n+    return true;\n+}\n+\n+int TxOrphanage::EraseTx(const uint256& txid)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+    std::map<uint256, OrphanTx>::iterator it = m_orphans.find(txid);\n+    if (it == m_orphans.end())\n+        return 0;\n+    for (const CTxIn& txin : it->second.tx->vin)\n+    {\n+        auto itPrev = m_outpoint_to_orphan_it.find(txin.prevout);\n+        if (itPrev == m_outpoint_to_orphan_it.end())\n+            continue;\n+        itPrev->second.erase(it);\n+        if (itPrev->second.empty())\n+            m_outpoint_to_orphan_it.erase(itPrev);\n+    }\n+\n+    size_t old_pos = it->second.list_pos;\n+    assert(m_orphan_list[old_pos] == it);\n+    if (old_pos + 1 != m_orphan_list.size()) {\n+        // Unless we're deleting the last entry in m_orphan_list, move the last\n+        // entry to the position we're deleting.\n+        auto it_last = m_orphan_list.back();\n+        m_orphan_list[old_pos] = it_last;\n+        it_last->second.list_pos = old_pos;\n+    }\n+    m_orphan_list.pop_back();\n+    m_wtxid_to_orphan_it.erase(it->second.tx->GetWitnessHash());\n+\n+    m_orphans.erase(it);\n+    return 1;\n+}\n+\n+void TxOrphanage::EraseForPeer(NodeId peer)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+\n+    int nErased = 0;\n+    std::map<uint256, OrphanTx>::iterator iter = m_orphans.begin();\n+    while (iter != m_orphans.end())\n+    {\n+        std::map<uint256, OrphanTx>::iterator maybeErase = iter++; // increment to avoid iterator becoming invalid\n+        if (maybeErase->second.fromPeer == peer)\n+        {\n+            nErased += EraseTx(maybeErase->second.tx->GetHash());\n+        }\n+    }\n+    if (nErased > 0) LogPrint(BCLog::MEMPOOL, \"Erased %d orphan tx from peer=%d\\n\", nErased, peer);\n+}\n+\n+unsigned int TxOrphanage::LimitOrphans(unsigned int max_orphans)\n+{\n+    AssertLockHeld(g_cs_orphans);\n+\n+    unsigned int nEvicted = 0;\n+    static int64_t nNextSweep;\n+    int64_t nNow = GetTime();\n+    if (nNextSweep <= nNow) {\n+        // Sweep out expired orphan pool entries:\n+        int nErased = 0;\n+        int64_t nMinExpTime = nNow + ORPHAN_TX_EXPIRE_TIME - ORPHAN_TX_EXPIRE_INTERVAL;\n+        std::map<uint256, OrphanTx>::iterator iter = m_orphans.begin();\n+        while (iter != m_orphans.end())\n+        {\n+            std::map<uint256, OrphanTx>::iterator maybeErase = iter++;\n+            if (maybeErase->second.nTimeExpire <= nNow) {\n+                nErased += EraseTx(maybeErase->second.tx->GetHash());\n+            } else {\n+                nMinExpTime = std::min(maybeErase->second.nTimeExpire, nMinExpTime);\n+            }\n+        }\n+        // Sweep again 5 minutes after the next entry that expires in order to batch the linear scan.\n+        nNextSweep = nMinExpTime + ORPHAN_TX_EXPIRE_INTERVAL;\n+        if (nErased > 0) LogPrint(BCLog::MEMPOOL, \"Erased %d orphan tx due to expiration\\n\", nErased);\n+    }\n+    FastRandomContext rng;\n+    while (m_orphans.size() > max_orphans)\n+    {\n+        // Evict a random orphan:\n+        size_t randompos = rng.randrange(m_orphan_list.size());\n+        EraseTx(m_orphan_list[randompos]->first);\n+        ++nEvicted;\n+    }\n+    return nEvicted;\n+}\n+\n+void TxOrphanage::AddChildrenToWorkSet(const CTransaction& tx, std::set<uint256>& orphan_work_set) const\n+{\n+    AssertLockHeld(g_cs_orphans);\n+    for (unsigned int i = 0; i < tx.vout.size(); i++) {\n+        const auto it_by_prev = m_outpoint_to_orphan_it.find(COutPoint(tx.GetHash(), i));\n+        if (it_by_prev != m_outpoint_to_orphan_it.end()) {\n+            for (const auto& elem : it_by_prev->second) {\n+                orphan_work_set.insert(elem->first);\n+            }\n+        }\n+    }\n+}\n+\n+bool TxOrphanage::HaveTx(const GenTxid& gtxid) const\n+{\n+    LOCK(g_cs_orphans);\n+    if (gtxid.IsWtxid()) {\n+        return m_wtxid_to_orphan_it.count(gtxid.GetHash());\n+    } else {\n+        return m_orphans.count(gtxid.GetHash());\n+    }\n+}\n+\n+std::pair<CTransactionRef, NodeId> TxOrphanage::GetTx(const uint256& txid) const\n+{\n+    AssertLockHeld(g_cs_orphans);\n+\n+    const auto it = m_orphans.find(txid);\n+    if (it == m_orphans.end()) return {nullptr, -1};\n+    return {it->second.tx, it->second.fromPeer};\n+}\n+\n+void TxOrphanage::EraseForBlock(const CBlock& block)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21148#discussion_r587547275",
+      "id" : 587547275,
+      "line" : 173,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU4NzU0NzI3NQ==",
+      "original_commit_id" : "5e50e2d1b95e7ca7709a9671ab21f1164b8d0cb8",
+      "original_line" : 173,
+      "original_position" : 173,
+      "original_start_line" : null,
+      "path" : "src/txorphanage.cpp",
+      "position" : 173,
+      "pull_request_review_id" : 604169093,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21148",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-03-04T15:21:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/587547275",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21148#discussion_r587548092"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21148"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/587548092"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit: originating",
+      "commit_id" : "5e50e2d1b95e7ca7709a9671ab21f1164b8d0cb8",
+      "created_at" : "2021-03-04T15:07:34Z",
+      "diff_hunk" : "@@ -0,0 +1,85 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_TXORPHANAGE_H\n+#define BITCOIN_TXORPHANAGE_H\n+\n+#include <net.h>\n+#include <primitives/block.h>\n+#include <primitives/transaction.h>\n+#include <sync.h>\n+\n+/** Guards orphan transactions and extra txs for compact blocks */\n+extern RecursiveMutex g_cs_orphans;\n+\n+/** A class to track orphan transactions (failed on TX_MISSING_INPUTS)\n+ * Since we cannot distinguish orphans from bad transactions with\n+ * non-existent inputs, we heavily limit the number of orphans\n+ * we keep and the duration we keep them for.\n+ */\n+class TxOrphanage {\n+public:\n+    /** Add a new orphan transaction */\n+    bool AddTx(const CTransactionRef& tx, NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(g_cs_orphans);\n+\n+    /** Check if we already have an orphan transaction (by txid or wtxid) */\n+    bool HaveTx(const GenTxid& gtxid) const EXCLUSIVE_LOCKS_REQUIRED(!g_cs_orphans);\n+\n+    /** Get an orphan transaction and its orginating peer",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21148#discussion_r587548092",
+      "id" : 587548092,
+      "line" : 29,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU4NzU0ODA5Mg==",
+      "original_commit_id" : "5e50e2d1b95e7ca7709a9671ab21f1164b8d0cb8",
+      "original_line" : 29,
+      "original_position" : 29,
+      "original_start_line" : null,
+      "path" : "src/txorphanage.h",
+      "position" : 29,
+      "pull_request_review_id" : 604169093,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21148",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-03-04T15:21:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/587548092",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
    }
 ]
