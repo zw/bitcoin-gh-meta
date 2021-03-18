@@ -1291,5 +1291,116 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jnewbery"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r596515495"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/596515495"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Could keep the old cached fee rate here, so that if you try end up doing `UpdateTip / CacheMinRebroadcastFee / RebroadcatTxs` you can do something sensible?\r\n\r\n```c++\r\n   new_tip = ::ChainActive().Tip();\r\n   if (new_tip != m_tip_at_cache_time) {\r\n       m_last_cached_fee_rate = m_cached_fee_rate;\r\n   } else {\r\n       m_last_cached_fee_rate = max; // ?\r\n   }\r\n   m_tip_at_cache_time = new_tip;\r\n```   ",
+      "commit_id" : "038f751e9ce27f885f0baa87cd13d89fe71fa3d5",
+      "created_at" : "2021-03-18T02:50:16Z",
+      "diff_hunk" : "@@ -0,0 +1,141 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <consensus/consensus.h>\n+#include <logging.h>\n+#include <miner.h>\n+#include <script/script.h>\n+#include <txrebroadcast.h>\n+#include <validation.h>\n+\n+/** We rebroadcast 3/4 of max block weight to reduce noise due to circumstances\n+ *  such as miners mining priority transactions. */\n+static constexpr unsigned int MAX_REBROADCAST_WEIGHT = 3 * MAX_BLOCK_WEIGHT / 4;\n+\n+/** Default minimum age for a transaction to be rebroadcast */\n+static constexpr std::chrono::minutes REBROADCAST_MIN_TX_AGE = 30min;\n+\n+/** Maximum number of times we will rebroadcast a tranasaction */\n+static constexpr int MAX_REBROADCAST_COUNT = 6;\n+\n+/** Minimum amount of time between returning the same transaction for\n+ * rebroadcast */\n+static constexpr std::chrono::hours MIN_REATTEMPT_INTERVAL = 4h;\n+\n+/** The maximum number of entries permitted in m_attempt_tracker */\n+static constexpr int MAX_ENTRIES = 500;\n+\n+/** The maximum age of an entry ~3 months */\n+static constexpr std::chrono::hours MAX_ENTRY_AGE = std::chrono::hours(3 * 30 * 24);\n+\n+std::vector<TxIds> TxRebroadcastHandler::GetRebroadcastTransactions()\n+{\n+    std::vector<TxIds> rebroadcast_txs;\n+    std::chrono::microseconds start_time = GetTime<std::chrono::microseconds>();\n+\n+    // If there has not been a cache run since the last block, the fee rate\n+    // condition will not filter out any transactions, so skip this run.\n+    if (m_tip_at_cache_time == ::ChainActive().Tip()) return rebroadcast_txs;\n+\n+    BlockAssembler::Options options;\n+    options.nBlockMaxWeight = MAX_REBROADCAST_WEIGHT;\n+    options.m_skip_inclusion_until = start_time - REBROADCAST_MIN_TX_AGE;\n+    options.check_block_validity = false;\n+    options.blockMinFeeRate = m_cached_fee_rate;\n+\n+    // Use CreateNewBlock to identify rebroadcast candidates\n+    auto block_template = BlockAssembler(m_mempool, Params(), options)\n+                          .CreateNewBlock(m_chainman.ActiveChainstate(), CScript());\n+    std::chrono::microseconds after_CNB_time = GetTime<std::chrono::microseconds>();\n+\n+    for (const CTransactionRef& tx : block_template->block.vtx) {\n+        if (tx->IsCoinBase()) continue;\n+\n+        uint256 txid = tx->GetHash();\n+        uint256 wtxid = tx->GetWitnessHash();\n+\n+        // Check if we have previously rebroadcasted, decide if we will this\n+        // round, and if so, record the attempt.\n+        auto entry_it = m_attempt_tracker.find(wtxid);\n+\n+        if (entry_it == m_attempt_tracker.end()) {\n+            // No existing entry, we will rebroadcast, so create a new one\n+            RebroadcastEntry entry(start_time, wtxid);\n+            m_attempt_tracker.insert(entry);\n+        } else if (entry_it->m_count >= MAX_REBROADCAST_COUNT) {\n+            // We have already rebroadcast this transaction the maximum number\n+            // of times permitted, so skip rebroadcasting.\n+            continue;\n+        } else if (entry_it->m_last_attempt > start_time - MIN_REATTEMPT_INTERVAL) {\n+            // We already rebroadcasted this in the past 4 hours. Even if we\n+            // added it to the set, it would probably not get INVed to most\n+            // peers due to filterInventoryKnown.\n+            continue;\n+        } else {\n+            // We have rebroadcasted this transaction before, but will try\n+            // again now.\n+            RecordAttempt(entry_it);\n+        }\n+\n+        // Add to set of rebroadcast candidates\n+        rebroadcast_txs.push_back(TxIds(txid, wtxid));\n+    }\n+\n+    TrimMaxRebroadcast();\n+\n+    std::chrono::microseconds delta1 = after_CNB_time - start_time;\n+    std::chrono::microseconds delta2 = GetTime<std::chrono::microseconds>() - start_time;\n+    LogPrint(BCLog::BENCH, \"GetRebroadcastTransactions(): %d Âµs total, %d Âµs spent in CreateNewBlock.\\n\", delta1.count(), delta2.count());\n+    LogPrint(BCLog::NET, \"Queued %d transactions for attempted rebroadcast, filtered from %d candidates with cached fee rate of %s.\\n\", rebroadcast_txs.size(), block_template->block.vtx.size() - 1, m_cached_fee_rate.ToString(FeeEstimateMode::SAT_VB));\n+\n+    for (TxIds ids : rebroadcast_txs) {\n+        LogPrint(BCLog::NET, \"Attempting to rebroadcast txid: %s, wtxid: %s\\n\", ids.m_txid.ToString(), ids.m_wtxid.ToString());\n+    }\n+\n+    return rebroadcast_txs;\n+};\n+\n+void TxRebroadcastHandler::CacheMinRebroadcastFee()\n+{\n+    // Update stamp of chain tip on cache run\n+    m_tip_at_cache_time = ::ChainActive().Tip();\n+\n+    // Update cache fee rate\n+    std::chrono::microseconds start_time = GetTime<std::chrono::microseconds>();\n+    m_cached_fee_rate = BlockAssembler(m_mempool, Params()).minTxFeeRate();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r596515495",
+      "id" : 596515495,
+      "line" : 107,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU5NjUxNTQ5NQ==",
+      "original_commit_id" : "038f751e9ce27f885f0baa87cd13d89fe71fa3d5",
+      "original_line" : 107,
+      "original_position" : 107,
+      "original_start_line" : null,
+      "path" : "src/txrebroadcast.cpp",
+      "position" : 107,
+      "pull_request_review_id" : 614939135,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-03-18T02:50:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/596515495",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r596516729"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/596516729"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "txrebroadcast.h is only included from net_processing and txrebroadcast.cpp itself, and net_processing already includes txmempool.h so there's not much saving to be had here I think",
+      "commit_id" : "038f751e9ce27f885f0baa87cd13d89fe71fa3d5",
+      "created_at" : "2021-03-18T02:54:33Z",
+      "diff_hunk" : "@@ -0,0 +1,95 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_TXREBROADCAST_H\n+#define BITCOIN_TXREBROADCAST_H\n+\n+#include <policy/feerate.h>\n+#include <tuple>\n+#include <txmempool.h>\n+#include <util/hasher.h>\n+#include <util/time.h>\n+#include <validation.h>\n+\n+#include <boost/multi_index/hashed_index.hpp>\n+#include <boost/multi_index/member.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+#include <boost/multi_index_container.hpp>",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r596516729",
+      "id" : 596516729,
+      "in_reply_to_id" : 594677303,
+      "line" : 18,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU5NjUxNjcyOQ==",
+      "original_commit_id" : "038f751e9ce27f885f0baa87cd13d89fe71fa3d5",
+      "original_line" : 18,
+      "original_position" : 18,
+      "original_start_line" : 15,
+      "path" : "src/txrebroadcast.h",
+      "position" : 18,
+      "pull_request_review_id" : 614940621,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061",
+      "side" : "RIGHT",
+      "start_line" : 15,
+      "start_side" : "RIGHT",
+      "updated_at" : "2021-03-18T02:54:33Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/596516729",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
    }
 ]
