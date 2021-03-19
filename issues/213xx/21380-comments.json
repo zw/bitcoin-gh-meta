@@ -2324,5 +2324,60 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jnewbery"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21380#discussion_r597331653"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21380"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/597331653"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "@JeremyRubin on #21377 wrote:\r\n\r\n> @MarcoFalke's comment is a slight misunderstanding I believe of how the fuzzer simulates time; I recall AJ saying (somewhere) that block times are steady interval in the fuzzing so that it doesn't matter (can't find that comment now tho). Is that correct?\r\n\r\nThe fuzzer picks the mtp parameters for the deployment by first picking a random block (`start_block` or `end_block`), figuring out the timestamp that block will have (same formula as `Blocks::mine_block` use for `nTime`), and then randomly bumps one or the other by half the interval, just to check it's not relying on exact equality.\r\n\r\n(So switching fuzzing from mtp to height should just be a matter of using `start_block` and `end_block` directly)\r\n\r\nThe steady interval means there's no direct testing of what happens if blocks happen to come really quickly or really slowly, however if the fuzzer picks two blocks in the same period for start/timeout, that should pretty much simulate the same behaviour.",
+      "commit_id" : "cf81c6533fe26a64bb8c5a5baf5be21367f7eee5",
+      "created_at" : "2021-03-19T00:36:16Z",
+      "diff_hunk" : "@@ -0,0 +1,345 @@\n+// Copyright (c) 2020-2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chain.h>\n+#include <chainparams.h>\n+#include <consensus/params.h>\n+#include <primitives/block.h>\n+#include <versionbits.h>\n+\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+\n+#include <cstdint>\n+#include <limits>\n+#include <memory>\n+#include <vector>\n+\n+namespace {\n+class TestConditionChecker : public AbstractThresholdConditionChecker\n+{\n+private:\n+    mutable ThresholdConditionCache m_cache;\n+    const Consensus::Params dummy_params{};\n+\n+public:\n+    const int64_t m_begin = 0;\n+    const int64_t m_end = 0;\n+    const int m_period = 0;\n+    const int m_threshold = 0;\n+    const int m_bit = 0;\n+\n+    TestConditionChecker(int64_t begin, int64_t end, int period, int threshold, int bit)\n+        : m_begin{begin}, m_end{end}, m_period{period}, m_threshold{threshold}, m_bit{bit}\n+    {\n+        assert(m_period > 0);\n+        assert(0 <= m_threshold && m_threshold <= m_period);\n+        assert(0 <= m_bit && m_bit <= 32 && m_bit < VERSIONBITS_NUM_BITS);\n+    }\n+\n+    virtual bool Condition(const CBlockIndex* pindex, const Consensus::Params& params) const override { return Condition(pindex->nVersion); }\n+    virtual int64_t BeginTime(const Consensus::Params& params) const override { return m_begin; }\n+    virtual int64_t EndTime(const Consensus::Params& params) const override { return m_end; }\n+    virtual int Period(const Consensus::Params& params) const override { return m_period; }\n+    virtual int Threshold(const Consensus::Params& params) const override { return m_threshold; }\n+\n+    ThresholdState GetStateFor(const CBlockIndex* pindexPrev) const { return AbstractThresholdConditionChecker::GetStateFor(pindexPrev, dummy_params, m_cache); }\n+    int GetStateSinceHeightFor(const CBlockIndex* pindexPrev) const { return AbstractThresholdConditionChecker::GetStateSinceHeightFor(pindexPrev, dummy_params, m_cache); }\n+    BIP9Stats GetStateStatisticsFor(const CBlockIndex* pindexPrev) const { return AbstractThresholdConditionChecker::GetStateStatisticsFor(pindexPrev, dummy_params); }\n+\n+    bool Condition(int64_t version) const\n+    {\n+        return ((version >> m_bit) & 1) != 0 && (version & VERSIONBITS_TOP_MASK) == VERSIONBITS_TOP_BITS;\n+    }\n+\n+    bool Condition(const CBlockIndex* pindex) const { return Condition(pindex->nVersion); }\n+};\n+\n+/** Track blocks mined for test */\n+class Blocks\n+{\n+private:\n+    std::vector<std::unique_ptr<CBlockIndex>> m_blocks;\n+    const uint32_t m_start_time;\n+    const uint32_t m_interval;\n+    const int32_t m_signal;\n+    const int32_t m_no_signal;\n+\n+public:\n+    Blocks(uint32_t start_time, uint32_t interval, int32_t signal, int32_t no_signal)\n+        : m_start_time{start_time}, m_interval{interval}, m_signal{signal}, m_no_signal{no_signal} {}\n+\n+    size_t size() const { return m_blocks.size(); }\n+\n+    CBlockIndex* tip() const\n+    {\n+        return m_blocks.empty() ? nullptr : m_blocks.back().get();\n+    }\n+\n+    CBlockIndex* mine_block(bool signal)\n+    {\n+        CBlockHeader header;\n+        header.nVersion = signal ? m_signal : m_no_signal;\n+        header.nTime = m_start_time + m_blocks.size() * m_interval;\n+        header.nBits = 0x1d00ffff;\n+\n+        auto current_block = std::make_unique<CBlockIndex>(header);\n+        current_block->pprev = tip();\n+        current_block->nHeight = m_blocks.size();\n+        current_block->BuildSkip();\n+\n+        return m_blocks.emplace_back(std::move(current_block)).get();\n+    }\n+};\n+\n+void initialize()\n+{\n+    SelectParams(CBaseChainParams::MAIN);\n+}\n+} // namespace\n+\n+constexpr uint32_t MAX_TIME = 4102444800; // 2100-01-01\n+\n+FUZZ_TARGET_INIT(versionbits, initialize)\n+{\n+    const CChainParams& params = Params();\n+\n+    const int64_t interval = params.GetConsensus().nPowTargetSpacing;\n+    assert(interval > 1); // need to be able to halve it\n+    assert(interval < std::numeric_limits<int32_t>::max());\n+\n+    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());\n+\n+    // these could be changed to be fuzzed inputs if desired\n+    const int period = 32;\n+    const int threshold = 29;\n+    const size_t max_periods = 16;\n+\n+    static_assert(0 < threshold && threshold < period, \"must be able to not signal!\");\n+    const size_t max_blocks = period * max_periods;\n+\n+    // pick the timestamp to switch based on a block\n+    // note states will change *after* these blocks because mediantime lags\n+    int start_block = fuzzed_data_provider.ConsumeIntegralInRange<int>(0, period * (max_periods - 3));\n+    int end_block = fuzzed_data_provider.ConsumeIntegralInRange<int>(start_block, period * (max_periods - 3));\n+\n+    const int64_t block_start_time = fuzzed_data_provider.ConsumeIntegralInRange<uint32_t>(params.GenesisBlock().nTime, MAX_TIME);\n+\n+    // too many blocks at 10min each might cause uint32_t time to overflow if\n+    // block_start_time is at the end of the range above\n+    assert(std::numeric_limits<uint32_t>::max() - MAX_TIME > interval * max_blocks);\n+\n+    // what values for version will we use to signal / not signal?\n+    const int32_t ver_signal = fuzzed_data_provider.ConsumeIntegral<int32_t>();\n+    const int32_t ver_nosignal = fuzzed_data_provider.ConsumeIntegral<int32_t>();\n+\n+    // select deployment parameters: bit, start time, timeout\n+    const int bit = fuzzed_data_provider.ConsumeIntegralInRange<int>(0, VERSIONBITS_NUM_BITS - 1);\n+\n+    bool always_active_test = false;\n+    bool never_active_test = false;\n+    int64_t start_time;\n+    int64_t timeout;\n+    if (fuzzed_data_provider.ConsumeBool()) {\n+        start_time = block_start_time + start_block * interval;\n+        timeout = block_start_time + end_block * interval;\n+\n+        assert(start_time <= timeout);\n+\n+        // allow for times to not exactly match a block\n+        if (fuzzed_data_provider.ConsumeBool()) start_time += interval / 2;\n+        if (fuzzed_data_provider.ConsumeBool()) timeout += interval / 2;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21380#discussion_r597331653",
+      "id" : 597331653,
+      "line" : 153,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDU5NzMzMTY1Mw==",
+      "original_commit_id" : "cf81c6533fe26a64bb8c5a5baf5be21367f7eee5",
+      "original_line" : 153,
+      "original_position" : 153,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/versionbits.cpp",
+      "position" : 153,
+      "pull_request_review_id" : 615977885,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21380",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-03-19T00:36:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/597331653",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
    }
 ]
