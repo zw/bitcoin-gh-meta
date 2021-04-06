@@ -7883,5 +7883,280 @@
          "type" : "User",
          "url" : "https://api.github.com/users/Sjors"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19521#discussion_r607823680"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19521"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/607823680"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "5b683ab suggest adding a comment here, as this is quite far away from the parent `if`\r\n```diff\r\n     } else {\r\n+        // genesis block\r\n         m_block_unspendable_amount += block_subsidy;\r\n         m_unspendables_genesis_block += block_subsidy;\r\n```",
+      "commit_id" : "5860532c4041bc3f90fc1f8919f56b6f3955ae9f",
+      "created_at" : "2021-04-06T12:56:13Z",
+      "diff_hunk" : "@@ -0,0 +1,470 @@\n+// Copyright (c) 2020-2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <coins.h>\n+#include <crypto/muhash.h>\n+#include <index/coinstatsindex.h>\n+#include <serialize.h>\n+#include <txdb.h>\n+#include <undo.h>\n+#include <validation.h>\n+\n+static constexpr char DB_BLOCK_HASH = 's';\n+static constexpr char DB_BLOCK_HEIGHT = 't';\n+static constexpr char DB_MUHASH = 'M';\n+\n+namespace {\n+\n+struct DBVal {\n+    uint256 muhash;\n+    uint64_t transaction_output_count;\n+    uint64_t bogo_size;\n+    CAmount total_amount;\n+    CAmount total_subsidy;\n+    CAmount block_unspendable_amount;\n+    CAmount block_prevout_spent_amount;\n+    CAmount block_new_outputs_ex_coinbase_amount;\n+    CAmount block_coinbase_amount;\n+    CAmount unspendables_genesis_block;\n+    CAmount unspendables_bip30;\n+    CAmount unspendables_scripts;\n+    CAmount unspendables_unclaimed_rewards;\n+\n+    SERIALIZE_METHODS(DBVal, obj)\n+    {\n+        READWRITE(obj.muhash);\n+        READWRITE(obj.transaction_output_count);\n+        READWRITE(obj.bogo_size);\n+        READWRITE(obj.total_amount);\n+        READWRITE(obj.total_subsidy);\n+        READWRITE(obj.block_unspendable_amount);\n+        READWRITE(obj.block_prevout_spent_amount);\n+        READWRITE(obj.block_new_outputs_ex_coinbase_amount);\n+        READWRITE(obj.block_coinbase_amount);\n+        READWRITE(obj.unspendables_genesis_block);\n+        READWRITE(obj.unspendables_bip30);\n+        READWRITE(obj.unspendables_scripts);\n+        READWRITE(obj.unspendables_unclaimed_rewards);\n+    }\n+};\n+\n+struct DBHeightKey {\n+    int height;\n+\n+    explicit DBHeightKey(int height_in) : height(height_in) {}\n+\n+    template <typename Stream>\n+    void Serialize(Stream& s) const\n+    {\n+        ser_writedata8(s, DB_BLOCK_HEIGHT);\n+        ser_writedata32be(s, height);\n+    }\n+\n+    template <typename Stream>\n+    void Unserialize(Stream& s)\n+    {\n+        char prefix{static_cast<char>(ser_readdata8(s))};\n+        if (prefix != DB_BLOCK_HEIGHT) {\n+            throw std::ios_base::failure(\"Invalid format for coinstatsindex DB height key\");\n+        }\n+        height = ser_readdata32be(s);\n+    }\n+};\n+\n+struct DBHashKey {\n+    uint256 block_hash;\n+\n+    explicit DBHashKey(const uint256& hash_in) : block_hash(hash_in) {}\n+\n+    SERIALIZE_METHODS(DBHashKey, obj)\n+    {\n+        char prefix{DB_BLOCK_HASH};\n+        READWRITE(prefix);\n+        if (prefix != DB_BLOCK_HASH) {\n+            throw std::ios_base::failure(\"Invalid format for coinstatsindex DB hash key\");\n+        }\n+\n+        READWRITE(obj.block_hash);\n+    }\n+};\n+\n+}; // namespace\n+\n+std::unique_ptr<CoinStatsIndex> g_coin_stats_index;\n+\n+CoinStatsIndex::CoinStatsIndex(size_t n_cache_size, bool f_memory, bool f_wipe)\n+{\n+    fs::path path{GetDataDir() / \"indexes\" / \"coinstats\"};\n+    fs::create_directories(path);\n+\n+    m_db = std::make_unique<CoinStatsIndex::DB>(path / \"db\", n_cache_size, f_memory, f_wipe);\n+}\n+\n+bool CoinStatsIndex::WriteBlock(const CBlock& block, const CBlockIndex* pindex)\n+{\n+    CBlockUndo block_undo;\n+    const CAmount block_subsidy{GetBlockSubsidy(pindex->nHeight, Params().GetConsensus())};\n+    m_total_subsidy += block_subsidy;\n+\n+    // Ignore genesis block\n+    if (pindex->nHeight > 0) {\n+        if (!UndoReadFromDisk(block_undo, pindex)) {\n+            return false;\n+        }\n+\n+        std::pair<uint256, DBVal> read_out;\n+        if (!m_db->Read(DBHeightKey(pindex->nHeight - 1), read_out)) {\n+            return false;\n+        }\n+\n+        uint256 expected_block_hash{pindex->pprev->GetBlockHash()};\n+        if (read_out.first != expected_block_hash) {\n+            if (!m_db->Read(DBHashKey(expected_block_hash), read_out)) {\n+                return error(\"%s: previous block header belongs to unexpected block %s; expected %s\",\n+                             __func__, read_out.first.ToString(), expected_block_hash.ToString());\n+            }\n+        }\n+\n+        // TODO: Deduplicate BIP30 related code\n+        bool is_bip30_block{(pindex->nHeight == 91722 && pindex->GetBlockHash() == uint256S(\"0x00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e\")) ||\n+                            (pindex->nHeight == 91812 && pindex->GetBlockHash() == uint256S(\"0x00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f\"))};\n+\n+        // Add the new utxos created from the block\n+        for (size_t i = 0; i < block.vtx.size(); ++i) {\n+            const auto& tx{block.vtx.at(i)};\n+\n+            // Skip duplicate txid coinbase transactions (BIP30).\n+            if (is_bip30_block && tx->IsCoinBase()) {\n+                m_block_unspendable_amount += block_subsidy;\n+                m_unspendables_bip30 += block_subsidy;\n+                continue;\n+            }\n+\n+            for (size_t j = 0; j < tx->vout.size(); ++j) {\n+                const CTxOut& out{tx->vout[j]};\n+                Coin coin{out, pindex->nHeight, tx->IsCoinBase()};\n+                COutPoint outpoint{tx->GetHash(), static_cast<uint32_t>(j)};\n+\n+                // Skip unspendable coins\n+                if (coin.out.scriptPubKey.IsUnspendable()) {\n+                    m_block_unspendable_amount += coin.out.nValue;\n+                    m_unspendables_scripts += coin.out.nValue;\n+                    continue;\n+                }\n+\n+                m_muhash.Insert(MakeUCharSpan(TxOutSer(outpoint, coin)));\n+\n+                if (tx->IsCoinBase()) {\n+                    m_block_coinbase_amount += coin.out.nValue;\n+                } else {\n+                    m_block_new_outputs_ex_coinbase_amount += coin.out.nValue;\n+                }\n+\n+                ++m_transaction_output_count;\n+                m_total_amount += coin.out.nValue;\n+                m_bogo_size += GetBogoSize(coin.out.scriptPubKey);\n+            }\n+\n+            // The coinbase tx has no undo data since no former output is spent\n+            if (!tx->IsCoinBase()) {\n+                const auto& tx_undo{block_undo.vtxundo.at(i - 1)};\n+\n+                for (size_t j = 0; j < tx_undo.vprevout.size(); ++j) {\n+                    Coin coin{tx_undo.vprevout[j]};\n+                    COutPoint outpoint{tx->vin[j].prevout.hash, tx->vin[j].prevout.n};\n+\n+                    m_muhash.Remove(MakeUCharSpan(TxOutSer(outpoint, coin)));\n+\n+                    m_block_prevout_spent_amount += coin.out.nValue;\n+\n+                    --m_transaction_output_count;\n+                    m_total_amount -= coin.out.nValue;\n+                    m_bogo_size -= GetBogoSize(coin.out.scriptPubKey);\n+                }\n+            }\n+        }\n+    } else {\n+        m_block_unspendable_amount += block_subsidy;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19521#discussion_r607823680",
+      "id" : 607823680,
+      "line" : 189,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYwNzgyMzY4MA==",
+      "original_commit_id" : "5860532c4041bc3f90fc1f8919f56b6f3955ae9f",
+      "original_line" : 189,
+      "original_position" : 189,
+      "original_start_line" : null,
+      "path" : "src/index/coinstatsindex.cpp",
+      "position" : 189,
+      "pull_request_review_id" : 628935807,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19521",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-04-06T14:39:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/607823680",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19521#discussion_r607846449"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19521"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/607846449"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "7287e76f28\r\n\r\n- what does this mean: \"Use Coinstatsindex even when it is available.\" ... I am `#notsurehere` but maybe it is supposed to say:\r\n```suggestion\r\n                    {\"use_index\", RPCArg::Type::BOOL, /* default */ \"true\", \"Use coinstatsindex, if available\"},\r\n```\r\n\r\n- s/Coinstatsindex/coinstatsindex/ for consistency\r\n\r\n- drop full stops for consistency\r\n",
+      "commit_id" : "5860532c4041bc3f90fc1f8919f56b6f3955ae9f",
+      "created_at" : "2021-04-06T13:25:54Z",
+      "diff_hunk" : "@@ -1043,42 +1070,84 @@ static RPCHelpMan gettxoutsetinfo()\n {\n     return RPCHelpMan{\"gettxoutsetinfo\",\n                 \"\\nReturns statistics about the unspent transaction output set.\\n\"\n-                \"Note this call may take some time.\\n\",\n+                \"Note this call may take some time if you are not using coinstatsindex.\\n\",\n                 {\n-                    {\"hash_type\", RPCArg::Type::STR, /* default */ \"hash_serialized_2\", \"Which UTXO set hash should be calculated. Options: 'hash_serialized_2' (the legacy algorithm), 'muhash', 'none'.\"},\n+                    {\"hash_type\", RPCArg::Type::STR, /* default */ \"hash_serialized_2\", \"Which UTXO set hash should be calculated. Options: 'hash_serialized_2' (the legacy algorithm), 'muhash', 'none'\"},\n+                    {\"hash_or_height\", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, \"The block hash or height of the target height (only available with coinstatsindex)\", \"\", {\"\", \"string or numeric\"}},\n+                    {\"use_index\", RPCArg::Type::BOOL, /* default */ \"true\", \"Use Coinstatsindex even when it is available.\"},",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19521#discussion_r607846449",
+      "id" : 607846449,
+      "line" : 1077,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYwNzg0NjQ0OQ==",
+      "original_commit_id" : "5860532c4041bc3f90fc1f8919f56b6f3955ae9f",
+      "original_line" : 1077,
+      "original_position" : 51,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 51,
+      "pull_request_review_id" : 628935807,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19521",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-04-06T14:39:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/607846449",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19521#discussion_r607877856"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19521"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/607877856"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "13d2fc63ac\r\n\r\nVerified this new error message (thanks for improving this):\r\n```\r\n$ bitcoin-cli -signet gettxoutsetinfo muhash 32353\r\nerror code: -32603\r\nerror message:\r\nUnable to read UTXO set. coinstatsindex is still syncing. Current height: 31025\r\n```\r\n\r\nsuggestion, as \"coinstatsindex\" after a full stop looks a little odd:\r\n```suggestion\r\n                throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf(\"Unable to read UTXO set because coinstatsindex is still syncing. Current height: %d\", summary.best_block_height));\r\n```",
+      "commit_id" : "5860532c4041bc3f90fc1f8919f56b6f3955ae9f",
+      "created_at" : "2021-04-06T14:02:19Z",
+      "diff_hunk" : "@@ -1087,9 +1156,42 @@ static RPCHelpMan gettxoutsetinfo()\n         if (hash_type == CoinStatsHashType::MUHASH) {\n               ret.pushKV(\"muhash\", stats.hashSerialized.GetHex());\n         }\n-        ret.pushKV(\"disk_size\", stats.nDiskSize);\n         ret.pushKV(\"total_amount\", ValueFromAmount(stats.nTotalAmount));\n+        if (!stats.index_used) {\n+            ret.pushKV(\"transactions\", static_cast<int64_t>(stats.nTransactions));\n+            ret.pushKV(\"disk_size\", stats.nDiskSize);\n+        } else {\n+            ret.pushKV(\"total_unspendable_amount\", ValueFromAmount(stats.block_unspendable_amount));\n+\n+            CCoinsStats prev_stats{hash_type};\n+\n+            if (pindex->nHeight > 0) {\n+                GetUTXOStats(coins_view, WITH_LOCK(::cs_main, return std::ref(g_chainman.m_blockman)), prev_stats, node.rpc_interruption_point, pindex->pprev);\n+            }\n+\n+            UniValue block_info(UniValue::VOBJ);\n+            block_info.pushKV(\"prevout_spent\", ValueFromAmount(stats.block_prevout_spent_amount - prev_stats.block_prevout_spent_amount));\n+            block_info.pushKV(\"coinbase\", ValueFromAmount(stats.block_coinbase_amount - prev_stats.block_coinbase_amount));\n+            block_info.pushKV(\"new_outputs_ex_coinbase\", ValueFromAmount(stats.block_new_outputs_ex_coinbase_amount - prev_stats.block_new_outputs_ex_coinbase_amount));\n+            block_info.pushKV(\"unspendable\", ValueFromAmount(stats.block_unspendable_amount - prev_stats.block_unspendable_amount));\n+\n+            UniValue unspendables(UniValue::VOBJ);\n+            unspendables.pushKV(\"genesis_block\", ValueFromAmount(stats.unspendables_genesis_block - prev_stats.unspendables_genesis_block));\n+            unspendables.pushKV(\"bip30\", ValueFromAmount(stats.unspendables_bip30 - prev_stats.unspendables_bip30));\n+            unspendables.pushKV(\"scripts\", ValueFromAmount(stats.unspendables_scripts - prev_stats.unspendables_scripts));\n+            unspendables.pushKV(\"unclaimed_rewards\", ValueFromAmount(stats.unspendables_unclaimed_rewards - prev_stats.unspendables_unclaimed_rewards));\n+            block_info.pushKV(\"unspendables\", unspendables);\n+\n+            ret.pushKV(\"block_info\", block_info);\n+        }\n     } else {\n+        if (g_coin_stats_index) {\n+            IndexSummary summary = g_coin_stats_index->GetSummary();\n+\n+            if (!summary.synced) {\n+                throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf(\"Unable to read UTXO set. coinstatsindex is still syncing. Current height: %d\", summary.best_block_height));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19521#discussion_r607877856",
+      "id" : 607877856,
+      "line" : 1192,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYwNzg3Nzg1Ng==",
+      "original_commit_id" : "5860532c4041bc3f90fc1f8919f56b6f3955ae9f",
+      "original_line" : 1192,
+      "original_position" : 175,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 175,
+      "pull_request_review_id" : 628935807,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19521",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-04-06T14:40:41Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/607877856",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19521#discussion_r607881278"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19521"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/607881278"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "13d2fc63ac\r\n\r\n```suggestion\r\n            const IndexSummary summary{g_coin_stats_index->GetSummary()};\r\n```",
+      "commit_id" : "5860532c4041bc3f90fc1f8919f56b6f3955ae9f",
+      "created_at" : "2021-04-06T14:06:21Z",
+      "diff_hunk" : "@@ -1087,9 +1156,42 @@ static RPCHelpMan gettxoutsetinfo()\n         if (hash_type == CoinStatsHashType::MUHASH) {\n               ret.pushKV(\"muhash\", stats.hashSerialized.GetHex());\n         }\n-        ret.pushKV(\"disk_size\", stats.nDiskSize);\n         ret.pushKV(\"total_amount\", ValueFromAmount(stats.nTotalAmount));\n+        if (!stats.index_used) {\n+            ret.pushKV(\"transactions\", static_cast<int64_t>(stats.nTransactions));\n+            ret.pushKV(\"disk_size\", stats.nDiskSize);\n+        } else {\n+            ret.pushKV(\"total_unspendable_amount\", ValueFromAmount(stats.block_unspendable_amount));\n+\n+            CCoinsStats prev_stats{hash_type};\n+\n+            if (pindex->nHeight > 0) {\n+                GetUTXOStats(coins_view, WITH_LOCK(::cs_main, return std::ref(g_chainman.m_blockman)), prev_stats, node.rpc_interruption_point, pindex->pprev);\n+            }\n+\n+            UniValue block_info(UniValue::VOBJ);\n+            block_info.pushKV(\"prevout_spent\", ValueFromAmount(stats.block_prevout_spent_amount - prev_stats.block_prevout_spent_amount));\n+            block_info.pushKV(\"coinbase\", ValueFromAmount(stats.block_coinbase_amount - prev_stats.block_coinbase_amount));\n+            block_info.pushKV(\"new_outputs_ex_coinbase\", ValueFromAmount(stats.block_new_outputs_ex_coinbase_amount - prev_stats.block_new_outputs_ex_coinbase_amount));\n+            block_info.pushKV(\"unspendable\", ValueFromAmount(stats.block_unspendable_amount - prev_stats.block_unspendable_amount));\n+\n+            UniValue unspendables(UniValue::VOBJ);\n+            unspendables.pushKV(\"genesis_block\", ValueFromAmount(stats.unspendables_genesis_block - prev_stats.unspendables_genesis_block));\n+            unspendables.pushKV(\"bip30\", ValueFromAmount(stats.unspendables_bip30 - prev_stats.unspendables_bip30));\n+            unspendables.pushKV(\"scripts\", ValueFromAmount(stats.unspendables_scripts - prev_stats.unspendables_scripts));\n+            unspendables.pushKV(\"unclaimed_rewards\", ValueFromAmount(stats.unspendables_unclaimed_rewards - prev_stats.unspendables_unclaimed_rewards));\n+            block_info.pushKV(\"unspendables\", unspendables);\n+\n+            ret.pushKV(\"block_info\", block_info);\n+        }\n     } else {\n+        if (g_coin_stats_index) {\n+            IndexSummary summary = g_coin_stats_index->GetSummary();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19521#discussion_r607881278",
+      "id" : 607881278,
+      "line" : 1189,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYwNzg4MTI3OA==",
+      "original_commit_id" : "5860532c4041bc3f90fc1f8919f56b6f3955ae9f",
+      "original_line" : 1189,
+      "original_position" : 172,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 172,
+      "pull_request_review_id" : 628935807,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19521",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-04-06T14:39:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/607881278",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19521#discussion_r607884218"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19521"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/607884218"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "13d2fc6 looks like this can be const (I'm not sure there is a reason to declare this variable instead of doing `std::make_unique<CoinStatsIndex>(/* coin_stats_cache_size */ 0, false, fReindex);` at line 1829 below)",
+      "commit_id" : "5860532c4041bc3f90fc1f8919f56b6f3955ae9f",
+      "created_at" : "2021-04-06T14:09:42Z",
+      "diff_hunk" : "@@ -1562,6 +1573,7 @@ bool AppInitMain(const std::any& context, NodeContext& node, interfaces::BlockAn\n         filter_index_cache = max_cache / n_indexes;\n         nTotalCache -= filter_index_cache * n_indexes;\n     }\n+    int64_t coin_stats_cache_size = 0;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19521#discussion_r607884218",
+      "id" : 607884218,
+      "line" : 1576,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYwNzg4NDIxOA==",
+      "original_commit_id" : "5860532c4041bc3f90fc1f8919f56b6f3955ae9f",
+      "original_line" : 1576,
+      "original_position" : 64,
+      "original_start_line" : null,
+      "path" : "src/init.cpp",
+      "position" : 64,
+      "pull_request_review_id" : 628935807,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19521",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-04-06T14:39:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/607884218",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
    }
 ]
