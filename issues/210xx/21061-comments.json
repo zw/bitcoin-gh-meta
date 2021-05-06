@@ -7113,7 +7113,7 @@
          }
       },
       "author_association" : "MEMBER",
-      "body" : "I think a deletion criteria which might applied before age is delaying if `m_count` == `MAX_REBROADCAST_COUNT`. A transaction might be the oldest one but still feerate compelling and was unlucky and its previous rebroadcast attempt ?",
+      "body" : "I think a deletion criteria which might applied before age is delaying if `m_count` == `MAX_REBROADCAST_COUNT`. A transaction might be the oldest one but still feerate compelling and was unlucky on its previous rebroadcast attempts ?",
       "commit_id" : "343e3cbb3aea6c8e1f561c798a62b343f5ac7e1c",
       "created_at" : "2021-04-16T22:58:11Z",
       "diff_hunk" : "@@ -0,0 +1,219 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <consensus/consensus.h>\n+#include <logging.h>\n+#include <miner.h>\n+#include <script/script.h>\n+#include <txrebroadcast.h>\n+#include <util/time.h>\n+#include <validation.h>\n+\n+#include <boost/multi_index/hashed_index.hpp>\n+#include <boost/multi_index/member.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+#include <boost/multi_index_container.hpp>\n+\n+/** We rebroadcast 3/4 of max block weight to reduce noise due to circumstances\n+ *  such as miners mining priority transactions. */\n+static constexpr unsigned int MAX_REBROADCAST_WEIGHT{3 * MAX_BLOCK_WEIGHT / 4};\n+\n+/** Default minimum age for a transaction to be rebroadcast */\n+static constexpr std::chrono::minutes REBROADCAST_MIN_TX_AGE{30min};\n+\n+/** Maximum number of times we will rebroadcast a transaction */\n+static constexpr int MAX_REBROADCAST_COUNT{6};\n+\n+/** Minimum amount of time between returning the same transaction for\n+ * rebroadcast */\n+static constexpr std::chrono::hours MIN_REATTEMPT_INTERVAL{4h};\n+\n+/** The maximum number of entries permitted in m_attempt_tracker */\n+static constexpr int MAX_ENTRIES{500};\n+\n+/** The maximum age of an entry ~3 months */\n+static constexpr std::chrono::hours MAX_ENTRY_AGE{24h * 30 * 3};\n+\n+struct RebroadcastEntry {\n+    RebroadcastEntry(std::chrono::microseconds now_time, uint256 wtxid)\n+        : m_last_attempt(now_time),\n+          m_wtxid(wtxid) {}\n+\n+    std::chrono::microseconds m_last_attempt;\n+    const uint256 m_wtxid;\n+    int m_count{1};\n+};\n+\n+/** Used for multi_index tag  */\n+struct index_by_last_attempt {};\n+\n+class indexed_rebroadcast_set : public\n+boost::multi_index_container<\n+    RebroadcastEntry,\n+    boost::multi_index::indexed_by<\n+        // sorted by wtxid\n+        boost::multi_index::hashed_unique<\n+            boost::multi_index::tag<index_by_wtxid>,\n+            boost::multi_index::member<RebroadcastEntry, const uint256, &RebroadcastEntry::m_wtxid>,\n+            SaltedTxidHasher\n+        >,\n+        // sorted by last rebroadcast time\n+        boost::multi_index::ordered_non_unique<\n+            boost::multi_index::tag<index_by_last_attempt>,\n+            boost::multi_index::member<RebroadcastEntry, std::chrono::microseconds, &RebroadcastEntry::m_last_attempt>\n+        >\n+    >\n+>{};\n+\n+TxRebroadcastHandler::~TxRebroadcastHandler() = default;\n+\n+TxRebroadcastHandler::TxRebroadcastHandler(const CTxMemPool& mempool, const ChainstateManager& chainman, const CChainParams& chainparams)\n+    : m_mempool{mempool},\n+      m_chainman{chainman},\n+      m_chainparams(chainparams),\n+      m_attempt_tracker{std::make_unique<indexed_rebroadcast_set>()}{}\n+\n+std::vector<TxIds> TxRebroadcastHandler::GetRebroadcastTransactions()\n+{\n+    std::vector<TxIds> rebroadcast_txs;\n+    auto start_time = GetTime<std::chrono::microseconds>();\n+\n+    // If the cache has run since we received the last block, the fee rate\n+    // condition will not filter out any transactions, so skip this run.\n+    if (m_tip_at_cache_time == m_chainman.ActiveTip()) return rebroadcast_txs;\n+\n+    BlockAssembler::Options options;\n+    options.nBlockMaxWeight = MAX_REBROADCAST_WEIGHT;\n+    options.m_skip_inclusion_until = start_time - REBROADCAST_MIN_TX_AGE;\n+    options.m_check_block_validity = false;\n+    options.blockMinFeeRate = m_cached_fee_rate;\n+\n+    // Use CreateNewBlock to identify rebroadcast candidates\n+    auto block_template = BlockAssembler(m_chainman.ActiveChainstate(), m_mempool, m_chainparams, options)\n+                              .CreateNewBlock(CScript());\n+    auto after_cnb_time = GetTime<std::chrono::microseconds>();\n+\n+    for (const CTransactionRef& tx : block_template->block.vtx) {\n+        if (tx->IsCoinBase()) continue;\n+\n+        uint256 txid = tx->GetHash();\n+        uint256 wtxid = tx->GetWitnessHash();\n+\n+        // Check if we have previously rebroadcasted, decide if we will this\n+        // round, and if so, record the attempt.\n+        auto entry_it = m_attempt_tracker->find(wtxid);\n+\n+        if (entry_it == m_attempt_tracker->end()) {\n+            // No existing entry, we will rebroadcast, so create a new one\n+            RebroadcastEntry entry(start_time, wtxid);\n+            m_attempt_tracker->insert(entry);\n+        } else if (entry_it->m_count >= MAX_REBROADCAST_COUNT) {\n+            // We have already rebroadcast this transaction the maximum number\n+            // of times permitted, so skip rebroadcasting.\n+            continue;\n+        } else if (entry_it->m_last_attempt > start_time - MIN_REATTEMPT_INTERVAL) {\n+            // We already rebroadcasted this in the past 4 hours. Even if we\n+            // added it to the set, it would probably not get INVed to most\n+            // peers due to filterInventoryKnown.\n+            continue;\n+        } else {\n+            // We have rebroadcasted this transaction before, but will try\n+            // again now. Record the attempt.\n+            auto UpdateRebroadcastEntry = [start_time](RebroadcastEntry& rebroadcast_entry) {\n+                rebroadcast_entry.m_last_attempt = start_time;\n+                ++rebroadcast_entry.m_count;\n+            };\n+\n+            m_attempt_tracker->modify(entry_it, UpdateRebroadcastEntry);\n+        }\n+\n+        // Add to set of rebroadcast candidates\n+        rebroadcast_txs.push_back(TxIds(txid, wtxid));\n+    }\n+\n+    TrimMaxRebroadcast();\n+\n+    auto delta1 = after_cnb_time - start_time;\n+    auto delta2 = GetTime<std::chrono::microseconds>() - start_time;\n+    LogPrint(BCLog::BENCH, \"GetRebroadcastTransactions(): %d us total, %d us spent in CreateNewBlock.\\n\", delta2.count(), delta1.count());\n+    LogPrint(BCLog::NET, \"Queued %d transactions for attempted rebroadcast, filtered from %d candidates with cached fee rate of %s.\\n\", rebroadcast_txs.size(), block_template->block.vtx.size() - 1, m_cached_fee_rate.ToString(FeeEstimateMode::SAT_VB));\n+\n+    for (TxIds ids : rebroadcast_txs) {\n+        LogPrint(BCLog::NET, \"Attempting to rebroadcast txid: %s, wtxid: %s\\n\", ids.m_txid.ToString(), ids.m_wtxid.ToString());\n+    }\n+\n+    return rebroadcast_txs;\n+};\n+\n+void TxRebroadcastHandler::CacheMinRebroadcastFee()\n+{\n+    if (m_chainman.ActiveChainstate().IsInitialBlockDownload()) return;\n+\n+    // Update stamp of chain tip on cache run\n+    m_tip_at_cache_time = m_chainman.ActiveTip();\n+\n+    // Update cache fee rate\n+    auto start_time = GetTime<std::chrono::microseconds>();\n+    m_cached_fee_rate = BlockAssembler(m_chainman.ActiveChainstate(), m_mempool, m_chainparams).MinTxFeeRate();\n+    auto delta_time = GetTime<std::chrono::microseconds>() - start_time;\n+    LogPrint(BCLog::BENCH, \"Caching minimum fee for rebroadcast to %s, took %d us to calculate.\\n\", m_cached_fee_rate.ToString(FeeEstimateMode::SAT_VB), delta_time.count());\n+};\n+\n+void TxRebroadcastHandler::RemoveFromAttemptTracker(const CTransactionRef& tx) {\n+    const auto it = m_attempt_tracker->find(tx->GetWitnessHash());\n+    if (it == m_attempt_tracker->end()) return;\n+    m_attempt_tracker->erase(it);\n+}\n+\n+void TxRebroadcastHandler::TrimMaxRebroadcast()\n+{\n+    // Delete any entries that are older than MAX_ENTRY_AGE\n+    auto min_age = GetTime<std::chrono::microseconds>() - MAX_ENTRY_AGE;\n+\n+    while (!m_attempt_tracker->empty()) {\n+        auto it = m_attempt_tracker->get<index_by_last_attempt>().begin();\n+        if (it->m_last_attempt < min_age) {\n+            m_attempt_tracker->get<index_by_last_attempt>().erase(it);\n+        } else {\n+            break;\n+        }\n+    }\n+\n+    // If there are still too many entries, delete the oldest ones",
@@ -7132,7 +7132,7 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2021-05-05T05:52:32Z",
+      "updated_at" : "2021-05-06T16:36:50Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/615159376",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
@@ -8466,6 +8466,230 @@
       "start_side" : null,
       "updated_at" : "2021-05-06T14:26:29Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/627470377",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r627575612"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/627575612"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Thanks for the second clarifying update, effectively this is documented L124 in `src/txrebroadcast.cpp`, \"No existing entry, we will rebroadcast, so create new one\". \r\n\r\nSo IIUC, even if `m_attempt_tracker` is fulfilled with pinning transactions, it won't block node rebroadcast capability. I think pinning costs of `m_attempt_tracker` above roughly above but it can't be abused by an attacker to jam rebroadcasting, so we're good.\r\n\r\nI would recommend to document this \"pinning-doesn't-block-rebroadcast-so-not-a-new-tx-relay jamming-vector\" around `m_attempt_tracker` declaration in `src/txreconciliation.h`, it's quite an important design aspect imo.\r\n\r\nW.r.t to asymmetric bandwidth usage and risks of bleeding, I don't think `m_attempt_tracker` pinning is making it better or worst, I share the opinion we're ultimately protected by `filterInventoryKnown`.\r\n\r\n>  I don't understand how the attacker avoids spending any funds- say A and A' are two versions of the same txn via RBF. A is sent to the victim & A' is sent to the rest of the network. according to the current patch, if A' gets mined into a block, A is removed from the attempt tracker.\r\n\r\nI should have precise this point. Transaction A feerate to successfully pin `m_attempt_tracker` must be at 170 sat/vbyte. However transaction A' feerate just need to be above miners'mempools min feerates to block propagation of transaction A. If transaction A' feerate is 2 sat/vbyte, with same equation laid out above, effective pinning cost for an attacker is 12_000 * 82 * 2 = 1_968_000 sats and not 167_280_000 sats. Miners observe and eventually mine transactions with a far lower-feerate than the ones maliciously sent to non-miner nodes. This is what I meant by \"not burnt if the mempool isolation is operated properly\".",
+      "commit_id" : "343e3cbb3aea6c8e1f561c798a62b343f5ac7e1c",
+      "created_at" : "2021-05-06T16:20:16Z",
+      "diff_hunk" : "@@ -0,0 +1,219 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <consensus/consensus.h>\n+#include <logging.h>\n+#include <miner.h>\n+#include <script/script.h>\n+#include <txrebroadcast.h>\n+#include <util/time.h>\n+#include <validation.h>\n+\n+#include <boost/multi_index/hashed_index.hpp>\n+#include <boost/multi_index/member.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+#include <boost/multi_index_container.hpp>\n+\n+/** We rebroadcast 3/4 of max block weight to reduce noise due to circumstances\n+ *  such as miners mining priority transactions. */\n+static constexpr unsigned int MAX_REBROADCAST_WEIGHT{3 * MAX_BLOCK_WEIGHT / 4};\n+\n+/** Default minimum age for a transaction to be rebroadcast */\n+static constexpr std::chrono::minutes REBROADCAST_MIN_TX_AGE{30min};\n+\n+/** Maximum number of times we will rebroadcast a transaction */\n+static constexpr int MAX_REBROADCAST_COUNT{6};\n+\n+/** Minimum amount of time between returning the same transaction for\n+ * rebroadcast */\n+static constexpr std::chrono::hours MIN_REATTEMPT_INTERVAL{4h};\n+\n+/** The maximum number of entries permitted in m_attempt_tracker */\n+static constexpr int MAX_ENTRIES{500};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r627575612",
+      "id" : 627575612,
+      "in_reply_to_id" : 615146994,
+      "line" : 34,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyNzU3NTYxMg==",
+      "original_commit_id" : "d1bcb1d213ae380bbfce516a04c11a68864d3bbd",
+      "original_line" : 34,
+      "original_position" : 34,
+      "original_start_line" : null,
+      "path" : "src/txrebroadcast.cpp",
+      "position" : 34,
+      "pull_request_review_id" : 653648606,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-06T17:13:44Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/627575612",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r627615103"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/627615103"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "IIRC, by \"legitimately expired\" I meant a transaction of which `m_count` has reached `MAX_REBROADCAST_COUNT`. As we already rebroadcasted this transaction the maximum number of times permitted, we skip its rebroadcasting forever, but without necessarily removing it from `m_attempt_tracker` ? I think such transaction has exhausted its rebroadcast \"credit\" and it's mature enough to be \"legitimately\" expired or pruned. Though this deletion criteria isn't currently considered in `TrimMaxRebroadcast()` ? \r\n\r\nI think this deletion criteria would be more efficient to expire transactions from the majority of network mempools rather than MAX_ENTRY_AGE, especially with a 3 months delay.\r\n\r\n> if we stored transactions on the attempt tracker for the same duration as MEMPOOL_EXPIRY time, that would leave room for the issue that the attempt tracker is meant to address. for more explanation on that, please see https://github.com/amitiuttarwar/bitcoin-notes/blob/main/rebroadcast-history.md#faq section \"What happens if a transaction can / will never be mined?\". expiry would be one of the main ways to get the ping-ponging behavior for never-going-to-be-mined transactions (eg. due to a policy upgrade on the network)\r\n\r\nIIUC, the problem we're trying to solve is \"How to avoid never-going-to-be-mined transactions to forever ping-pong across the network ?\". \r\n\r\nTo achieve this aim, I believe we should expire a rebroadcast entry as soon as it has exhausted its rebroadcast count, a hint that either feerate is definitively aloof or severer circumstances as described in documentation. But selecting a MAX_ENTRY_AGE superior to MEMPOOL_EXPIRY moves in the opposite direction. \r\n\r\nIf rebroadcast entry _average_ rebroadcast interval  is superior to 56 hours, 56 * MAX_REBROADCAST_COUNT== MEMPOOL_EXPIRY and node rebroadcast guarantees attempts beyond the mempool expiration limit ?\r\n\r\nOr is the behavior I'm describing not possible ? I'm happy to illustrate with a test to assert our intuitions :)\r\n\r\nupdate: Or is the purpose of keeping rebroadcast entry with `m_count` == `MAX_REBROADCAST_COUNT` and only expire them when `last_attempt` is older than MAX_ENTRY_AGE prevent new registration in `m_attempt_tracker` cache provoked by rebroadcast from other network mempools ? Thus you expect a transaction to expire from mempools after MEMPOOL_EXPIRY, then to avoid network laggards with differing policy to trigger new rebroadcasting wawes, you have MAX_ENTRY_AGE as an upper bound of MEMPOOL_EXPIRY ? \r\n\r\nOkay I can see how it solves mempool ping-pong though reasoning could be better documented and still we should envisage to reduce MAX_ENTRY_AGE to minimize node fingerprinting.",
+      "commit_id" : "343e3cbb3aea6c8e1f561c798a62b343f5ac7e1c",
+      "created_at" : "2021-05-06T17:08:55Z",
+      "diff_hunk" : "@@ -0,0 +1,219 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <consensus/consensus.h>\n+#include <logging.h>\n+#include <miner.h>\n+#include <script/script.h>\n+#include <txrebroadcast.h>\n+#include <util/time.h>\n+#include <validation.h>\n+\n+#include <boost/multi_index/hashed_index.hpp>\n+#include <boost/multi_index/member.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+#include <boost/multi_index_container.hpp>\n+\n+/** We rebroadcast 3/4 of max block weight to reduce noise due to circumstances\n+ *  such as miners mining priority transactions. */\n+static constexpr unsigned int MAX_REBROADCAST_WEIGHT{3 * MAX_BLOCK_WEIGHT / 4};\n+\n+/** Default minimum age for a transaction to be rebroadcast */\n+static constexpr std::chrono::minutes REBROADCAST_MIN_TX_AGE{30min};\n+\n+/** Maximum number of times we will rebroadcast a transaction */\n+static constexpr int MAX_REBROADCAST_COUNT{6};\n+\n+/** Minimum amount of time between returning the same transaction for\n+ * rebroadcast */\n+static constexpr std::chrono::hours MIN_REATTEMPT_INTERVAL{4h};\n+\n+/** The maximum number of entries permitted in m_attempt_tracker */\n+static constexpr int MAX_ENTRIES{500};\n+\n+/** The maximum age of an entry ~3 months */\n+static constexpr std::chrono::hours MAX_ENTRY_AGE{24h * 30 * 3};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r627615103",
+      "id" : 627615103,
+      "in_reply_to_id" : 615156761,
+      "line" : 37,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyNzYxNTEwMw==",
+      "original_commit_id" : "7ae2e385b69764bd381677a17183ee01ffc7f178",
+      "original_line" : 37,
+      "original_position" : 37,
+      "original_start_line" : null,
+      "path" : "src/txrebroadcast.cpp",
+      "position" : 37,
+      "pull_request_review_id" : 653697420,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-06T17:32:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/627615103",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r627623142"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/627623142"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Do we agree first on the problem solved by `m_attempt_tracker` ? See new comment : https://github.com/bitcoin/bitcoin/pull/21061#discussion_r627615103\r\n\r\nWhat we want to do in `TrimMaxRebroadcast()` is pending on this conversation imo.",
+      "commit_id" : "343e3cbb3aea6c8e1f561c798a62b343f5ac7e1c",
+      "created_at" : "2021-05-06T17:21:38Z",
+      "diff_hunk" : "@@ -0,0 +1,219 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <consensus/consensus.h>\n+#include <logging.h>\n+#include <miner.h>\n+#include <script/script.h>\n+#include <txrebroadcast.h>\n+#include <util/time.h>\n+#include <validation.h>\n+\n+#include <boost/multi_index/hashed_index.hpp>\n+#include <boost/multi_index/member.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+#include <boost/multi_index_container.hpp>\n+\n+/** We rebroadcast 3/4 of max block weight to reduce noise due to circumstances\n+ *  such as miners mining priority transactions. */\n+static constexpr unsigned int MAX_REBROADCAST_WEIGHT{3 * MAX_BLOCK_WEIGHT / 4};\n+\n+/** Default minimum age for a transaction to be rebroadcast */\n+static constexpr std::chrono::minutes REBROADCAST_MIN_TX_AGE{30min};\n+\n+/** Maximum number of times we will rebroadcast a transaction */\n+static constexpr int MAX_REBROADCAST_COUNT{6};\n+\n+/** Minimum amount of time between returning the same transaction for\n+ * rebroadcast */\n+static constexpr std::chrono::hours MIN_REATTEMPT_INTERVAL{4h};\n+\n+/** The maximum number of entries permitted in m_attempt_tracker */\n+static constexpr int MAX_ENTRIES{500};\n+\n+/** The maximum age of an entry ~3 months */\n+static constexpr std::chrono::hours MAX_ENTRY_AGE{24h * 30 * 3};\n+\n+struct RebroadcastEntry {\n+    RebroadcastEntry(std::chrono::microseconds now_time, uint256 wtxid)\n+        : m_last_attempt(now_time),\n+          m_wtxid(wtxid) {}\n+\n+    std::chrono::microseconds m_last_attempt;\n+    const uint256 m_wtxid;\n+    int m_count{1};\n+};\n+\n+/** Used for multi_index tag  */\n+struct index_by_last_attempt {};\n+\n+class indexed_rebroadcast_set : public\n+boost::multi_index_container<\n+    RebroadcastEntry,\n+    boost::multi_index::indexed_by<\n+        // sorted by wtxid\n+        boost::multi_index::hashed_unique<\n+            boost::multi_index::tag<index_by_wtxid>,\n+            boost::multi_index::member<RebroadcastEntry, const uint256, &RebroadcastEntry::m_wtxid>,\n+            SaltedTxidHasher\n+        >,\n+        // sorted by last rebroadcast time\n+        boost::multi_index::ordered_non_unique<\n+            boost::multi_index::tag<index_by_last_attempt>,\n+            boost::multi_index::member<RebroadcastEntry, std::chrono::microseconds, &RebroadcastEntry::m_last_attempt>\n+        >\n+    >\n+>{};\n+\n+TxRebroadcastHandler::~TxRebroadcastHandler() = default;\n+\n+TxRebroadcastHandler::TxRebroadcastHandler(const CTxMemPool& mempool, const ChainstateManager& chainman, const CChainParams& chainparams)\n+    : m_mempool{mempool},\n+      m_chainman{chainman},\n+      m_chainparams(chainparams),\n+      m_attempt_tracker{std::make_unique<indexed_rebroadcast_set>()}{}\n+\n+std::vector<TxIds> TxRebroadcastHandler::GetRebroadcastTransactions()\n+{\n+    std::vector<TxIds> rebroadcast_txs;\n+    auto start_time = GetTime<std::chrono::microseconds>();\n+\n+    // If the cache has run since we received the last block, the fee rate\n+    // condition will not filter out any transactions, so skip this run.\n+    if (m_tip_at_cache_time == m_chainman.ActiveTip()) return rebroadcast_txs;\n+\n+    BlockAssembler::Options options;\n+    options.nBlockMaxWeight = MAX_REBROADCAST_WEIGHT;\n+    options.m_skip_inclusion_until = start_time - REBROADCAST_MIN_TX_AGE;\n+    options.m_check_block_validity = false;\n+    options.blockMinFeeRate = m_cached_fee_rate;\n+\n+    // Use CreateNewBlock to identify rebroadcast candidates\n+    auto block_template = BlockAssembler(m_chainman.ActiveChainstate(), m_mempool, m_chainparams, options)\n+                              .CreateNewBlock(CScript());\n+    auto after_cnb_time = GetTime<std::chrono::microseconds>();\n+\n+    for (const CTransactionRef& tx : block_template->block.vtx) {\n+        if (tx->IsCoinBase()) continue;\n+\n+        uint256 txid = tx->GetHash();\n+        uint256 wtxid = tx->GetWitnessHash();\n+\n+        // Check if we have previously rebroadcasted, decide if we will this\n+        // round, and if so, record the attempt.\n+        auto entry_it = m_attempt_tracker->find(wtxid);\n+\n+        if (entry_it == m_attempt_tracker->end()) {\n+            // No existing entry, we will rebroadcast, so create a new one\n+            RebroadcastEntry entry(start_time, wtxid);\n+            m_attempt_tracker->insert(entry);\n+        } else if (entry_it->m_count >= MAX_REBROADCAST_COUNT) {\n+            // We have already rebroadcast this transaction the maximum number\n+            // of times permitted, so skip rebroadcasting.\n+            continue;\n+        } else if (entry_it->m_last_attempt > start_time - MIN_REATTEMPT_INTERVAL) {\n+            // We already rebroadcasted this in the past 4 hours. Even if we\n+            // added it to the set, it would probably not get INVed to most\n+            // peers due to filterInventoryKnown.\n+            continue;\n+        } else {\n+            // We have rebroadcasted this transaction before, but will try\n+            // again now. Record the attempt.\n+            auto UpdateRebroadcastEntry = [start_time](RebroadcastEntry& rebroadcast_entry) {\n+                rebroadcast_entry.m_last_attempt = start_time;\n+                ++rebroadcast_entry.m_count;\n+            };\n+\n+            m_attempt_tracker->modify(entry_it, UpdateRebroadcastEntry);\n+        }\n+\n+        // Add to set of rebroadcast candidates\n+        rebroadcast_txs.push_back(TxIds(txid, wtxid));\n+    }\n+\n+    TrimMaxRebroadcast();\n+\n+    auto delta1 = after_cnb_time - start_time;\n+    auto delta2 = GetTime<std::chrono::microseconds>() - start_time;\n+    LogPrint(BCLog::BENCH, \"GetRebroadcastTransactions(): %d us total, %d us spent in CreateNewBlock.\\n\", delta2.count(), delta1.count());\n+    LogPrint(BCLog::NET, \"Queued %d transactions for attempted rebroadcast, filtered from %d candidates with cached fee rate of %s.\\n\", rebroadcast_txs.size(), block_template->block.vtx.size() - 1, m_cached_fee_rate.ToString(FeeEstimateMode::SAT_VB));\n+\n+    for (TxIds ids : rebroadcast_txs) {\n+        LogPrint(BCLog::NET, \"Attempting to rebroadcast txid: %s, wtxid: %s\\n\", ids.m_txid.ToString(), ids.m_wtxid.ToString());\n+    }\n+\n+    return rebroadcast_txs;\n+};\n+\n+void TxRebroadcastHandler::CacheMinRebroadcastFee()\n+{\n+    if (m_chainman.ActiveChainstate().IsInitialBlockDownload()) return;\n+\n+    // Update stamp of chain tip on cache run\n+    m_tip_at_cache_time = m_chainman.ActiveTip();\n+\n+    // Update cache fee rate\n+    auto start_time = GetTime<std::chrono::microseconds>();\n+    m_cached_fee_rate = BlockAssembler(m_chainman.ActiveChainstate(), m_mempool, m_chainparams).MinTxFeeRate();\n+    auto delta_time = GetTime<std::chrono::microseconds>() - start_time;\n+    LogPrint(BCLog::BENCH, \"Caching minimum fee for rebroadcast to %s, took %d us to calculate.\\n\", m_cached_fee_rate.ToString(FeeEstimateMode::SAT_VB), delta_time.count());\n+};\n+\n+void TxRebroadcastHandler::RemoveFromAttemptTracker(const CTransactionRef& tx) {\n+    const auto it = m_attempt_tracker->find(tx->GetWitnessHash());\n+    if (it == m_attempt_tracker->end()) return;\n+    m_attempt_tracker->erase(it);\n+}\n+\n+void TxRebroadcastHandler::TrimMaxRebroadcast()\n+{\n+    // Delete any entries that are older than MAX_ENTRY_AGE\n+    auto min_age = GetTime<std::chrono::microseconds>() - MAX_ENTRY_AGE;\n+\n+    while (!m_attempt_tracker->empty()) {\n+        auto it = m_attempt_tracker->get<index_by_last_attempt>().begin();\n+        if (it->m_last_attempt < min_age) {\n+            m_attempt_tracker->get<index_by_last_attempt>().erase(it);\n+        } else {\n+            break;\n+        }\n+    }\n+\n+    // If there are still too many entries, delete the oldest ones",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r627623142",
+      "id" : 627623142,
+      "in_reply_to_id" : 615159376,
+      "line" : 205,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyNzYyMzE0Mg==",
+      "original_commit_id" : "7ae2e385b69764bd381677a17183ee01ffc7f178",
+      "original_line" : 205,
+      "original_position" : 184,
+      "original_start_line" : null,
+      "path" : "src/txrebroadcast.cpp",
+      "position" : 205,
+      "pull_request_review_id" : 653708582,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-06T17:21:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/627623142",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r627635595"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/627635595"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "See second half of other comment answer on why you can consider RBF cheap for an attacker. More generally there is also the fact that the bip125 replacement penalty is static (DEFAULT_INCREMENTAL_RELAY_FEE) is _static_ and doesn't scale up in function of your mempool congestion.\r\n\r\nSimplify fee-bumping algorithms a lot though at the price of bandwidth overcost for network nodes processing replacement...\r\n\r\nW.r.t to `filterInventoryKnown`, a malicious roll over isn't new from introducing node rebroadcast logic, though from now this module make assumptions on it to prevent bandwidth bleeding.",
+      "commit_id" : "343e3cbb3aea6c8e1f561c798a62b343f5ac7e1c",
+      "created_at" : "2021-05-06T17:38:49Z",
+      "diff_hunk" : "@@ -0,0 +1,219 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <consensus/consensus.h>\n+#include <logging.h>\n+#include <miner.h>\n+#include <script/script.h>\n+#include <txrebroadcast.h>\n+#include <util/time.h>\n+#include <validation.h>\n+\n+#include <boost/multi_index/hashed_index.hpp>\n+#include <boost/multi_index/member.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+#include <boost/multi_index_container.hpp>\n+\n+/** We rebroadcast 3/4 of max block weight to reduce noise due to circumstances\n+ *  such as miners mining priority transactions. */\n+static constexpr unsigned int MAX_REBROADCAST_WEIGHT{3 * MAX_BLOCK_WEIGHT / 4};\n+\n+/** Default minimum age for a transaction to be rebroadcast */\n+static constexpr std::chrono::minutes REBROADCAST_MIN_TX_AGE{30min};\n+\n+/** Maximum number of times we will rebroadcast a transaction */\n+static constexpr int MAX_REBROADCAST_COUNT{6};\n+\n+/** Minimum amount of time between returning the same transaction for\n+ * rebroadcast */\n+static constexpr std::chrono::hours MIN_REATTEMPT_INTERVAL{4h};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r627635595",
+      "id" : 627635595,
+      "in_reply_to_id" : 615164135,
+      "line" : 31,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyNzYzNTU5NQ==",
+      "original_commit_id" : "7ae2e385b69764bd381677a17183ee01ffc7f178",
+      "original_line" : 31,
+      "original_position" : 31,
+      "original_start_line" : null,
+      "path" : "src/txrebroadcast.cpp",
+      "position" : 31,
+      "pull_request_review_id" : 653724809,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-06T17:38:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/627635595",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
          "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
