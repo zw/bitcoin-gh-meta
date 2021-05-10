@@ -9644,5 +9644,60 @@
          "type" : "User",
          "url" : "https://api.github.com/users/amitiuttarwar"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r629292659"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629292659"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Quick comment noticed while writing about this review club session. IIRC it's preferable to pass `uint256` by reference to const rather than by value, e.g. `const uint256& txid{tx->GetHash()};` or `const auto& txid = tx->GetHash();` (and here these aliases may as well be const anyway). It looks like there are a few other places.",
+      "commit_id" : "343e3cbb3aea6c8e1f561c798a62b343f5ac7e1c",
+      "created_at" : "2021-05-10T11:50:13Z",
+      "diff_hunk" : "@@ -0,0 +1,242 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <chainparams.h>\n+#include <consensus/consensus.h>\n+#include <logging.h>\n+#include <miner.h>\n+#include <node/blockstorage.h>\n+#include <script/script.h>\n+#include <txrebroadcast.h>\n+#include <util/time.h>\n+\n+#include <boost/multi_index/hashed_index.hpp>\n+#include <boost/multi_index/member.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+#include <boost/multi_index_container.hpp>\n+\n+/** We rebroadcast upto 3/4 of max block weight to reduce noise due to\n+ * circumstances such as miners mining priority transactions. */\n+static constexpr unsigned int MAX_REBROADCAST_WEIGHT{3 * MAX_BLOCK_WEIGHT / 4};\n+\n+/** Default minimum age for a transaction to be rebroadcast */\n+static constexpr std::chrono::minutes REBROADCAST_MIN_TX_AGE{30min};\n+\n+/** Maximum number of times we will rebroadcast a transaction */\n+static constexpr int MAX_REBROADCAST_COUNT{6};\n+\n+/** Minimum amount of time between returning the same transaction for\n+ * rebroadcast */\n+static constexpr std::chrono::hours MIN_REATTEMPT_INTERVAL{4h};\n+\n+/** The maximum number of entries permitted in m_attempt_tracker */\n+static constexpr int MAX_ENTRIES{500};\n+\n+/** The maximum age of an entry ~3 months */\n+static constexpr std::chrono::hours MAX_ENTRY_AGE{24h * 30 * 3};\n+\n+struct RebroadcastEntry {\n+    RebroadcastEntry(std::chrono::microseconds now_time, uint256 wtxid)\n+        : m_last_attempt(now_time),\n+          m_wtxid(wtxid) {}\n+\n+    std::chrono::microseconds m_last_attempt;\n+    const uint256 m_wtxid;\n+    int m_count{1};\n+};\n+\n+/** Used for multi_index tag  */\n+struct index_by_last_attempt {};\n+\n+class indexed_rebroadcast_set : public\n+boost::multi_index_container<\n+    RebroadcastEntry,\n+    boost::multi_index::indexed_by<\n+        // sorted by wtxid\n+        boost::multi_index::hashed_unique<\n+            boost::multi_index::tag<index_by_wtxid>,\n+            boost::multi_index::member<RebroadcastEntry, const uint256, &RebroadcastEntry::m_wtxid>,\n+            SaltedTxidHasher\n+        >,\n+        // sorted by last rebroadcast time\n+        boost::multi_index::ordered_non_unique<\n+            boost::multi_index::tag<index_by_last_attempt>,\n+            boost::multi_index::member<RebroadcastEntry, std::chrono::microseconds, &RebroadcastEntry::m_last_attempt>\n+        >\n+    >\n+>{};\n+\n+TxRebroadcastHandler::~TxRebroadcastHandler() = default;\n+\n+TxRebroadcastHandler::TxRebroadcastHandler(const CTxMemPool& mempool, const ChainstateManager& chainman, const CChainParams& chainparams)\n+    : m_mempool{mempool},\n+      m_chainman{chainman},\n+      m_chainparams(chainparams),\n+      m_attempt_tracker{std::make_unique<indexed_rebroadcast_set>()}{}\n+\n+std::vector<TxIds> TxRebroadcastHandler::GetRebroadcastTransactions(const CBlockIndex* recent_block_index)\n+{\n+    std::vector<TxIds> rebroadcast_txs;\n+    auto start_time = GetTime<std::chrono::microseconds>();\n+\n+    int rebroadcast_block_weight = MAX_REBROADCAST_WEIGHT;\n+    CBlock block;\n+    const Consensus::Params& consensus_params = m_chainparams.GetConsensus();\n+    if (ReadBlockFromDisk(block, recent_block_index, consensus_params)) {\n+        rebroadcast_block_weight = 3 * GetBlockWeight(block) / 4;\n+    }\n+\n+    BlockAssembler::Options options;\n+    options.nBlockMaxWeight = rebroadcast_block_weight;\n+    options.m_skip_inclusion_until = start_time - REBROADCAST_MIN_TX_AGE;\n+    options.m_check_block_validity = false;\n+\n+    // The fee rate condition only filters out transactions if it runs before\n+    // we process the recently mined block. If the cache has since been\n+    // updated, used the value from the previous run to filter transactions.\n+    {\n+        LOCK(m_rebroadcast_mutex);\n+        if (m_tip_at_cache_time == m_chainman.ActiveTip()) {\n+            options.blockMinFeeRate = m_previous_cached_fee_rate;\n+        } else {\n+            options.blockMinFeeRate = m_cached_fee_rate;\n+        }\n+    }\n+\n+    // Use CreateNewBlock to identify rebroadcast candidates\n+    auto block_template = BlockAssembler(m_chainman.ActiveChainstate(), m_mempool, m_chainparams, options)\n+                              .CreateNewBlock(CScript());\n+    auto after_cnb_time = GetTime<std::chrono::microseconds>();\n+\n+    LOCK(m_rebroadcast_mutex);\n+    for (const CTransactionRef& tx : block_template->block.vtx) {\n+        if (tx->IsCoinBase()) continue;\n+\n+        uint256 txid = tx->GetHash();\n+        uint256 wtxid = tx->GetWitnessHash();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21061#discussion_r629292659",
+      "id" : 629292659,
+      "line" : 117,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyOTI5MjY1OQ==",
+      "original_commit_id" : "343e3cbb3aea6c8e1f561c798a62b343f5ac7e1c",
+      "original_line" : 117,
+      "original_position" : 117,
+      "original_start_line" : null,
+      "path" : "src/txrebroadcast.cpp",
+      "position" : 117,
+      "pull_request_review_id" : 655550429,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21061",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-10T11:51:12Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629292659",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
    }
 ]
