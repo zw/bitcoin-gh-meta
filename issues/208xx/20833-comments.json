@@ -19982,6 +19982,61 @@
    {
       "_links" : {
          "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629361807"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629361807"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Do we have any reason to special-case `TX_MISSING_INPUTS` ?\r\n\r\nIt sounds to have been here since the introduction of `testmempoolaccept` with #11742. Though, looking on error path in `PreChecks, L773, the reject reason sounds informative enough \"bad-txns-inputs-missingorspent\"",
+      "commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "created_at" : "2021-05-10T13:32:30Z",
+      "diff_hunk" : "@@ -932,62 +938,79 @@ static RPCHelpMan testmempoolaccept()\n         UniValueType(), // VNUM or VSTR, checked inside AmountFromValue()\n     });\n \n-    if (request.params[0].get_array().size() != 1) {\n-        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Array must contain exactly one raw transaction for now\");\n+    if (request.params[0].get_array().size() > MAX_PACKAGE_COUNT) {\n+        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Array cannot contain more than \" + ToString(MAX_PACKAGE_COUNT) + \" transactions.\");\n     }\n \n-    CMutableTransaction mtx;\n-    if (!DecodeHexTx(mtx, request.params[0].get_array()[0].get_str())) {\n-        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"TX decode failed. Make sure the tx has at least one input.\");\n-    }\n-    CTransactionRef tx(MakeTransactionRef(std::move(mtx)));\n-\n+    const UniValue raw_transactions = request.params[0].get_array();\n     const CFeeRate max_raw_tx_fee_rate = request.params[1].isNull() ?\n                                              DEFAULT_MAX_RAW_TX_FEE_RATE :\n                                              CFeeRate(AmountFromValue(request.params[1]));\n \n-    NodeContext& node = EnsureAnyNodeContext(request.context);\n+    std::vector<CTransactionRef> txns;\n+    for (const auto& rawtx : raw_transactions.getValues()) {\n+        CMutableTransaction mtx;\n+        if (!DecodeHexTx(mtx, rawtx.get_str())) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"TX decode failed. Make sure the tx has at least one input.\");\n+        }\n+        txns.emplace_back(MakeTransactionRef(std::move(mtx)));\n+    }\n \n+    NodeContext& node = EnsureAnyNodeContext(request.context);\n     CTxMemPool& mempool = EnsureMemPool(node);\n-    int64_t virtual_size = GetVirtualTransactionSize(*tx);\n-    CAmount max_raw_tx_fee = max_raw_tx_fee_rate.GetFee(virtual_size);\n-\n-    UniValue result(UniValue::VARR);\n-    UniValue result_0(UniValue::VOBJ);\n-    result_0.pushKV(\"txid\", tx->GetHash().GetHex());\n-    result_0.pushKV(\"wtxid\", tx->GetWitnessHash().GetHex());\n-\n-    ChainstateManager& chainman = EnsureChainman(node);\n-    const MempoolAcceptResult accept_result = WITH_LOCK(cs_main, return AcceptToMemoryPool(chainman.ActiveChainstate(), mempool, std::move(tx),\n-                                                  false /* bypass_limits */, /* test_accept */ true));\n-\n-    // Only return the fee and vsize if the transaction would pass ATMP.\n-    // These can be used to calculate the feerate.\n-    if (accept_result.m_result_type == MempoolAcceptResult::ResultType::VALID) {\n-        const CAmount fee = accept_result.m_base_fees.value();\n-        // Check that fee does not exceed maximum fee\n-        if (max_raw_tx_fee && fee > max_raw_tx_fee) {\n-            result_0.pushKV(\"allowed\", false);\n-            result_0.pushKV(\"reject-reason\", \"max-fee-exceeded\");\n-        } else {\n-            result_0.pushKV(\"allowed\", true);\n-            result_0.pushKV(\"vsize\", virtual_size);\n-            UniValue fees(UniValue::VOBJ);\n-            fees.pushKV(\"base\", ValueFromAmount(fee));\n-            result_0.pushKV(\"fees\", fees);\n+    CChainState& chainstate = EnsureChainman(node).ActiveChainstate();\n+    const PackageMempoolAcceptResult validation_result = [&] {\n+        LOCK(::cs_main);\n+        if (txns.size() > 1) return ProcessNewPackage(chainstate, mempool, txns, /* test_accept */ true);\n+        return PackageMempoolAcceptResult(txns[0]->GetWitnessHash(),\n+               AcceptToMemoryPool(chainstate, mempool, txns[0], /* bypass_limits */ false, /* test_accept*/ true));\n+    }();\n+\n+    UniValue rpc_result(UniValue::VARR);\n+\n+    for (auto tx : txns) {\n+        UniValue result_inner(UniValue::VOBJ);\n+        result_inner.pushKV(\"txid\", tx->GetHash().GetHex());\n+        result_inner.pushKV(\"wtxid\", tx->GetWitnessHash().GetHex());\n+        if (validation_result.m_state.GetResult() == PackageValidationResult::PCKG_POLICY) {\n+            result_inner.pushKV(\"package-error\", validation_result.m_state.GetRejectReason());\n         }\n-        result.push_back(std::move(result_0));\n-    } else {\n-        result_0.pushKV(\"allowed\", false);\n-        const TxValidationState state = accept_result.m_state;\n-        if (state.GetResult() == TxValidationResult::TX_MISSING_INPUTS) {\n-            result_0.pushKV(\"reject-reason\", \"missing-inputs\");\n+        auto it = validation_result.m_tx_results.find(tx->GetWitnessHash());\n+        if (it == validation_result.m_tx_results.end()) {\n+            // Validation unfinished. Just return the txid and wtxid.\n+            rpc_result.push_back(result_inner);\n+            continue;\n+        }\n+        const auto& accept_result = it->second;\n+        if (accept_result.m_result_type == MempoolAcceptResult::ResultType::VALID) {\n+            const CAmount fee = accept_result.m_base_fees.value();\n+            // Check that fee does not exceed maximum fee\n+            const int64_t virtual_size = GetVirtualTransactionSize(*tx);\n+            const CAmount max_raw_tx_fee = max_raw_tx_fee_rate.GetFee(virtual_size);\n+            if (max_raw_tx_fee && fee > max_raw_tx_fee) {\n+                result_inner.pushKV(\"allowed\", false);\n+                result_inner.pushKV(\"reject-reason\", \"max-fee-exceeded\");\n+            } else {\n+                // Only return the fee and vsize if the transaction would pass ATMP.\n+                // These can be used to calculate the feerate.\n+                result_inner.pushKV(\"allowed\", true);\n+                result_inner.pushKV(\"vsize\", virtual_size);\n+                UniValue fees(UniValue::VOBJ);\n+                fees.pushKV(\"base\", ValueFromAmount(fee));\n+                result_inner.pushKV(\"fees\", fees);\n+            }\n         } else {\n-            result_0.pushKV(\"reject-reason\", state.GetRejectReason());\n+            result_inner.pushKV(\"allowed\", false);\n+            const TxValidationState state = accept_result.m_state;\n+            if (state.GetResult() == TxValidationResult::TX_MISSING_INPUTS) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629361807",
+      "id" : 629361807,
+      "line" : 1005,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyOTM2MTgwNw==",
+      "original_commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "original_line" : 1005,
+      "original_position" : 150,
+      "original_start_line" : null,
+      "path" : "src/rpc/rawtransaction.cpp",
+      "position" : 150,
+      "pull_request_review_id" : 655648021,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-10T16:54:02Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629361807",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
             "href" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629449767"
          },
          "pull_request" : {
@@ -20032,6 +20087,284 @@
          "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629481038"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629481038"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Thanks for noting the outcome of this conversation, but I think this limitation would be better described as \"be rejected as infringing on mempool size limit if effectively added\". What we can describe as min mempool fee enforcement I believe is done by `CheckFeeRate`.",
+      "commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "created_at" : "2021-05-10T15:57:52Z",
+      "diff_hunk" : "@@ -108,6 +108,16 @@ Updated RPCs\n   Respectively, these new fields indicate the duration of a ban and the time remaining until a ban expires,\n   both in seconds. Additionally, the `ban_created` field is repositioned to come before `banned_until`. (#21602)\n \n+- The `testmempoolaccept` RPC now accepts multiple transactions. This is intended for testing\n+  transaction packages with dependency relationships; it is not recommended for batch-validating\n+  independent transactions. In addition to mempool policy, package policies apply: the list cannot\n+  contain more than 25 transactions or have a total size exceeding 101K virtual bytes, and the\n+  transactions must be ordered by dependency (parents appear before children).  Transactions cannot\n+  conflict with (spend the same inputs as) each other or the mempool, even if it would be a valid\n+  BIP125 replace-by-fee. There are also limitations on how accurate the policy checks are: a package\n+  that passed `testmempoolaccept` may actually exceed in-mempool ancestor limits or be below the\n+  true minimum mempool fee. (#20833)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629481038",
+      "id" : 629481038,
+      "line" : 119,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyOTQ4MTAzOA==",
+      "original_commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "original_line" : 119,
+      "original_position" : 12,
+      "original_start_line" : null,
+      "path" : "doc/release-notes.md",
+      "position" : 12,
+      "pull_request_review_id" : 655648021,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-10T16:54:02Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629481038",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629494952"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629494952"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit: what about `m_viewtmp` to dissociate clearly from `m_viewmempool`?",
+      "commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "created_at" : "2021-05-10T16:17:00Z",
+      "diff_hunk" : "@@ -541,7 +641,7 @@ class MemPoolAccept\n \n private:\n     CTxMemPool& m_pool;\n-    CCoinsViewCache m_view;\n+    CoinsViewTemporary m_view;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629494952",
+      "id" : 629494952,
+      "line" : 644,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyOTQ5NDk1Mg==",
+      "original_commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "original_line" : 644,
+      "original_position" : 180,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 180,
+      "pull_request_review_id" : 655648021,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-10T16:54:02Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629494952",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629514373"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629514373"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I think `package_count==1` is a good hint of internal API `AcceptMultipleTransactions` misusage and an assert would be cleaner. Though not a strong opinion.",
+      "commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "created_at" : "2021-05-10T16:45:51Z",
+      "diff_hunk" : "@@ -1062,28 +1162,141 @@ MempoolAcceptResult MemPoolAccept::AcceptSingleTransaction(const CTransactionRef\n \n     Workspace ws(ptx);\n \n-    if (!PreChecks(args, ws)) return MempoolAcceptResult(ws.m_state);\n+    if (!PreChecks(args, ws)) return MempoolAcceptResult::Failure(ws.m_state);\n \n     // Only compute the precomputed transaction data if we need to verify\n     // scripts (ie, other policy checks pass). We perform the inexpensive\n     // checks first and avoid hashing and signature verification unless those\n     // checks pass, to mitigate CPU exhaustion denial-of-service attacks.\n     PrecomputedTransactionData txdata;\n \n-    if (!PolicyScriptChecks(args, ws, txdata)) return MempoolAcceptResult(ws.m_state);\n+    if (!PolicyScriptChecks(args, ws, txdata)) return MempoolAcceptResult::Failure(ws.m_state);\n \n-    if (!ConsensusScriptChecks(args, ws, txdata)) return MempoolAcceptResult(ws.m_state);\n+    if (!ConsensusScriptChecks(args, ws, txdata)) return MempoolAcceptResult::Failure(ws.m_state);\n \n     // Tx was accepted, but not added\n     if (args.m_test_accept) {\n-        return MempoolAcceptResult(std::move(ws.m_replaced_transactions), ws.m_base_fees);\n+        return MempoolAcceptResult::Success(std::move(ws.m_replaced_transactions), ws.m_base_fees);\n     }\n \n-    if (!Finalize(args, ws)) return MempoolAcceptResult(ws.m_state);\n+    if (!Finalize(args, ws)) return MempoolAcceptResult::Failure(ws.m_state);\n \n     GetMainSignals().TransactionAddedToMempool(ptx, m_pool.GetAndIncrementSequence());\n \n-    return MempoolAcceptResult(std::move(ws.m_replaced_transactions), ws.m_base_fees);\n+    return MempoolAcceptResult::Success(std::move(ws.m_replaced_transactions), ws.m_base_fees);\n+}\n+\n+PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::vector<CTransactionRef>& txns, ATMPArgs& args)\n+{\n+    AssertLockHeld(cs_main);\n+\n+    PackageValidationState package_state;\n+    // Check for malformed input.\n+    if (txns.empty()) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-too-few-transactions\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+    if (!std::all_of(txns.cbegin(), txns.cend(),\n+                     [](const auto& tx){ return tx && !tx->IsNull(); })) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-malformed-transaction\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+\n+    const unsigned int package_count = txns.size();\n+\n+    // These context-free package limits can be checked before taking the mempool lock.\n+    if (package_count > MAX_PACKAGE_COUNT) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-too-many-transactions\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+\n+    const int64_t total_size = std::accumulate(txns.cbegin(), txns.cend(), 0,\n+                               [](int64_t sum, const auto& tx) { return sum + GetVirtualTransactionSize(*tx); });\n+    // If the package only contains 1 tx, it's better to report the policy violation on individual tx size.\n+    if (package_count > 1 && total_size > MAX_PACKAGE_SIZE * 1000) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629514373",
+      "id" : 629514373,
+      "in_reply_to_id" : 625927118,
+      "line" : 1188,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyOTUxNDM3Mw==",
+      "original_commit_id" : "d8642c19991ca91ae7edeab82d3409a73fcfdb56",
+      "original_line" : 1188,
+      "original_position" : 268,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 257,
+      "pull_request_review_id" : 655648021,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-10T16:54:02Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629514373",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629533725"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629533725"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "(Out of the scope of this PR to change this) Correct, I don't think the special gate on `TX_MISSING_INPUTS` is necessary anymore, but changing it will mean all the tests will need to assert \"bad-txns-inputs-missingorspent\" instead of \"missing-inputs.\"",
+      "commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "created_at" : "2021-05-10T17:15:30Z",
+      "diff_hunk" : "@@ -932,62 +938,79 @@ static RPCHelpMan testmempoolaccept()\n         UniValueType(), // VNUM or VSTR, checked inside AmountFromValue()\n     });\n \n-    if (request.params[0].get_array().size() != 1) {\n-        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Array must contain exactly one raw transaction for now\");\n+    if (request.params[0].get_array().size() > MAX_PACKAGE_COUNT) {\n+        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Array cannot contain more than \" + ToString(MAX_PACKAGE_COUNT) + \" transactions.\");\n     }\n \n-    CMutableTransaction mtx;\n-    if (!DecodeHexTx(mtx, request.params[0].get_array()[0].get_str())) {\n-        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"TX decode failed. Make sure the tx has at least one input.\");\n-    }\n-    CTransactionRef tx(MakeTransactionRef(std::move(mtx)));\n-\n+    const UniValue raw_transactions = request.params[0].get_array();\n     const CFeeRate max_raw_tx_fee_rate = request.params[1].isNull() ?\n                                              DEFAULT_MAX_RAW_TX_FEE_RATE :\n                                              CFeeRate(AmountFromValue(request.params[1]));\n \n-    NodeContext& node = EnsureAnyNodeContext(request.context);\n+    std::vector<CTransactionRef> txns;\n+    for (const auto& rawtx : raw_transactions.getValues()) {\n+        CMutableTransaction mtx;\n+        if (!DecodeHexTx(mtx, rawtx.get_str())) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"TX decode failed. Make sure the tx has at least one input.\");\n+        }\n+        txns.emplace_back(MakeTransactionRef(std::move(mtx)));\n+    }\n \n+    NodeContext& node = EnsureAnyNodeContext(request.context);\n     CTxMemPool& mempool = EnsureMemPool(node);\n-    int64_t virtual_size = GetVirtualTransactionSize(*tx);\n-    CAmount max_raw_tx_fee = max_raw_tx_fee_rate.GetFee(virtual_size);\n-\n-    UniValue result(UniValue::VARR);\n-    UniValue result_0(UniValue::VOBJ);\n-    result_0.pushKV(\"txid\", tx->GetHash().GetHex());\n-    result_0.pushKV(\"wtxid\", tx->GetWitnessHash().GetHex());\n-\n-    ChainstateManager& chainman = EnsureChainman(node);\n-    const MempoolAcceptResult accept_result = WITH_LOCK(cs_main, return AcceptToMemoryPool(chainman.ActiveChainstate(), mempool, std::move(tx),\n-                                                  false /* bypass_limits */, /* test_accept */ true));\n-\n-    // Only return the fee and vsize if the transaction would pass ATMP.\n-    // These can be used to calculate the feerate.\n-    if (accept_result.m_result_type == MempoolAcceptResult::ResultType::VALID) {\n-        const CAmount fee = accept_result.m_base_fees.value();\n-        // Check that fee does not exceed maximum fee\n-        if (max_raw_tx_fee && fee > max_raw_tx_fee) {\n-            result_0.pushKV(\"allowed\", false);\n-            result_0.pushKV(\"reject-reason\", \"max-fee-exceeded\");\n-        } else {\n-            result_0.pushKV(\"allowed\", true);\n-            result_0.pushKV(\"vsize\", virtual_size);\n-            UniValue fees(UniValue::VOBJ);\n-            fees.pushKV(\"base\", ValueFromAmount(fee));\n-            result_0.pushKV(\"fees\", fees);\n+    CChainState& chainstate = EnsureChainman(node).ActiveChainstate();\n+    const PackageMempoolAcceptResult validation_result = [&] {\n+        LOCK(::cs_main);\n+        if (txns.size() > 1) return ProcessNewPackage(chainstate, mempool, txns, /* test_accept */ true);\n+        return PackageMempoolAcceptResult(txns[0]->GetWitnessHash(),\n+               AcceptToMemoryPool(chainstate, mempool, txns[0], /* bypass_limits */ false, /* test_accept*/ true));\n+    }();\n+\n+    UniValue rpc_result(UniValue::VARR);\n+\n+    for (auto tx : txns) {\n+        UniValue result_inner(UniValue::VOBJ);\n+        result_inner.pushKV(\"txid\", tx->GetHash().GetHex());\n+        result_inner.pushKV(\"wtxid\", tx->GetWitnessHash().GetHex());\n+        if (validation_result.m_state.GetResult() == PackageValidationResult::PCKG_POLICY) {\n+            result_inner.pushKV(\"package-error\", validation_result.m_state.GetRejectReason());\n         }\n-        result.push_back(std::move(result_0));\n-    } else {\n-        result_0.pushKV(\"allowed\", false);\n-        const TxValidationState state = accept_result.m_state;\n-        if (state.GetResult() == TxValidationResult::TX_MISSING_INPUTS) {\n-            result_0.pushKV(\"reject-reason\", \"missing-inputs\");\n+        auto it = validation_result.m_tx_results.find(tx->GetWitnessHash());\n+        if (it == validation_result.m_tx_results.end()) {\n+            // Validation unfinished. Just return the txid and wtxid.\n+            rpc_result.push_back(result_inner);\n+            continue;\n+        }\n+        const auto& accept_result = it->second;\n+        if (accept_result.m_result_type == MempoolAcceptResult::ResultType::VALID) {\n+            const CAmount fee = accept_result.m_base_fees.value();\n+            // Check that fee does not exceed maximum fee\n+            const int64_t virtual_size = GetVirtualTransactionSize(*tx);\n+            const CAmount max_raw_tx_fee = max_raw_tx_fee_rate.GetFee(virtual_size);\n+            if (max_raw_tx_fee && fee > max_raw_tx_fee) {\n+                result_inner.pushKV(\"allowed\", false);\n+                result_inner.pushKV(\"reject-reason\", \"max-fee-exceeded\");\n+            } else {\n+                // Only return the fee and vsize if the transaction would pass ATMP.\n+                // These can be used to calculate the feerate.\n+                result_inner.pushKV(\"allowed\", true);\n+                result_inner.pushKV(\"vsize\", virtual_size);\n+                UniValue fees(UniValue::VOBJ);\n+                fees.pushKV(\"base\", ValueFromAmount(fee));\n+                result_inner.pushKV(\"fees\", fees);\n+            }\n         } else {\n-            result_0.pushKV(\"reject-reason\", state.GetRejectReason());\n+            result_inner.pushKV(\"allowed\", false);\n+            const TxValidationState state = accept_result.m_state;\n+            if (state.GetResult() == TxValidationResult::TX_MISSING_INPUTS) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629533725",
+      "id" : 629533725,
+      "in_reply_to_id" : 629361807,
+      "line" : 1005,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyOTUzMzcyNQ==",
+      "original_commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "original_line" : 1005,
+      "original_position" : 150,
+      "original_start_line" : null,
+      "path" : "src/rpc/rawtransaction.cpp",
+      "position" : 150,
+      "pull_request_review_id" : 655881926,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-10T17:15:31Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629533725",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629534782"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629534782"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Ok, I can update the doc. Generally, would it be better to just note \"multiple transaction testmempoolaccept is experimental, expect the API to be unstable?\" And then list the known limitations.",
+      "commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "created_at" : "2021-05-10T17:17:10Z",
+      "diff_hunk" : "@@ -108,6 +108,16 @@ Updated RPCs\n   Respectively, these new fields indicate the duration of a ban and the time remaining until a ban expires,\n   both in seconds. Additionally, the `ban_created` field is repositioned to come before `banned_until`. (#21602)\n \n+- The `testmempoolaccept` RPC now accepts multiple transactions. This is intended for testing\n+  transaction packages with dependency relationships; it is not recommended for batch-validating\n+  independent transactions. In addition to mempool policy, package policies apply: the list cannot\n+  contain more than 25 transactions or have a total size exceeding 101K virtual bytes, and the\n+  transactions must be ordered by dependency (parents appear before children).  Transactions cannot\n+  conflict with (spend the same inputs as) each other or the mempool, even if it would be a valid\n+  BIP125 replace-by-fee. There are also limitations on how accurate the policy checks are: a package\n+  that passed `testmempoolaccept` may actually exceed in-mempool ancestor limits or be below the\n+  true minimum mempool fee. (#20833)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r629534782",
+      "id" : 629534782,
+      "in_reply_to_id" : 629481038,
+      "line" : 119,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYyOTUzNDc4Mg==",
+      "original_commit_id" : "d93d51f1132bc6ae54f7d23a5bbb434ce01b7c37",
+      "original_line" : 119,
+      "original_position" : 12,
+      "original_start_line" : null,
+      "path" : "doc/release-notes.md",
+      "position" : 12,
+      "pull_request_review_id" : 655883372,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-10T17:17:11Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/629534782",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
       }
    }
 ]
