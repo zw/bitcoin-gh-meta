@@ -12167,8 +12167,8 @@
          }
       },
       "author_association" : "CONTRIBUTOR",
-      "body" : "In commit \"Move output reductions for fee to after coin selection\" (2b445b7c1336506d43874a7ee31f85f511cd3114)\r\n\r\nMinor style suggestion. Would be a little clearer to replace\r\n\r\n```c++\r\nif (nSubtractFeeFromAmount == 0) {\r\n    ...\r\n} else if (nSubtractFeeFromAmount != 0) {\r\n    ...\r\n} else {\r\n    assert(false); // It shouldn't be possible to reach this\r\n}\r\n```\r\n\r\nwith \r\n\r\n```c++\r\nif (nSubtractFeeFromAmount == 0) {\r\n    ...\r\n} else {\r\n   assert (nSubtractFeeFromAmount != 0);\r\n   ...\r\n}\r\n```",
-      "commit_id" : "57590fba000c875ebc680b27ce37ceb99c7433fb",
+      "body" : "In commit \"Move output reductions for fee to after coin selection\" (2b445b7c1336506d43874a7ee31f85f511cd3114)\r\n\r\nEDIT: Never mind this suggestion, later loop removing commit makes this better.\r\n\r\n~~Minor style suggestion. Would be a little clearer to replace~~\r\n\r\n```c++\r\nif (nSubtractFeeFromAmount == 0) {\r\n    ...\r\n} else if (nSubtractFeeFromAmount != 0) {\r\n    ...\r\n} else {\r\n    assert(false); // It shouldn't be possible to reach this\r\n}\r\n```\r\n\r\n~~with~~\r\n\r\n```c++\r\nif (nSubtractFeeFromAmount == 0) {\r\n    ...\r\n} else {\r\n   assert (nSubtractFeeFromAmount != 0);\r\n   ...\r\n}\r\n```",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
       "created_at" : "2021-05-18T18:52:41Z",
       "diff_hunk" : "@@ -3046,69 +3005,105 @@ bool CWallet::CreateTransactionInternal(\n                     return false;\n                 }\n \n-                nFeeNeeded = coin_selection_params.m_effective_feerate.GetFee(nBytes);\n-                if (nFeeRet >= nFeeNeeded) {\n-                    // Reduce fee to only the needed amount if possible. This\n-                    // prevents potential overpayment in fees if the coins\n-                    // selected to meet nFeeNeeded result in a transaction that\n-                    // requires less fee than the prior iteration.\n-\n-                    // If we have no change and a big enough excess fee, then\n-                    // try to construct transaction again only without picking\n-                    // new inputs. We now know we only need the smaller fee\n-                    // (because of reduced tx size) and so we should add a\n-                    // change output. Only try this once.\n-                    if (nChangePosInOut == -1 && nSubtractFeeFromAmount == 0 && pick_new_inputs) {\n-                        unsigned int tx_size_with_change = nBytes + coin_selection_params.change_output_size + 2; // Add 2 as a buffer in case increasing # of outputs changes compact size\n-                        CAmount fee_needed_with_change = coin_selection_params.m_effective_feerate.GetFee(tx_size_with_change);\n-                        CAmount minimum_value_for_change = GetDustThreshold(change_prototype_txout, coin_selection_params.m_discard_feerate);\n-                        if (nFeeRet >= fee_needed_with_change + minimum_value_for_change) {\n-                            pick_new_inputs = false;\n-                            nFeeRet = fee_needed_with_change;\n-                            continue;\n+                nFeeRet = coin_selection_params.m_effective_feerate.GetFee(nBytes);\n+                // Try to reduce change to include necessary fee\n+                if (nSubtractFeeFromAmount == 0) {\n+                    assert(nChangePosInOut != -1);\n+                    std::vector<CTxOut>::iterator change_position = txNew.vout.begin()+nChangePosInOut;\n+                    change_position->nValue -= nFeeRet;\n+\n+                    if (change_position->nValue < 0) {\n+                        CAmount orig_fee = nFeeRet;\n+                        // Maybe the change value was just enough to cover the fee if we did not have change in this transaction\n+                        // Let's try dropping the change, recalculating the fee, and comparing the new fee to change_and_Fee\n+                        nChangePosInOut = -1;\n+                        txNew.vout.erase(change_position);\n+\n+                        tx_sizes = CalculateMaximumSignedTxSize(CTransaction(txNew), this, coin_control.fAllowWatchOnly);\n+                        nBytes = tx_sizes.first;\n+                        nFeeRet = coin_selection_params.m_effective_feerate.GetFee(nBytes);\n+                        if (nFeeRet <= change_and_fee) {\n+                            // Dropping the change value puts us exactly at the value, so we can exit now\n+                            break;\n                         }\n+\n+                        // The change value was not enough to cover the fees, even after dropping the change\n+                        // We set nFeeRet back to its original value (the one that includes the change output) and try selecting again\n+                        assert(change_and_fee < nFeeRet);\n+                        nFeeRet = orig_fee;\n+                        continue;\n                     }\n \n-                    // If we have change output already, just increase it\n-                    if (nFeeRet > nFeeNeeded && nChangePosInOut != -1 && nSubtractFeeFromAmount == 0) {\n-                        CAmount extraFeePaid = nFeeRet - nFeeNeeded;\n-                        std::vector<CTxOut>::iterator change_position = txNew.vout.begin()+nChangePosInOut;\n-                        change_position->nValue += extraFeePaid;\n-                        nFeeRet -= extraFeePaid;\n+                    // The change value was enough to cover the fees. We may want to drop it to fees if it is too small,\n+                    // or try selecting again if we don't meet the minimum change requirement\n+\n+                    // We want to drop the change to fees if:\n+                    // 1. The change output would be dust\n+                    // 2. The change is within the (almost) exact match window, i.e. it is less than or equal to the cost of the change output (cost_of_change)\n+                    if (IsDust(*change_position, coin_selection_params.m_discard_feerate) || change_position->nValue <= coin_selection_params.m_cost_of_change)\n+                    {\n+                        nFeeRet += change_position->nValue;\n+                        nChangePosInOut = -1;\n+                        txNew.vout.erase(change_position);\n                     }\n-                    break; // Done, enough fee included.\n-                }\n-                else if (!pick_new_inputs) {\n-                    // This shouldn't happen, we should have had enough excess\n-                    // fee to pay for the new output and still meet nFeeNeeded\n-                    // Or we should have just subtracted fee from recipients and\n-                    // nFeeNeeded should not have changed\n-                    error = _(\"Transaction fee and change calculation failed\");\n-                    return false;\n+                    break; // Fee requirements were met\n                 }\n+                // Reduce output values for subtractFeeFromAmount\n+                else if (nSubtractFeeFromAmount != 0) {\n+                    int i = 0;\n+                    bool fFirst = true;\n+                    CAmount to_reduce = nFeeRet;\n+                    if (nChangePosInOut != -1) {\n+                        // Although we aren't going to reduce this change output to handle the transaction fees,\n+                        // we still want to check if we would drop it to fees\n+                        std::vector<CTxOut>::iterator change_position = txNew.vout.begin()+nChangePosInOut;\n+                        if (IsDust(*change_position, coin_selection_params.m_discard_feerate) || change_position->nValue <= coin_selection_params.m_cost_of_change)\n+                        {\n+                            nChangePosInOut = -1;\n+                            txNew.vout.erase(change_position);\n \n-                // Try to reduce change to include necessary fee\n-                if (nChangePosInOut != -1 && nSubtractFeeFromAmount == 0) {\n-                    CAmount additionalFeeNeeded = nFeeNeeded - nFeeRet;\n-                    std::vector<CTxOut>::iterator change_position = txNew.vout.begin()+nChangePosInOut;\n-                    // Only reduce change if remaining amount is still a large enough output.\n-                    if (change_position->nValue >= MIN_FINAL_CHANGE + additionalFeeNeeded) {\n-                        change_position->nValue -= additionalFeeNeeded;\n-                        nFeeRet += additionalFeeNeeded;\n-                        break; // Done, able to increase fee from change\n+                            // Because we have dropped this change, our tx size and required fee will be different. So let's recalculate those.\n+                            tx_sizes = CalculateMaximumSignedTxSize(CTransaction(txNew), this, coin_control.fAllowWatchOnly);\n+                            nBytes = tx_sizes.first;\n+                            to_reduce = nFeeRet = coin_selection_params.m_effective_feerate.GetFee(nBytes);\n+\n+                            // Furthermore, because we have dropped the change value, that will be part of the fee.\n+                            // We give this back to the recipients as a discount to the amount that is being reduced from them.\n+                            to_reduce -= change_and_fee;\n+                        }\n                     }\n-                }\n+                    for (const auto& recipient : vecSend)\n+                    {\n+                        if (i == nChangePosInOut) {\n+                            ++i;\n+                        }\n+                        CTxOut& txout = txNew.vout[i];\n \n-                // If subtracting fee from recipients, we now know what fee we\n-                // need to subtract, we have no reason to reselect inputs\n-                if (nSubtractFeeFromAmount > 0) {\n-                    pick_new_inputs = false;\n+                        if (recipient.fSubtractFeeFromAmount)\n+                        {\n+                            txout.nValue -= to_reduce / nSubtractFeeFromAmount; // Subtract fee equally from each selected recipient\n+\n+                            if (fFirst) // first receiver pays the remainder not divisible by output count\n+                            {\n+                                fFirst = false;\n+                                txout.nValue -= to_reduce % nSubtractFeeFromAmount;\n+                            }\n+\n+                            // Error if this output is reduced to be below dust\n+                            if (IsDust(txout, chain().relayDustFee())) {\n+                                if (txout.nValue < 0) {\n+                                    error = _(\"The transaction amount is too small to pay the fee\");\n+                                } else {\n+                                    error = _(\"The transaction amount is too small to send after the fee has been deducted\");\n+                                }\n+                                return false;\n+                            }\n+                        }\n+                        ++i;\n+                    }\n+                    break; // The fee has been deducted from the recipients, nothing left to do here\n                 }\n-\n-                // Include more fee and try again.\n-                nFeeRet = nFeeNeeded;\n-                coin_selection_params.use_bnb = false;\n-                continue;\n+                assert(false); // It shouldn't be possible to reach this",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r634665258",
@@ -12186,7 +12186,7 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2021-05-18T19:56:47Z",
+      "updated_at" : "2021-05-19T19:41:08Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/634665258",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
@@ -12404,6 +12404,595 @@
          "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635509067"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635509067"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "In commit \"Roll static tx fees into nValueToSelect instead of having it be separate\" (67fc8b7be1d5fbdb199d6e995434431a7282d446)\r\n\r\nThis logic is not making sense to me. It wasn't this complicated before, and even though commits are reordered and nTargetValue is passed differently now I would expect these lines 2957-2964 to look like:\r\n\r\n```c++\r\nCAmount nValueToSelect = nValue;\r\nif (coin_selection_params.use_bnb) nValueToSelect += not_input_fees;\r\nif (nSubtractFeeFromAmount != 0) nValueToSelect += nFeeRet;\r\n```\r\n\r\nThis would:\r\n- Avoid adding not_input_fees and then subtracting it\r\n- Avoid introducing unexplained std::max not_input_fees > nFeeRet corner case\r\n- Avoid changing behavior in the bnb && nSubtractFeeFromAmount case.\r\n  - If it is actually desirable to change bnb behavior I think it should happen in a different commit. This commit is already doing multiple things and I think would be good to split, see https://github.com/bitcoin/bitcoin/pull/17331#discussion_r632069270\r\n- Let you drop or shorten the \"Note that setting nValueToSelect is changed...\" paragraph in commit description since it should be obvious this only changes bnb",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
+      "created_at" : "2021-05-19T19:01:09Z",
+      "diff_hunk" : "@@ -2956,11 +2952,21 @@ bool CWallet::CreateTransactionInternal(\n                     txNew.vout.push_back(txout);\n                 }\n \n+                // Include the fees for things that aren't inputs, excluding the change output\n+                const CAmount not_input_fees = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.tx_noinputs_size);\n+                CAmount nValueToSelect = nValue + not_input_fees;\n+\n+                // For KnapsackSolver, when we are not subtracting the fee from the recipients, we also want to include the fees for the\n+                // inputs that we found in the previous iteration.\n+                if (!coin_selection_params.use_bnb && nSubtractFeeFromAmount == 0) {\n+                    nValueToSelect += std::max(CAmount(0), nFeeRet - not_input_fees);\n+                }\n+",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635509067",
+      "id" : 635509067,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNTUwOTA2Nw==",
+      "original_commit_id" : "67fc8b7be1d5fbdb199d6e995434431a7282d446",
+      "original_line" : 2956,
+      "original_position" : 54,
+      "original_start_line" : 2957,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : null,
+      "pull_request_review_id" : 663562523,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "updated_at" : "2021-05-19T19:43:44Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635509067",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635518342"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635518342"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "In commit \"Roll static tx fees into nValueToSelect instead of having it be separate\" (67fc8b7be1d5fbdb199d6e995434431a7282d446)\r\n\r\nI could be thinking about this wrong, but this change seems backwards. It matches the description which says \"use the changeless nFeeRet when iterating for KnapsackSolver. This is because we include\r\nthe change fee when doing KnapsackSolver, so nFeeRet on furtheriterations won't include the change fee.\"\r\n\r\nBut isn't this the opposite of what we want? If KnapSackSolver is going to find a solution requiring a change output, shouldn't nFeeRet be set to the full cost of a transaction including the change output (orig_fee)? Not the cost of the smaller transaction without a change output.",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
+      "created_at" : "2021-05-19T19:16:07Z",
+      "diff_hunk" : "@@ -3027,10 +3032,8 @@ bool CWallet::CreateTransactionInternal(\n                             break;\n                         }\n \n-                        // The change value was not enough to cover the fees, even after dropping the change\n-                        // We set nFeeRet back to its original value (the one that includes the change output) and try selecting again\n+                        // The change value was not enough to cover the fees, even after dropping the change. Try selecting again.\n                         assert(change_and_fee < nFeeRet);\n-                        nFeeRet = orig_fee;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635518342",
+      "id" : 635518342,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNTUxODM0Mg==",
+      "original_commit_id" : "67fc8b7be1d5fbdb199d6e995434431a7282d446",
+      "original_line" : 3033,
+      "original_position" : 80,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : null,
+      "pull_request_review_id" : 663562523,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331",
+      "side" : "LEFT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-19T19:43:44Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635518342",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635523507"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635523507"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "In commit \"Have KnapsackSolver actually use effective values\" (a07552b94fe05651970e53813ae67606692d6f19)\r\n\r\nWould be good to change the error to \"Bug: Cannot reduce change to cover transaction fees\" or \"Unexpected condition: Cannot reduce change to cover transaction fees\" or just use CHECK_NONFATAL(false) or assert(false), so it is clearer this shouldn't happen, or if it does happen it's a bug and not the user doing something wrong.",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
+      "created_at" : "2021-05-19T19:24:22Z",
+      "diff_hunk" : "@@ -3032,9 +3024,10 @@ bool CWallet::CreateTransactionInternal(\n                             break;\n                         }\n \n-                        // The change value was not enough to cover the fees, even after dropping the change. Try selecting again.\n-                        assert(change_and_fee < nFeeRet);\n-                        continue;\n+                        // Since we use effective values now, it should not be possible to reach this situation where the change value was not\n+                        // enough to cover the fees\n+                        error = _(\"Cannot reduce change to cover transaction fees\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635523507",
+      "id" : 635523507,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNTUyMzUwNw==",
+      "original_commit_id" : "a07552b94fe05651970e53813ae67606692d6f19",
+      "original_line" : 3029,
+      "original_position" : 52,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : null,
+      "pull_request_review_id" : 663562523,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-19T19:43:44Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635523507",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635534606"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635534606"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Renamed to `coin_sel_params`.",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
+      "created_at" : "2021-05-19T19:42:36Z",
+      "diff_hunk" : "@@ -4250,12 +4243,12 @@ bool CWalletTx::IsImmatureCoinBase() const\n     return GetBlocksToMaturity() > 0;\n }\n \n-std::vector<OutputGroup> CWallet::GroupOutputs(const std::vector<COutput>& outputs, bool separate_coins, const CFeeRate& effective_feerate, const CFeeRate& long_term_feerate, const CoinEligibilityFilter& filter, bool positive_only) const\n+std::vector<OutputGroup> CWallet::GroupOutputs(const std::vector<COutput>& outputs, const CoinSelectionParams& cs_params, const CoinEligibilityFilter& filter, bool positive_only) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635534606",
+      "id" : 635534606,
+      "in_reply_to_id" : 633009303,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNTUzNDYwNg==",
+      "original_commit_id" : "57590fba000c875ebc680b27ce37ceb99c7433fb",
+      "original_line" : 4246,
+      "original_position" : 28,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : null,
+      "pull_request_review_id" : 663595635,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-19T19:42:37Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635534606",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635534655"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635534655"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
+      "created_at" : "2021-05-19T19:42:42Z",
+      "diff_hunk" : "@@ -2901,205 +2893,174 @@ bool CWallet::CreateTransactionInternal(\n             cc_temp.m_confirm_target = chain().estimateMaxBlocks();\n             coin_selection_params.m_long_term_feerate = GetMinimumFeeRate(*this, cc_temp, nullptr);\n \n-            nFeeRet = 0;\n-            bool pick_new_inputs = true;\n-            CAmount nValueIn = 0;\n+            // Calculate the cost of change\n+            // Cost of change is the cost of creating the change output + cost of spending the change output in the future.\n+            // For creating the change output now, we use the effective feerate.\n+            // For spending the change output in the future, we use the discard feerate for now.\n+            // So cost of change = (change output size * effective feerate) + (size of spending change output * discard feerate)\n+            coin_selection_params.m_change_fee = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.change_output_size);\n+            coin_selection_params.m_cost_of_change = coin_selection_params.m_discard_feerate.GetFee(coin_selection_params.change_spend_size) + coin_selection_params.m_change_fee;\n \n-            // BnB selector is the only selector used when this is true.\n-            // That should only happen on the first pass through the loop.\n-            coin_selection_params.use_bnb = true;\n             coin_selection_params.m_subtract_fee_outputs = nSubtractFeeFromAmount != 0; // If we are doing subtract fee from recipient, don't use effective values\n-            // Start with no fee and loop until there is enough fee\n-            while (true)\n-            {\n-                nChangePosInOut = nChangePosRequest;\n-                txNew.vin.clear();\n-                txNew.vout.clear();\n-                bool fFirst = true;\n \n-                CAmount nValueToSelect = nValue;\n-                if (nSubtractFeeFromAmount == 0)\n-                    nValueToSelect += nFeeRet;\n+            // vouts to the payees\n+            if (!coin_selection_params.m_subtract_fee_outputs) {\n+                coin_selection_params.tx_noinputs_size = 11; // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 1 output count, 1 witness overhead (dummy, flag, stack size)\n+            }\n+            for (const auto& recipient : vecSend)\n+            {\n+                CTxOut txout(recipient.nAmount, recipient.scriptPubKey);\n \n-                // vouts to the payees\n+                // Include the fee cost for outputs.\n                 if (!coin_selection_params.m_subtract_fee_outputs) {\n-                    coin_selection_params.tx_noinputs_size = 11; // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 1 output count, 1 witness overhead (dummy, flag, stack size)\n+                    coin_selection_params.tx_noinputs_size += ::GetSerializeSize(txout, PROTOCOL_VERSION);\n                 }\n-                for (const auto& recipient : vecSend)\n+\n+                if (IsDust(txout, chain().relayDustFee()))\n                 {\n-                    CTxOut txout(recipient.nAmount, recipient.scriptPubKey);\n+                    error = _(\"Transaction amount too small\");\n+                    return false;\n+                }\n+                txNew.vout.push_back(txout);\n+            }\n \n-                    if (recipient.fSubtractFeeFromAmount)\n-                    {\n-                        assert(nSubtractFeeFromAmount != 0);\n-                        txout.nValue -= nFeeRet / nSubtractFeeFromAmount; // Subtract fee equally from each selected recipient\n+            // Include the fees for things that aren't inputs, excluding the change output\n+            const CAmount not_input_fees = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.tx_noinputs_size);\n+            CAmount nValueToSelect = nValue + not_input_fees;\n \n-                        if (fFirst) // first receiver pays the remainder not divisible by output count\n-                        {\n-                            fFirst = false;\n-                            txout.nValue -= nFeeRet % nSubtractFeeFromAmount;\n-                        }\n-                    }\n-                    // Include the fee cost for outputs. Note this is only used for BnB right now\n-                    if (!coin_selection_params.m_subtract_fee_outputs) {\n-                        coin_selection_params.tx_noinputs_size += ::GetSerializeSize(txout, PROTOCOL_VERSION);\n-                    }\n+            // Choose coins to use\n+            CAmount input_sum = 0;\n+            setCoins.clear();\n \n-                    if (IsDust(txout, chain().relayDustFee()))\n-                    {\n-                        if (recipient.fSubtractFeeFromAmount && nFeeRet > 0)\n-                        {\n-                            if (txout.nValue < 0)\n-                                error = _(\"The transaction amount is too small to pay the fee\");\n-                            else\n-                                error = _(\"The transaction amount is too small to send after the fee has been deducted\");\n-                        }\n-                        else\n-                            error = _(\"Transaction amount too small\");\n-                        return false;\n-                    }\n-                    txNew.vout.push_back(txout);\n-                }\n+            if (!SelectCoins(vAvailableCoins, /* nTargetValue */ nValueToSelect, setCoins, input_sum, coin_control, coin_selection_params))\n+            {\n+                error = _(\"Insufficient funds\");\n+                return false;\n+            }\n \n-                // Choose coins to use\n-                bool bnb_used = false;\n-                if (pick_new_inputs) {\n-                    nValueIn = 0;\n-                    setCoins.clear();\n-                    int change_spend_size = CalculateMaximumSignedInputSize(change_prototype_txout, this);\n-                    // If the wallet doesn't know how to sign change output, assume p2sh-p2wpkh\n-                    // as lower-bound to allow BnB to do it's thing\n-                    if (change_spend_size == -1) {\n-                        coin_selection_params.change_spend_size = DUMMY_NESTED_P2WPKH_INPUT_SIZE;\n-                    } else {\n-                        coin_selection_params.change_spend_size = (size_t)change_spend_size;\n-                    }\n-                    if (!SelectCoins(vAvailableCoins, nValueToSelect, setCoins, nValueIn, coin_control, coin_selection_params, bnb_used))\n-                    {\n-                        // If BnB was used, it was the first pass. No longer the first pass and continue loop with knapsack.\n-                        if (bnb_used) {\n-                            coin_selection_params.use_bnb = false;\n-                            continue;\n-                        }\n-                        else {\n-                            error = _(\"Insufficient funds\");\n-                            return false;\n-                        }\n+            const CAmount change_and_fee = input_sum - nValue;\n+            assert(change_and_fee >= 0);\n+            // Fill a vout to ourself\n+            CTxOut newTxOut(change_and_fee, scriptChange);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635534655",
+      "id" : 635534655,
+      "in_reply_to_id" : 633018567,
+      "line" : 2944,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNTUzNDY1NQ==",
+      "original_commit_id" : "57590fba000c875ebc680b27ce37ceb99c7433fb",
+      "original_line" : 2944,
+      "original_position" : 279,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : 255,
+      "pull_request_review_id" : 663595700,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-19T19:42:42Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635534655",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635534764"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635534764"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This comment was removed/rewritten.",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
+      "created_at" : "2021-05-19T19:42:55Z",
+      "diff_hunk" : "@@ -2901,205 +2893,174 @@ bool CWallet::CreateTransactionInternal(\n             cc_temp.m_confirm_target = chain().estimateMaxBlocks();\n             coin_selection_params.m_long_term_feerate = GetMinimumFeeRate(*this, cc_temp, nullptr);\n \n-            nFeeRet = 0;\n-            bool pick_new_inputs = true;\n-            CAmount nValueIn = 0;\n+            // Calculate the cost of change\n+            // Cost of change is the cost of creating the change output + cost of spending the change output in the future.\n+            // For creating the change output now, we use the effective feerate.\n+            // For spending the change output in the future, we use the discard feerate for now.\n+            // So cost of change = (change output size * effective feerate) + (size of spending change output * discard feerate)\n+            coin_selection_params.m_change_fee = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.change_output_size);\n+            coin_selection_params.m_cost_of_change = coin_selection_params.m_discard_feerate.GetFee(coin_selection_params.change_spend_size) + coin_selection_params.m_change_fee;\n \n-            // BnB selector is the only selector used when this is true.\n-            // That should only happen on the first pass through the loop.\n-            coin_selection_params.use_bnb = true;\n             coin_selection_params.m_subtract_fee_outputs = nSubtractFeeFromAmount != 0; // If we are doing subtract fee from recipient, don't use effective values\n-            // Start with no fee and loop until there is enough fee\n-            while (true)\n-            {\n-                nChangePosInOut = nChangePosRequest;\n-                txNew.vin.clear();\n-                txNew.vout.clear();\n-                bool fFirst = true;\n \n-                CAmount nValueToSelect = nValue;\n-                if (nSubtractFeeFromAmount == 0)\n-                    nValueToSelect += nFeeRet;\n+            // vouts to the payees\n+            if (!coin_selection_params.m_subtract_fee_outputs) {\n+                coin_selection_params.tx_noinputs_size = 11; // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 1 output count, 1 witness overhead (dummy, flag, stack size)\n+            }\n+            for (const auto& recipient : vecSend)\n+            {\n+                CTxOut txout(recipient.nAmount, recipient.scriptPubKey);\n \n-                // vouts to the payees\n+                // Include the fee cost for outputs.\n                 if (!coin_selection_params.m_subtract_fee_outputs) {\n-                    coin_selection_params.tx_noinputs_size = 11; // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 1 output count, 1 witness overhead (dummy, flag, stack size)\n+                    coin_selection_params.tx_noinputs_size += ::GetSerializeSize(txout, PROTOCOL_VERSION);\n                 }\n-                for (const auto& recipient : vecSend)\n+\n+                if (IsDust(txout, chain().relayDustFee()))\n                 {\n-                    CTxOut txout(recipient.nAmount, recipient.scriptPubKey);\n+                    error = _(\"Transaction amount too small\");\n+                    return false;\n+                }\n+                txNew.vout.push_back(txout);\n+            }\n \n-                    if (recipient.fSubtractFeeFromAmount)\n-                    {\n-                        assert(nSubtractFeeFromAmount != 0);\n-                        txout.nValue -= nFeeRet / nSubtractFeeFromAmount; // Subtract fee equally from each selected recipient\n+            // Include the fees for things that aren't inputs, excluding the change output\n+            const CAmount not_input_fees = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.tx_noinputs_size);\n+            CAmount nValueToSelect = nValue + not_input_fees;\n \n-                        if (fFirst) // first receiver pays the remainder not divisible by output count\n-                        {\n-                            fFirst = false;\n-                            txout.nValue -= nFeeRet % nSubtractFeeFromAmount;\n-                        }\n-                    }\n-                    // Include the fee cost for outputs. Note this is only used for BnB right now\n-                    if (!coin_selection_params.m_subtract_fee_outputs) {\n-                        coin_selection_params.tx_noinputs_size += ::GetSerializeSize(txout, PROTOCOL_VERSION);\n-                    }\n+            // Choose coins to use\n+            CAmount input_sum = 0;\n+            setCoins.clear();\n \n-                    if (IsDust(txout, chain().relayDustFee()))\n-                    {\n-                        if (recipient.fSubtractFeeFromAmount && nFeeRet > 0)\n-                        {\n-                            if (txout.nValue < 0)\n-                                error = _(\"The transaction amount is too small to pay the fee\");\n-                            else\n-                                error = _(\"The transaction amount is too small to send after the fee has been deducted\");\n-                        }\n-                        else\n-                            error = _(\"Transaction amount too small\");\n-                        return false;\n-                    }\n-                    txNew.vout.push_back(txout);\n-                }\n+            if (!SelectCoins(vAvailableCoins, /* nTargetValue */ nValueToSelect, setCoins, input_sum, coin_control, coin_selection_params))\n+            {\n+                error = _(\"Insufficient funds\");\n+                return false;\n+            }\n \n-                // Choose coins to use\n-                bool bnb_used = false;\n-                if (pick_new_inputs) {\n-                    nValueIn = 0;\n-                    setCoins.clear();\n-                    int change_spend_size = CalculateMaximumSignedInputSize(change_prototype_txout, this);\n-                    // If the wallet doesn't know how to sign change output, assume p2sh-p2wpkh\n-                    // as lower-bound to allow BnB to do it's thing\n-                    if (change_spend_size == -1) {\n-                        coin_selection_params.change_spend_size = DUMMY_NESTED_P2WPKH_INPUT_SIZE;\n-                    } else {\n-                        coin_selection_params.change_spend_size = (size_t)change_spend_size;\n-                    }\n-                    if (!SelectCoins(vAvailableCoins, nValueToSelect, setCoins, nValueIn, coin_control, coin_selection_params, bnb_used))\n-                    {\n-                        // If BnB was used, it was the first pass. No longer the first pass and continue loop with knapsack.\n-                        if (bnb_used) {\n-                            coin_selection_params.use_bnb = false;\n-                            continue;\n-                        }\n-                        else {\n-                            error = _(\"Insufficient funds\");\n-                            return false;\n-                        }\n+            const CAmount change_and_fee = input_sum - nValue;\n+            assert(change_and_fee >= 0);\n+            // Fill a vout to ourself\n+            CTxOut newTxOut(change_and_fee, scriptChange);\n+\n+            if (nChangePosInOut == -1)\n+            {\n+                // Insert change txn at random position:\n+                nChangePosInOut = GetRandInt(txNew.vout.size()+1);\n+            }\n+            else if ((unsigned int)nChangePosInOut > txNew.vout.size())\n+            {\n+                error = _(\"Change index out of range\");\n+                return false;\n+            }\n+\n+            std::vector<CTxOut>::iterator position = txNew.vout.begin()+nChangePosInOut;\n+            txNew.vout.insert(position, newTxOut);\n+\n+            // Dummy fill vin for maximum size estimation\n+            //\n+            for (const auto& coin : setCoins) {\n+                txNew.vin.push_back(CTxIn(coin.outpoint,CScript()));\n+            }\n+\n+            tx_sizes = CalculateMaximumSignedTxSize(CTransaction(txNew), this, coin_control.fAllowWatchOnly);\n+            nBytes = tx_sizes.first;\n+            if (nBytes < 0) {\n+                error = _(\"Signing transaction failed\");\n+                return false;\n+            }\n+\n+            nFeeRet = coin_selection_params.m_effective_feerate.GetFee(nBytes);\n+            // Try to reduce change to include necessary fee\n+            if (nSubtractFeeFromAmount == 0) {\n+                assert(nChangePosInOut != -1);\n+                std::vector<CTxOut>::iterator change_position = txNew.vout.begin()+nChangePosInOut;\n+                change_position->nValue -= nFeeRet;\n+\n+                if (change_position->nValue < 0) {\n+                    // Maybe the change value was just enough to cover the fee if we did not have change in this transaction\n+                    // Let's try dropping the change, recalculating the fee, and comparing the new fee to change_and_Fee",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635534764",
+      "id" : 635534764,
+      "in_reply_to_id" : 633083525,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNTUzNDc2NA==",
+      "original_commit_id" : "57590fba000c875ebc680b27ce37ceb99c7433fb",
+      "original_line" : 2982,
+      "original_position" : 317,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : null,
+      "pull_request_review_id" : 663595866,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-19T19:42:55Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635534764",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635535238"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635535238"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I'm not sure how safe it is to use an iterator after modifying the vector with an insert afterwards. But because insert returns an iterator pointing to the inserted element, I've changed this so that change_position is set by the insert.",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
+      "created_at" : "2021-05-19T19:43:41Z",
+      "diff_hunk" : "@@ -2901,205 +2893,174 @@ bool CWallet::CreateTransactionInternal(\n             cc_temp.m_confirm_target = chain().estimateMaxBlocks();\n             coin_selection_params.m_long_term_feerate = GetMinimumFeeRate(*this, cc_temp, nullptr);\n \n-            nFeeRet = 0;\n-            bool pick_new_inputs = true;\n-            CAmount nValueIn = 0;\n+            // Calculate the cost of change\n+            // Cost of change is the cost of creating the change output + cost of spending the change output in the future.\n+            // For creating the change output now, we use the effective feerate.\n+            // For spending the change output in the future, we use the discard feerate for now.\n+            // So cost of change = (change output size * effective feerate) + (size of spending change output * discard feerate)\n+            coin_selection_params.m_change_fee = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.change_output_size);\n+            coin_selection_params.m_cost_of_change = coin_selection_params.m_discard_feerate.GetFee(coin_selection_params.change_spend_size) + coin_selection_params.m_change_fee;\n \n-            // BnB selector is the only selector used when this is true.\n-            // That should only happen on the first pass through the loop.\n-            coin_selection_params.use_bnb = true;\n             coin_selection_params.m_subtract_fee_outputs = nSubtractFeeFromAmount != 0; // If we are doing subtract fee from recipient, don't use effective values\n-            // Start with no fee and loop until there is enough fee\n-            while (true)\n-            {\n-                nChangePosInOut = nChangePosRequest;\n-                txNew.vin.clear();\n-                txNew.vout.clear();\n-                bool fFirst = true;\n \n-                CAmount nValueToSelect = nValue;\n-                if (nSubtractFeeFromAmount == 0)\n-                    nValueToSelect += nFeeRet;\n+            // vouts to the payees\n+            if (!coin_selection_params.m_subtract_fee_outputs) {\n+                coin_selection_params.tx_noinputs_size = 11; // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 1 output count, 1 witness overhead (dummy, flag, stack size)\n+            }\n+            for (const auto& recipient : vecSend)\n+            {\n+                CTxOut txout(recipient.nAmount, recipient.scriptPubKey);\n \n-                // vouts to the payees\n+                // Include the fee cost for outputs.\n                 if (!coin_selection_params.m_subtract_fee_outputs) {\n-                    coin_selection_params.tx_noinputs_size = 11; // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 1 output count, 1 witness overhead (dummy, flag, stack size)\n+                    coin_selection_params.tx_noinputs_size += ::GetSerializeSize(txout, PROTOCOL_VERSION);\n                 }\n-                for (const auto& recipient : vecSend)\n+\n+                if (IsDust(txout, chain().relayDustFee()))\n                 {\n-                    CTxOut txout(recipient.nAmount, recipient.scriptPubKey);\n+                    error = _(\"Transaction amount too small\");\n+                    return false;\n+                }\n+                txNew.vout.push_back(txout);\n+            }\n \n-                    if (recipient.fSubtractFeeFromAmount)\n-                    {\n-                        assert(nSubtractFeeFromAmount != 0);\n-                        txout.nValue -= nFeeRet / nSubtractFeeFromAmount; // Subtract fee equally from each selected recipient\n+            // Include the fees for things that aren't inputs, excluding the change output\n+            const CAmount not_input_fees = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.tx_noinputs_size);\n+            CAmount nValueToSelect = nValue + not_input_fees;\n \n-                        if (fFirst) // first receiver pays the remainder not divisible by output count\n-                        {\n-                            fFirst = false;\n-                            txout.nValue -= nFeeRet % nSubtractFeeFromAmount;\n-                        }\n-                    }\n-                    // Include the fee cost for outputs. Note this is only used for BnB right now\n-                    if (!coin_selection_params.m_subtract_fee_outputs) {\n-                        coin_selection_params.tx_noinputs_size += ::GetSerializeSize(txout, PROTOCOL_VERSION);\n-                    }\n+            // Choose coins to use\n+            CAmount input_sum = 0;\n+            setCoins.clear();\n \n-                    if (IsDust(txout, chain().relayDustFee()))\n-                    {\n-                        if (recipient.fSubtractFeeFromAmount && nFeeRet > 0)\n-                        {\n-                            if (txout.nValue < 0)\n-                                error = _(\"The transaction amount is too small to pay the fee\");\n-                            else\n-                                error = _(\"The transaction amount is too small to send after the fee has been deducted\");\n-                        }\n-                        else\n-                            error = _(\"Transaction amount too small\");\n-                        return false;\n-                    }\n-                    txNew.vout.push_back(txout);\n-                }\n+            if (!SelectCoins(vAvailableCoins, /* nTargetValue */ nValueToSelect, setCoins, input_sum, coin_control, coin_selection_params))\n+            {\n+                error = _(\"Insufficient funds\");\n+                return false;\n+            }\n \n-                // Choose coins to use\n-                bool bnb_used = false;\n-                if (pick_new_inputs) {\n-                    nValueIn = 0;\n-                    setCoins.clear();\n-                    int change_spend_size = CalculateMaximumSignedInputSize(change_prototype_txout, this);\n-                    // If the wallet doesn't know how to sign change output, assume p2sh-p2wpkh\n-                    // as lower-bound to allow BnB to do it's thing\n-                    if (change_spend_size == -1) {\n-                        coin_selection_params.change_spend_size = DUMMY_NESTED_P2WPKH_INPUT_SIZE;\n-                    } else {\n-                        coin_selection_params.change_spend_size = (size_t)change_spend_size;\n-                    }\n-                    if (!SelectCoins(vAvailableCoins, nValueToSelect, setCoins, nValueIn, coin_control, coin_selection_params, bnb_used))\n-                    {\n-                        // If BnB was used, it was the first pass. No longer the first pass and continue loop with knapsack.\n-                        if (bnb_used) {\n-                            coin_selection_params.use_bnb = false;\n-                            continue;\n-                        }\n-                        else {\n-                            error = _(\"Insufficient funds\");\n-                            return false;\n-                        }\n+            const CAmount change_and_fee = input_sum - nValue;\n+            assert(change_and_fee >= 0);\n+            // Fill a vout to ourself\n+            CTxOut newTxOut(change_and_fee, scriptChange);\n+\n+            if (nChangePosInOut == -1)\n+            {\n+                // Insert change txn at random position:\n+                nChangePosInOut = GetRandInt(txNew.vout.size()+1);\n+            }\n+            else if ((unsigned int)nChangePosInOut > txNew.vout.size())\n+            {\n+                error = _(\"Change index out of range\");\n+                return false;\n+            }\n+\n+            std::vector<CTxOut>::iterator position = txNew.vout.begin()+nChangePosInOut;\n+            txNew.vout.insert(position, newTxOut);\n+\n+            // Dummy fill vin for maximum size estimation\n+            //\n+            for (const auto& coin : setCoins) {\n+                txNew.vin.push_back(CTxIn(coin.outpoint,CScript()));\n+            }\n+\n+            tx_sizes = CalculateMaximumSignedTxSize(CTransaction(txNew), this, coin_control.fAllowWatchOnly);\n+            nBytes = tx_sizes.first;\n+            if (nBytes < 0) {\n+                error = _(\"Signing transaction failed\");\n+                return false;\n+            }\n+\n+            nFeeRet = coin_selection_params.m_effective_feerate.GetFee(nBytes);\n+            // Try to reduce change to include necessary fee\n+            if (nSubtractFeeFromAmount == 0) {\n+                assert(nChangePosInOut != -1);\n+                std::vector<CTxOut>::iterator change_position = txNew.vout.begin()+nChangePosInOut;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635535238",
+      "id" : 635535238,
+      "in_reply_to_id" : 633089668,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNTUzNTIzOA==",
+      "original_commit_id" : "57590fba000c875ebc680b27ce37ceb99c7433fb",
+      "original_line" : 2977,
+      "original_position" : 312,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : null,
+      "pull_request_review_id" : 663596471,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-19T19:43:41Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635535238",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "I've updated this to include @ryanofsky's suggested changes.",
+      "created_at" : "2021-05-19T19:44:25Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#issuecomment-844415446",
+      "id" : 844415446,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/17331",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDg0NDQxNTQ0Ng==",
+      "performed_via_github_app" : null,
+      "updated_at" : "2021-05-19T19:44:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/844415446",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635538054"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635538054"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I had done it this way so that a future commit which has to remove this special case would not need to modify any lines, just drop the code. This code is required at this commit because nFeeRet itself includes not_input_fees, so KnapsackSolver would always be trying to choose more coins than it actually needs. However in the next commit, this is just dropped directly because it is no longer needed once KnapsackSolver uses effective value.",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
+      "created_at" : "2021-05-19T19:48:19Z",
+      "diff_hunk" : "@@ -2956,11 +2952,21 @@ bool CWallet::CreateTransactionInternal(\n                     txNew.vout.push_back(txout);\n                 }\n \n+                // Include the fees for things that aren't inputs, excluding the change output\n+                const CAmount not_input_fees = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.tx_noinputs_size);\n+                CAmount nValueToSelect = nValue + not_input_fees;\n+\n+                // For KnapsackSolver, when we are not subtracting the fee from the recipients, we also want to include the fees for the\n+                // inputs that we found in the previous iteration.\n+                if (!coin_selection_params.use_bnb && nSubtractFeeFromAmount == 0) {\n+                    nValueToSelect += std::max(CAmount(0), nFeeRet - not_input_fees);\n+                }\n+",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635538054",
+      "id" : 635538054,
+      "in_reply_to_id" : 635509067,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNTUzODA1NA==",
+      "original_commit_id" : "67fc8b7be1d5fbdb199d6e995434431a7282d446",
+      "original_line" : 2956,
+      "original_position" : 54,
+      "original_start_line" : 2957,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : null,
+      "pull_request_review_id" : 663600218,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "updated_at" : "2021-05-19T19:48:20Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635538054",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635540237"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635540237"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "It's because we are including the change fee during `SelectCoinsMinConf`. So using the fee that includes the change fee results in us targeting a slightly higher value than we actually need. This is also moot because we stop the looping behavior in the next two commits that have KnapsackSolver use effective values.",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
+      "created_at" : "2021-05-19T19:51:55Z",
+      "diff_hunk" : "@@ -3027,10 +3032,8 @@ bool CWallet::CreateTransactionInternal(\n                             break;\n                         }\n \n-                        // The change value was not enough to cover the fees, even after dropping the change\n-                        // We set nFeeRet back to its original value (the one that includes the change output) and try selecting again\n+                        // The change value was not enough to cover the fees, even after dropping the change. Try selecting again.\n                         assert(change_and_fee < nFeeRet);\n-                        nFeeRet = orig_fee;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635540237",
+      "id" : 635540237,
+      "in_reply_to_id" : 635518342,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNTU0MDIzNw==",
+      "original_commit_id" : "67fc8b7be1d5fbdb199d6e995434431a7282d446",
+      "original_line" : 3033,
+      "original_position" : 80,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : null,
+      "pull_request_review_id" : 663603112,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331",
+      "side" : "LEFT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-19T19:51:56Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635540237",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635540800"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635540800"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Following your suggested diff, this error condition was removed and I haven't quite figured out the correct place to reintroduce it.",
+      "commit_id" : "51a3ac242c92e69b59df26f8f9e287b31e5c3b0f",
+      "created_at" : "2021-05-19T19:52:49Z",
+      "diff_hunk" : "@@ -3032,9 +3024,10 @@ bool CWallet::CreateTransactionInternal(\n                             break;\n                         }\n \n-                        // The change value was not enough to cover the fees, even after dropping the change. Try selecting again.\n-                        assert(change_and_fee < nFeeRet);\n-                        continue;\n+                        // Since we use effective values now, it should not be possible to reach this situation where the change value was not\n+                        // enough to cover the fees\n+                        error = _(\"Cannot reduce change to cover transaction fees\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/17331#discussion_r635540800",
+      "id" : 635540800,
+      "in_reply_to_id" : 635523507,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNTU0MDgwMA==",
+      "original_commit_id" : "a07552b94fe05651970e53813ae67606692d6f19",
+      "original_line" : 3029,
+      "original_position" : 52,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : null,
+      "pull_request_review_id" : 663603883,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/17331",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-19T19:52:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/635540800",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
       }
    }
 ]
