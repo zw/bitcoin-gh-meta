@@ -21496,5 +21496,61 @@
          "type" : "User",
          "url" : "https://api.github.com/users/glozow"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r637231672"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/637231672"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "@mzumsande \r\n\r\nI think applying the maxfeerate on a combined package level makes sense once we start to verify mempool min feerate at the package level too ? For now, I think I would be even more liberal than John suggestion and only mark the fee excess on the fainting transaction, while documenting the case in RPC field.\r\n\r\nI thought about another solution which would be looping first on all transactions to verify if any of them violates the `max_raw_tx_fee` then mark `allowed`=false but it leads to the even more confusing result API of attaching a `max-fee-exceeded` as reject reason to feerate sane transactions...",
+      "commit_id" : "930c6d3b12a6d3647dc47177c4d625956c77a77f",
+      "created_at" : "2021-05-21T21:04:10Z",
+      "diff_hunk" : "@@ -932,62 +937,74 @@ static RPCHelpMan testmempoolaccept()\n         UniValueType(), // VNUM or VSTR, checked inside AmountFromValue()\n     });\n \n-    if (request.params[0].get_array().size() != 1) {\n-        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Array must contain exactly one raw transaction for now\");\n+    if (request.params[0].get_array().size() > MAX_PACKAGE_COUNT) {\n+        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Array cannot contain more than \" + ToString(MAX_PACKAGE_COUNT) + \" transactions.\");\n     }\n \n-    CMutableTransaction mtx;\n-    if (!DecodeHexTx(mtx, request.params[0].get_array()[0].get_str())) {\n-        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"TX decode failed. Make sure the tx has at least one input.\");\n-    }\n-    CTransactionRef tx(MakeTransactionRef(std::move(mtx)));\n-\n+    const UniValue raw_transactions = request.params[0].get_array();\n     const CFeeRate max_raw_tx_fee_rate = request.params[1].isNull() ?\n                                              DEFAULT_MAX_RAW_TX_FEE_RATE :\n                                              CFeeRate(AmountFromValue(request.params[1]));\n \n-    NodeContext& node = EnsureAnyNodeContext(request.context);\n+    std::vector<CTransactionRef> txns;\n+    for (const auto& rawtx : raw_transactions.getValues()) {\n+        CMutableTransaction mtx;\n+        if (!DecodeHexTx(mtx, rawtx.get_str())) {\n+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, \"TX decode failed. Make sure the tx has at least one input.\");\n+        }\n+        txns.emplace_back(MakeTransactionRef(std::move(mtx)));\n+    }\n \n+    NodeContext& node = EnsureAnyNodeContext(request.context);\n     CTxMemPool& mempool = EnsureMemPool(node);\n-    int64_t virtual_size = GetVirtualTransactionSize(*tx);\n-    CAmount max_raw_tx_fee = max_raw_tx_fee_rate.GetFee(virtual_size);\n-\n-    UniValue result(UniValue::VARR);\n-    UniValue result_0(UniValue::VOBJ);\n-    result_0.pushKV(\"txid\", tx->GetHash().GetHex());\n-    result_0.pushKV(\"wtxid\", tx->GetWitnessHash().GetHex());\n-\n-    ChainstateManager& chainman = EnsureChainman(node);\n-    const MempoolAcceptResult accept_result = WITH_LOCK(cs_main, return AcceptToMemoryPool(chainman.ActiveChainstate(), mempool, std::move(tx),\n-                                                  false /* bypass_limits */, /* test_accept */ true));\n-\n-    // Only return the fee and vsize if the transaction would pass ATMP.\n-    // These can be used to calculate the feerate.\n-    if (accept_result.m_result_type == MempoolAcceptResult::ResultType::VALID) {\n-        const CAmount fee = accept_result.m_base_fees.value();\n-        // Check that fee does not exceed maximum fee\n-        if (max_raw_tx_fee && fee > max_raw_tx_fee) {\n-            result_0.pushKV(\"allowed\", false);\n-            result_0.pushKV(\"reject-reason\", \"max-fee-exceeded\");\n-        } else {\n-            result_0.pushKV(\"allowed\", true);\n-            result_0.pushKV(\"vsize\", virtual_size);\n-            UniValue fees(UniValue::VOBJ);\n-            fees.pushKV(\"base\", ValueFromAmount(fee));\n-            result_0.pushKV(\"fees\", fees);\n+    CChainState& chainstate = EnsureChainman(node).ActiveChainstate();\n+    const PackageMempoolAcceptResult validation_result = txns.size() > 1\n+        ? WITH_LOCK(cs_main, return ProcessNewPackage(chainstate, mempool, txns, /* test_accept */ true))\n+        : WITH_LOCK(cs_main, return PackageMempoolAcceptResult(txns[0]->GetWitnessHash(),\n+                             AcceptToMemoryPool(chainstate, mempool, txns[0], /* bypass_limits */ false,  /* test_accept */ true)));\n+\n+    UniValue rpc_result(UniValue::VARR);\n+\n+    for (auto tx : txns) {\n+        UniValue result_inner(UniValue::VOBJ);\n+        result_inner.pushKV(\"txid\", tx->GetHash().GetHex());\n+        result_inner.pushKV(\"wtxid\", tx->GetWitnessHash().GetHex());\n+        auto it = validation_result.m_tx_results.find(tx->GetWitnessHash());\n+        if (it == validation_result.m_tx_results.end()) {\n+            // Validation unfinished. Just return the txid and wtxid.\n+            rpc_result.push_back(result_inner);\n+            continue;\n         }\n-        result.push_back(std::move(result_0));\n-    } else {\n-        result_0.pushKV(\"allowed\", false);\n-        const TxValidationState state = accept_result.m_state;\n-        if (state.GetResult() == TxValidationResult::TX_MISSING_INPUTS) {\n-            result_0.pushKV(\"reject-reason\", \"missing-inputs\");\n+        const auto& accept_result = it->second;\n+        if (accept_result.m_result_type == MempoolAcceptResult::ResultType::VALID) {\n+            const CAmount fee = accept_result.m_base_fees.value();\n+            // Check that fee does not exceed maximum fee\n+            const int64_t virtual_size = GetVirtualTransactionSize(*tx);\n+            const CAmount max_raw_tx_fee = max_raw_tx_fee_rate.GetFee(virtual_size);\n+            if (max_raw_tx_fee && fee > max_raw_tx_fee) {\n+                result_inner.pushKV(\"allowed\", false);\n+                result_inner.pushKV(\"reject-reason\", \"max-fee-exceeded\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20833#discussion_r637231672",
+      "id" : 637231672,
+      "in_reply_to_id" : 619141139,
+      "line" : 994,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDYzNzIzMTY3Mg==",
+      "original_commit_id" : "9ce7b0f3850a0d69e81a68f18906a9d1aa4356fb",
+      "original_line" : 994,
+      "original_position" : 130,
+      "original_start_line" : null,
+      "path" : "src/rpc/rawtransaction.cpp",
+      "position" : 138,
+      "pull_request_review_id" : 665886271,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20833",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-05-21T21:04:11Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/637231672",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
    }
 ]
