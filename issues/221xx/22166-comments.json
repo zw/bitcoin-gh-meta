@@ -85,5 +85,61 @@
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/22166#discussion_r647029293"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22166"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/647029293"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Restructured things a bit by adding explicit \"explored\" and \"inner\" flags to the nodes. This avoids the need for testing the specifics of the unexplored child.\r\n\r\nAlso expanded the comment to explain this better.",
+      "commit_id" : "f9d6f9a52c61833bbc5c611ff6a3e59066e1c92f",
+      "created_at" : "2021-06-08T00:38:06Z",
+      "diff_hunk" : "@@ -516,3 +516,120 @@ TaprootSpendData TaprootBuilder::GetSpendData() const\n     }\n     return spd;\n }\n+\n+std::optional<std::vector<std::tuple<int, CScript, int>>> InferTaprootTree(const TaprootSpendData& spenddata, const XOnlyPubKey& output)\n+{\n+    // Verify that the output matches the assumed Merkle root and internal key.\n+    auto tweak = spenddata.internal_key.CreateTapTweak(spenddata.merkle_root.IsNull() ? nullptr : &spenddata.merkle_root);\n+    if (!tweak || tweak->first != output) return std::nullopt;\n+    // If the Merkle root is 0, the tree is empty, and we're done.\n+    std::vector<std::tuple<int, CScript, int>> ret;\n+    if (spenddata.merkle_root.IsNull()) return ret;\n+\n+    /** Data structure to represent the nodes of the tree we're going to be build. */\n+    struct TreeNode {\n+        /** Hash of this none, if known; 0 otherwise. */\n+        uint256 hash;\n+        /** The left and right subtrees (note that their order is irrelevant). */\n+        std::unique_ptr<TreeNode> sub[2];\n+        /** If this is known to be a leaf node, a pointer to the (script, leaf_ver) pair.\n+         *  nullptr otherwise. */\n+        const std::pair<CScript, int>* leaf = nullptr;\n+        /** Whether or not we have produced output for this subtree. */\n+        bool done = false;\n+    };\n+\n+    // Build tree from the provides branches.\n+    TreeNode root;\n+    root.hash = spenddata.merkle_root;\n+    for (const auto& elem : spenddata.scripts) {\n+        const CScript& script = elem.first.first;\n+        int leaf_ver = elem.first.second;\n+        const std::vector<unsigned char>& control = elem.second;\n+        // Skip script records with nonsensical leaf version.\n+        if (leaf_ver < 0 || leaf_ver >= 0x100 || leaf_ver & 1) continue;\n+        // Skip script records with invalid control block sizes.\n+        if (control.size() < TAPROOT_CONTROL_BASE_SIZE || control.size() > TAPROOT_CONTROL_MAX_SIZE ||\n+            ((control.size() - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE) != 0) continue;\n+        // Skip script records that don't match the control block.\n+        if ((control[0] & TAPROOT_LEAF_MASK) != leaf_ver) continue;\n+        // Skip script records that don't match the provided Merkle root.\n+        const uint256 leaf_hash = ComputeTapleafHash(leaf_ver, script);\n+        const uint256 merkle_root = ComputeTaprootMerkleRoot(control, leaf_hash);\n+        if (merkle_root != spenddata.merkle_root) continue;\n+\n+        TreeNode* node = &root;\n+        size_t levels = (control.size() - TAPROOT_CONTROL_BASE_SIZE) / TAPROOT_CONTROL_NODE_SIZE;\n+        for (size_t depth = 0; depth < levels; ++depth) {\n+            // Can't descend into a node which we already know is a leaf.\n+            if (node->leaf) return std::nullopt;\n+\n+            // Extract partner hash from Merkle branch in control block.\n+            uint256 hash;\n+            std::copy(control.begin() + TAPROOT_CONTROL_BASE_SIZE + (levels - 1 - depth) * TAPROOT_CONTROL_NODE_SIZE,\n+                      control.begin() + TAPROOT_CONTROL_BASE_SIZE + (levels - depth) * TAPROOT_CONTROL_NODE_SIZE,\n+                      hash.begin());\n+\n+            if (node->sub[0]) {\n+                // Descend into the existing left or right branch.\n+                bool desc = false;\n+                for (int i = 0; i < 2; ++i) {\n+                    if (node->sub[i]->hash == hash || (node->sub[i]->hash.IsNull() && node->sub[1-i]->hash != hash)) {\n+                        node->sub[i]->hash = hash;\n+                        node = &*node->sub[1-i];\n+                        desc = true;\n+                        break;\n+                    }\n+                }\n+                if (!desc) return std::nullopt; // This probably requires a hash collision to hit.\n+            } else {\n+                // We're in an unexplored node. Create subtrees and descend.\n+                node->sub[0] = std::make_unique<TreeNode>();\n+                node->sub[1] = std::make_unique<TreeNode>();\n+                node->sub[1]->hash = hash;\n+                node = &*node->sub[0];\n+            }\n+        }\n+        // Cannot turn a known inner node into a leaf.\n+        if (node->sub[0]) return std::nullopt;\n+        node->leaf = &elem.first;\n+        node->hash = leaf_hash;\n+    }\n+\n+    // Recursive processing to turn the tree into flattened output. Use an explicit stack here to avoid\n+    // overflowing the call stack (the tree may be 128 levels deep).\n+    std::vector<TreeNode*> stack{&root};\n+    while (!stack.empty()) {\n+        TreeNode& node = *stack.back();\n+        if (node.leaf) {\n+            // Leaf node; produce output.\n+            ret.emplace_back(stack.size() - 1, node.leaf->first, node.leaf->second);\n+            node.done = true;\n+            stack.pop_back();\n+        } else if (!node.sub[0]) {\n+            // Unexplored node, which means the tree is incomplete.\n+            return std::nullopt;\n+        } else if (node.sub[0]->done && !node.sub[1]->done && !node.sub[1]->leaf && !node.sub[1]->sub[0] && !node.sub[1]->hash.IsNull() &&\n+                   (CHashWriter{HASHER_TAPBRANCH} << node.sub[1]->hash << node.sub[1]->hash).GetSHA256() == node.hash) {\n+            // Special case to deal with duplicate subtrees: after exploring the left subtree (which holds actual data),\n+            // iterate through it again, but mark the right (unexplored, but implicitly identical) subtree as finished,\n+            // so that we don't end up in an infinite loop.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22166#discussion_r647029293",
+      "id" : 647029293,
+      "in_reply_to_id" : 646907609,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDY0NzAyOTI5Mw==",
+      "original_commit_id" : "77466ae5c58b4a46e545d3d24521fa635f7b8fbe",
+      "original_line" : 616,
+      "original_position" : 101,
+      "original_start_line" : 612,
+      "path" : "src/script/standard.cpp",
+      "position" : null,
+      "pull_request_review_id" : 677993161,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22166",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "updated_at" : "2021-06-08T00:38:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/647029293",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
    }
 ]
