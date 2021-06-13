@@ -3346,27 +3346,27 @@
          }
       },
       "author_association" : "MEMBER",
-      "body" : "Thanks for checking this! Agree, the tests pass with this change:\r\n```diff\r\n-                if (num_protected >= max_protect_by_network) {\r\n+                assert(num_protected <= max_protect_by_network);\r\n+                if (num_protected == max_protect_by_network) {\r\n```\r\nI think it's expected behavior based on these lines:\r\n```cpp\r\n    while (num_protected < max_protect_by_network) {\r\n        const size_t disadvantaged_to_protect{max_protect_by_network - num_protected};\r\n        const size_t protect_per_network{std::max(disadvantaged_to_protect / networks.size(), static_cast<size_t>(1))};\r\n```\r\n",
-      "commit_id" : "42530190d82ee1692a546a8daae89e3ba0f5a3a2",
+      "body" : "Thanks for checking this! Agree, the tests pass with this change:\r\n```diff\r\n-                if (num_protected >= max_protect_by_network) {\r\n+                assert(num_protected <= max_protect_by_network);\r\n+                if (num_protected == max_protect_by_network) {\r\n```\r\nI think it's expected behavior based on these lines:\r\n```cpp\r\n    while (num_protected < max_protect_by_network) {\r\n        const size_t disadvantaged_to_protect{max_protect_by_network - num_protected};\r\n        const size_t protect_per_network{std::max(disadvantaged_to_protect / networks.size(), static_cast<size_t>(1))};\r\n```\r\n\r\nEdit: This pull has seen several rewrites, so tomorrow I plan to re-verify the pertinence of each test and check for missing cases.",
+      "commit_id" : "ce211cd558c6c92231bfe88d1aa8fe6349ed867d",
       "created_at" : "2021-06-12T17:37:49Z",
       "diff_hunk" : "@@ -894,40 +902,58 @@ static void EraseLastKElements(\n     elements.erase(std::remove_if(elements.end() - eraseSize, elements.end(), predicate), elements.end());\n }\n \n-void ProtectEvictionCandidatesByRatio(std::vector<NodeEvictionCandidate>& vEvictionCandidates)\n+void ProtectEvictionCandidatesByRatio(std::vector<NodeEvictionCandidate>& candidates)\n {\n+    // Networks to protect: localhost, onion, I2P. In case of equal counts, earlier array members\n+    // have the first opportunity to recover unused protection slots from the previous iteration.\n+    struct Net { Network id; size_t count; bool is_local; };\n+    std::array<Net, 3> networks{{{/* localhost */ NET_MAX, 0, 1}, {NET_ONION, 0, 0}, {NET_I2P, 0, 0}}};\n+\n+    for (Net& n : networks) { // Count and store the number of eviction candidates per network.\n+        n.count = std::count_if(candidates.cbegin(), candidates.cend(),\n+                                [&n](const NodeEvictionCandidate& c) { return n.is_local ? c.m_is_local : c.m_network == n.id; });\n+    }\n+    // Sort `networks` by descending candidate count, to give networks having more candidates\n+    // the first opportunity to recover unused protection slots from the previous iteration.\n+    std::stable_sort(networks.begin(), networks.end(), [](Net a, Net b) { return a.count > b.count; });\n+\n     // Protect the half of the remaining nodes which have been connected the longest.\n     // This replicates the non-eviction implicit behavior, and precludes attacks that start later.\n-    // To favorise the diversity of our peer connections, reserve up to (half + 2) of\n-    // these protected spots for onion and localhost peers, if any, even if they're not\n-    // longest uptime overall. This helps protect tor peers, which tend to be otherwise\n-    // disadvantaged under our eviction criteria.\n-    const size_t initial_size = vEvictionCandidates.size();\n-    size_t total_protect_size = initial_size / 2;\n-    const size_t onion_protect_size = total_protect_size / 2;\n-\n-    if (onion_protect_size) {\n-        // Pick out up to 1/4 peers connected via our onion service, sorted by longest uptime.\n-        EraseLastKElements(vEvictionCandidates, CompareOnionTimeConnected, onion_protect_size,\n-                           [](const NodeEvictionCandidate& n) { return n.m_is_onion; });\n-    }\n-\n-    const size_t localhost_min_protect_size{2};\n-    if (onion_protect_size >= localhost_min_protect_size) {\n-        // Allocate any remaining slots of the 1/4, or minimum 2 additional slots,\n-        // to localhost peers, sorted by longest uptime, as manually configured\n-        // hidden services not using `-bind=addr[:port]=onion` will not be detected\n-        // as inbound onion connections.\n-        const size_t remaining_tor_slots{onion_protect_size - (initial_size - vEvictionCandidates.size())};\n-        const size_t localhost_protect_size{std::max(remaining_tor_slots, localhost_min_protect_size)};\n-        EraseLastKElements(vEvictionCandidates, CompareLocalHostTimeConnected, localhost_protect_size,\n-                           [](const NodeEvictionCandidate& n) { return n.m_is_local; });\n+    // To favorise the diversity of our peer connections, reserve up to half of\n+    // these protected spots for onion, localhost and I2P peers, even if they're\n+    // not longest uptime overall. This helps protect these higher-latency peers\n+    // that tend to be otherwise disadvantaged under our eviction criteria.\n+    const size_t initial_size = candidates.size();\n+    const size_t total_protect_size{initial_size / 2};\n+\n+    // Protect up to 25% of the candidates by disadvantaged network.\n+    const size_t max_protect_by_network{total_protect_size / 2};\n+    size_t num_protected{0};\n+\n+    while (num_protected < max_protect_by_network) {\n+        const size_t remaining_to_protect{max_protect_by_network - num_protected};\n+        const size_t protect_per_network{std::max(remaining_to_protect / networks.size(), static_cast<size_t>(1))};\n+        bool protected_at_least_one{false};\n+        for (const Net& n : networks) {\n+            if (n.count == 0) continue;\n+            const size_t before = candidates.size();\n+            EraseLastKElements(candidates, CompareNodeNetworkTime(n.is_local, n.id), protect_per_network,\n+                               [&n](const NodeEvictionCandidate& c) { return n.is_local ? c.m_is_local : c.m_network == n.id; });\n+            const size_t after = candidates.size();\n+            if (before > after) {\n+                protected_at_least_one = true;\n+                num_protected += before - after;\n+                if (num_protected >= max_protect_by_network) break;",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/21261#discussion_r650416293",
       "id" : 650416293,
       "in_reply_to_id" : 650190229,
-      "line" : 946,
+      "line" : null,
       "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDY1MDQxNjI5Mw==",
       "original_commit_id" : "42530190d82ee1692a546a8daae89e3ba0f5a3a2",
       "original_line" : 946,
       "original_position" : 116,
       "original_start_line" : null,
       "path" : "src/net.cpp",
-      "position" : 116,
+      "position" : null,
       "pull_request_review_id" : 682341347,
       "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21261",
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2021-06-12T17:42:27Z",
+      "updated_at" : "2021-06-13T08:50:29Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/650416293",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/2415484?v=4",
@@ -3387,6 +3387,150 @@
          "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "Updated, taking all review feedback by @vasild and @ariard, and also improving readability and updating the tests.\r\n\r\n`git diff 4253019 ce211cd --color-words`",
+      "created_at" : "2021-06-13T16:45:51Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21261#issuecomment-860239666",
+      "id" : 860239666,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/21261",
+      "node_id" : "MDEyOklzc3VlQ29tbWVudDg2MDIzOTY2Ng==",
+      "performed_via_github_app" : null,
+      "updated_at" : "2021-06-13T16:45:51Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/860239666",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21261#discussion_r650553691"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21261"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/650553691"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Huh, the CI is barfing on this change. Strange.",
+      "commit_id" : "ce211cd558c6c92231bfe88d1aa8fe6349ed867d",
+      "created_at" : "2021-06-13T17:18:33Z",
+      "diff_hunk" : "@@ -36,7 +32,7 @@ std::vector<NodeEvictionCandidate> GetRandomNodeEvictionCandidates(const int n_c\n             /* nKeyedNetGroup */ random_context.randrange(100),\n             /* prefer_evict */ random_context.randbool(),\n             /* m_is_local */ random_context.randbool(),\n-            /* m_is_onion */ random_context.randbool(),\n+            /* m_network */ static_cast<Network>(random_context.randrange(static_cast<int>(Network::NET_INTERNAL))),",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21261#discussion_r650553691",
+      "id" : 650553691,
+      "in_reply_to_id" : 650041974,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDY1MDU1MzY5MQ==",
+      "original_commit_id" : "42530190d82ee1692a546a8daae89e3ba0f5a3a2",
+      "original_line" : 35,
+      "original_position" : 25,
+      "original_start_line" : null,
+      "path" : "src/test/net_peer_eviction_tests.cpp",
+      "position" : null,
+      "pull_request_review_id" : 682430070,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21261",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-06-13T17:18:33Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/650553691",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/2415484?v=4",
+         "events_url" : "https://api.github.com/users/jonatack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jonatack/followers",
+         "following_url" : "https://api.github.com/users/jonatack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jonatack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jonatack",
+         "id" : 2415484,
+         "login" : "jonatack",
+         "node_id" : "MDQ6VXNlcjI0MTU0ODQ=",
+         "organizations_url" : "https://api.github.com/users/jonatack/orgs",
+         "received_events_url" : "https://api.github.com/users/jonatack/received_events",
+         "repos_url" : "https://api.github.com/users/jonatack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jonatack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jonatack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jonatack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/21261#discussion_r650556232"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21261"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/650556232"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This might be a compiler bug. I used `static constexpr auto ALL_FEE_ESTIMATE_HORIZONS = std::array{` to work around that.",
+      "commit_id" : "ce211cd558c6c92231bfe88d1aa8fe6349ed867d",
+      "created_at" : "2021-06-13T17:43:17Z",
+      "diff_hunk" : "@@ -36,7 +32,7 @@ std::vector<NodeEvictionCandidate> GetRandomNodeEvictionCandidates(const int n_c\n             /* nKeyedNetGroup */ random_context.randrange(100),\n             /* prefer_evict */ random_context.randbool(),\n             /* m_is_local */ random_context.randbool(),\n-            /* m_is_onion */ random_context.randbool(),\n+            /* m_network */ static_cast<Network>(random_context.randrange(static_cast<int>(Network::NET_INTERNAL))),",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/21261#discussion_r650556232",
+      "id" : 650556232,
+      "in_reply_to_id" : 650041974,
+      "line" : null,
+      "node_id" : "MDI0OlB1bGxSZXF1ZXN0UmV2aWV3Q29tbWVudDY1MDU1NjIzMg==",
+      "original_commit_id" : "42530190d82ee1692a546a8daae89e3ba0f5a3a2",
+      "original_line" : 35,
+      "original_position" : 25,
+      "original_start_line" : null,
+      "path" : "src/test/net_peer_eviction_tests.cpp",
+      "position" : null,
+      "pull_request_review_id" : 682431757,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/21261",
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-06-13T17:43:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/650556232",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
       }
    }
 ]
