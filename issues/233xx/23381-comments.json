@@ -784,5 +784,72 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jnewbery"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23381#discussion_r739138737"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23381"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/739138737"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This parameter isn't used in this PR or #22674. I suggest leaving it out until it's used in #22290 (and I think there, you can just pass the vector of `Workspace`s and not the vector of `CTransactionRef`s, since the `Workspace`s contain the `CTransactionRef`s)",
+      "commit_id" : "4d262e060e714042d747c4f0b2e0398234893d34",
+      "created_at" : "2021-10-29T11:01:52Z",
+      "diff_hunk" : "@@ -760,60 +813,88 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)\n         // to be secure by simply only having two immediately-spendable\n         // outputs - one for each counterparty. For more info on the uses for\n         // this, see https://lists.linuxfoundation.org/pipermail/bitcoin-dev/2018-November/016518.html\n-        if (nSize >  EXTRA_DESCENDANT_TX_SIZE_LIMIT ||\n-                !m_pool.CalculateMemPoolAncestors(*entry, setAncestors, 2, m_limit_ancestor_size, m_limit_descendants + 1, m_limit_descendant_size + EXTRA_DESCENDANT_TX_SIZE_LIMIT, dummy_err_string)) {\n+        if (ws.m_vsize > EXTRA_DESCENDANT_TX_SIZE_LIMIT ||\n+            !m_pool.CalculateMemPoolAncestors(*entry, ws.m_ancestors, /* limitancestors */ 2,\n+                m_limit_ancestor_size, ws.m_limit_descendants + 1,\n+                ws.m_limit_descendant_size + EXTRA_DESCENDANT_TX_SIZE_LIMIT, dummy_err_string)) {\n             return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, \"too-long-mempool-chain\", errString);\n         }\n     }\n \n     // A transaction that spends outputs that would be replaced by it is invalid. Now\n     // that we have the set of all ancestors we can detect this\n-    // pathological case by making sure setConflicts and setAncestors don't\n+    // pathological case by making sure ws.m_conflicts and ws.m_ancestors don't\n     // intersect.\n-    if (const auto err_string{EntriesAndTxidsDisjoint(setAncestors, setConflicts, hash)}) {\n+    if (const auto err_string{EntriesAndTxidsDisjoint(ws.m_ancestors, ws.m_conflicts, hash)}) {\n         // We classify this as a consensus error because a transaction depending on something it\n         // conflicts with would be inconsistent.\n         return state.Invalid(TxValidationResult::TX_CONSENSUS, \"bad-txns-spends-conflicting-tx\", *err_string);\n     }\n \n+    m_rbf = !ws.m_conflicts.empty();\n+    return true;\n+}\n \n-    if (!setConflicts.empty()) {\n-        CFeeRate newFeeRate(nModifiedFees, nSize);\n-        // It's possible that the replacement pays more fees than its direct conflicts but not more\n-        // than all conflicts (i.e. the direct conflicts have high-fee descendants). However, if the\n-        // replacement doesn't pay more fees than its direct conflicts, then we can be sure it's not\n-        // more economically rational to mine. Before we go digging through the mempool for all\n-        // transactions that would need to be removed (direct conflicts and all descendants), check\n-        // that the replacement transaction pays more than its direct conflicts.\n-        if (const auto err_string{PaysMoreThanConflicts(setIterConflicting, newFeeRate, hash)}) {\n-            return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, \"insufficient fee\", *err_string);\n-        }\n+bool MemPoolAccept::ReplacementChecks(Workspace& ws)\n+{\n+    AssertLockHeld(cs_main);\n+    AssertLockHeld(m_pool.cs);\n \n-        // Calculate all conflicting entries and enforce BIP125 Rule #5.\n-        if (const auto err_string{GetEntriesForConflicts(tx, m_pool, setIterConflicting, allConflicting)}) {\n-            return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,\n-                                 \"too many potential replacements\", *err_string);\n-        }\n-        // Enforce BIP125 Rule #2.\n-        if (const auto err_string{HasNoNewUnconfirmed(tx, m_pool, setIterConflicting)}) {\n-            return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,\n-                                 \"replacement-adds-unconfirmed\", *err_string);\n-        }\n+    const CTransaction& tx = *ws.m_ptx;\n+    const uint256& hash = ws.m_hash;\n+    TxValidationState& state = ws.m_state;\n \n-        // Check if it's economically rational to mine this transaction rather than the ones it\n-        // replaces and pays for its own relay fees. Enforce BIP125 Rules #3 and #4.\n-        for (CTxMemPool::txiter it : allConflicting) {\n-            nConflictingFees += it->GetModifiedFee();\n-            nConflictingSize += it->GetTxSize();\n-        }\n-        if (const auto err_string{PaysForRBF(nConflictingFees, nModifiedFees, nSize, ::incrementalRelayFee, hash)}) {\n-            return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, \"insufficient fee\", *err_string);\n-        }\n+    CFeeRate newFeeRate(ws.m_modified_fees, ws.m_vsize);\n+    // It's possible that the replacement pays more fees than its direct conflicts but not more\n+    // than all conflicts (i.e. the direct conflicts have high-fee descendants). However, if the\n+    // replacement doesn't pay more fees than its direct conflicts, then we can be sure it's not\n+    // more economically rational to mine. Before we go digging through the mempool for all\n+    // transactions that would need to be removed (direct conflicts and all descendants), check\n+    // that the replacement transaction pays more than its direct conflicts.\n+    if (const auto err_string{PaysMoreThanConflicts(ws.m_iters_conflicting, newFeeRate, hash)}) {\n+        return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, \"insufficient fee\", *err_string);\n+    }\n+\n+    // Calculate all conflicting entries and enforce BIP125 Rule #5.\n+    if (const auto err_string{GetEntriesForConflicts(tx, m_pool, ws.m_iters_conflicting, ws.m_all_conflicting)}) {\n+        return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,\n+                             \"too many potential replacements\", *err_string);\n+    }\n+    // Enforce BIP125 Rule #2.\n+    if (const auto err_string{HasNoNewUnconfirmed(tx, m_pool, ws.m_iters_conflicting)}) {\n+        return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,\n+                             \"replacement-adds-unconfirmed\", *err_string);\n+    }\n+    // Check if it's economically rational to mine this transaction rather than the ones it\n+    // replaces and pays for its own relay fees. Enforce BIP125 Rules #3 and #4.\n+    for (CTxMemPool::txiter it : ws.m_all_conflicting) {\n+        ws.m_conflicting_fees += it->GetModifiedFee();\n+        ws.m_conflicting_size += it->GetTxSize();\n+    }\n+    if (const auto err_string{PaysForRBF(ws.m_conflicting_fees, ws.m_modified_fees, ws.m_vsize,\n+                                         ::incrementalRelayFee, hash)}) {\n+        return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, \"insufficient fee\", *err_string);\n     }\n     return true;\n }\n \n-bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws, PrecomputedTransactionData& txdata)\n+bool MemPoolAccept::PackageMempoolChecks(const std::vector<CTransactionRef>& txns,\n+                                         std::vector<Workspace>& workspaces,",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23381#discussion_r739138737",
+      "id" : 739138737,
+      "line" : 882,
+      "node_id" : "PRRC_kwDOABII584sDlyx",
+      "original_commit_id" : "4d262e060e714042d747c4f0b2e0398234893d34",
+      "original_line" : 882,
+      "original_position" : 322,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 322,
+      "pull_request_review_id" : 792904885,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23381",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/739138737/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-10-29T11:01:52Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/739138737",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
    }
 ]
