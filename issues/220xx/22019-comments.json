@@ -1358,5 +1358,73 @@
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/22019#discussion_r741394282"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22019"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/741394282"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Looks like this hasn't been caught by the tests, probably a nice to have follow up and a good first issue.",
+      "commit_id" : "c97801c398c7e83ee769b1b6347e2afc9d13cec3",
+      "created_at" : "2021-11-02T19:16:52Z",
+      "diff_hunk" : "@@ -373,76 +373,72 @@ std::vector<OutputGroup> GroupOutputs(const CWallet& wallet, const std::vector<C\n     return groups_out;\n }\n \n-bool AttemptSelection(const CWallet& wallet, const CAmount& nTargetValue, const CoinEligibilityFilter& eligibility_filter, std::vector<COutput> coins,\n-                                 std::set<CInputCoin>& setCoinsRet, CAmount& nValueRet, const CoinSelectionParams& coin_selection_params)\n+std::optional<SelectionResult> AttemptSelection(const CWallet& wallet, const CAmount& nTargetValue, const CoinEligibilityFilter& eligibility_filter, std::vector<COutput> coins,\n+                               const CoinSelectionParams& coin_selection_params)\n {\n-    setCoinsRet.clear();\n-    nValueRet = 0;\n-    // Vector of results for use with waste calculation\n-    // In order: calculated waste, selected inputs, selected input value (sum of input values)\n-    // TODO: Use a struct representing the selection result\n-    std::vector<std::tuple<CAmount, std::set<CInputCoin>, CAmount>> results;\n+    // Vector of result and waste pairs. We will choose the best one based on waste.\n+    std::vector<std::pair<SelectionResult, CAmount>> results;\n \n     // Note that unlike KnapsackSolver, we do not include the fee for creating a change output as BnB will not create a change output.\n     std::vector<OutputGroup> positive_groups = GroupOutputs(wallet, coins, coin_selection_params, eligibility_filter, true /* positive_only */);\n-    std::set<CInputCoin> bnb_coins;\n-    CAmount bnb_value;\n-    if (SelectCoinsBnB(positive_groups, nTargetValue, coin_selection_params.m_cost_of_change, bnb_coins, bnb_value)) {\n-        const auto waste = GetSelectionWaste(bnb_coins, /* cost of change */ CAmount(0), nTargetValue, !coin_selection_params.m_subtract_fee_outputs);\n-        results.emplace_back(std::make_tuple(waste, std::move(bnb_coins), bnb_value));\n+    std::optional<SelectionResult> bnb_result = SelectCoinsBnB(positive_groups, nTargetValue, coin_selection_params.m_cost_of_change);\n+    if (bnb_result) {\n+        results.push_back(std::make_pair(*bnb_result, bnb_result->GetWaste(CAmount(0))));\n     }\n \n     // The knapsack solver has some legacy behavior where it will spend dust outputs. We retain this behavior, so don't filter for positive only here.\n     std::vector<OutputGroup> all_groups = GroupOutputs(wallet, coins, coin_selection_params, eligibility_filter, false /* positive_only */);\n     // While nTargetValue includes the transaction fees for non-input things, it does not include the fee for creating a change output.\n     // So we need to include that for KnapsackSolver as well, as we are expecting to create a change output.\n-    std::set<CInputCoin> knapsack_coins;\n-    CAmount knapsack_value;\n-    if (KnapsackSolver(nTargetValue + coin_selection_params.m_change_fee, all_groups, knapsack_coins, knapsack_value)) {\n-        const auto waste = GetSelectionWaste(knapsack_coins, coin_selection_params.m_cost_of_change, nTargetValue + coin_selection_params.m_change_fee, !coin_selection_params.m_subtract_fee_outputs);\n-        results.emplace_back(std::make_tuple(waste, std::move(knapsack_coins), knapsack_value));\n+    std::optional<SelectionResult> knapsack_result = KnapsackSolver(all_groups, nTargetValue + coin_selection_params.m_change_fee);\n+    if (knapsack_result) {\n+        results.push_back(std::make_pair(*knapsack_result, knapsack_result->GetWaste(coin_selection_params.m_cost_of_change)));\n     }\n \n     // We include the minimum final change for SRD as we do want to avoid making really small change.\n     // KnapsackSolver does not need this because it includes MIN_CHANGE internally.\n     const CAmount srd_target = nTargetValue + coin_selection_params.m_change_fee + MIN_FINAL_CHANGE;\n     auto srd_result = SelectCoinsSRD(positive_groups, srd_target);\n     if (srd_result != std::nullopt) {\n-        const auto waste = GetSelectionWaste(srd_result->first, coin_selection_params.m_cost_of_change, srd_target, !coin_selection_params.m_subtract_fee_outputs);\n-        results.emplace_back(std::make_tuple(waste, std::move(srd_result->first), srd_result->second));\n+        results.push_back(std::make_pair(*srd_result, srd_result->GetWaste(coin_selection_params.m_cost_of_change)));\n     }\n \n     if (results.size() == 0) {\n         // No solution found\n-        return false;\n+        return std::nullopt;\n     }\n \n     // Choose the result with the least waste\n     // If the waste is the same, choose the one which spends more inputs.\n-    const auto& best_result = std::min_element(results.begin(), results.end(), [](const auto& a, const auto& b) {\n-        return std::get<0>(a) < std::get<0>(b) || (std::get<0>(a) == std::get<0>(b) && std::get<1>(a).size() > std::get<1>(b).size());\n+    auto [best_result, waste] = *std::min_element(results.begin(), results.end(), [](const auto& a, const auto& b){\n+        const auto [a_result, a_waste] = a;\n+        const auto [b_result, b_waste] = b;\n+        return a_waste < b_waste || (a_waste == b_waste && a_result.m_selected_inputs.size() > b_result.m_selected_inputs.size());\n     });\n-    setCoinsRet = std::get<1>(*best_result);\n-    nValueRet = std::get<2>(*best_result);\n-    return true;\n+    return best_result;\n }\n \n-bool SelectCoins(const CWallet& wallet, const std::vector<COutput>& vAvailableCoins, const CAmount& nTargetValue, std::set<CInputCoin>& setCoinsRet, CAmount& nValueRet, const CCoinControl& coin_control, CoinSelectionParams& coin_selection_params)\n+std::optional<SelectionResult> SelectCoins(const CWallet& wallet, const std::vector<COutput>& vAvailableCoins, const CAmount& nTargetValue, const CCoinControl& coin_control, CoinSelectionParams& coin_selection_params)\n {\n     std::vector<COutput> vCoins(vAvailableCoins);\n     CAmount value_to_select = nTargetValue;\n \n+    OutputGroup preset_inputs(coin_selection_params);\n+\n     // coin control -> return all selected outputs (we want all selected to go into the transaction for sure)\n     if (coin_control.HasSelected() && !coin_control.fAllowOtherInputs)\n     {\n-        for (const COutput& out : vCoins)\n-        {\n-            if (!out.fSpendable)\n-                 continue;\n-            nValueRet += out.tx->tx->vout[out.i].nValue;\n-            setCoinsRet.insert(out.GetInputCoin());\n+        for (const COutput& out : vCoins) {\n+            if (!out.fSpendable) continue;\n+            /* Set depth, from_me, ancestors, and descendants to 0 or false as these don't matter for preset inputs as no actual selection is being done.\n+             * positive_only is set to false because we want to include all preset inputs, even if they are dust.\n+             */\n+            preset_inputs.Insert(out.GetInputCoin(), 0, false, 0, 0, false);\n         }\n-        return (nValueRet >= nTargetValue);\n+        SelectionResult result(nTargetValue);\n+        result.AddInput(preset_inputs);\n+        if (result.GetSelectedValue() >= nTargetValue) return std::nullopt;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22019#discussion_r741394282",
+      "id" : 741394282,
+      "in_reply_to_id" : 740817760,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII584sMMdq",
+      "original_commit_id" : "1036ab72f8db0f85c7a294d01c25d00ec8f0b421",
+      "original_line" : 440,
+      "original_position" : 102,
+      "original_start_line" : null,
+      "path" : "src/wallet/spend.cpp",
+      "position" : null,
+      "pull_request_review_id" : 795825067,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22019",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/741394282/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-02T19:16:52Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/741394282",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1466284?v=4",
+         "events_url" : "https://api.github.com/users/S3RK/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/S3RK/followers",
+         "following_url" : "https://api.github.com/users/S3RK/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/S3RK/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/S3RK",
+         "id" : 1466284,
+         "login" : "S3RK",
+         "node_id" : "MDQ6VXNlcjE0NjYyODQ=",
+         "organizations_url" : "https://api.github.com/users/S3RK/orgs",
+         "received_events_url" : "https://api.github.com/users/S3RK/received_events",
+         "repos_url" : "https://api.github.com/users/S3RK/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/S3RK/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/S3RK/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/S3RK"
+      }
    }
 ]
