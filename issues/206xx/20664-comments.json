@@ -3819,5 +3819,889 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jamesob"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752623127"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752623127"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I'd like to handle moving this code out of RPC land in a future change. It isn't a trivial move (given the global progress state), people are probably going to want unittests if we do the move, and IMO the important short-term objective here is getting fast rescans working ASAP. So if it's okay with you guys I'd like to save this move for a later PR once.",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:02:59Z",
+      "diff_hunk" : "@@ -2288,6 +2288,198 @@ static RPCHelpMan scantxoutset()\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit BlockFiltersScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+                \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+                \"This call may take serval minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+                {\n+                    {\"action\", RPCArg::Type::STR, RPCArg::Optional::NO, \"The action to execute\\n\"\n+            \"                                      \\\"start\\\" for starting a scan\\n\"\n+            \"                                      \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                      \\\"status\\\" for progress report (in %) of the current scan (returns Null if there is no ongoing scan)\"},\n+                    {\"scanobjects\", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, \"Array of scan objects.\\n\"\n+            \"                                  Every scan object is either a string descriptor or an object:\",\n+                        {\n+                            {\"descriptor\", RPCArg::Type::STR, RPCArg::Optional::OMITTED, \"An output descriptor\"},\n+                            {\"\", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, \"An object with output descriptor and metadata\",\n+                                {\n+                                    {\"desc\", RPCArg::Type::STR, RPCArg::Optional::NO, \"An output descriptor\"},\n+                                    {\"range\", RPCArg::Type::RANGE, /* default */ \"1000\", \"The range of HD chain indexes to explore (either end or [begin,end])\"},\n+                                },\n+                            },\n+                        },\n+                        \"[scanobjects,...]\"},\n+                    {\"start_height\", RPCArg::Type::NUM, /*default*/ \"0\", \"height to start to filter from\"},\n+                    {\"stop_height\", RPCArg::Type::NUM, /*default*/ \"<tip>\", \"height to stop to scan\"},\n+                    {\"filtertype\", RPCArg::Type::STR, /*default*/ \"basic\", \"The type name of the filter\"}\n+                },\n+                RPCResult{\n+                    RPCResult::Type::ARR, \"\", \"\",\n+                    {\n+                        {RPCResult::Type::STR_HEX, \"\", \"The blockhash\"},\n+                    }},\n+                RPCExamples{\n+                    HelpExampleCli(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\") +\n+                    HelpExampleRpc(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\")\n+                },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+{\n+    UniValue ret(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // no scan in progress\n+            return NullUniValue;\n+        }\n+        ret.pushKV(\"progress\", g_scanfilter_progress);\n+        ret.pushKV(\"current_height\", g_scanfilter_progress_height);\n+        return ret;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // reserve was possible which means no scan was running\n+            return false;\n+        }\n+        // set the abort flag\n+        g_scanfilter_should_abort_scan = true;\n+        return true;\n+    }\n+    else if (request.params[0].get_str() == \"start\") {\n+        BlockFiltersScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        const std::string filtertype_name{request.params[4].isNull() ? \"basic\" : request.params[4].get_str()};\n+\n+        BlockFilterType filtertype;\n+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Unknown filtertype\");\n+        }\n+\n+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);\n+        if (!index) {\n+            throw JSONRPCError(RPC_MISC_ERROR, \"Index is not enabled for filtertype \" + filtertype_name);\n+        }\n+\n+        // set the start-height\n+        const CBlockIndex* block = nullptr;\n+        const CBlockIndex* stop_block = nullptr;\n+        {\n+            LOCK(cs_main);\n+            block = ::ChainActive().Genesis();\n+            stop_block = ::ChainActive().Tip();\n+            if (!request.params[2].isNull()) {\n+                block = ::ChainActive()[request.params[2].get_int()];\n+                if (!block) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid start_height\");\n+                }\n+            }\n+            if (!request.params[3].isNull()) {\n+                stop_block = ::ChainActive()[request.params[3].get_int()];\n+                if (!stop_block || stop_block->nHeight < block->nHeight) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid stop_height\");\n+                }\n+            }\n+        }\n+        CHECK_NONFATAL(block);\n+\n+        // loop through the scan objects, add scripts to the needle_set",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752623127",
+      "id" : 752623127,
+      "in_reply_to_id" : 593002948,
+      "line" : 2415,
+      "node_id" : "PRRC_kwDOABII584s3B4X",
+      "original_commit_id" : "6a69dd267e4b96e6657de7b77521311994b2a902",
+      "original_line" : 2415,
+      "original_position" : 128,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 136,
+      "pull_request_review_id" : 810451671,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752623127/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:02:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752623127",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752623617"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752623617"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This is only subject to authenticated RPC user input and isn't handled in previous RPC calls (e.g. `scantxoutset`) so if someone wants to DoS their own node with a massive input array that seems okay to me.",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:03:49Z",
+      "diff_hunk" : "@@ -2281,13 +2281,205 @@ static RPCHelpMan scantxoutset()\n         result.pushKV(\"unspents\", unspents);\n         result.pushKV(\"total_amount\", ValueFromAmount(total_in));\n     } else {\n-        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid command\");\n+        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid action argument\");\n     }\n     return result;\n },\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit BlockFiltersScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+                \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+                \"This call may take serval minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+                {\n+                    {\"action\", RPCArg::Type::STR, RPCArg::Optional::NO, \"The action to execute\\n\"\n+            \"                                      \\\"start\\\" for starting a scan\\n\"\n+            \"                                      \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                      \\\"status\\\" for progress report (in %) of the current scan (returns Null if there is no ongoing scan)\"},\n+                    {\"scanobjects\", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, \"Array of scan objects.\\n\"\n+            \"                                  Every scan object is either a string descriptor or an object:\",\n+                        {\n+                            {\"descriptor\", RPCArg::Type::STR, RPCArg::Optional::OMITTED, \"An output descriptor\"},\n+                            {\"\", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, \"An object with output descriptor and metadata\",\n+                                {\n+                                    {\"desc\", RPCArg::Type::STR, RPCArg::Optional::NO, \"An output descriptor\"},\n+                                    {\"range\", RPCArg::Type::RANGE, /* default */ \"1000\", \"The range of HD chain indexes to explore (either end or [begin,end])\"},\n+                                },\n+                            },\n+                        },\n+                        \"[scanobjects,...]\"},\n+                    {\"start_height\", RPCArg::Type::NUM, /*default*/ \"0\", \"height to start to filter from\"},\n+                    {\"stop_height\", RPCArg::Type::NUM, /*default*/ \"<tip>\", \"height to stop to scan\"},\n+                    {\"filtertype\", RPCArg::Type::STR, /*default*/ \"basic\", \"The type name of the filter\"}\n+                },\n+                RPCResult{\n+                    RPCResult::Type::ARR, \"\", \"\",\n+                    {\n+                        {RPCResult::Type::STR_HEX, \"\", \"The blockhash\"},\n+                    }},\n+                RPCExamples{\n+                    HelpExampleCli(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\") +\n+                    HelpExampleRpc(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\")\n+                },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+{\n+    UniValue ret(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // no scan in progress\n+            return NullUniValue;\n+        }\n+        ret.pushKV(\"progress\", g_scanfilter_progress);\n+        ret.pushKV(\"current_height\", g_scanfilter_progress_height);\n+        return ret;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // reserve was possible which means no scan was running\n+            return false;\n+        }\n+        // set the abort flag\n+        g_scanfilter_should_abort_scan = true;\n+        return true;\n+    }\n+    else if (request.params[0].get_str() == \"start\") {\n+        BlockFiltersScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        const std::string filtertype_name{request.params[4].isNull() ? \"basic\" : request.params[4].get_str()};\n+\n+        BlockFilterType filtertype;\n+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Unknown filtertype\");\n+        }\n+\n+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);\n+        if (!index) {\n+            throw JSONRPCError(RPC_MISC_ERROR, \"Index is not enabled for filtertype \" + filtertype_name);\n+        }\n+\n+        // set the start-height\n+        const CBlockIndex* block = nullptr;\n+        const CBlockIndex* stop_block = nullptr;\n+        {\n+            LOCK(cs_main);\n+            block = ::ChainActive().Genesis();\n+            stop_block = ::ChainActive().Tip();\n+            if (!request.params[2].isNull()) {\n+                block = ::ChainActive()[request.params[2].get_int()];\n+                if (!block) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid start_height\");\n+                }\n+            }\n+            if (!request.params[3].isNull()) {\n+                stop_block = ::ChainActive()[request.params[3].get_int()];\n+                if (!stop_block || stop_block->nHeight < block->nHeight) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid stop_height\");\n+                }\n+            }\n+        }\n+        CHECK_NONFATAL(block);\n+\n+        // loop through the scan objects, add scripts to the needle_set\n+        GCSFilter::ElementSet needle_set;\n+        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752623617",
+      "id" : 752623617,
+      "in_reply_to_id" : 619298914,
+      "line" : 2417,
+      "node_id" : "PRRC_kwDOABII584s3CAB",
+      "original_commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "original_line" : 2417,
+      "original_position" : 138,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 138,
+      "pull_request_review_id" : 810452379,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752623617/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:03:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752623617",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752624685"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752624685"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This is overkill IMO; even for a long list, `EvalDescriptorStringOrObject` should be quite fast since it doesn't rely on any disk IO, unlike the calls below.",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:05:48Z",
+      "diff_hunk" : "@@ -2281,13 +2281,205 @@ static RPCHelpMan scantxoutset()\n         result.pushKV(\"unspents\", unspents);\n         result.pushKV(\"total_amount\", ValueFromAmount(total_in));\n     } else {\n-        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid command\");\n+        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid action argument\");\n     }\n     return result;\n },\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit BlockFiltersScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+                \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+                \"This call may take serval minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+                {\n+                    {\"action\", RPCArg::Type::STR, RPCArg::Optional::NO, \"The action to execute\\n\"\n+            \"                                      \\\"start\\\" for starting a scan\\n\"\n+            \"                                      \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                      \\\"status\\\" for progress report (in %) of the current scan (returns Null if there is no ongoing scan)\"},\n+                    {\"scanobjects\", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, \"Array of scan objects.\\n\"\n+            \"                                  Every scan object is either a string descriptor or an object:\",\n+                        {\n+                            {\"descriptor\", RPCArg::Type::STR, RPCArg::Optional::OMITTED, \"An output descriptor\"},\n+                            {\"\", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, \"An object with output descriptor and metadata\",\n+                                {\n+                                    {\"desc\", RPCArg::Type::STR, RPCArg::Optional::NO, \"An output descriptor\"},\n+                                    {\"range\", RPCArg::Type::RANGE, /* default */ \"1000\", \"The range of HD chain indexes to explore (either end or [begin,end])\"},\n+                                },\n+                            },\n+                        },\n+                        \"[scanobjects,...]\"},\n+                    {\"start_height\", RPCArg::Type::NUM, /*default*/ \"0\", \"height to start to filter from\"},\n+                    {\"stop_height\", RPCArg::Type::NUM, /*default*/ \"<tip>\", \"height to stop to scan\"},\n+                    {\"filtertype\", RPCArg::Type::STR, /*default*/ \"basic\", \"The type name of the filter\"}\n+                },\n+                RPCResult{\n+                    RPCResult::Type::ARR, \"\", \"\",\n+                    {\n+                        {RPCResult::Type::STR_HEX, \"\", \"The blockhash\"},\n+                    }},\n+                RPCExamples{\n+                    HelpExampleCli(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\") +\n+                    HelpExampleRpc(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\")\n+                },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+{\n+    UniValue ret(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // no scan in progress\n+            return NullUniValue;\n+        }\n+        ret.pushKV(\"progress\", g_scanfilter_progress);\n+        ret.pushKV(\"current_height\", g_scanfilter_progress_height);\n+        return ret;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // reserve was possible which means no scan was running\n+            return false;\n+        }\n+        // set the abort flag\n+        g_scanfilter_should_abort_scan = true;\n+        return true;\n+    }\n+    else if (request.params[0].get_str() == \"start\") {\n+        BlockFiltersScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        const std::string filtertype_name{request.params[4].isNull() ? \"basic\" : request.params[4].get_str()};\n+\n+        BlockFilterType filtertype;\n+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Unknown filtertype\");\n+        }\n+\n+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);\n+        if (!index) {\n+            throw JSONRPCError(RPC_MISC_ERROR, \"Index is not enabled for filtertype \" + filtertype_name);\n+        }\n+\n+        // set the start-height\n+        const CBlockIndex* block = nullptr;\n+        const CBlockIndex* stop_block = nullptr;\n+        {\n+            LOCK(cs_main);\n+            block = ::ChainActive().Genesis();\n+            stop_block = ::ChainActive().Tip();\n+            if (!request.params[2].isNull()) {\n+                block = ::ChainActive()[request.params[2].get_int()];\n+                if (!block) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid start_height\");\n+                }\n+            }\n+            if (!request.params[3].isNull()) {\n+                stop_block = ::ChainActive()[request.params[3].get_int()];\n+                if (!stop_block || stop_block->nHeight < block->nHeight) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid stop_height\");\n+                }\n+            }\n+        }\n+        CHECK_NONFATAL(block);\n+\n+        // loop through the scan objects, add scripts to the needle_set\n+        GCSFilter::ElementSet needle_set;\n+        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {\n+            FlatSigningProvider provider;\n+            std::vector<CScript> scripts = EvalDescriptorStringOrObject(scanobject, provider);\n+            for (const CScript& script : scripts) {\n+                needle_set.emplace(script.begin(), script.end());\n+            }\n+        }\n+        NodeContext& node = EnsureNodeContext(request.context);\n+        UniValue blocks(UniValue::VARR);\n+        const int amount_per_chunk = 10000;\n+        const CBlockIndex* start_index = block; // for remembering the start of a blockfilter range\n+        std::vector<BlockFilter> filters;\n+        const CBlockIndex* start_block = block; // for progress reporting\n+        const CBlockIndex* last_scanned_block = block;\n+        g_scanfilter_should_abort_scan = false;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752624685",
+      "id" : 752624685,
+      "in_reply_to_id" : 619310187,
+      "line" : 2431,
+      "node_id" : "PRRC_kwDOABII584s3CQt",
+      "original_commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "original_line" : 2431,
+      "original_position" : 152,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 152,
+      "pull_request_review_id" : 810454061,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752624685/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:06:04Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752624685",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656192"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656192"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed in https://github.com/bitcoin/bitcoin/pull/23549",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:57:16Z",
+      "diff_hunk" : "@@ -2281,13 +2281,205 @@ static RPCHelpMan scantxoutset()\n         result.pushKV(\"unspents\", unspents);\n         result.pushKV(\"total_amount\", ValueFromAmount(total_in));\n     } else {\n-        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid command\");\n+        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid action argument\");\n     }\n     return result;\n },\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit BlockFiltersScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+                \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+                \"This call may take serval minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656192",
+      "id" : 752656192,
+      "in_reply_to_id" : 619289998,
+      "line" : 2323,
+      "node_id" : "PRRC_kwDOABII584s3J9A",
+      "original_commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "original_line" : 2323,
+      "original_position" : 44,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 44,
+      "pull_request_review_id" : 810497204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656192/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:58:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656192",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656256"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656256"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed in #23549",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:57:23Z",
+      "diff_hunk" : "@@ -2281,13 +2281,205 @@ static RPCHelpMan scantxoutset()\n         result.pushKV(\"unspents\", unspents);\n         result.pushKV(\"total_amount\", ValueFromAmount(total_in));\n     } else {\n-        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid command\");\n+        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid action argument\");\n     }\n     return result;\n },\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit BlockFiltersScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+                \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+                \"This call may take serval minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+                {\n+                    {\"action\", RPCArg::Type::STR, RPCArg::Optional::NO, \"The action to execute\\n\"\n+            \"                                      \\\"start\\\" for starting a scan\\n\"\n+            \"                                      \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                      \\\"status\\\" for progress report (in %) of the current scan (returns Null if there is no ongoing scan)\"},\n+                    {\"scanobjects\", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, \"Array of scan objects.\\n\"\n+            \"                                  Every scan object is either a string descriptor or an object:\",\n+                        {\n+                            {\"descriptor\", RPCArg::Type::STR, RPCArg::Optional::OMITTED, \"An output descriptor\"},\n+                            {\"\", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, \"An object with output descriptor and metadata\",\n+                                {\n+                                    {\"desc\", RPCArg::Type::STR, RPCArg::Optional::NO, \"An output descriptor\"},\n+                                    {\"range\", RPCArg::Type::RANGE, /* default */ \"1000\", \"The range of HD chain indexes to explore (either end or [begin,end])\"},\n+                                },\n+                            },\n+                        },\n+                        \"[scanobjects,...]\"},\n+                    {\"start_height\", RPCArg::Type::NUM, /*default*/ \"0\", \"height to start to filter from\"},",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656256",
+      "id" : 752656256,
+      "in_reply_to_id" : 619289075,
+      "line" : 2341,
+      "node_id" : "PRRC_kwDOABII584s3J-A",
+      "original_commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "original_line" : 2341,
+      "original_position" : 62,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 62,
+      "pull_request_review_id" : 810497204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656256/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:58:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656256",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656322"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656322"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed in #23549",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:57:28Z",
+      "diff_hunk" : "@@ -2288,6 +2288,198 @@ static RPCHelpMan scantxoutset()\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit BlockFiltersScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+                \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+                \"This call may take serval minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+                {\n+                    {\"action\", RPCArg::Type::STR, RPCArg::Optional::NO, \"The action to execute\\n\"\n+            \"                                      \\\"start\\\" for starting a scan\\n\"\n+            \"                                      \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                      \\\"status\\\" for progress report (in %) of the current scan (returns Null if there is no ongoing scan)\"},\n+                    {\"scanobjects\", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, \"Array of scan objects.\\n\"\n+            \"                                  Every scan object is either a string descriptor or an object:\",\n+                        {\n+                            {\"descriptor\", RPCArg::Type::STR, RPCArg::Optional::OMITTED, \"An output descriptor\"},\n+                            {\"\", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, \"An object with output descriptor and metadata\",\n+                                {\n+                                    {\"desc\", RPCArg::Type::STR, RPCArg::Optional::NO, \"An output descriptor\"},\n+                                    {\"range\", RPCArg::Type::RANGE, /* default */ \"1000\", \"The range of HD chain indexes to explore (either end or [begin,end])\"},\n+                                },\n+                            },\n+                        },\n+                        \"[scanobjects,...]\"},\n+                    {\"start_height\", RPCArg::Type::NUM, /*default*/ \"0\", \"height to start to filter from\"},\n+                    {\"stop_height\", RPCArg::Type::NUM, /*default*/ \"<tip>\", \"height to stop to scan\"},\n+                    {\"filtertype\", RPCArg::Type::STR, /*default*/ \"basic\", \"The type name of the filter\"}\n+                },\n+                RPCResult{",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656322",
+      "id" : 752656322,
+      "in_reply_to_id" : 629622396,
+      "line" : 2345,
+      "node_id" : "PRRC_kwDOABII584s3J_C",
+      "original_commit_id" : "6a69dd267e4b96e6657de7b77521311994b2a902",
+      "original_line" : 2345,
+      "original_position" : 58,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 66,
+      "pull_request_review_id" : 810497204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656322/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:58:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656322",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656439"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656439"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed in #23549",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:57:38Z",
+      "diff_hunk" : "@@ -2281,13 +2281,205 @@ static RPCHelpMan scantxoutset()\n         result.pushKV(\"unspents\", unspents);\n         result.pushKV(\"total_amount\", ValueFromAmount(total_in));\n     } else {\n-        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid command\");\n+        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid action argument\");\n     }\n     return result;\n },\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit BlockFiltersScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+                \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+                \"This call may take serval minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+                {\n+                    {\"action\", RPCArg::Type::STR, RPCArg::Optional::NO, \"The action to execute\\n\"\n+            \"                                      \\\"start\\\" for starting a scan\\n\"\n+            \"                                      \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                      \\\"status\\\" for progress report (in %) of the current scan (returns Null if there is no ongoing scan)\"},\n+                    {\"scanobjects\", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, \"Array of scan objects.\\n\"\n+            \"                                  Every scan object is either a string descriptor or an object:\",\n+                        {\n+                            {\"descriptor\", RPCArg::Type::STR, RPCArg::Optional::OMITTED, \"An output descriptor\"},\n+                            {\"\", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, \"An object with output descriptor and metadata\",\n+                                {\n+                                    {\"desc\", RPCArg::Type::STR, RPCArg::Optional::NO, \"An output descriptor\"},\n+                                    {\"range\", RPCArg::Type::RANGE, /* default */ \"1000\", \"The range of HD chain indexes to explore (either end or [begin,end])\"},\n+                                },\n+                            },\n+                        },\n+                        \"[scanobjects,...]\"},\n+                    {\"start_height\", RPCArg::Type::NUM, /*default*/ \"0\", \"height to start to filter from\"},\n+                    {\"stop_height\", RPCArg::Type::NUM, /*default*/ \"<tip>\", \"height to stop to scan\"},\n+                    {\"filtertype\", RPCArg::Type::STR, /*default*/ \"basic\", \"The type name of the filter\"}\n+                },\n+                RPCResult{\n+                    RPCResult::Type::ARR, \"\", \"\",\n+                    {\n+                        {RPCResult::Type::STR_HEX, \"\", \"The blockhash\"},\n+                    }},\n+                RPCExamples{\n+                    HelpExampleCli(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\") +\n+                    HelpExampleRpc(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\")\n+                },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+{\n+    UniValue ret(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // no scan in progress\n+            return NullUniValue;\n+        }\n+        ret.pushKV(\"progress\", g_scanfilter_progress);\n+        ret.pushKV(\"current_height\", g_scanfilter_progress_height);\n+        return ret;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // reserve was possible which means no scan was running\n+            return false;\n+        }\n+        // set the abort flag\n+        g_scanfilter_should_abort_scan = true;\n+        return true;\n+    }\n+    else if (request.params[0].get_str() == \"start\") {\n+        BlockFiltersScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        const std::string filtertype_name{request.params[4].isNull() ? \"basic\" : request.params[4].get_str()};\n+\n+        BlockFilterType filtertype;\n+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Unknown filtertype\");\n+        }\n+\n+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);\n+        if (!index) {\n+            throw JSONRPCError(RPC_MISC_ERROR, \"Index is not enabled for filtertype \" + filtertype_name);\n+        }\n+\n+        // set the start-height\n+        const CBlockIndex* block = nullptr;\n+        const CBlockIndex* stop_block = nullptr;\n+        {\n+            LOCK(cs_main);\n+            block = ::ChainActive().Genesis();\n+            stop_block = ::ChainActive().Tip();\n+            if (!request.params[2].isNull()) {\n+                block = ::ChainActive()[request.params[2].get_int()];\n+                if (!block) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid start_height\");\n+                }\n+            }\n+            if (!request.params[3].isNull()) {\n+                stop_block = ::ChainActive()[request.params[3].get_int()];\n+                if (!stop_block || stop_block->nHeight < block->nHeight) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid stop_height\");\n+                }\n+            }\n+        }\n+        CHECK_NONFATAL(block);\n+\n+        // loop through the scan objects, add scripts to the needle_set\n+        GCSFilter::ElementSet needle_set;\n+        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {\n+            FlatSigningProvider provider;\n+            std::vector<CScript> scripts = EvalDescriptorStringOrObject(scanobject, provider);\n+            for (const CScript& script : scripts) {\n+                needle_set.emplace(script.begin(), script.end());\n+            }\n+        }\n+        NodeContext& node = EnsureNodeContext(request.context);\n+        UniValue blocks(UniValue::VARR);\n+        const int amount_per_chunk = 10000;\n+        const CBlockIndex* start_index = block; // for remembering the start of a blockfilter range\n+        std::vector<BlockFilter> filters;\n+        const CBlockIndex* start_block = block; // for progress reporting\n+        const CBlockIndex* last_scanned_block = block;\n+        g_scanfilter_should_abort_scan = false;\n+        g_scanfilter_progress = 0;\n+        g_scanfilter_progress_height = start_block->nHeight;\n+        while (block) {\n+            node.rpc_interruption_point(); // allow a clean shutdown\n+            if (g_scanfilter_should_abort_scan) {\n+                break;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656439",
+      "id" : 752656439,
+      "in_reply_to_id" : 619281660,
+      "line" : 2437,
+      "node_id" : "PRRC_kwDOABII584s3KA3",
+      "original_commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "original_line" : 2437,
+      "original_position" : 158,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 158,
+      "pull_request_review_id" : 810497204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656439/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:58:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656439",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656509"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656509"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed in #23549",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:57:44Z",
+      "diff_hunk" : "@@ -2281,13 +2281,205 @@ static RPCHelpMan scantxoutset()\n         result.pushKV(\"unspents\", unspents);\n         result.pushKV(\"total_amount\", ValueFromAmount(total_in));\n     } else {\n-        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid command\");\n+        throw JSONRPCError(RPC_INVALID_PARAMETER, \"Invalid action argument\");\n     }\n     return result;\n },\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit BlockFiltersScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+                \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+                \"This call may take serval minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+                {\n+                    {\"action\", RPCArg::Type::STR, RPCArg::Optional::NO, \"The action to execute\\n\"\n+            \"                                      \\\"start\\\" for starting a scan\\n\"\n+            \"                                      \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                      \\\"status\\\" for progress report (in %) of the current scan (returns Null if there is no ongoing scan)\"},\n+                    {\"scanobjects\", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, \"Array of scan objects.\\n\"\n+            \"                                  Every scan object is either a string descriptor or an object:\",\n+                        {\n+                            {\"descriptor\", RPCArg::Type::STR, RPCArg::Optional::OMITTED, \"An output descriptor\"},\n+                            {\"\", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, \"An object with output descriptor and metadata\",\n+                                {\n+                                    {\"desc\", RPCArg::Type::STR, RPCArg::Optional::NO, \"An output descriptor\"},\n+                                    {\"range\", RPCArg::Type::RANGE, /* default */ \"1000\", \"The range of HD chain indexes to explore (either end or [begin,end])\"},\n+                                },\n+                            },\n+                        },\n+                        \"[scanobjects,...]\"},\n+                    {\"start_height\", RPCArg::Type::NUM, /*default*/ \"0\", \"height to start to filter from\"},\n+                    {\"stop_height\", RPCArg::Type::NUM, /*default*/ \"<tip>\", \"height to stop to scan\"},\n+                    {\"filtertype\", RPCArg::Type::STR, /*default*/ \"basic\", \"The type name of the filter\"}\n+                },\n+                RPCResult{\n+                    RPCResult::Type::ARR, \"\", \"\",\n+                    {\n+                        {RPCResult::Type::STR_HEX, \"\", \"The blockhash\"},\n+                    }},\n+                RPCExamples{\n+                    HelpExampleCli(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\") +\n+                    HelpExampleRpc(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\")\n+                },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+{\n+    UniValue ret(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // no scan in progress\n+            return NullUniValue;\n+        }\n+        ret.pushKV(\"progress\", g_scanfilter_progress);\n+        ret.pushKV(\"current_height\", g_scanfilter_progress_height);\n+        return ret;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // reserve was possible which means no scan was running\n+            return false;\n+        }\n+        // set the abort flag\n+        g_scanfilter_should_abort_scan = true;\n+        return true;\n+    }\n+    else if (request.params[0].get_str() == \"start\") {\n+        BlockFiltersScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        const std::string filtertype_name{request.params[4].isNull() ? \"basic\" : request.params[4].get_str()};\n+\n+        BlockFilterType filtertype;\n+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Unknown filtertype\");\n+        }\n+\n+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);\n+        if (!index) {\n+            throw JSONRPCError(RPC_MISC_ERROR, \"Index is not enabled for filtertype \" + filtertype_name);\n+        }\n+\n+        // set the start-height\n+        const CBlockIndex* block = nullptr;\n+        const CBlockIndex* stop_block = nullptr;\n+        {\n+            LOCK(cs_main);\n+            block = ::ChainActive().Genesis();\n+            stop_block = ::ChainActive().Tip();\n+            if (!request.params[2].isNull()) {\n+                block = ::ChainActive()[request.params[2].get_int()];\n+                if (!block) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid start_height\");\n+                }\n+            }\n+            if (!request.params[3].isNull()) {\n+                stop_block = ::ChainActive()[request.params[3].get_int()];\n+                if (!stop_block || stop_block->nHeight < block->nHeight) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid stop_height\");\n+                }\n+            }\n+        }\n+        CHECK_NONFATAL(block);\n+\n+        // loop through the scan objects, add scripts to the needle_set\n+        GCSFilter::ElementSet needle_set;\n+        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {\n+            FlatSigningProvider provider;\n+            std::vector<CScript> scripts = EvalDescriptorStringOrObject(scanobject, provider);\n+            for (const CScript& script : scripts) {\n+                needle_set.emplace(script.begin(), script.end());\n+            }\n+        }\n+        NodeContext& node = EnsureNodeContext(request.context);\n+        UniValue blocks(UniValue::VARR);\n+        const int amount_per_chunk = 10000;\n+        const CBlockIndex* start_index = block; // for remembering the start of a blockfilter range\n+        std::vector<BlockFilter> filters;\n+        const CBlockIndex* start_block = block; // for progress reporting\n+        const CBlockIndex* last_scanned_block = block;\n+        g_scanfilter_should_abort_scan = false;\n+        g_scanfilter_progress = 0;\n+        g_scanfilter_progress_height = start_block->nHeight;\n+        while (block) {\n+            node.rpc_interruption_point(); // allow a clean shutdown\n+            if (g_scanfilter_should_abort_scan) {\n+                break;\n+            }\n+            const CBlockIndex* next = nullptr;\n+            {\n+                LOCK(cs_main);\n+                next = ChainActive().Next(block);\n+                if (block == stop_block) next = nullptr;\n+            }\n+            if (start_index->nHeight + amount_per_chunk == block->nHeight || next == nullptr) {\n+                LogPrint(BCLog::RPC, \"Fetching blockfilters from height %d to height %d.\\n\", start_index->nHeight, block->nHeight);\n+                if (index->LookupFilterRange(start_index->nHeight, block, filters)) {\n+                    for (const BlockFilter& filter : filters) {\n+                        // compare the elements-set with each filter\n+                        if (filter.GetFilter().MatchAny(needle_set)) {\n+                            blocks.push_back(filter.GetBlockHash().GetHex());\n+                            LogPrint(BCLog::RPC, \"scanblocks: found match in %s\\n\", filter.GetBlockHash().GetHex());\n+                        }\n+                    }\n+                }\n+                start_index = block;\n+\n+                // update progress\n+                int blocks_processed = block->nHeight - start_block->nHeight;\n+                int total_blocks_to_process = stop_block->nHeight - start_block->nHeight;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656509",
+      "id" : 752656509,
+      "in_reply_to_id" : 619279994,
+      "line" : 2460,
+      "node_id" : "PRRC_kwDOABII584s3KB9",
+      "original_commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "original_line" : 2460,
+      "original_position" : 181,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 181,
+      "pull_request_review_id" : 810497204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656509/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:58:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656509",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656549"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656549"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed in #23549",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:57:48Z",
+      "diff_hunk" : "@@ -2290,6 +2290,198 @@ static RPCHelpMan scantxoutset()\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve;\n+public:\n+    explicit BlockFiltersScanReserver() : m_could_reserve(false) {}\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+                \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+                \"This call may take serval minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+                {\n+                    {\"action\", RPCArg::Type::STR, RPCArg::Optional::NO, \"The action to execute\\n\"\n+            \"                                      \\\"start\\\" for starting a scan\\n\"\n+            \"                                      \\\"abort\\\" for aborting the current scan (returns true when abort was successful)\\n\"\n+            \"                                      \\\"status\\\" for progress report (in %) of the current scan\"},\n+                    {\"scanobjects\", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, \"Array of scan objects.\\n\"\n+            \"                                  Every scan object is either a string descriptor or an object:\",\n+                        {\n+                            {\"descriptor\", RPCArg::Type::STR, RPCArg::Optional::OMITTED, \"An output descriptor\"},\n+                            {\"\", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, \"An object with output descriptor and metadata\",\n+                                {\n+                                    {\"desc\", RPCArg::Type::STR, RPCArg::Optional::NO, \"An output descriptor\"},\n+                                    {\"range\", RPCArg::Type::RANGE, /* default */ \"1000\", \"The range of HD chain indexes to explore (either end or [begin,end])\"},\n+                                },\n+                            },\n+                        },\n+                        \"[scanobjects,...]\"},\n+                    {\"start_height\", RPCArg::Type::NUM, /*default*/ \"0\", \"height to start to filter from\"},\n+                    {\"stop_height\", RPCArg::Type::NUM, /*default*/ \"<tip>\", \"height to stop to scan\"},\n+                    {\"filtertype\", RPCArg::Type::STR, /*default*/ \"basic\", \"The type name of the filter\"}\n+                },\n+                RPCResult{\n+                    RPCResult::Type::ARR, \"\", \"\",\n+                    {\n+                        {RPCResult::Type::STR_HEX, \"\", \"The blockhash\"},\n+                    }},\n+                RPCExamples{\n+                    HelpExampleCli(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\") +\n+                    HelpExampleRpc(\"scanblocks\", \"\\\"[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]\\\" 300000\")\n+                },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+{\n+    UniValue ret(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // no scan in progress\n+            return NullUniValue;\n+        }\n+        ret.pushKV(\"progress\", g_scanfilter_progress);\n+        ret.pushKV(\"current_height\", g_scanfilter_progress_height);\n+        return ret;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // reserve was possible which means no scan was running\n+            return false;\n+        }\n+        // set the abort flag\n+        g_scanfilter_should_abort_scan = true;\n+        return true;\n+    }\n+    else if (request.params[0].get_str() == \"start\") {\n+        BlockFiltersScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        const std::string filtertype_name{request.params[4].isNull() ? \"basic\" : request.params[4].get_str()};\n+\n+        BlockFilterType filtertype;\n+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Unknown filtertype\");\n+        }\n+\n+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);\n+        if (!index) {\n+            throw JSONRPCError(RPC_MISC_ERROR, \"Index is not enabled for filtertype \" + filtertype_name);\n+        }\n+\n+        // set the start-height\n+        const CBlockIndex* block = nullptr;\n+        const CBlockIndex* stop_block = nullptr;\n+        {\n+            LOCK(cs_main);\n+            block = ::ChainActive().Genesis();\n+            stop_block = ::ChainActive().Tip();\n+            if (!request.params[2].isNull()) {\n+                block = ::ChainActive()[request.params[2].get_int()];\n+                if (!block) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid start_height\");\n+                }\n+            }\n+            if (!request.params[3].isNull()) {\n+                stop_block = ::ChainActive()[request.params[3].get_int()];\n+                if (!stop_block || stop_block->nHeight < block->nHeight) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid stop_height\");\n+                }\n+            }\n+        }\n+        CHECK_NONFATAL(block);\n+\n+        // loop through the scan objects, add scripts to the element_set\n+        GCSFilter::ElementSet needle_set;\n+        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {\n+            FlatSigningProvider provider;\n+            std::vector<CScript> scripts = EvalDescriptorStringOrObject(scanobject, provider);\n+            for (const CScript& script : scripts) {\n+                needle_set.emplace(script.begin(), script.end());\n+            }\n+        }\n+        NodeContext& node = EnsureNodeContext(request.context);\n+        UniValue blocks(UniValue::VARR);\n+        const int amount_per_chunk = 10000;\n+        const CBlockIndex* start_index = block; // for remembering the start of a blockfilter range\n+        std::vector<BlockFilter> filters;\n+        const CBlockIndex* start_block = block; // for progress reporting\n+        const CBlockIndex* last_scanned_block = block;\n+        g_scanfilter_should_abort_scan = false;\n+        g_scanfilter_progress = 0;\n+        g_scanfilter_progress_height = start_block->nHeight;\n+        while (block) {\n+            node.rpc_interruption_point(); // allow a clean shutdown\n+            if (g_scanfilter_should_abort_scan) {\n+                break;\n+            }\n+            const CBlockIndex* next = nullptr;\n+            {\n+                LOCK(cs_main);\n+                next = ChainActive().Next(block);\n+                if (block == stop_block) next = nullptr;\n+            }\n+            if (start_index->nHeight+amount_per_chunk == block->nHeight || next == nullptr) {\n+                LogPrint(BCLog::RPC, \"Fetching blockfilters from height %d to height %d.\\n\", start_index->nHeight, block->nHeight);\n+                if (index->LookupFilterRange(start_index->nHeight, block, filters)) {\n+                    for (const BlockFilter& filter : filters) {\n+                        // compare the elements-set with each filter\n+                        if (filter.GetFilter().MatchAny(needle_set)) {\n+                            blocks.push_back(filter.GetBlockHash().GetHex());\n+                            LogPrint(BCLog::RPC, \"scanblocks: found match in %s\\n\", filter.GetBlockHash().GetHex());\n+                        }\n+                    }\n+                }\n+                start_index = block;\n+\n+                // update progress\n+                int blocks_processed = block->nHeight - start_block->nHeight;\n+                int total_blocks_to_process = stop_block->nHeight - start_block->nHeight;\n+                if (total_blocks_to_process > 0) { // avoid division by zero\n+                    g_scanfilter_progress = (int)(100.0 / total_blocks_to_process * blocks_processed);\n+                } else {\n+                    g_scanfilter_progress = 100;\n+                }\n+                g_scanfilter_progress_height = block->nHeight;\n+            }\n+            last_scanned_block = block;\n+            block = next;\n+        }\n+        ret.pushKV(\"from_height\", start_block->nHeight);\n+        ret.pushKV(\"to_height\", last_scanned_block->nHeight);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656549",
+      "id" : 752656549,
+      "in_reply_to_id" : 571642073,
+      "line" : 2472,
+      "node_id" : "PRRC_kwDOABII584s3KCl",
+      "original_commit_id" : "7bb2c05e576f56f9ccfc44f7b95c3a8ebfb9419c",
+      "original_line" : 2472,
+      "original_position" : 185,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 193,
+      "pull_request_review_id" : 810497204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656549/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:58:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656549",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656608"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656608"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed in #23549",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:57:55Z",
+      "diff_hunk" : "@@ -0,0 +1,73 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2021 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test the scanblocks rpc call.\"\"\"",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656608",
+      "id" : 752656608,
+      "in_reply_to_id" : 619313659,
+      "line" : 5,
+      "node_id" : "PRRC_kwDOABII584s3KDg",
+      "original_commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "original_line" : 5,
+      "original_position" : 5,
+      "original_start_line" : null,
+      "path" : "test/functional/rpc_scanblockfilters.py",
+      "position" : 5,
+      "pull_request_review_id" : 810497204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656608/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:58:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656608",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656652"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656652"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed in #23549",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:57:58Z",
+      "diff_hunk" : "@@ -0,0 +1,73 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2021 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test the scanblocks rpc call.\"\"\"\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import assert_equal, assert_raises_rpc_error\n+\n+class scanblocksTest(BitcoinTestFramework):",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656652",
+      "id" : 752656652,
+      "in_reply_to_id" : 619314758,
+      "line" : 9,
+      "node_id" : "PRRC_kwDOABII584s3KEM",
+      "original_commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "original_line" : 9,
+      "original_position" : 9,
+      "original_start_line" : null,
+      "path" : "test/functional/rpc_scanblockfilters.py",
+      "position" : 9,
+      "pull_request_review_id" : 810497204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656652/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:58:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656652",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656686"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656686"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed in #23549",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:58:02Z",
+      "diff_hunk" : "@@ -0,0 +1,73 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2021 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test the scanblocks rpc call.\"\"\"\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import assert_equal, assert_raises_rpc_error\n+\n+class scanblocksTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 2\n+        self.extra_args = [[\"-blockfilterindex=1\"],[]]\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+\n+    def run_test(self):\n+        # send 1.0, mempool only\n+        addr_1 = self.nodes[0].getnewaddress()\n+        self.nodes[0].sendtoaddress(addr_1, 1.0)\n+\n+        # send 1.0, mempool only\n+        self.nodes[0].sendtoaddress(\"mkS4HXoTYWRTescLGaUTGbtTTYX5EjJyEE\", 1.0) # childkey 5 of tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B\n+\n+        # mine a block and assure that the mined blockhash is in the filterresult\n+        blockhash = self.nodes[0].generate(1)[0]",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656686",
+      "id" : 752656686,
+      "in_reply_to_id" : 629630832,
+      "line" : 26,
+      "node_id" : "PRRC_kwDOABII584s3KEu",
+      "original_commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "original_line" : 26,
+      "original_position" : 26,
+      "original_start_line" : null,
+      "path" : "test/functional/rpc_scanblockfilters.py",
+      "position" : 26,
+      "pull_request_review_id" : 810497204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656686/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:58:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656686",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656745"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656745"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed in #23549",
+      "commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "created_at" : "2021-11-18T21:58:07Z",
+      "diff_hunk" : "@@ -0,0 +1,73 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2021 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test the scanblocks rpc call.\"\"\"\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import assert_equal, assert_raises_rpc_error\n+\n+class scanblocksTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 2\n+        self.extra_args = [[\"-blockfilterindex=1\"],[]]\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+\n+    def run_test(self):\n+        # send 1.0, mempool only\n+        addr_1 = self.nodes[0].getnewaddress()\n+        self.nodes[0].sendtoaddress(addr_1, 1.0)\n+\n+        # send 1.0, mempool only\n+        self.nodes[0].sendtoaddress(\"mkS4HXoTYWRTescLGaUTGbtTTYX5EjJyEE\", 1.0) # childkey 5 of tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B\n+\n+        # mine a block and assure that the mined blockhash is in the filterresult\n+        blockhash = self.nodes[0].generate(1)[0]\n+        out = self.nodes[0].scanblocks(\"start\", [\"addr(\"+addr_1+\")\"])\n+        assert(blockhash in out['relevant_blocks'])\n+        assert_equal(self.nodes[0].getblockheader(blockhash)['height'], out['to_height'])\n+        assert_equal(0, out['from_height'])\n+\n+        # mine another block\n+        blockhash_new = self.nodes[0].generate(1)[0]\n+\n+        # make sure the blockhash is not in the filter result if we set the start_height to the just mined block (unlikely to hit a false positive)\n+        assert(blockhash not in self.nodes[0].scanblocks(\"start\", [\"addr(\"+addr_1+\")\"], self.nodes[0].getblockheader(blockhash_new)['height'])['relevant_blocks'])\n+\n+        # make sure the blockhash is present when using the first mined block as start_height\n+        assert(blockhash in self.nodes[0].scanblocks(\"start\", [\"addr(\"+addr_1+\")\"], self.nodes[0].getblockheader(blockhash)['height'])['relevant_blocks'])\n+\n+        # also test the stop height\n+        assert(blockhash in self.nodes[0].scanblocks(\"start\", [\"addr(\"+addr_1+\")\"], self.nodes[0].getblockheader(blockhash)['height'], self.nodes[0].getblockheader(blockhash)['height'])['relevant_blocks'])\n+\n+        # use the stop_height to exclude the relevent block",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/20664#discussion_r752656745",
+      "id" : 752656745,
+      "in_reply_to_id" : 725696957,
+      "line" : 44,
+      "node_id" : "PRRC_kwDOABII584s3KFp",
+      "original_commit_id" : "71b7cdb460e2d0179aa87bdd0d30a82a821f6d05",
+      "original_line" : 44,
+      "original_position" : 44,
+      "original_start_line" : null,
+      "path" : "test/functional/rpc_scanblockfilters.py",
+      "position" : 44,
+      "pull_request_review_id" : 810497204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/20664",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656745/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-11-18T21:58:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/752656745",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
    }
 ]
