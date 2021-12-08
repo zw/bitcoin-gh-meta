@@ -931,5 +931,139 @@
          "type" : "User",
          "url" : "https://api.github.com/users/mjdietzx"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/22867#discussion_r765292617"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22867"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/765292617"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: My understanding is that it's better not to have actual values in comments\r\n```suggestion\r\n        # Now we have a chain of: `optin_parent_tx`, `joined_tx`, and `MAX_REPLACEMENT_LIMIT - 1` txs. The last tx in the loop exceeded `MAX_REPLACEMENT_LIMIT`\r\n```",
+      "commit_id" : "64c20402b258709af8c18eac1697939eca07082f",
+      "created_at" : "2021-12-08T22:25:45Z",
+      "diff_hunk" : "@@ -623,5 +642,130 @@ def test_replacement_relay_fee(self):\n         tx.vout[0].nValue -= 1\n         assert_raises_rpc_error(-26, \"insufficient fee\", self.nodes[0].sendrawtransaction, tx.serialize().hex())\n \n+    def test_prechecks_overestimates_replacements(self):\n+        confirmed_utxos = [self.wallet.get_utxo(), self.wallet.get_utxo()]\n+\n+        # Two opt-in parent transactions\n+        parent_txs = list(map(lambda utxo: self.wallet.send_self_transfer(\n+            from_node=self.nodes[0],\n+            utxo_to_spend=utxo,\n+            sequence=BIP125_SEQUENCE_NUMBER,\n+            fee_rate=Decimal('0.0001'),\n+        ), confirmed_utxos))\n+\n+        # Craft a transaction that spends both parents so we can create one chain of descendant transactions\n+        parent_utxos = list(map(lambda tx: self.wallet.get_utxo(txid=tx['txid']), parent_txs))\n+        joined_tx_hex = self.create_double_input_self_transfer(parent_utxos, Decimal('0.0001'))\n+        joined_tx_txid = self.nodes[0].sendrawtransaction(joined_tx_hex)\n+\n+        # Get the `joined_tx` utxo into our wallet so we can spend a chain of descendants from it\n+        joined_tx = self.nodes[0].decoderawtransaction(joined_tx_hex)\n+        self.wallet.scan_tx(joined_tx)\n+        joined_utxo = self.wallet.get_utxo(txid=joined_tx_txid)\n+\n+        # Create a chain half the size of `MAX_REPLACEMENT_LIMIT` spending `joined_tx` - well under the BIP125 Rule #5 imposed limit\n+        tx = None\n+        for _ in range(MAX_REPLACEMENT_LIMIT // 2):\n+            tx = self.wallet.send_self_transfer(\n+                from_node=self.nodes[0],\n+                utxo_to_spend=joined_utxo if tx is None else self.wallet.get_utxo(txid=tx['txid']),  # a straight line of descendants\n+                fee_rate=Decimal('0.0001'),\n+            )\n+\n+        # Even though there are well under `MAX_REPLACEMENT_LIMIT` transactions that will be evicted due to this replacement,\n+        # in this case we still reject the replacement attempt because of the way `MemPoolAccept::PreChecks` double-counts descendants.\n+        # Each `confirmed_utxo` has the exact same descendants, but they are each counted twice!\n+        replacement_attempt_tx_hex = self.create_double_input_self_transfer(confirmed_utxos, Decimal('0.01'))\n+        assert_raises_rpc_error(-26, 'too many potential replacements', self.nodes[0].sendrawtransaction, replacement_attempt_tx_hex, 0)\n+\n+        # However, we can still craft a transaction that replaces the entire descendant chain by only replacing one of the `parent_txs`\n+        replacement_tx = self.wallet.send_self_transfer(\n+            from_node=self.nodes[0],\n+            utxo_to_spend=confirmed_utxos[0],  # replace the opt-in parent transaction\n+            sequence=BIP125_SEQUENCE_NUMBER,\n+            fee_rate=Decimal('0.01'),\n+        )\n+        mempool = self.nodes[0].getrawmempool()\n+        assert replacement_tx['txid'] in mempool\n+        assert parent_txs[0]['txid'] not in mempool\n+        assert parent_txs[1]['txid'] in mempool\n+        assert tx['txid'] not in mempool\n+\n+        # And funny enough, _now_ we can successfully broadcast that same `replacement_tx_hex` which just failed with the\n+        # \"too many potential replacements\" error. It was just a little tricky to get around `MemPoolAccept::PreChecks`\n+        # double-counting evictions.\n+        replacement_attempt_tx_txid = self.nodes[0].sendrawtransaction(replacement_attempt_tx_hex, 0)\n+        mempool = self.nodes[0].getrawmempool()\n+        assert replacement_attempt_tx_txid in mempool\n+        assert replacement_tx['txid'] not in mempool\n+        for parent_tx in parent_txs:\n+            assert parent_tx not in mempool\n+\n+        # clean up all evicted utxos / update wallet utxo state\n+        self.wallet.get_utxo(txid=tx['txid'])\n+        self.wallet.get_utxo(txid=replacement_tx['txid'])\n+\n+    def test_reorged_inherited_signaling_and_descendant_limit(self):\n+        confirmed_utxos = [self.wallet.get_utxo(), self.wallet.get_utxo()]\n+\n+        # One opt-in parent transaction, one opt-out\n+        parent_txs = list(map(lambda utxo: self.wallet.send_self_transfer(\n+            from_node=self.nodes[0],\n+            utxo_to_spend=utxo,\n+            sequence=BIP125_SEQUENCE_NUMBER if confirmed_utxos.index(utxo) == 0 else 0xffffffff,\n+            fee_rate=Decimal('0.0001'),\n+        ), confirmed_utxos))\n+        optin_parent_tx, optout_parent_tx = parent_txs\n+\n+        # Craft a transaction that spends both parents so we can create one chain of descendant transactions\n+        parent_utxos = list(map(lambda tx: self.wallet.get_utxo(txid=tx['txid']), parent_txs))\n+        joined_tx_hex = self.create_double_input_self_transfer(parent_utxos, Decimal('0.0001'), sequence=0xffffffff)\n+        joined_tx_txid = self.nodes[0].sendrawtransaction(joined_tx_hex)\n+\n+        # Only a single input needs to signal replaceability (whether explicitly or through inheritance) for the resulting transaction to signal\n+        assert_equal(True, self.nodes[0].getmempoolentry(joined_tx_txid)['bip125-replaceable'])\n+\n+        # Get the `joined_tx` utxo into our wallet so we can spend a chain of descendants from it\n+        joined_tx = self.nodes[0].decoderawtransaction(joined_tx_hex)\n+        self.wallet.scan_tx(joined_tx)\n+        joined_utxo = self.wallet.get_utxo(txid=joined_tx_txid)\n+\n+        # If we confirm `optin_parent_tx` descendants will no longer inherit signaling\n+        hash = self.generateblock(self.nodes[0], output=self.wallet.get_address(), transactions=[optin_parent_tx['txid']])['hash']\n+        assert_equal(False, self.nodes[0].getmempoolentry(joined_tx_txid)['bip125-replaceable'])\n+\n+        # Get `optin_parent_tx` back in our mempool, once again descendants inherit signaling\n+        self.nodes[0].invalidateblock(hash)\n+        assert_equal(True, self.nodes[0].getmempoolentry(joined_tx_txid)['bip125-replaceable'])\n+\n+        # Create a chain the size of `MAX_REPLACEMENT_LIMIT` spending `joined_tx` - the BIP125 Rule #5 imposed limit\n+        tx = None\n+        for _ in range(MAX_REPLACEMENT_LIMIT - 1):\n+            tx = self.wallet.send_self_transfer(\n+                from_node=self.nodes[0],\n+                utxo_to_spend=joined_utxo if tx is None else self.wallet.get_utxo(txid=tx['txid']),  # a straight line of descendants\n+                sequence=0xffffffff,\n+                fee_rate=Decimal('0.0001'),\n+            )\n+            assert_equal(True, self.nodes[0].getmempoolentry(tx['txid'])['bip125-replaceable'])  # inherited\n+        # Now we have a chain of: `optin_parent_tx`, `joined_tx`, and 99 txs. The last tx in the loop exceeded `MAX_REPLACEMENT_LIMIT`",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22867#discussion_r765292617",
+      "id" : 765292617,
+      "line" : 751,
+      "node_id" : "PRRC_kwDOABII584tnXBJ",
+      "original_commit_id" : "64c20402b258709af8c18eac1697939eca07082f",
+      "original_line" : 751,
+      "original_position" : 189,
+      "original_start_line" : null,
+      "path" : "test/functional/feature_rbf.py",
+      "position" : 189,
+      "pull_request_review_id" : 827020805,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22867",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/765292617/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-08T22:39:00Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/765292617",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/41220998?v=4",
+         "events_url" : "https://api.github.com/users/DariusParvin/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/DariusParvin/followers",
+         "following_url" : "https://api.github.com/users/DariusParvin/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/DariusParvin/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/DariusParvin",
+         "id" : 41220998,
+         "login" : "DariusParvin",
+         "node_id" : "MDQ6VXNlcjQxMjIwOTk4",
+         "organizations_url" : "https://api.github.com/users/DariusParvin/orgs",
+         "received_events_url" : "https://api.github.com/users/DariusParvin/received_events",
+         "repos_url" : "https://api.github.com/users/DariusParvin/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/DariusParvin/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/DariusParvin/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/DariusParvin"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/22867#discussion_r765296491"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22867"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/765296491"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: To check the specific error message\r\n```suggestion\r\n        replacement_parent_tx = self.wallet.create_self_transfer(\r\n            from_node=self.nodes[0],\r\n            utxo_to_spend=confirmed_utxos[0],\r\n            fee_rate=Decimal('0.01'),\r\n            mempool_valid=False\r\n        )['hex']\r\n        assert_raises_rpc_error(-26, 'too many potential replacements', self.nodes[0].sendrawtransaction, replacement_parent_tx, 0)\r\n```",
+      "commit_id" : "64c20402b258709af8c18eac1697939eca07082f",
+      "created_at" : "2021-12-08T22:33:13Z",
+      "diff_hunk" : "@@ -623,5 +642,130 @@ def test_replacement_relay_fee(self):\n         tx.vout[0].nValue -= 1\n         assert_raises_rpc_error(-26, \"insufficient fee\", self.nodes[0].sendrawtransaction, tx.serialize().hex())\n \n+    def test_prechecks_overestimates_replacements(self):\n+        confirmed_utxos = [self.wallet.get_utxo(), self.wallet.get_utxo()]\n+\n+        # Two opt-in parent transactions\n+        parent_txs = list(map(lambda utxo: self.wallet.send_self_transfer(\n+            from_node=self.nodes[0],\n+            utxo_to_spend=utxo,\n+            sequence=BIP125_SEQUENCE_NUMBER,\n+            fee_rate=Decimal('0.0001'),\n+        ), confirmed_utxos))\n+\n+        # Craft a transaction that spends both parents so we can create one chain of descendant transactions\n+        parent_utxos = list(map(lambda tx: self.wallet.get_utxo(txid=tx['txid']), parent_txs))\n+        joined_tx_hex = self.create_double_input_self_transfer(parent_utxos, Decimal('0.0001'))\n+        joined_tx_txid = self.nodes[0].sendrawtransaction(joined_tx_hex)\n+\n+        # Get the `joined_tx` utxo into our wallet so we can spend a chain of descendants from it\n+        joined_tx = self.nodes[0].decoderawtransaction(joined_tx_hex)\n+        self.wallet.scan_tx(joined_tx)\n+        joined_utxo = self.wallet.get_utxo(txid=joined_tx_txid)\n+\n+        # Create a chain half the size of `MAX_REPLACEMENT_LIMIT` spending `joined_tx` - well under the BIP125 Rule #5 imposed limit\n+        tx = None\n+        for _ in range(MAX_REPLACEMENT_LIMIT // 2):\n+            tx = self.wallet.send_self_transfer(\n+                from_node=self.nodes[0],\n+                utxo_to_spend=joined_utxo if tx is None else self.wallet.get_utxo(txid=tx['txid']),  # a straight line of descendants\n+                fee_rate=Decimal('0.0001'),\n+            )\n+\n+        # Even though there are well under `MAX_REPLACEMENT_LIMIT` transactions that will be evicted due to this replacement,\n+        # in this case we still reject the replacement attempt because of the way `MemPoolAccept::PreChecks` double-counts descendants.\n+        # Each `confirmed_utxo` has the exact same descendants, but they are each counted twice!\n+        replacement_attempt_tx_hex = self.create_double_input_self_transfer(confirmed_utxos, Decimal('0.01'))\n+        assert_raises_rpc_error(-26, 'too many potential replacements', self.nodes[0].sendrawtransaction, replacement_attempt_tx_hex, 0)\n+\n+        # However, we can still craft a transaction that replaces the entire descendant chain by only replacing one of the `parent_txs`\n+        replacement_tx = self.wallet.send_self_transfer(\n+            from_node=self.nodes[0],\n+            utxo_to_spend=confirmed_utxos[0],  # replace the opt-in parent transaction\n+            sequence=BIP125_SEQUENCE_NUMBER,\n+            fee_rate=Decimal('0.01'),\n+        )\n+        mempool = self.nodes[0].getrawmempool()\n+        assert replacement_tx['txid'] in mempool\n+        assert parent_txs[0]['txid'] not in mempool\n+        assert parent_txs[1]['txid'] in mempool\n+        assert tx['txid'] not in mempool\n+\n+        # And funny enough, _now_ we can successfully broadcast that same `replacement_tx_hex` which just failed with the\n+        # \"too many potential replacements\" error. It was just a little tricky to get around `MemPoolAccept::PreChecks`\n+        # double-counting evictions.\n+        replacement_attempt_tx_txid = self.nodes[0].sendrawtransaction(replacement_attempt_tx_hex, 0)\n+        mempool = self.nodes[0].getrawmempool()\n+        assert replacement_attempt_tx_txid in mempool\n+        assert replacement_tx['txid'] not in mempool\n+        for parent_tx in parent_txs:\n+            assert parent_tx not in mempool\n+\n+        # clean up all evicted utxos / update wallet utxo state\n+        self.wallet.get_utxo(txid=tx['txid'])\n+        self.wallet.get_utxo(txid=replacement_tx['txid'])\n+\n+    def test_reorged_inherited_signaling_and_descendant_limit(self):\n+        confirmed_utxos = [self.wallet.get_utxo(), self.wallet.get_utxo()]\n+\n+        # One opt-in parent transaction, one opt-out\n+        parent_txs = list(map(lambda utxo: self.wallet.send_self_transfer(\n+            from_node=self.nodes[0],\n+            utxo_to_spend=utxo,\n+            sequence=BIP125_SEQUENCE_NUMBER if confirmed_utxos.index(utxo) == 0 else 0xffffffff,\n+            fee_rate=Decimal('0.0001'),\n+        ), confirmed_utxos))\n+        optin_parent_tx, optout_parent_tx = parent_txs\n+\n+        # Craft a transaction that spends both parents so we can create one chain of descendant transactions\n+        parent_utxos = list(map(lambda tx: self.wallet.get_utxo(txid=tx['txid']), parent_txs))\n+        joined_tx_hex = self.create_double_input_self_transfer(parent_utxos, Decimal('0.0001'), sequence=0xffffffff)\n+        joined_tx_txid = self.nodes[0].sendrawtransaction(joined_tx_hex)\n+\n+        # Only a single input needs to signal replaceability (whether explicitly or through inheritance) for the resulting transaction to signal\n+        assert_equal(True, self.nodes[0].getmempoolentry(joined_tx_txid)['bip125-replaceable'])\n+\n+        # Get the `joined_tx` utxo into our wallet so we can spend a chain of descendants from it\n+        joined_tx = self.nodes[0].decoderawtransaction(joined_tx_hex)\n+        self.wallet.scan_tx(joined_tx)\n+        joined_utxo = self.wallet.get_utxo(txid=joined_tx_txid)\n+\n+        # If we confirm `optin_parent_tx` descendants will no longer inherit signaling\n+        hash = self.generateblock(self.nodes[0], output=self.wallet.get_address(), transactions=[optin_parent_tx['txid']])['hash']\n+        assert_equal(False, self.nodes[0].getmempoolentry(joined_tx_txid)['bip125-replaceable'])\n+\n+        # Get `optin_parent_tx` back in our mempool, once again descendants inherit signaling\n+        self.nodes[0].invalidateblock(hash)\n+        assert_equal(True, self.nodes[0].getmempoolentry(joined_tx_txid)['bip125-replaceable'])\n+\n+        # Create a chain the size of `MAX_REPLACEMENT_LIMIT` spending `joined_tx` - the BIP125 Rule #5 imposed limit\n+        tx = None\n+        for _ in range(MAX_REPLACEMENT_LIMIT - 1):\n+            tx = self.wallet.send_self_transfer(\n+                from_node=self.nodes[0],\n+                utxo_to_spend=joined_utxo if tx is None else self.wallet.get_utxo(txid=tx['txid']),  # a straight line of descendants\n+                sequence=0xffffffff,\n+                fee_rate=Decimal('0.0001'),\n+            )\n+            assert_equal(True, self.nodes[0].getmempoolentry(tx['txid'])['bip125-replaceable'])  # inherited\n+        # Now we have a chain of: `optin_parent_tx`, `joined_tx`, and 99 txs. The last tx in the loop exceeded `MAX_REPLACEMENT_LIMIT`\n+\n+        # Attempting to replace the opt-in parent transaction will now result in more than `MAX_REPLACEMENT_LIMIT`\n+        # conflicting txns being evicted from the mempool. However, it (and all of its descendants) are still signaling replaceability.\n+        # We would've expected that once `MAX_REPLACEMENT_LIMIT` is exceeded, the opt-in parent txn stops signaling\n+        # replaceability, along with _all_ of its descendants.\n+        entry = self.nodes[0].getmempoolentry(optin_parent_tx[\"txid\"])\n+        assert_greater_than(entry['descendantcount'], MAX_REPLACEMENT_LIMIT)\n+        assert_equal(True, entry['bip125-replaceable'])\n+        assert_equal(True, self.nodes[0].getmempoolentry(tx[\"txid\"])['bip125-replaceable'])\n+\n+        # Case in point, we can't actually replace `optin_parent_tx` once it has `MAX_REPLACEMENT_LIMIT` descendants\n+        self.wallet.create_self_transfer(",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22867#discussion_r765296491",
+      "id" : 765296491,
+      "line" : 763,
+      "node_id" : "PRRC_kwDOABII584tnX9r",
+      "original_commit_id" : "64c20402b258709af8c18eac1697939eca07082f",
+      "original_line" : 763,
+      "original_position" : 201,
+      "original_start_line" : null,
+      "path" : "test/functional/feature_rbf.py",
+      "position" : 201,
+      "pull_request_review_id" : 827020805,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22867",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/765296491/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-08T22:39:00Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/765296491",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/41220998?v=4",
+         "events_url" : "https://api.github.com/users/DariusParvin/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/DariusParvin/followers",
+         "following_url" : "https://api.github.com/users/DariusParvin/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/DariusParvin/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/DariusParvin",
+         "id" : 41220998,
+         "login" : "DariusParvin",
+         "node_id" : "MDQ6VXNlcjQxMjIwOTk4",
+         "organizations_url" : "https://api.github.com/users/DariusParvin/orgs",
+         "received_events_url" : "https://api.github.com/users/DariusParvin/received_events",
+         "repos_url" : "https://api.github.com/users/DariusParvin/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/DariusParvin/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/DariusParvin/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/DariusParvin"
+      }
    }
 ]
