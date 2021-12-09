@@ -2515,5 +2515,49 @@
          "type" : "User",
          "url" : "https://api.github.com/users/MarcoFalke"
       }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "Change looks good to me. I agree it fixes the lockpoint invalidity bug introduced in #22677.\r\n\r\nA few suggestions for the `check_final_and_mature` lambda:\r\n\r\n- A contributing factor to the the bug being introduced was misleading naming (of `update_lock_points()`) and a lack of documentation. Therefore, we should be extra explicit about what's going on in these functions by adding plenty of code documentation.\r\n- the return value is the inverse of what I'd expect. I'd expect a `check_blah()` function to return `true` if the check passes and `false` if it fails.\r\n- the local `should_remove` variable seems unnecessary. The function can just return immediately if one of the checks fails.\r\n\r\nI've included a suggested patch below. Feel free to take whatever you think is an improvement.\r\n\r\n<details>\r\n<summary>Suggested patch</summary>\r\n\r\n```diff\r\ndiff --git a/src/txmempool.cpp b/src/txmempool.cpp\r\nindex 26cb2ff4b4..c742548875 100644\r\n--- a/src/txmempool.cpp\r\n+++ b/src/txmempool.cpp\r\n@@ -631,7 +631,7 @@ void CTxMemPool::removeForReorg(CChain& chain, std::function<bool(txiter)> check\r\n \r\n     setEntries txToRemove;\r\n     for (indexed_transaction_set::const_iterator it = mapTx.begin(); it != mapTx.end(); it++) {\r\n-        if (check_final_and_mature(it)) txToRemove.insert(it);\r\n+        if (!check_final_and_mature(it)) txToRemove.insert(it);\r\n     }\r\n     setEntries setAllRemoves;\r\n     for (txiter it : txToRemove) {\r\ndiff --git a/src/validation.cpp b/src/validation.cpp\r\nindex f53641e786..8da2e80510 100644\r\n--- a/src/validation.cpp\r\n+++ b/src/validation.cpp\r\n@@ -350,21 +350,38 @@ void CChainState::MaybeUpdateMempoolForReorg(\r\n     // the disconnectpool that were added back and cleans up the mempool state.\r\n     m_mempool->UpdateTransactionsFromBlock(vHashUpdate);\r\n \r\n-    const auto check_final_and_mature = [this, flags=STANDARD_LOCKTIME_VERIFY_FLAGS](CTxMemPool::txiter it)\r\n+    // Check whether the transaction is still final/mature, and update\r\n+    // the transaction's cached lockpoints if necessary.\r\n+    // If this returns false, the mempool *must* remove the transaction, since\r\n+    // it is no longer valid for inclusion in the next block (and its cached\r\n+    // lockpoints may be invalid).\r\n+    const auto check_final_and_mature = [this, flags=STANDARD_LOCKTIME_VERIFY_FLAGS](CTxMemPool::txiter it) -> bool\r\n         EXCLUSIVE_LOCKS_REQUIRED(m_mempool->cs, ::cs_main) {\r\n-        bool should_remove = false;\r\n         AssertLockHeld(m_mempool->cs);\r\n         AssertLockHeld(::cs_main);\r\n         const CTransaction& tx = it->GetTx();\r\n+\r\n+        // Check transaction finality\r\n+        if (!CheckFinalTx(m_chain.Tip(), tx, flags)) {\r\n+            return false;\r\n+        }\r\n+\r\n+        // Check sequence locks\r\n         LockPoints lp = it->GetLockPoints();\r\n         const bool validLP{TestLockPointValidity(m_chain, lp)};\r\n         CCoinsViewMemPool view_mempool(&CoinsTip(), *m_mempool);\r\n-        if (!CheckFinalTx(m_chain.Tip(), tx, flags)\r\n-            || !CheckSequenceLocks(m_chain.Tip(), view_mempool, tx, flags, &lp, validLP)) {\r\n-            // Note if CheckSequenceLocks fails the LockPoints may still be invalid\r\n-            // So it's critical that we remove the tx and not depend on the LockPoints.\r\n-            should_remove = true;\r\n-        } else if (it->GetSpendsCoinbase()) {\r\n+\r\n+        if (!CheckSequenceLocks(m_chain.Tip(), view_mempool, tx, flags, &lp, validLP)) {\r\n+            // Sequence locks fail. The mempool *must* remove this transaction since\r\n+            // we're not going to update its cached lockpoints.\r\n+            return false;\r\n+        } else if (!validLP) {\r\n+            // CheckSequenceLocks has modified lp. Update the cached lockpoints.\r\n+             m_mempool->mapTx.modify(it, update_lock_points(lp));\r\n+        }\r\n+\r\n+        // Check coinbase spend maturity\r\n+        if (it->GetSpendsCoinbase()) {\r\n             for (const CTxIn& txin : tx.vin) {\r\n                 auto it2 = m_mempool->mapTx.find(txin.prevout.hash);\r\n                 if (it2 != m_mempool->mapTx.end())\r\n@@ -373,18 +390,19 @@ void CChainState::MaybeUpdateMempoolForReorg(\r\n                 assert(!coin.IsSpent());\r\n                 const auto mempool_spend_height{m_chain.Tip()->nHeight + 1};\r\n                 if (coin.IsSpent() || (coin.IsCoinBase() && mempool_spend_height - coin.nHeight < COINBASE_MATURITY)) {\r\n-                    should_remove = true;\r\n-                    break;\r\n+                    // Coinbase spend is now immature. Remove tx from mempool.\r\n+                    return false;\r\n                 }\r\n             }\r\n         }\r\n-        // CheckSequenceLocks updates lp. Update the mempool entry LockPoints.\r\n-        if (!validLP) m_mempool->mapTx.modify(it, update_lock_points(lp));\r\n-        return should_remove;\r\n+\r\n+        // Transaction is still final and mature. Cached lockpoints have been updated.\r\n+        return true;\r\n     };\r\n \r\n-    // We also need to remove any now-immature transactions\r\n+    // Remove any transactions that are no longer final/mature, and update cached lockpoints.\r\n     m_mempool->removeForReorg(m_chain, check_final_and_mature);\r\n+\r\n     // Re-limit mempool size, in case we added any transactions\r\n     LimitMempoolSize(\r\n         *m_mempool,\r\n```\r\n\r\n</details>",
+      "created_at" : "2021-12-09T10:56:18Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23683#issuecomment-989741186",
+      "id" : 989741186,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/23683",
+      "node_id" : "IC_kwDOABII5846_kCC",
+      "performed_via_github_app" : null,
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/989741186/reactions"
+      },
+      "updated_at" : "2021-12-09T10:56:18Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/989741186",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1063656?v=4",
+         "events_url" : "https://api.github.com/users/jnewbery/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jnewbery/followers",
+         "following_url" : "https://api.github.com/users/jnewbery/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jnewbery/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jnewbery",
+         "id" : 1063656,
+         "login" : "jnewbery",
+         "node_id" : "MDQ6VXNlcjEwNjM2NTY=",
+         "organizations_url" : "https://api.github.com/users/jnewbery/orgs",
+         "received_events_url" : "https://api.github.com/users/jnewbery/received_events",
+         "repos_url" : "https://api.github.com/users/jnewbery/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jnewbery/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jnewbery/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jnewbery"
+      }
    }
 ]
