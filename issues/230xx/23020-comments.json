@@ -946,5 +946,1010 @@
          "type" : "User",
          "url" : "https://api.github.com/users/ryanofsky"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766033525"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766033525"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Add exit code {gpg_retval}?",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T18:04:37Z",
+      "diff_hunk" : "@@ -59,124 +194,457 @@ def download_with_wget(remote_file, local_file=None):\n     return result.returncode == 0, result.stdout.decode().rstrip()\n \n \n+def download_lines_with_urllib(url) -> (bool, [str]):\n+    \"\"\"Get (success, text lines of a file) over HTTP.\"\"\"\n+    try:\n+        return True, [\n+            line.strip().decode() for line in urllib.request.urlopen(url).readlines()]\n+    except urllib.request.HTTPError:\n+        log.warning(f\"HTTP request to {url} failed (HTTPError)\")\n+    except Exception as e:\n+        log.warning(f\"HTTP request to {url} failed ({e})\")\n+    return (False, [])\n+\n+\n+def verify_with_gpg(\n+    signature_filename,\n+    output_filename: t.Optional[str] = None\n+) -> t.Tuple[int, str]:\n+    # Enforce English output since we're relying on output that contains natural language.\n+    # Use string-shell form (vs. args as list) because passing LANGUAGE via `env` doesn't\n+    # seem to work.\n+    args = (\n+        'LANGUAGE=en gpg --yes --decrypt '\n+        + (f' --output {output_filename} ' if output_filename else '')\n+        + signature_filename)\n+\n+    result = subprocess.run(args, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n+    return result.returncode, result.stdout.decode().rstrip()\n+\n+\n+def remove_files(filenames):\n+    for filename in filenames:\n+        os.remove(filename)\n+\n+\n+class SigData:\n+    \"\"\"GPG signature data as parsed from GPG stdout.\"\"\"\n+    def __init__(self, key: str, name: str, trusted: bool, status: str):\n+        self.key = key\n+        self.name = name\n+        self.trusted = trusted\n+        self.status = status\n+\n+    def __repr__(self):\n+        return (\n+            \"SigData(%r, %r, trusted=%s, status=%r)\" %\n+            (self.key, self.name, self.trusted, self.status))\n+\n+\n+def parse_gpg_result(output: str) -> ([SigData], [SigData], [SigData]):\n+    \"\"\"Returns good, unknown, and bad signatures from GPG stdout.\"\"\"\n+    good_sigs = []\n+    unknown_sigs = []\n+    bad_sigs = []\n+    total_resolved_sigs = 0\n+    curr_key = None\n+\n+    for i, line in enumerate(output):\n+        if 'using RSA key' in line:\n+            if curr_key:\n+                raise RuntimeError(\n+                    f\"WARNING: encountered a new sig without resolving the last ({curr_key}) - \"\n+                    \"this could mean we have encountered a bad signature! check GPG output!\")\n+            curr_key = line.split('key ')[-1].strip()\n+            assert len(curr_key) == 40 or (len(curr_key) == 18 and curr_key.startswith('0x'))\n+\n+        if \"Can't check signature: No public key\" in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            unknown_sigs.append(SigData(curr_key, '', False, ''))\n+            curr_key = None\n+\n+        if 'Good signature from ' in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+\n+            # It's safe to index output[i + 1] because if we saw a good sig, there should\n+            # always be another line\n+            trusted = (\n+                'This key is not certified with a trusted signature' not in output[i + 1])\n+            good_sigs.append(SigData(curr_key, name, trusted, status))\n+            curr_key = None\n+\n+        if 'bad signature from' in line.lower():\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+            bad_sigs.append(SigData(curr_key, name, False, status))\n+            curr_key = None\n+\n+        # Track total signatures included\n+        if ': Signature made ' in line:\n+            total_resolved_sigs += 1\n+\n+    all_found = len(good_sigs + bad_sigs + unknown_sigs)\n+    if all_found != total_resolved_sigs:\n+        raise RuntimeError(\n+            f\"failed to evaluate all signatures: found {all_found} \"\n+            f\"but expected {total_resolved_sigs}\")\n+\n+    return (good_sigs, unknown_sigs, bad_sigs)\n+\n+\n+def parse_gpg_from_line(line: str) -> (str, str):\n+    \"\"\"Returns name and expiration status.\"\"\"\n+    assert 'signature from' in line\n+\n+    name_end = line.split(' from ')[-1]\n+    m = re.search(r'(?P<name>\".+\") \\[(?P<status>\\w+)\\]', name_end)\n+    assert m\n+    (name, status) = m.groups()\n+    name = name.strip('\"\\'')\n+\n+    return (name, status)\n+\n+\n def files_are_equal(filename1, filename2):\n     with open(filename1, 'rb') as file1:\n         contents1 = file1.read()\n     with open(filename2, 'rb') as file2:\n         contents2 = file2.read()\n-    return contents1 == contents2\n+    eq = contents1 == contents2\n \n+    if not eq:\n+        with open(filename1, 'r', encoding='utf-8') as f1, \\\n+                open(filename2, 'r', encoding='utf-8') as f2:\n+            f1lines = f1.readlines()\n+            f2lines = f2.readlines()\n \n-def verify_with_gpg(signature_filename, output_filename):\n-    result = subprocess.run(['gpg', '--yes', '--decrypt', '--output',\n-                             output_filename, signature_filename],\n-                             stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n-    return result.returncode, result.stdout.decode().rstrip()\n+            diff = indent(\n+                ''.join(difflib.unified_diff(f1lines, f2lines)))\n+            log.warning(f\"found diff in files ({filename1}, {filename2}):\\n{diff}\\n\")\n \n+    return eq\n \n-def remove_files(filenames):\n-    for filename in filenames:\n-        os.remove(filename)\n+\n+def get_files_from_hosts_and_compare(\n+    hosts: t.List[str], path: str, filename: str, require_all: bool = False\n+) -> ReturnCode:\n+    \"\"\"\n+    Retrieve the same file from a number of hosts and ensure they have the same contents.\n+    The first host given will be treated as the \"primary\" host, and is required to succeed.\n+\n+    Args:\n+        filename: for writing the file locally.\n+    \"\"\"\n+    assert len(hosts) > 1\n+    primary_host = hosts[0]\n+    other_hosts = hosts[1:]\n+    got_files = []\n+\n+    def join_url(host: str) -> str:\n+        return host.rstrip('/') + '/' + path.lstrip('/')\n+\n+    url = join_url(primary_host)\n+    success, output = download_with_wget(url, filename)\n+    if not success:\n+        log.error(\n+            f\"couldn't fetch file ({url}). \"\n+            \"Have you specified the version number in the following format?\\n\"\n+            f\"[{VERSIONPREFIX}]{VERSION_FORMAT} \"\n+            f\"(example: {VERSIONPREFIX}{VERSION_EXAMPLE})\\n\"\n+            f\"wget output:\\n{indent(output)}\")\n+        return ReturnCode.FILE_GET_FAILED\n+    else:\n+        log.info(f\"got file {url} as {filename}\")\n+        got_files.append(filename)\n+\n+    for i, host in enumerate(other_hosts):\n+        url = join_url(host)\n+        fname = filename + f'.{i + 2}'\n+        success, output = download_with_wget(url, fname)\n+\n+        if require_all and not success:\n+            log.error(\n+                f\"{host} failed to provide file ({url}), but {primary_host} did?\\n\"\n+                f\"wget output:\\n{indent(output)}\")\n+            return ReturnCode.FILE_MISSING_FROM_ONE_HOST\n+        elif not success:\n+            log.warning(\n+                f\"{host} failed to provide file ({url}). \"\n+                f\"Continuing based solely upon {primary_host}.\")\n+        else:\n+            log.info(f\"got file {url} as {fname}\")\n+            got_files.append(fname)\n+\n+    for i, got_file in enumerate(got_files):\n+        if got_file == got_files[-1]:\n+            break  # break on last file, nothing after it to compare to\n+\n+        compare_to = got_files[i + 1]\n+        if not files_are_equal(got_file, compare_to):\n+            log.error(f\"files not equal: {got_file} and {compare_to}\")\n+            return ReturnCode.FILES_NOT_EQUAL\n+\n+    return ReturnCode.SUCCESS\n+\n+\n+def get_builder_keys(bitcoin_dir: Path) -> t.Dict[str, str]:\n+    \"\"\"\n+    Return a map of builder key to name from a local or remote source,\n+    in that order of preference.\n+    If we have them locally, compare them to the github repo.\n+    \"\"\"\n+    local_builder_keys = []\n+    local_builder_path = bitcoin_dir / 'contrib' / 'builder-keys' / 'keys.txt'\n+    if local_builder_path.exists():\n+        local_builder_keys = local_builder_path.read_text().splitlines()\n+\n+    success, gh_builder_keys = download_lines_with_urllib(BUILDER_KEYS_GH_URL)\n+    if not success:\n+        log.warning(f\"unable to retrieve builder keys from {BUILDER_KEYS_GH_URL}\")\n+\n+    if not (success or local_builder_keys):\n+        log.error(\"unable to retrieve builder keys locally or remotely\")\n+\n+    # check the local and remote builder keys against each other and report diff\n+    if local_builder_keys and gh_builder_keys:\n+        if local_builder_keys != gh_builder_keys:\n+            diff = indent(\n+                '\\n'.join(difflib.unified_diff(local_builder_keys, gh_builder_keys)))\n+            log.warning(f\"found diff (local vs. GH) in builder keys:\\n{diff}\\n\")\n+\n+    # Prefer local builder keys to those obtained remotely.\n+    builder_keys = local_builder_keys or gh_builder_keys or []\n+\n+    builder_key_map = {}\n+    for i in builder_keys:\n+        key, name = i.split(' ', 1)\n+        builder_key_map[key] = name\n+\n+    return builder_key_map\n+\n+\n+def check_multisig(\n+    sigfilename: str, args: argparse.Namespace, builder_key_map: t.Dict[str, str]\n+):\n+    # check signature\n+    #\n+    # We don't write output to a file because this command will almost certainly\n+    # fail with GPG exit code '2' (and so not writing to --output) because of the\n+    # likely presence of multiple untrusted signatures.\n+    retval, output = verify_with_gpg(sigfilename)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    # Retrieve unknown keys that are in the repo builder list and then try GPG again.\n+    if unknown and not args.noninteractive and not args.skip_import_builders:\n+        for unsig in unknown:\n+            name = builder_key_map.get(unsig.key, '<unknown>')\n+            if input(f\" ? Retrieve key {unsig.key} for {name}? (y/N) \").lower() == \"y\":\n+                ran = subprocess.run(\n+                    f\"gpg --keyserver {args.keyserver} --recv-keys {unsig.key}\", shell=True)\n+\n+                if ran.returncode != 0:\n+                    log.warning(f\"failed to retrieve key {unsig.key} for {name}\")\n+\n+    return retval, output, good, unknown, bad\n+\n+\n+def check_single_sig(sigfilename: str, args: argparse.Namespace):\n+    retval, output = verify_with_gpg(sigfilename, SUMS_FILENAME)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    return retval, output, good, unknown, bad\n \n \n def main(args):\n-    # sanity check\n-    if len(args) < 1:\n-        print(\"Error: need to specify a version on the command line\")\n-        return 3\n+    args = parser.parse_args()\n+    if args.quiet:\n+        log.setLevel(logging.WARNING)\n+\n+    WORKINGDIR = Path(tempfile.gettempdir()) / f\"bitcoin_verify_binaries.{args.version}\"\n+\n+    def cleanup():\n+        log.info(\"cleaning up files\")\n+        os.chdir(Path.home())\n+        shutil.rmtree(WORKINGDIR)\n \n     # determine remote dir dependent on provided version string\n-    version_base, version_rc, os_filter = parse_version_string(args[0])\n+    version_base, version_rc, os_filter = parse_version_string(args.version)\n     remote_dir = f\"/bin/{VERSIONPREFIX}{version_base}/\"\n     if version_rc:\n         remote_dir += f\"test.{version_rc}/\"\n-    remote_sigfile = remote_dir + SIGNATUREFILENAME\n+    remote_sigs_path = remote_dir + SIGNATUREFILENAME\n+    remote_sums_path = remote_dir + SUMS_FILENAME\n \n+    bitcoin_dir_maybe = Path(args.bitcoin_src_path) if args.bitcoin_src_path else Path.cwd()\n     # create working directory\n     os.makedirs(WORKINGDIR, exist_ok=True)\n     os.chdir(WORKINGDIR)\n \n-    # fetch first signature file\n-    sigfile1 = SIGNATUREFILENAME\n-    success, output = download_with_wget(HOST1 + remote_sigfile, sigfile1)\n-    if not success:\n-        print(\"Error: couldn't fetch signature file. \"\n-              \"Have you specified the version number in the following format?\")\n-        print(f\"[{VERSIONPREFIX}]<version>[-rc[0-9]][-platform] \"\n-              f\"(example: {VERSIONPREFIX}0.21.0-rc3-osx)\")\n-        print(\"wget output:\")\n-        print(indent(output, '\\t'))\n-        return 4\n-\n-    # fetch second signature file\n-    sigfile2 = SIGNATUREFILENAME + \".2\"\n-    success, output = download_with_wget(HOST2 + remote_sigfile, sigfile2)\n-    if not success:\n-        print(\"bitcoin.org failed to provide signature file, \"\n-              \"but bitcoincore.org did?\")\n-        print(\"wget output:\")\n-        print(indent(output, '\\t'))\n-        remove_files([sigfile1])\n-        return 5\n-\n-    # ensure that both signature files are equal\n-    if not files_are_equal(sigfile1, sigfile2):\n-        print(\"bitcoin.org and bitcoincore.org signature files were not equal?\")\n-        print(f\"See files {WORKINGDIR}/{sigfile1} and {WORKINGDIR}/{sigfile2}\")\n-        return 6\n-\n-    # check signature and extract data into file\n-    retval, output = verify_with_gpg(sigfile1, HASHFILE)\n-    if retval != 0:\n-        if retval == 1:\n-            print(\"Bad signature.\")\n-        elif retval == 2:\n-            print(\"gpg error. Do you have the Bitcoin Core binary release \"\n-                  \"signing key installed?\")\n-        print(\"gpg output:\")\n-        print(indent(output, '\\t'))\n-        remove_files([sigfile1, sigfile2, HASHFILE])\n-        return 1\n+    version_tuple = [int(i) for i in version_base.split('.')]\n+    hosts = [HOST1, HOST2]\n+\n+    got_sig_status = get_files_from_hosts_and_compare(\n+        hosts, remote_sigs_path, SIGNATUREFILENAME, args.require_all_hosts)\n+    if got_sig_status != ReturnCode.SUCCESS:\n+        return got_sig_status\n+\n+    # Multi-sig verification is available after 22.0.\n+    MULTISIG_SUPPORTED = version_tuple[0] >= 22\n+\n+    if MULTISIG_SUPPORTED:\n+        min_trusted_sigs = args.min_trusted_sigs\n+        gpg_allowed_codes = [0, 2]  # 2 is returned when untrusted signatures are present.\n+        builder_key_map = get_builder_keys(bitcoin_dir_maybe)\n+\n+        got_sums_status = get_files_from_hosts_and_compare(\n+            hosts, remote_sums_path, SUMS_FILENAME, args.require_all_hosts)\n+        if got_sums_status != ReturnCode.SUCCESS:\n+            return got_sums_status\n+\n+        gpg_retval, gpg_output, good, unknown, bad = check_multisig(\n+            SIGNATUREFILENAME, args, builder_key_map)\n+    else:\n+        # As long as GPG return codes are okay, the sig is valid for pre-22.0.\n+        min_trusted_sigs = 0\n+        gpg_allowed_codes = [0]\n+        builder_key_map = {}\n+\n+        gpg_retval, gpg_output, good, unknown, bad = check_single_sig(\n+            SIGNATUREFILENAME, args)\n+\n+    if gpg_retval not in gpg_allowed_codes:\n+        if gpg_retval == 1:\n+            log.critical(\"Bad signature.\")\n+        if gpg_retval == 2:\n+            log.critical(\n+                \"gpg error. Do you have the Bitcoin Core binary release \"\n+                \"signing key installed?\")\n+        else:\n+            log.critical(\"unexpected GPG exit code\")",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766033525",
+      "id" : 766033525,
+      "line" : 535,
+      "node_id" : "PRRC_kwDOABII584tqL51",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 535,
+      "original_position" : 578,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 578,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766033525/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766033525",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766076167"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766076167"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Does not seem great if BINVERIFY_REQUIRE_ALL_HOSTS=yes is treated as false. It would be better to raise an error if value is unrecognized.\r\n\r\n```python\r\nif value.lower() in (\"1', \"true\"):\r\n    return True\r\nif value.lower() in (\"0\", \"false\"):\r\n    return False\r\nraise ValueError(f\"Unrecognized environment value {key}={value}\")\r\n```",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T19:07:16Z",
+      "diff_hunk" : "@@ -2,29 +2,164 @@\n # Copyright (c) 2020 The Bitcoin Core developers\n # Distributed under the MIT software license, see the accompanying\n # file COPYING or http://www.opensource.org/licenses/mit-license.php.\n-\"\"\"Script for verifying Bitcoin Core release binaries\n-\n-This script attempts to download the signature file SHA256SUMS.asc from\n-bitcoincore.org and bitcoin.org and compares them.\n-It first checks if the signature passes, and then downloads the files\n-specified in the file, and checks if the hashes of these files match those\n-that are specified in the signature file.\n-The script returns 0 if everything passes the checks. It returns 1 if either\n-the signature check or the hash check doesn't pass. If an error occurs the\n-return value is >= 2.\n+\"\"\"Script for verifying Bitcoin Core release binaries.\n+\n+This script attempts to download the sum file SHA256SUMS and corresponding\n+signature file SHA256SUMS.asc from bitcoincore.org and bitcoin.org and\n+compares them.\n+\n+The sum-signature file is signed by a number of builder keys. This script\n+ensures that there is a minimum threshold of signatures from pubkeys that\n+we trust. This trust is articulated on the basis of configuration options\n+here, but by default is based upon a unionof (i) local GPG trust settings,\n+and (ii) keys which appear in the builder-keys/keys.txt file.\n+\n+If a minimum good, trusted signature threshold is met on the sum file, we then\n+download the files specified in SHA256SUMS, and check if the hashes of these\n+files match those that are specified. The script returns 0 if everything passes\n+the checks. It returns 1 if either the signature check or the hash check\n+doesn't pass. If an error occurs the return value is >= 2.\n+\n+Logging output goes to stderr and final binary verification data goes to stdout.\n+\n+JSON output can by obtained by setting env BINVERIFY_JSON=1.\n \"\"\"\n-from hashlib import sha256\n+import argparse\n+import difflib\n+import json\n+import logging\n import os\n import subprocess\n+import typing as t\n+import re\n import sys\n-from textwrap import indent\n+import shutil\n+import tempfile\n+import textwrap\n+import urllib.request\n+import enum\n+from hashlib import sha256\n+from pathlib import Path\n \n-WORKINGDIR = \"/tmp/bitcoin_verify_binaries\"\n-HASHFILE = \"hashes.tmp\"\n+# The primary host; this will fail if we can't retrieve files from here.\n HOST1 = \"https://bitcoincore.org\"\n HOST2 = \"https://bitcoin.org\"\n VERSIONPREFIX = \"bitcoin-core-\"\n-SIGNATUREFILENAME = \"SHA256SUMS.asc\"\n+SUMS_FILENAME = 'SHA256SUMS'\n+SIGNATUREFILENAME = f\"{SUMS_FILENAME}.asc\"\n+BUILDER_KEYS_GH_URL = (\n+    \"https://raw.githubusercontent.com/bitcoin/bitcoin/master/contrib/builder-keys/keys.txt\"\n+)\n+\n+\n+class ReturnCode(enum.IntEnum):\n+    SUCCESS = 0\n+    INTEGRITY_FAILURE = 1\n+    FILE_GET_FAILED = 4\n+    FILE_MISSING_FROM_ONE_HOST = 5\n+    FILES_NOT_EQUAL = 6\n+    NO_BINARIES_MATCH = 7\n+    NOT_ENOUGH_GOOD_SIGS = 9\n+    BINARY_DOWNLOAD_FAILED = 10\n+\n+\n+def set_up_logger(is_verbose: bool = True) -> logging.Logger:\n+    \"\"\"Set up a logger that writes to stderr.\"\"\"\n+    log = logging.getLogger(__name__)\n+    log.setLevel(logging.INFO if is_verbose else logging.WARNING)\n+    console = logging.StreamHandler(sys.stderr)  # log to stderr\n+    console.setLevel(logging.DEBUG)\n+    formatter = logging.Formatter('[%(levelname)s] %(message)s')\n+    console.setFormatter(formatter)\n+    log.addHandler(console)\n+    return log\n+\n+\n+log = set_up_logger()\n+\n+\n+def indent(output: str) -> str:\n+    return textwrap.indent(output, '  ')\n+\n+\n+def bool_from_env(key, default=False) -> bool:\n+    if key not in os.environ:\n+        return default\n+    raw = os.environ[key]\n+    return raw in ['1', 'True', 'true']",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766076167",
+      "id" : 766076167,
+      "line" : 89,
+      "node_id" : "PRRC_kwDOABII584tqWUH",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 89,
+      "original_position" : 103,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 103,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766076167/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766076167",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766085408"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766085408"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Version is the main required argument so if it isn't parsed correctly it might be good to print a helpful error like \"Version {args.version!r} can't be parsed\" instead of just printing the exception",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T19:21:06Z",
+      "diff_hunk" : "@@ -59,124 +194,457 @@ def download_with_wget(remote_file, local_file=None):\n     return result.returncode == 0, result.stdout.decode().rstrip()\n \n \n+def download_lines_with_urllib(url) -> (bool, [str]):\n+    \"\"\"Get (success, text lines of a file) over HTTP.\"\"\"\n+    try:\n+        return True, [\n+            line.strip().decode() for line in urllib.request.urlopen(url).readlines()]\n+    except urllib.request.HTTPError:\n+        log.warning(f\"HTTP request to {url} failed (HTTPError)\")\n+    except Exception as e:\n+        log.warning(f\"HTTP request to {url} failed ({e})\")\n+    return (False, [])\n+\n+\n+def verify_with_gpg(\n+    signature_filename,\n+    output_filename: t.Optional[str] = None\n+) -> t.Tuple[int, str]:\n+    # Enforce English output since we're relying on output that contains natural language.\n+    # Use string-shell form (vs. args as list) because passing LANGUAGE via `env` doesn't\n+    # seem to work.\n+    args = (\n+        'LANGUAGE=en gpg --yes --decrypt '\n+        + (f' --output {output_filename} ' if output_filename else '')\n+        + signature_filename)\n+\n+    result = subprocess.run(args, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n+    return result.returncode, result.stdout.decode().rstrip()\n+\n+\n+def remove_files(filenames):\n+    for filename in filenames:\n+        os.remove(filename)\n+\n+\n+class SigData:\n+    \"\"\"GPG signature data as parsed from GPG stdout.\"\"\"\n+    def __init__(self, key: str, name: str, trusted: bool, status: str):\n+        self.key = key\n+        self.name = name\n+        self.trusted = trusted\n+        self.status = status\n+\n+    def __repr__(self):\n+        return (\n+            \"SigData(%r, %r, trusted=%s, status=%r)\" %\n+            (self.key, self.name, self.trusted, self.status))\n+\n+\n+def parse_gpg_result(output: str) -> ([SigData], [SigData], [SigData]):\n+    \"\"\"Returns good, unknown, and bad signatures from GPG stdout.\"\"\"\n+    good_sigs = []\n+    unknown_sigs = []\n+    bad_sigs = []\n+    total_resolved_sigs = 0\n+    curr_key = None\n+\n+    for i, line in enumerate(output):\n+        if 'using RSA key' in line:\n+            if curr_key:\n+                raise RuntimeError(\n+                    f\"WARNING: encountered a new sig without resolving the last ({curr_key}) - \"\n+                    \"this could mean we have encountered a bad signature! check GPG output!\")\n+            curr_key = line.split('key ')[-1].strip()\n+            assert len(curr_key) == 40 or (len(curr_key) == 18 and curr_key.startswith('0x'))\n+\n+        if \"Can't check signature: No public key\" in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            unknown_sigs.append(SigData(curr_key, '', False, ''))\n+            curr_key = None\n+\n+        if 'Good signature from ' in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+\n+            # It's safe to index output[i + 1] because if we saw a good sig, there should\n+            # always be another line\n+            trusted = (\n+                'This key is not certified with a trusted signature' not in output[i + 1])\n+            good_sigs.append(SigData(curr_key, name, trusted, status))\n+            curr_key = None\n+\n+        if 'bad signature from' in line.lower():\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+            bad_sigs.append(SigData(curr_key, name, False, status))\n+            curr_key = None\n+\n+        # Track total signatures included\n+        if ': Signature made ' in line:\n+            total_resolved_sigs += 1\n+\n+    all_found = len(good_sigs + bad_sigs + unknown_sigs)\n+    if all_found != total_resolved_sigs:\n+        raise RuntimeError(\n+            f\"failed to evaluate all signatures: found {all_found} \"\n+            f\"but expected {total_resolved_sigs}\")\n+\n+    return (good_sigs, unknown_sigs, bad_sigs)\n+\n+\n+def parse_gpg_from_line(line: str) -> (str, str):\n+    \"\"\"Returns name and expiration status.\"\"\"\n+    assert 'signature from' in line\n+\n+    name_end = line.split(' from ')[-1]\n+    m = re.search(r'(?P<name>\".+\") \\[(?P<status>\\w+)\\]', name_end)\n+    assert m\n+    (name, status) = m.groups()\n+    name = name.strip('\"\\'')\n+\n+    return (name, status)\n+\n+\n def files_are_equal(filename1, filename2):\n     with open(filename1, 'rb') as file1:\n         contents1 = file1.read()\n     with open(filename2, 'rb') as file2:\n         contents2 = file2.read()\n-    return contents1 == contents2\n+    eq = contents1 == contents2\n \n+    if not eq:\n+        with open(filename1, 'r', encoding='utf-8') as f1, \\\n+                open(filename2, 'r', encoding='utf-8') as f2:\n+            f1lines = f1.readlines()\n+            f2lines = f2.readlines()\n \n-def verify_with_gpg(signature_filename, output_filename):\n-    result = subprocess.run(['gpg', '--yes', '--decrypt', '--output',\n-                             output_filename, signature_filename],\n-                             stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n-    return result.returncode, result.stdout.decode().rstrip()\n+            diff = indent(\n+                ''.join(difflib.unified_diff(f1lines, f2lines)))\n+            log.warning(f\"found diff in files ({filename1}, {filename2}):\\n{diff}\\n\")\n \n+    return eq\n \n-def remove_files(filenames):\n-    for filename in filenames:\n-        os.remove(filename)\n+\n+def get_files_from_hosts_and_compare(\n+    hosts: t.List[str], path: str, filename: str, require_all: bool = False\n+) -> ReturnCode:\n+    \"\"\"\n+    Retrieve the same file from a number of hosts and ensure they have the same contents.\n+    The first host given will be treated as the \"primary\" host, and is required to succeed.\n+\n+    Args:\n+        filename: for writing the file locally.\n+    \"\"\"\n+    assert len(hosts) > 1\n+    primary_host = hosts[0]\n+    other_hosts = hosts[1:]\n+    got_files = []\n+\n+    def join_url(host: str) -> str:\n+        return host.rstrip('/') + '/' + path.lstrip('/')\n+\n+    url = join_url(primary_host)\n+    success, output = download_with_wget(url, filename)\n+    if not success:\n+        log.error(\n+            f\"couldn't fetch file ({url}). \"\n+            \"Have you specified the version number in the following format?\\n\"\n+            f\"[{VERSIONPREFIX}]{VERSION_FORMAT} \"\n+            f\"(example: {VERSIONPREFIX}{VERSION_EXAMPLE})\\n\"\n+            f\"wget output:\\n{indent(output)}\")\n+        return ReturnCode.FILE_GET_FAILED\n+    else:\n+        log.info(f\"got file {url} as {filename}\")\n+        got_files.append(filename)\n+\n+    for i, host in enumerate(other_hosts):\n+        url = join_url(host)\n+        fname = filename + f'.{i + 2}'\n+        success, output = download_with_wget(url, fname)\n+\n+        if require_all and not success:\n+            log.error(\n+                f\"{host} failed to provide file ({url}), but {primary_host} did?\\n\"\n+                f\"wget output:\\n{indent(output)}\")\n+            return ReturnCode.FILE_MISSING_FROM_ONE_HOST\n+        elif not success:\n+            log.warning(\n+                f\"{host} failed to provide file ({url}). \"\n+                f\"Continuing based solely upon {primary_host}.\")\n+        else:\n+            log.info(f\"got file {url} as {fname}\")\n+            got_files.append(fname)\n+\n+    for i, got_file in enumerate(got_files):\n+        if got_file == got_files[-1]:\n+            break  # break on last file, nothing after it to compare to\n+\n+        compare_to = got_files[i + 1]\n+        if not files_are_equal(got_file, compare_to):\n+            log.error(f\"files not equal: {got_file} and {compare_to}\")\n+            return ReturnCode.FILES_NOT_EQUAL\n+\n+    return ReturnCode.SUCCESS\n+\n+\n+def get_builder_keys(bitcoin_dir: Path) -> t.Dict[str, str]:\n+    \"\"\"\n+    Return a map of builder key to name from a local or remote source,\n+    in that order of preference.\n+    If we have them locally, compare them to the github repo.\n+    \"\"\"\n+    local_builder_keys = []\n+    local_builder_path = bitcoin_dir / 'contrib' / 'builder-keys' / 'keys.txt'\n+    if local_builder_path.exists():\n+        local_builder_keys = local_builder_path.read_text().splitlines()\n+\n+    success, gh_builder_keys = download_lines_with_urllib(BUILDER_KEYS_GH_URL)\n+    if not success:\n+        log.warning(f\"unable to retrieve builder keys from {BUILDER_KEYS_GH_URL}\")\n+\n+    if not (success or local_builder_keys):\n+        log.error(\"unable to retrieve builder keys locally or remotely\")\n+\n+    # check the local and remote builder keys against each other and report diff\n+    if local_builder_keys and gh_builder_keys:\n+        if local_builder_keys != gh_builder_keys:\n+            diff = indent(\n+                '\\n'.join(difflib.unified_diff(local_builder_keys, gh_builder_keys)))\n+            log.warning(f\"found diff (local vs. GH) in builder keys:\\n{diff}\\n\")\n+\n+    # Prefer local builder keys to those obtained remotely.\n+    builder_keys = local_builder_keys or gh_builder_keys or []\n+\n+    builder_key_map = {}\n+    for i in builder_keys:\n+        key, name = i.split(' ', 1)\n+        builder_key_map[key] = name\n+\n+    return builder_key_map\n+\n+\n+def check_multisig(\n+    sigfilename: str, args: argparse.Namespace, builder_key_map: t.Dict[str, str]\n+):\n+    # check signature\n+    #\n+    # We don't write output to a file because this command will almost certainly\n+    # fail with GPG exit code '2' (and so not writing to --output) because of the\n+    # likely presence of multiple untrusted signatures.\n+    retval, output = verify_with_gpg(sigfilename)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    # Retrieve unknown keys that are in the repo builder list and then try GPG again.\n+    if unknown and not args.noninteractive and not args.skip_import_builders:\n+        for unsig in unknown:\n+            name = builder_key_map.get(unsig.key, '<unknown>')\n+            if input(f\" ? Retrieve key {unsig.key} for {name}? (y/N) \").lower() == \"y\":\n+                ran = subprocess.run(\n+                    f\"gpg --keyserver {args.keyserver} --recv-keys {unsig.key}\", shell=True)\n+\n+                if ran.returncode != 0:\n+                    log.warning(f\"failed to retrieve key {unsig.key} for {name}\")\n+\n+    return retval, output, good, unknown, bad\n+\n+\n+def check_single_sig(sigfilename: str, args: argparse.Namespace):\n+    retval, output = verify_with_gpg(sigfilename, SUMS_FILENAME)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    return retval, output, good, unknown, bad\n \n \n def main(args):\n-    # sanity check\n-    if len(args) < 1:\n-        print(\"Error: need to specify a version on the command line\")\n-        return 3\n+    args = parser.parse_args()\n+    if args.quiet:\n+        log.setLevel(logging.WARNING)\n+\n+    WORKINGDIR = Path(tempfile.gettempdir()) / f\"bitcoin_verify_binaries.{args.version}\"\n+\n+    def cleanup():\n+        log.info(\"cleaning up files\")\n+        os.chdir(Path.home())\n+        shutil.rmtree(WORKINGDIR)\n \n     # determine remote dir dependent on provided version string\n-    version_base, version_rc, os_filter = parse_version_string(args[0])\n+    version_base, version_rc, os_filter = parse_version_string(args.version)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766085408",
+      "id" : 766085408,
+      "line" : 483,
+      "node_id" : "PRRC_kwDOABII584tqYkg",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 483,
+      "original_position" : 484,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 484,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766085408/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766085408",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766087843"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766087843"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Another use of shell=True here doesn't handle spaces and special characters and would be easy to eliminate with\r\n\r\n```python\r\n[\"gpg\", \"--keyserver\", args.keyserver, \"--recv-keys\", unsig.key]\r\n```",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T19:24:54Z",
+      "diff_hunk" : "@@ -59,124 +194,457 @@ def download_with_wget(remote_file, local_file=None):\n     return result.returncode == 0, result.stdout.decode().rstrip()\n \n \n+def download_lines_with_urllib(url) -> (bool, [str]):\n+    \"\"\"Get (success, text lines of a file) over HTTP.\"\"\"\n+    try:\n+        return True, [\n+            line.strip().decode() for line in urllib.request.urlopen(url).readlines()]\n+    except urllib.request.HTTPError:\n+        log.warning(f\"HTTP request to {url} failed (HTTPError)\")\n+    except Exception as e:\n+        log.warning(f\"HTTP request to {url} failed ({e})\")\n+    return (False, [])\n+\n+\n+def verify_with_gpg(\n+    signature_filename,\n+    output_filename: t.Optional[str] = None\n+) -> t.Tuple[int, str]:\n+    # Enforce English output since we're relying on output that contains natural language.\n+    # Use string-shell form (vs. args as list) because passing LANGUAGE via `env` doesn't\n+    # seem to work.\n+    args = (\n+        'LANGUAGE=en gpg --yes --decrypt '\n+        + (f' --output {output_filename} ' if output_filename else '')\n+        + signature_filename)\n+\n+    result = subprocess.run(args, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n+    return result.returncode, result.stdout.decode().rstrip()\n+\n+\n+def remove_files(filenames):\n+    for filename in filenames:\n+        os.remove(filename)\n+\n+\n+class SigData:\n+    \"\"\"GPG signature data as parsed from GPG stdout.\"\"\"\n+    def __init__(self, key: str, name: str, trusted: bool, status: str):\n+        self.key = key\n+        self.name = name\n+        self.trusted = trusted\n+        self.status = status\n+\n+    def __repr__(self):\n+        return (\n+            \"SigData(%r, %r, trusted=%s, status=%r)\" %\n+            (self.key, self.name, self.trusted, self.status))\n+\n+\n+def parse_gpg_result(output: str) -> ([SigData], [SigData], [SigData]):\n+    \"\"\"Returns good, unknown, and bad signatures from GPG stdout.\"\"\"\n+    good_sigs = []\n+    unknown_sigs = []\n+    bad_sigs = []\n+    total_resolved_sigs = 0\n+    curr_key = None\n+\n+    for i, line in enumerate(output):\n+        if 'using RSA key' in line:\n+            if curr_key:\n+                raise RuntimeError(\n+                    f\"WARNING: encountered a new sig without resolving the last ({curr_key}) - \"\n+                    \"this could mean we have encountered a bad signature! check GPG output!\")\n+            curr_key = line.split('key ')[-1].strip()\n+            assert len(curr_key) == 40 or (len(curr_key) == 18 and curr_key.startswith('0x'))\n+\n+        if \"Can't check signature: No public key\" in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            unknown_sigs.append(SigData(curr_key, '', False, ''))\n+            curr_key = None\n+\n+        if 'Good signature from ' in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+\n+            # It's safe to index output[i + 1] because if we saw a good sig, there should\n+            # always be another line\n+            trusted = (\n+                'This key is not certified with a trusted signature' not in output[i + 1])\n+            good_sigs.append(SigData(curr_key, name, trusted, status))\n+            curr_key = None\n+\n+        if 'bad signature from' in line.lower():\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+            bad_sigs.append(SigData(curr_key, name, False, status))\n+            curr_key = None\n+\n+        # Track total signatures included\n+        if ': Signature made ' in line:\n+            total_resolved_sigs += 1\n+\n+    all_found = len(good_sigs + bad_sigs + unknown_sigs)\n+    if all_found != total_resolved_sigs:\n+        raise RuntimeError(\n+            f\"failed to evaluate all signatures: found {all_found} \"\n+            f\"but expected {total_resolved_sigs}\")\n+\n+    return (good_sigs, unknown_sigs, bad_sigs)\n+\n+\n+def parse_gpg_from_line(line: str) -> (str, str):\n+    \"\"\"Returns name and expiration status.\"\"\"\n+    assert 'signature from' in line\n+\n+    name_end = line.split(' from ')[-1]\n+    m = re.search(r'(?P<name>\".+\") \\[(?P<status>\\w+)\\]', name_end)\n+    assert m\n+    (name, status) = m.groups()\n+    name = name.strip('\"\\'')\n+\n+    return (name, status)\n+\n+\n def files_are_equal(filename1, filename2):\n     with open(filename1, 'rb') as file1:\n         contents1 = file1.read()\n     with open(filename2, 'rb') as file2:\n         contents2 = file2.read()\n-    return contents1 == contents2\n+    eq = contents1 == contents2\n \n+    if not eq:\n+        with open(filename1, 'r', encoding='utf-8') as f1, \\\n+                open(filename2, 'r', encoding='utf-8') as f2:\n+            f1lines = f1.readlines()\n+            f2lines = f2.readlines()\n \n-def verify_with_gpg(signature_filename, output_filename):\n-    result = subprocess.run(['gpg', '--yes', '--decrypt', '--output',\n-                             output_filename, signature_filename],\n-                             stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n-    return result.returncode, result.stdout.decode().rstrip()\n+            diff = indent(\n+                ''.join(difflib.unified_diff(f1lines, f2lines)))\n+            log.warning(f\"found diff in files ({filename1}, {filename2}):\\n{diff}\\n\")\n \n+    return eq\n \n-def remove_files(filenames):\n-    for filename in filenames:\n-        os.remove(filename)\n+\n+def get_files_from_hosts_and_compare(\n+    hosts: t.List[str], path: str, filename: str, require_all: bool = False\n+) -> ReturnCode:\n+    \"\"\"\n+    Retrieve the same file from a number of hosts and ensure they have the same contents.\n+    The first host given will be treated as the \"primary\" host, and is required to succeed.\n+\n+    Args:\n+        filename: for writing the file locally.\n+    \"\"\"\n+    assert len(hosts) > 1\n+    primary_host = hosts[0]\n+    other_hosts = hosts[1:]\n+    got_files = []\n+\n+    def join_url(host: str) -> str:\n+        return host.rstrip('/') + '/' + path.lstrip('/')\n+\n+    url = join_url(primary_host)\n+    success, output = download_with_wget(url, filename)\n+    if not success:\n+        log.error(\n+            f\"couldn't fetch file ({url}). \"\n+            \"Have you specified the version number in the following format?\\n\"\n+            f\"[{VERSIONPREFIX}]{VERSION_FORMAT} \"\n+            f\"(example: {VERSIONPREFIX}{VERSION_EXAMPLE})\\n\"\n+            f\"wget output:\\n{indent(output)}\")\n+        return ReturnCode.FILE_GET_FAILED\n+    else:\n+        log.info(f\"got file {url} as {filename}\")\n+        got_files.append(filename)\n+\n+    for i, host in enumerate(other_hosts):\n+        url = join_url(host)\n+        fname = filename + f'.{i + 2}'\n+        success, output = download_with_wget(url, fname)\n+\n+        if require_all and not success:\n+            log.error(\n+                f\"{host} failed to provide file ({url}), but {primary_host} did?\\n\"\n+                f\"wget output:\\n{indent(output)}\")\n+            return ReturnCode.FILE_MISSING_FROM_ONE_HOST\n+        elif not success:\n+            log.warning(\n+                f\"{host} failed to provide file ({url}). \"\n+                f\"Continuing based solely upon {primary_host}.\")\n+        else:\n+            log.info(f\"got file {url} as {fname}\")\n+            got_files.append(fname)\n+\n+    for i, got_file in enumerate(got_files):\n+        if got_file == got_files[-1]:\n+            break  # break on last file, nothing after it to compare to\n+\n+        compare_to = got_files[i + 1]\n+        if not files_are_equal(got_file, compare_to):\n+            log.error(f\"files not equal: {got_file} and {compare_to}\")\n+            return ReturnCode.FILES_NOT_EQUAL\n+\n+    return ReturnCode.SUCCESS\n+\n+\n+def get_builder_keys(bitcoin_dir: Path) -> t.Dict[str, str]:\n+    \"\"\"\n+    Return a map of builder key to name from a local or remote source,\n+    in that order of preference.\n+    If we have them locally, compare them to the github repo.\n+    \"\"\"\n+    local_builder_keys = []\n+    local_builder_path = bitcoin_dir / 'contrib' / 'builder-keys' / 'keys.txt'\n+    if local_builder_path.exists():\n+        local_builder_keys = local_builder_path.read_text().splitlines()\n+\n+    success, gh_builder_keys = download_lines_with_urllib(BUILDER_KEYS_GH_URL)\n+    if not success:\n+        log.warning(f\"unable to retrieve builder keys from {BUILDER_KEYS_GH_URL}\")\n+\n+    if not (success or local_builder_keys):\n+        log.error(\"unable to retrieve builder keys locally or remotely\")\n+\n+    # check the local and remote builder keys against each other and report diff\n+    if local_builder_keys and gh_builder_keys:\n+        if local_builder_keys != gh_builder_keys:\n+            diff = indent(\n+                '\\n'.join(difflib.unified_diff(local_builder_keys, gh_builder_keys)))\n+            log.warning(f\"found diff (local vs. GH) in builder keys:\\n{diff}\\n\")\n+\n+    # Prefer local builder keys to those obtained remotely.\n+    builder_keys = local_builder_keys or gh_builder_keys or []\n+\n+    builder_key_map = {}\n+    for i in builder_keys:\n+        key, name = i.split(' ', 1)\n+        builder_key_map[key] = name\n+\n+    return builder_key_map\n+\n+\n+def check_multisig(\n+    sigfilename: str, args: argparse.Namespace, builder_key_map: t.Dict[str, str]\n+):\n+    # check signature\n+    #\n+    # We don't write output to a file because this command will almost certainly\n+    # fail with GPG exit code '2' (and so not writing to --output) because of the\n+    # likely presence of multiple untrusted signatures.\n+    retval, output = verify_with_gpg(sigfilename)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    # Retrieve unknown keys that are in the repo builder list and then try GPG again.\n+    if unknown and not args.noninteractive and not args.skip_import_builders:\n+        for unsig in unknown:\n+            name = builder_key_map.get(unsig.key, '<unknown>')\n+            if input(f\" ? Retrieve key {unsig.key} for {name}? (y/N) \").lower() == \"y\":\n+                ran = subprocess.run(\n+                    f\"gpg --keyserver {args.keyserver} --recv-keys {unsig.key}\", shell=True)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766087843",
+      "id" : 766087843,
+      "line" : 451,
+      "node_id" : "PRRC_kwDOABII584tqZKj",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 451,
+      "original_position" : 447,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 447,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766087843/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766087843",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766089203"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766089203"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "It would be better if this loop if an unrecognized response was given, instead of assuming a response like \"yes\" means no.",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T19:26:46Z",
+      "diff_hunk" : "@@ -59,124 +194,457 @@ def download_with_wget(remote_file, local_file=None):\n     return result.returncode == 0, result.stdout.decode().rstrip()\n \n \n+def download_lines_with_urllib(url) -> (bool, [str]):\n+    \"\"\"Get (success, text lines of a file) over HTTP.\"\"\"\n+    try:\n+        return True, [\n+            line.strip().decode() for line in urllib.request.urlopen(url).readlines()]\n+    except urllib.request.HTTPError:\n+        log.warning(f\"HTTP request to {url} failed (HTTPError)\")\n+    except Exception as e:\n+        log.warning(f\"HTTP request to {url} failed ({e})\")\n+    return (False, [])\n+\n+\n+def verify_with_gpg(\n+    signature_filename,\n+    output_filename: t.Optional[str] = None\n+) -> t.Tuple[int, str]:\n+    # Enforce English output since we're relying on output that contains natural language.\n+    # Use string-shell form (vs. args as list) because passing LANGUAGE via `env` doesn't\n+    # seem to work.\n+    args = (\n+        'LANGUAGE=en gpg --yes --decrypt '\n+        + (f' --output {output_filename} ' if output_filename else '')\n+        + signature_filename)\n+\n+    result = subprocess.run(args, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n+    return result.returncode, result.stdout.decode().rstrip()\n+\n+\n+def remove_files(filenames):\n+    for filename in filenames:\n+        os.remove(filename)\n+\n+\n+class SigData:\n+    \"\"\"GPG signature data as parsed from GPG stdout.\"\"\"\n+    def __init__(self, key: str, name: str, trusted: bool, status: str):\n+        self.key = key\n+        self.name = name\n+        self.trusted = trusted\n+        self.status = status\n+\n+    def __repr__(self):\n+        return (\n+            \"SigData(%r, %r, trusted=%s, status=%r)\" %\n+            (self.key, self.name, self.trusted, self.status))\n+\n+\n+def parse_gpg_result(output: str) -> ([SigData], [SigData], [SigData]):\n+    \"\"\"Returns good, unknown, and bad signatures from GPG stdout.\"\"\"\n+    good_sigs = []\n+    unknown_sigs = []\n+    bad_sigs = []\n+    total_resolved_sigs = 0\n+    curr_key = None\n+\n+    for i, line in enumerate(output):\n+        if 'using RSA key' in line:\n+            if curr_key:\n+                raise RuntimeError(\n+                    f\"WARNING: encountered a new sig without resolving the last ({curr_key}) - \"\n+                    \"this could mean we have encountered a bad signature! check GPG output!\")\n+            curr_key = line.split('key ')[-1].strip()\n+            assert len(curr_key) == 40 or (len(curr_key) == 18 and curr_key.startswith('0x'))\n+\n+        if \"Can't check signature: No public key\" in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            unknown_sigs.append(SigData(curr_key, '', False, ''))\n+            curr_key = None\n+\n+        if 'Good signature from ' in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+\n+            # It's safe to index output[i + 1] because if we saw a good sig, there should\n+            # always be another line\n+            trusted = (\n+                'This key is not certified with a trusted signature' not in output[i + 1])\n+            good_sigs.append(SigData(curr_key, name, trusted, status))\n+            curr_key = None\n+\n+        if 'bad signature from' in line.lower():\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+            bad_sigs.append(SigData(curr_key, name, False, status))\n+            curr_key = None\n+\n+        # Track total signatures included\n+        if ': Signature made ' in line:\n+            total_resolved_sigs += 1\n+\n+    all_found = len(good_sigs + bad_sigs + unknown_sigs)\n+    if all_found != total_resolved_sigs:\n+        raise RuntimeError(\n+            f\"failed to evaluate all signatures: found {all_found} \"\n+            f\"but expected {total_resolved_sigs}\")\n+\n+    return (good_sigs, unknown_sigs, bad_sigs)\n+\n+\n+def parse_gpg_from_line(line: str) -> (str, str):\n+    \"\"\"Returns name and expiration status.\"\"\"\n+    assert 'signature from' in line\n+\n+    name_end = line.split(' from ')[-1]\n+    m = re.search(r'(?P<name>\".+\") \\[(?P<status>\\w+)\\]', name_end)\n+    assert m\n+    (name, status) = m.groups()\n+    name = name.strip('\"\\'')\n+\n+    return (name, status)\n+\n+\n def files_are_equal(filename1, filename2):\n     with open(filename1, 'rb') as file1:\n         contents1 = file1.read()\n     with open(filename2, 'rb') as file2:\n         contents2 = file2.read()\n-    return contents1 == contents2\n+    eq = contents1 == contents2\n \n+    if not eq:\n+        with open(filename1, 'r', encoding='utf-8') as f1, \\\n+                open(filename2, 'r', encoding='utf-8') as f2:\n+            f1lines = f1.readlines()\n+            f2lines = f2.readlines()\n \n-def verify_with_gpg(signature_filename, output_filename):\n-    result = subprocess.run(['gpg', '--yes', '--decrypt', '--output',\n-                             output_filename, signature_filename],\n-                             stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n-    return result.returncode, result.stdout.decode().rstrip()\n+            diff = indent(\n+                ''.join(difflib.unified_diff(f1lines, f2lines)))\n+            log.warning(f\"found diff in files ({filename1}, {filename2}):\\n{diff}\\n\")\n \n+    return eq\n \n-def remove_files(filenames):\n-    for filename in filenames:\n-        os.remove(filename)\n+\n+def get_files_from_hosts_and_compare(\n+    hosts: t.List[str], path: str, filename: str, require_all: bool = False\n+) -> ReturnCode:\n+    \"\"\"\n+    Retrieve the same file from a number of hosts and ensure they have the same contents.\n+    The first host given will be treated as the \"primary\" host, and is required to succeed.\n+\n+    Args:\n+        filename: for writing the file locally.\n+    \"\"\"\n+    assert len(hosts) > 1\n+    primary_host = hosts[0]\n+    other_hosts = hosts[1:]\n+    got_files = []\n+\n+    def join_url(host: str) -> str:\n+        return host.rstrip('/') + '/' + path.lstrip('/')\n+\n+    url = join_url(primary_host)\n+    success, output = download_with_wget(url, filename)\n+    if not success:\n+        log.error(\n+            f\"couldn't fetch file ({url}). \"\n+            \"Have you specified the version number in the following format?\\n\"\n+            f\"[{VERSIONPREFIX}]{VERSION_FORMAT} \"\n+            f\"(example: {VERSIONPREFIX}{VERSION_EXAMPLE})\\n\"\n+            f\"wget output:\\n{indent(output)}\")\n+        return ReturnCode.FILE_GET_FAILED\n+    else:\n+        log.info(f\"got file {url} as {filename}\")\n+        got_files.append(filename)\n+\n+    for i, host in enumerate(other_hosts):\n+        url = join_url(host)\n+        fname = filename + f'.{i + 2}'\n+        success, output = download_with_wget(url, fname)\n+\n+        if require_all and not success:\n+            log.error(\n+                f\"{host} failed to provide file ({url}), but {primary_host} did?\\n\"\n+                f\"wget output:\\n{indent(output)}\")\n+            return ReturnCode.FILE_MISSING_FROM_ONE_HOST\n+        elif not success:\n+            log.warning(\n+                f\"{host} failed to provide file ({url}). \"\n+                f\"Continuing based solely upon {primary_host}.\")\n+        else:\n+            log.info(f\"got file {url} as {fname}\")\n+            got_files.append(fname)\n+\n+    for i, got_file in enumerate(got_files):\n+        if got_file == got_files[-1]:\n+            break  # break on last file, nothing after it to compare to\n+\n+        compare_to = got_files[i + 1]\n+        if not files_are_equal(got_file, compare_to):\n+            log.error(f\"files not equal: {got_file} and {compare_to}\")\n+            return ReturnCode.FILES_NOT_EQUAL\n+\n+    return ReturnCode.SUCCESS\n+\n+\n+def get_builder_keys(bitcoin_dir: Path) -> t.Dict[str, str]:\n+    \"\"\"\n+    Return a map of builder key to name from a local or remote source,\n+    in that order of preference.\n+    If we have them locally, compare them to the github repo.\n+    \"\"\"\n+    local_builder_keys = []\n+    local_builder_path = bitcoin_dir / 'contrib' / 'builder-keys' / 'keys.txt'\n+    if local_builder_path.exists():\n+        local_builder_keys = local_builder_path.read_text().splitlines()\n+\n+    success, gh_builder_keys = download_lines_with_urllib(BUILDER_KEYS_GH_URL)\n+    if not success:\n+        log.warning(f\"unable to retrieve builder keys from {BUILDER_KEYS_GH_URL}\")\n+\n+    if not (success or local_builder_keys):\n+        log.error(\"unable to retrieve builder keys locally or remotely\")\n+\n+    # check the local and remote builder keys against each other and report diff\n+    if local_builder_keys and gh_builder_keys:\n+        if local_builder_keys != gh_builder_keys:\n+            diff = indent(\n+                '\\n'.join(difflib.unified_diff(local_builder_keys, gh_builder_keys)))\n+            log.warning(f\"found diff (local vs. GH) in builder keys:\\n{diff}\\n\")\n+\n+    # Prefer local builder keys to those obtained remotely.\n+    builder_keys = local_builder_keys or gh_builder_keys or []\n+\n+    builder_key_map = {}\n+    for i in builder_keys:\n+        key, name = i.split(' ', 1)\n+        builder_key_map[key] = name\n+\n+    return builder_key_map\n+\n+\n+def check_multisig(\n+    sigfilename: str, args: argparse.Namespace, builder_key_map: t.Dict[str, str]\n+):\n+    # check signature\n+    #\n+    # We don't write output to a file because this command will almost certainly\n+    # fail with GPG exit code '2' (and so not writing to --output) because of the\n+    # likely presence of multiple untrusted signatures.\n+    retval, output = verify_with_gpg(sigfilename)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    # Retrieve unknown keys that are in the repo builder list and then try GPG again.\n+    if unknown and not args.noninteractive and not args.skip_import_builders:\n+        for unsig in unknown:\n+            name = builder_key_map.get(unsig.key, '<unknown>')\n+            if input(f\" ? Retrieve key {unsig.key} for {name}? (y/N) \").lower() == \"y\":",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766089203",
+      "id" : 766089203,
+      "line" : 449,
+      "node_id" : "PRRC_kwDOABII584tqZfz",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 449,
+      "original_position" : 445,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 445,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766089203/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766089203",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766093053"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766093053"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "This `main()` function has a lot of verification logic mixed in with a lot of printing code like this. Would be good to move informational parts of `main()` to separate `print_signature_info` or similar functions, so it's easy for someone trying to see how verification works to see what this is doing.",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T19:32:06Z",
+      "diff_hunk" : "@@ -59,124 +194,457 @@ def download_with_wget(remote_file, local_file=None):\n     return result.returncode == 0, result.stdout.decode().rstrip()\n \n \n+def download_lines_with_urllib(url) -> (bool, [str]):\n+    \"\"\"Get (success, text lines of a file) over HTTP.\"\"\"\n+    try:\n+        return True, [\n+            line.strip().decode() for line in urllib.request.urlopen(url).readlines()]\n+    except urllib.request.HTTPError:\n+        log.warning(f\"HTTP request to {url} failed (HTTPError)\")\n+    except Exception as e:\n+        log.warning(f\"HTTP request to {url} failed ({e})\")\n+    return (False, [])\n+\n+\n+def verify_with_gpg(\n+    signature_filename,\n+    output_filename: t.Optional[str] = None\n+) -> t.Tuple[int, str]:\n+    # Enforce English output since we're relying on output that contains natural language.\n+    # Use string-shell form (vs. args as list) because passing LANGUAGE via `env` doesn't\n+    # seem to work.\n+    args = (\n+        'LANGUAGE=en gpg --yes --decrypt '\n+        + (f' --output {output_filename} ' if output_filename else '')\n+        + signature_filename)\n+\n+    result = subprocess.run(args, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n+    return result.returncode, result.stdout.decode().rstrip()\n+\n+\n+def remove_files(filenames):\n+    for filename in filenames:\n+        os.remove(filename)\n+\n+\n+class SigData:\n+    \"\"\"GPG signature data as parsed from GPG stdout.\"\"\"\n+    def __init__(self, key: str, name: str, trusted: bool, status: str):\n+        self.key = key\n+        self.name = name\n+        self.trusted = trusted\n+        self.status = status\n+\n+    def __repr__(self):\n+        return (\n+            \"SigData(%r, %r, trusted=%s, status=%r)\" %\n+            (self.key, self.name, self.trusted, self.status))\n+\n+\n+def parse_gpg_result(output: str) -> ([SigData], [SigData], [SigData]):\n+    \"\"\"Returns good, unknown, and bad signatures from GPG stdout.\"\"\"\n+    good_sigs = []\n+    unknown_sigs = []\n+    bad_sigs = []\n+    total_resolved_sigs = 0\n+    curr_key = None\n+\n+    for i, line in enumerate(output):\n+        if 'using RSA key' in line:\n+            if curr_key:\n+                raise RuntimeError(\n+                    f\"WARNING: encountered a new sig without resolving the last ({curr_key}) - \"\n+                    \"this could mean we have encountered a bad signature! check GPG output!\")\n+            curr_key = line.split('key ')[-1].strip()\n+            assert len(curr_key) == 40 or (len(curr_key) == 18 and curr_key.startswith('0x'))\n+\n+        if \"Can't check signature: No public key\" in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            unknown_sigs.append(SigData(curr_key, '', False, ''))\n+            curr_key = None\n+\n+        if 'Good signature from ' in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+\n+            # It's safe to index output[i + 1] because if we saw a good sig, there should\n+            # always be another line\n+            trusted = (\n+                'This key is not certified with a trusted signature' not in output[i + 1])\n+            good_sigs.append(SigData(curr_key, name, trusted, status))\n+            curr_key = None\n+\n+        if 'bad signature from' in line.lower():\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+            bad_sigs.append(SigData(curr_key, name, False, status))\n+            curr_key = None\n+\n+        # Track total signatures included\n+        if ': Signature made ' in line:\n+            total_resolved_sigs += 1\n+\n+    all_found = len(good_sigs + bad_sigs + unknown_sigs)\n+    if all_found != total_resolved_sigs:\n+        raise RuntimeError(\n+            f\"failed to evaluate all signatures: found {all_found} \"\n+            f\"but expected {total_resolved_sigs}\")\n+\n+    return (good_sigs, unknown_sigs, bad_sigs)\n+\n+\n+def parse_gpg_from_line(line: str) -> (str, str):\n+    \"\"\"Returns name and expiration status.\"\"\"\n+    assert 'signature from' in line\n+\n+    name_end = line.split(' from ')[-1]\n+    m = re.search(r'(?P<name>\".+\") \\[(?P<status>\\w+)\\]', name_end)\n+    assert m\n+    (name, status) = m.groups()\n+    name = name.strip('\"\\'')\n+\n+    return (name, status)\n+\n+\n def files_are_equal(filename1, filename2):\n     with open(filename1, 'rb') as file1:\n         contents1 = file1.read()\n     with open(filename2, 'rb') as file2:\n         contents2 = file2.read()\n-    return contents1 == contents2\n+    eq = contents1 == contents2\n \n+    if not eq:\n+        with open(filename1, 'r', encoding='utf-8') as f1, \\\n+                open(filename2, 'r', encoding='utf-8') as f2:\n+            f1lines = f1.readlines()\n+            f2lines = f2.readlines()\n \n-def verify_with_gpg(signature_filename, output_filename):\n-    result = subprocess.run(['gpg', '--yes', '--decrypt', '--output',\n-                             output_filename, signature_filename],\n-                             stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n-    return result.returncode, result.stdout.decode().rstrip()\n+            diff = indent(\n+                ''.join(difflib.unified_diff(f1lines, f2lines)))\n+            log.warning(f\"found diff in files ({filename1}, {filename2}):\\n{diff}\\n\")\n \n+    return eq\n \n-def remove_files(filenames):\n-    for filename in filenames:\n-        os.remove(filename)\n+\n+def get_files_from_hosts_and_compare(\n+    hosts: t.List[str], path: str, filename: str, require_all: bool = False\n+) -> ReturnCode:\n+    \"\"\"\n+    Retrieve the same file from a number of hosts and ensure they have the same contents.\n+    The first host given will be treated as the \"primary\" host, and is required to succeed.\n+\n+    Args:\n+        filename: for writing the file locally.\n+    \"\"\"\n+    assert len(hosts) > 1\n+    primary_host = hosts[0]\n+    other_hosts = hosts[1:]\n+    got_files = []\n+\n+    def join_url(host: str) -> str:\n+        return host.rstrip('/') + '/' + path.lstrip('/')\n+\n+    url = join_url(primary_host)\n+    success, output = download_with_wget(url, filename)\n+    if not success:\n+        log.error(\n+            f\"couldn't fetch file ({url}). \"\n+            \"Have you specified the version number in the following format?\\n\"\n+            f\"[{VERSIONPREFIX}]{VERSION_FORMAT} \"\n+            f\"(example: {VERSIONPREFIX}{VERSION_EXAMPLE})\\n\"\n+            f\"wget output:\\n{indent(output)}\")\n+        return ReturnCode.FILE_GET_FAILED\n+    else:\n+        log.info(f\"got file {url} as {filename}\")\n+        got_files.append(filename)\n+\n+    for i, host in enumerate(other_hosts):\n+        url = join_url(host)\n+        fname = filename + f'.{i + 2}'\n+        success, output = download_with_wget(url, fname)\n+\n+        if require_all and not success:\n+            log.error(\n+                f\"{host} failed to provide file ({url}), but {primary_host} did?\\n\"\n+                f\"wget output:\\n{indent(output)}\")\n+            return ReturnCode.FILE_MISSING_FROM_ONE_HOST\n+        elif not success:\n+            log.warning(\n+                f\"{host} failed to provide file ({url}). \"\n+                f\"Continuing based solely upon {primary_host}.\")\n+        else:\n+            log.info(f\"got file {url} as {fname}\")\n+            got_files.append(fname)\n+\n+    for i, got_file in enumerate(got_files):\n+        if got_file == got_files[-1]:\n+            break  # break on last file, nothing after it to compare to\n+\n+        compare_to = got_files[i + 1]\n+        if not files_are_equal(got_file, compare_to):\n+            log.error(f\"files not equal: {got_file} and {compare_to}\")\n+            return ReturnCode.FILES_NOT_EQUAL\n+\n+    return ReturnCode.SUCCESS\n+\n+\n+def get_builder_keys(bitcoin_dir: Path) -> t.Dict[str, str]:\n+    \"\"\"\n+    Return a map of builder key to name from a local or remote source,\n+    in that order of preference.\n+    If we have them locally, compare them to the github repo.\n+    \"\"\"\n+    local_builder_keys = []\n+    local_builder_path = bitcoin_dir / 'contrib' / 'builder-keys' / 'keys.txt'\n+    if local_builder_path.exists():\n+        local_builder_keys = local_builder_path.read_text().splitlines()\n+\n+    success, gh_builder_keys = download_lines_with_urllib(BUILDER_KEYS_GH_URL)\n+    if not success:\n+        log.warning(f\"unable to retrieve builder keys from {BUILDER_KEYS_GH_URL}\")\n+\n+    if not (success or local_builder_keys):\n+        log.error(\"unable to retrieve builder keys locally or remotely\")\n+\n+    # check the local and remote builder keys against each other and report diff\n+    if local_builder_keys and gh_builder_keys:\n+        if local_builder_keys != gh_builder_keys:\n+            diff = indent(\n+                '\\n'.join(difflib.unified_diff(local_builder_keys, gh_builder_keys)))\n+            log.warning(f\"found diff (local vs. GH) in builder keys:\\n{diff}\\n\")\n+\n+    # Prefer local builder keys to those obtained remotely.\n+    builder_keys = local_builder_keys or gh_builder_keys or []\n+\n+    builder_key_map = {}\n+    for i in builder_keys:\n+        key, name = i.split(' ', 1)\n+        builder_key_map[key] = name\n+\n+    return builder_key_map\n+\n+\n+def check_multisig(\n+    sigfilename: str, args: argparse.Namespace, builder_key_map: t.Dict[str, str]\n+):\n+    # check signature\n+    #\n+    # We don't write output to a file because this command will almost certainly\n+    # fail with GPG exit code '2' (and so not writing to --output) because of the\n+    # likely presence of multiple untrusted signatures.\n+    retval, output = verify_with_gpg(sigfilename)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    # Retrieve unknown keys that are in the repo builder list and then try GPG again.\n+    if unknown and not args.noninteractive and not args.skip_import_builders:\n+        for unsig in unknown:\n+            name = builder_key_map.get(unsig.key, '<unknown>')\n+            if input(f\" ? Retrieve key {unsig.key} for {name}? (y/N) \").lower() == \"y\":\n+                ran = subprocess.run(\n+                    f\"gpg --keyserver {args.keyserver} --recv-keys {unsig.key}\", shell=True)\n+\n+                if ran.returncode != 0:\n+                    log.warning(f\"failed to retrieve key {unsig.key} for {name}\")\n+\n+    return retval, output, good, unknown, bad\n+\n+\n+def check_single_sig(sigfilename: str, args: argparse.Namespace):\n+    retval, output = verify_with_gpg(sigfilename, SUMS_FILENAME)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    return retval, output, good, unknown, bad\n \n \n def main(args):\n-    # sanity check\n-    if len(args) < 1:\n-        print(\"Error: need to specify a version on the command line\")\n-        return 3\n+    args = parser.parse_args()\n+    if args.quiet:\n+        log.setLevel(logging.WARNING)\n+\n+    WORKINGDIR = Path(tempfile.gettempdir()) / f\"bitcoin_verify_binaries.{args.version}\"\n+\n+    def cleanup():\n+        log.info(\"cleaning up files\")\n+        os.chdir(Path.home())\n+        shutil.rmtree(WORKINGDIR)\n \n     # determine remote dir dependent on provided version string\n-    version_base, version_rc, os_filter = parse_version_string(args[0])\n+    version_base, version_rc, os_filter = parse_version_string(args.version)\n     remote_dir = f\"/bin/{VERSIONPREFIX}{version_base}/\"\n     if version_rc:\n         remote_dir += f\"test.{version_rc}/\"\n-    remote_sigfile = remote_dir + SIGNATUREFILENAME\n+    remote_sigs_path = remote_dir + SIGNATUREFILENAME\n+    remote_sums_path = remote_dir + SUMS_FILENAME\n \n+    bitcoin_dir_maybe = Path(args.bitcoin_src_path) if args.bitcoin_src_path else Path.cwd()\n     # create working directory\n     os.makedirs(WORKINGDIR, exist_ok=True)\n     os.chdir(WORKINGDIR)\n \n-    # fetch first signature file\n-    sigfile1 = SIGNATUREFILENAME\n-    success, output = download_with_wget(HOST1 + remote_sigfile, sigfile1)\n-    if not success:\n-        print(\"Error: couldn't fetch signature file. \"\n-              \"Have you specified the version number in the following format?\")\n-        print(f\"[{VERSIONPREFIX}]<version>[-rc[0-9]][-platform] \"\n-              f\"(example: {VERSIONPREFIX}0.21.0-rc3-osx)\")\n-        print(\"wget output:\")\n-        print(indent(output, '\\t'))\n-        return 4\n-\n-    # fetch second signature file\n-    sigfile2 = SIGNATUREFILENAME + \".2\"\n-    success, output = download_with_wget(HOST2 + remote_sigfile, sigfile2)\n-    if not success:\n-        print(\"bitcoin.org failed to provide signature file, \"\n-              \"but bitcoincore.org did?\")\n-        print(\"wget output:\")\n-        print(indent(output, '\\t'))\n-        remove_files([sigfile1])\n-        return 5\n-\n-    # ensure that both signature files are equal\n-    if not files_are_equal(sigfile1, sigfile2):\n-        print(\"bitcoin.org and bitcoincore.org signature files were not equal?\")\n-        print(f\"See files {WORKINGDIR}/{sigfile1} and {WORKINGDIR}/{sigfile2}\")\n-        return 6\n-\n-    # check signature and extract data into file\n-    retval, output = verify_with_gpg(sigfile1, HASHFILE)\n-    if retval != 0:\n-        if retval == 1:\n-            print(\"Bad signature.\")\n-        elif retval == 2:\n-            print(\"gpg error. Do you have the Bitcoin Core binary release \"\n-                  \"signing key installed?\")\n-        print(\"gpg output:\")\n-        print(indent(output, '\\t'))\n-        remove_files([sigfile1, sigfile2, HASHFILE])\n-        return 1\n+    version_tuple = [int(i) for i in version_base.split('.')]\n+    hosts = [HOST1, HOST2]\n+\n+    got_sig_status = get_files_from_hosts_and_compare(\n+        hosts, remote_sigs_path, SIGNATUREFILENAME, args.require_all_hosts)\n+    if got_sig_status != ReturnCode.SUCCESS:\n+        return got_sig_status\n+\n+    # Multi-sig verification is available after 22.0.\n+    MULTISIG_SUPPORTED = version_tuple[0] >= 22\n+\n+    if MULTISIG_SUPPORTED:\n+        min_trusted_sigs = args.min_trusted_sigs\n+        gpg_allowed_codes = [0, 2]  # 2 is returned when untrusted signatures are present.\n+        builder_key_map = get_builder_keys(bitcoin_dir_maybe)\n+\n+        got_sums_status = get_files_from_hosts_and_compare(\n+            hosts, remote_sums_path, SUMS_FILENAME, args.require_all_hosts)\n+        if got_sums_status != ReturnCode.SUCCESS:\n+            return got_sums_status\n+\n+        gpg_retval, gpg_output, good, unknown, bad = check_multisig(\n+            SIGNATUREFILENAME, args, builder_key_map)\n+    else:\n+        # As long as GPG return codes are okay, the sig is valid for pre-22.0.\n+        min_trusted_sigs = 0\n+        gpg_allowed_codes = [0]\n+        builder_key_map = {}\n+\n+        gpg_retval, gpg_output, good, unknown, bad = check_single_sig(\n+            SIGNATUREFILENAME, args)\n+\n+    if gpg_retval not in gpg_allowed_codes:\n+        if gpg_retval == 1:\n+            log.critical(\"Bad signature.\")\n+        if gpg_retval == 2:\n+            log.critical(\n+                \"gpg error. Do you have the Bitcoin Core binary release \"\n+                \"signing key installed?\")\n+        else:\n+            log.critical(\"unexpected GPG exit code\")\n+\n+        log.error(f\"gpg output:\\n{indent(gpg_output)}\")\n+        cleanup()\n+        return ReturnCode.INTEGRITY_FAILURE\n+\n+    # Decide which keys we trust, though not \"trust\" in the GPG sense, but rather\n+    # which pubkeys convince us that this sums file is legitimate. In other words,\n+    # which pubkeys within the Bitcoin community do we trust for the purposes of\n+    # binary verification?\n+    trusted_keys = set()\n+    if not args.no_builder_keys:\n+        trusted_keys |= set(builder_key_map.keys())\n+    if args.trusted_keys:\n+        trusted_keys |= set(args.trusted_keys.split(','))\n+\n+    # Tally signatures and make sure we have enough good, trusted to fulfill\n+    # our threshold.\n+    good_trusted = {sig for sig in good if sig.trusted or sig.key in trusted_keys}\n+    good_untrusted = [sig for sig in good if sig not in good_trusted]\n+    num_trusted = len(good_trusted)\n+    log.info(f\"got {num_trusted} good, trusted signatures\")\n+\n+    if num_trusted < min_trusted_sigs:\n+        log.error(\n+            \"not enough trusted sigs to meet threshold \"\n+            f\"({num_trusted} vs. {min_trusted_sigs})\")\n+        return ReturnCode.NOT_ENOUGH_GOOD_SIGS\n+\n+    for sig in good_trusted:\n+        log.info(f\"GOOD SIGNATURE: {sig}\")\n+\n+    for sig in good_untrusted:\n+        log.info(f\"GOOD SIGNATURE (untrusted): {sig}\")\n+\n+    for sig in [sig for sig in good if sig.status == 'expired']:\n+        log.warning(f\"key {sig.key} for {sig.name} is expired\")\n+\n+    for sig in bad:\n+        log.warning(f\"BAD SIGNATURE: {sig}\")\n+\n+    for sig in unknown:\n+        log.warning(f\"UNKNOWN SIGNATURE: {sig}\")",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766093053",
+      "id" : 766093053,
+      "line" : 577,
+      "node_id" : "PRRC_kwDOABII584tqab9",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 577,
+      "original_position" : 620,
+      "original_start_line" : 564,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 620,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766093053/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 564,
+      "start_side" : "RIGHT",
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766093053",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766105083"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766105083"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Instead of making behavior depend on directory where script was called from, I think it would be more stable to use the script location like:\r\n\r\n```python\r\nlocal_keys = (Path(args.bitcoin_src_path) / 'contrib' if args.bitcoin_src_path else\r\n              Path(__file__).resolve().parent.parent) / 'builder-keys' / 'keys.txt'\r\n```\r\n",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T19:49:46Z",
+      "diff_hunk" : "@@ -59,124 +194,457 @@ def download_with_wget(remote_file, local_file=None):\n     return result.returncode == 0, result.stdout.decode().rstrip()\n \n \n+def download_lines_with_urllib(url) -> (bool, [str]):\n+    \"\"\"Get (success, text lines of a file) over HTTP.\"\"\"\n+    try:\n+        return True, [\n+            line.strip().decode() for line in urllib.request.urlopen(url).readlines()]\n+    except urllib.request.HTTPError:\n+        log.warning(f\"HTTP request to {url} failed (HTTPError)\")\n+    except Exception as e:\n+        log.warning(f\"HTTP request to {url} failed ({e})\")\n+    return (False, [])\n+\n+\n+def verify_with_gpg(\n+    signature_filename,\n+    output_filename: t.Optional[str] = None\n+) -> t.Tuple[int, str]:\n+    # Enforce English output since we're relying on output that contains natural language.\n+    # Use string-shell form (vs. args as list) because passing LANGUAGE via `env` doesn't\n+    # seem to work.\n+    args = (\n+        'LANGUAGE=en gpg --yes --decrypt '\n+        + (f' --output {output_filename} ' if output_filename else '')\n+        + signature_filename)\n+\n+    result = subprocess.run(args, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n+    return result.returncode, result.stdout.decode().rstrip()\n+\n+\n+def remove_files(filenames):\n+    for filename in filenames:\n+        os.remove(filename)\n+\n+\n+class SigData:\n+    \"\"\"GPG signature data as parsed from GPG stdout.\"\"\"\n+    def __init__(self, key: str, name: str, trusted: bool, status: str):\n+        self.key = key\n+        self.name = name\n+        self.trusted = trusted\n+        self.status = status\n+\n+    def __repr__(self):\n+        return (\n+            \"SigData(%r, %r, trusted=%s, status=%r)\" %\n+            (self.key, self.name, self.trusted, self.status))\n+\n+\n+def parse_gpg_result(output: str) -> ([SigData], [SigData], [SigData]):\n+    \"\"\"Returns good, unknown, and bad signatures from GPG stdout.\"\"\"\n+    good_sigs = []\n+    unknown_sigs = []\n+    bad_sigs = []\n+    total_resolved_sigs = 0\n+    curr_key = None\n+\n+    for i, line in enumerate(output):\n+        if 'using RSA key' in line:\n+            if curr_key:\n+                raise RuntimeError(\n+                    f\"WARNING: encountered a new sig without resolving the last ({curr_key}) - \"\n+                    \"this could mean we have encountered a bad signature! check GPG output!\")\n+            curr_key = line.split('key ')[-1].strip()\n+            assert len(curr_key) == 40 or (len(curr_key) == 18 and curr_key.startswith('0x'))\n+\n+        if \"Can't check signature: No public key\" in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            unknown_sigs.append(SigData(curr_key, '', False, ''))\n+            curr_key = None\n+\n+        if 'Good signature from ' in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+\n+            # It's safe to index output[i + 1] because if we saw a good sig, there should\n+            # always be another line\n+            trusted = (\n+                'This key is not certified with a trusted signature' not in output[i + 1])\n+            good_sigs.append(SigData(curr_key, name, trusted, status))\n+            curr_key = None\n+\n+        if 'bad signature from' in line.lower():\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+            bad_sigs.append(SigData(curr_key, name, False, status))\n+            curr_key = None\n+\n+        # Track total signatures included\n+        if ': Signature made ' in line:\n+            total_resolved_sigs += 1\n+\n+    all_found = len(good_sigs + bad_sigs + unknown_sigs)\n+    if all_found != total_resolved_sigs:\n+        raise RuntimeError(\n+            f\"failed to evaluate all signatures: found {all_found} \"\n+            f\"but expected {total_resolved_sigs}\")\n+\n+    return (good_sigs, unknown_sigs, bad_sigs)\n+\n+\n+def parse_gpg_from_line(line: str) -> (str, str):\n+    \"\"\"Returns name and expiration status.\"\"\"\n+    assert 'signature from' in line\n+\n+    name_end = line.split(' from ')[-1]\n+    m = re.search(r'(?P<name>\".+\") \\[(?P<status>\\w+)\\]', name_end)\n+    assert m\n+    (name, status) = m.groups()\n+    name = name.strip('\"\\'')\n+\n+    return (name, status)\n+\n+\n def files_are_equal(filename1, filename2):\n     with open(filename1, 'rb') as file1:\n         contents1 = file1.read()\n     with open(filename2, 'rb') as file2:\n         contents2 = file2.read()\n-    return contents1 == contents2\n+    eq = contents1 == contents2\n \n+    if not eq:\n+        with open(filename1, 'r', encoding='utf-8') as f1, \\\n+                open(filename2, 'r', encoding='utf-8') as f2:\n+            f1lines = f1.readlines()\n+            f2lines = f2.readlines()\n \n-def verify_with_gpg(signature_filename, output_filename):\n-    result = subprocess.run(['gpg', '--yes', '--decrypt', '--output',\n-                             output_filename, signature_filename],\n-                             stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n-    return result.returncode, result.stdout.decode().rstrip()\n+            diff = indent(\n+                ''.join(difflib.unified_diff(f1lines, f2lines)))\n+            log.warning(f\"found diff in files ({filename1}, {filename2}):\\n{diff}\\n\")\n \n+    return eq\n \n-def remove_files(filenames):\n-    for filename in filenames:\n-        os.remove(filename)\n+\n+def get_files_from_hosts_and_compare(\n+    hosts: t.List[str], path: str, filename: str, require_all: bool = False\n+) -> ReturnCode:\n+    \"\"\"\n+    Retrieve the same file from a number of hosts and ensure they have the same contents.\n+    The first host given will be treated as the \"primary\" host, and is required to succeed.\n+\n+    Args:\n+        filename: for writing the file locally.\n+    \"\"\"\n+    assert len(hosts) > 1\n+    primary_host = hosts[0]\n+    other_hosts = hosts[1:]\n+    got_files = []\n+\n+    def join_url(host: str) -> str:\n+        return host.rstrip('/') + '/' + path.lstrip('/')\n+\n+    url = join_url(primary_host)\n+    success, output = download_with_wget(url, filename)\n+    if not success:\n+        log.error(\n+            f\"couldn't fetch file ({url}). \"\n+            \"Have you specified the version number in the following format?\\n\"\n+            f\"[{VERSIONPREFIX}]{VERSION_FORMAT} \"\n+            f\"(example: {VERSIONPREFIX}{VERSION_EXAMPLE})\\n\"\n+            f\"wget output:\\n{indent(output)}\")\n+        return ReturnCode.FILE_GET_FAILED\n+    else:\n+        log.info(f\"got file {url} as {filename}\")\n+        got_files.append(filename)\n+\n+    for i, host in enumerate(other_hosts):\n+        url = join_url(host)\n+        fname = filename + f'.{i + 2}'\n+        success, output = download_with_wget(url, fname)\n+\n+        if require_all and not success:\n+            log.error(\n+                f\"{host} failed to provide file ({url}), but {primary_host} did?\\n\"\n+                f\"wget output:\\n{indent(output)}\")\n+            return ReturnCode.FILE_MISSING_FROM_ONE_HOST\n+        elif not success:\n+            log.warning(\n+                f\"{host} failed to provide file ({url}). \"\n+                f\"Continuing based solely upon {primary_host}.\")\n+        else:\n+            log.info(f\"got file {url} as {fname}\")\n+            got_files.append(fname)\n+\n+    for i, got_file in enumerate(got_files):\n+        if got_file == got_files[-1]:\n+            break  # break on last file, nothing after it to compare to\n+\n+        compare_to = got_files[i + 1]\n+        if not files_are_equal(got_file, compare_to):\n+            log.error(f\"files not equal: {got_file} and {compare_to}\")\n+            return ReturnCode.FILES_NOT_EQUAL\n+\n+    return ReturnCode.SUCCESS\n+\n+\n+def get_builder_keys(bitcoin_dir: Path) -> t.Dict[str, str]:\n+    \"\"\"\n+    Return a map of builder key to name from a local or remote source,\n+    in that order of preference.\n+    If we have them locally, compare them to the github repo.\n+    \"\"\"\n+    local_builder_keys = []\n+    local_builder_path = bitcoin_dir / 'contrib' / 'builder-keys' / 'keys.txt'\n+    if local_builder_path.exists():\n+        local_builder_keys = local_builder_path.read_text().splitlines()\n+\n+    success, gh_builder_keys = download_lines_with_urllib(BUILDER_KEYS_GH_URL)\n+    if not success:\n+        log.warning(f\"unable to retrieve builder keys from {BUILDER_KEYS_GH_URL}\")\n+\n+    if not (success or local_builder_keys):\n+        log.error(\"unable to retrieve builder keys locally or remotely\")\n+\n+    # check the local and remote builder keys against each other and report diff\n+    if local_builder_keys and gh_builder_keys:\n+        if local_builder_keys != gh_builder_keys:\n+            diff = indent(\n+                '\\n'.join(difflib.unified_diff(local_builder_keys, gh_builder_keys)))\n+            log.warning(f\"found diff (local vs. GH) in builder keys:\\n{diff}\\n\")\n+\n+    # Prefer local builder keys to those obtained remotely.\n+    builder_keys = local_builder_keys or gh_builder_keys or []\n+\n+    builder_key_map = {}\n+    for i in builder_keys:\n+        key, name = i.split(' ', 1)\n+        builder_key_map[key] = name\n+\n+    return builder_key_map\n+\n+\n+def check_multisig(\n+    sigfilename: str, args: argparse.Namespace, builder_key_map: t.Dict[str, str]\n+):\n+    # check signature\n+    #\n+    # We don't write output to a file because this command will almost certainly\n+    # fail with GPG exit code '2' (and so not writing to --output) because of the\n+    # likely presence of multiple untrusted signatures.\n+    retval, output = verify_with_gpg(sigfilename)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    # Retrieve unknown keys that are in the repo builder list and then try GPG again.\n+    if unknown and not args.noninteractive and not args.skip_import_builders:\n+        for unsig in unknown:\n+            name = builder_key_map.get(unsig.key, '<unknown>')\n+            if input(f\" ? Retrieve key {unsig.key} for {name}? (y/N) \").lower() == \"y\":\n+                ran = subprocess.run(\n+                    f\"gpg --keyserver {args.keyserver} --recv-keys {unsig.key}\", shell=True)\n+\n+                if ran.returncode != 0:\n+                    log.warning(f\"failed to retrieve key {unsig.key} for {name}\")\n+\n+    return retval, output, good, unknown, bad\n+\n+\n+def check_single_sig(sigfilename: str, args: argparse.Namespace):\n+    retval, output = verify_with_gpg(sigfilename, SUMS_FILENAME)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    return retval, output, good, unknown, bad\n \n \n def main(args):\n-    # sanity check\n-    if len(args) < 1:\n-        print(\"Error: need to specify a version on the command line\")\n-        return 3\n+    args = parser.parse_args()\n+    if args.quiet:\n+        log.setLevel(logging.WARNING)\n+\n+    WORKINGDIR = Path(tempfile.gettempdir()) / f\"bitcoin_verify_binaries.{args.version}\"\n+\n+    def cleanup():\n+        log.info(\"cleaning up files\")\n+        os.chdir(Path.home())\n+        shutil.rmtree(WORKINGDIR)\n \n     # determine remote dir dependent on provided version string\n-    version_base, version_rc, os_filter = parse_version_string(args[0])\n+    version_base, version_rc, os_filter = parse_version_string(args.version)\n     remote_dir = f\"/bin/{VERSIONPREFIX}{version_base}/\"\n     if version_rc:\n         remote_dir += f\"test.{version_rc}/\"\n-    remote_sigfile = remote_dir + SIGNATUREFILENAME\n+    remote_sigs_path = remote_dir + SIGNATUREFILENAME\n+    remote_sums_path = remote_dir + SUMS_FILENAME\n \n+    bitcoin_dir_maybe = Path(args.bitcoin_src_path) if args.bitcoin_src_path else Path.cwd()",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766105083",
+      "id" : 766105083,
+      "line" : 490,
+      "node_id" : "PRRC_kwDOABII584tqdX7",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 490,
+      "original_position" : 492,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 492,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766105083/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766105083",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766119564"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766119564"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "This optiony seems awkard currently and not useful. Would suggest dropping or replacing with a '--import-builder-keys' bool option.\r\n\r\nRight now this option is redundant and does the exact same thing as --noninteractive. It's also indirect, choosing whether or not to prompt about receiving keys, instead of just choosing whether or not to receive keys.\r\n\r\nI think it would be better have a plain `--import-builder-keys` option (defaulting to false) that would provide a way to import keys with `--noninteractive`, and confirm before importing each key without `--noninteractive`",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T20:11:20Z",
+      "diff_hunk" : "@@ -2,29 +2,164 @@\n # Copyright (c) 2020 The Bitcoin Core developers\n # Distributed under the MIT software license, see the accompanying\n # file COPYING or http://www.opensource.org/licenses/mit-license.php.\n-\"\"\"Script for verifying Bitcoin Core release binaries\n-\n-This script attempts to download the signature file SHA256SUMS.asc from\n-bitcoincore.org and bitcoin.org and compares them.\n-It first checks if the signature passes, and then downloads the files\n-specified in the file, and checks if the hashes of these files match those\n-that are specified in the signature file.\n-The script returns 0 if everything passes the checks. It returns 1 if either\n-the signature check or the hash check doesn't pass. If an error occurs the\n-return value is >= 2.\n+\"\"\"Script for verifying Bitcoin Core release binaries.\n+\n+This script attempts to download the sum file SHA256SUMS and corresponding\n+signature file SHA256SUMS.asc from bitcoincore.org and bitcoin.org and\n+compares them.\n+\n+The sum-signature file is signed by a number of builder keys. This script\n+ensures that there is a minimum threshold of signatures from pubkeys that\n+we trust. This trust is articulated on the basis of configuration options\n+here, but by default is based upon a unionof (i) local GPG trust settings,\n+and (ii) keys which appear in the builder-keys/keys.txt file.\n+\n+If a minimum good, trusted signature threshold is met on the sum file, we then\n+download the files specified in SHA256SUMS, and check if the hashes of these\n+files match those that are specified. The script returns 0 if everything passes\n+the checks. It returns 1 if either the signature check or the hash check\n+doesn't pass. If an error occurs the return value is >= 2.\n+\n+Logging output goes to stderr and final binary verification data goes to stdout.\n+\n+JSON output can by obtained by setting env BINVERIFY_JSON=1.\n \"\"\"\n-from hashlib import sha256\n+import argparse\n+import difflib\n+import json\n+import logging\n import os\n import subprocess\n+import typing as t\n+import re\n import sys\n-from textwrap import indent\n+import shutil\n+import tempfile\n+import textwrap\n+import urllib.request\n+import enum\n+from hashlib import sha256\n+from pathlib import Path\n \n-WORKINGDIR = \"/tmp/bitcoin_verify_binaries\"\n-HASHFILE = \"hashes.tmp\"\n+# The primary host; this will fail if we can't retrieve files from here.\n HOST1 = \"https://bitcoincore.org\"\n HOST2 = \"https://bitcoin.org\"\n VERSIONPREFIX = \"bitcoin-core-\"\n-SIGNATUREFILENAME = \"SHA256SUMS.asc\"\n+SUMS_FILENAME = 'SHA256SUMS'\n+SIGNATUREFILENAME = f\"{SUMS_FILENAME}.asc\"\n+BUILDER_KEYS_GH_URL = (\n+    \"https://raw.githubusercontent.com/bitcoin/bitcoin/master/contrib/builder-keys/keys.txt\"\n+)\n+\n+\n+class ReturnCode(enum.IntEnum):\n+    SUCCESS = 0\n+    INTEGRITY_FAILURE = 1\n+    FILE_GET_FAILED = 4\n+    FILE_MISSING_FROM_ONE_HOST = 5\n+    FILES_NOT_EQUAL = 6\n+    NO_BINARIES_MATCH = 7\n+    NOT_ENOUGH_GOOD_SIGS = 9\n+    BINARY_DOWNLOAD_FAILED = 10\n+\n+\n+def set_up_logger(is_verbose: bool = True) -> logging.Logger:\n+    \"\"\"Set up a logger that writes to stderr.\"\"\"\n+    log = logging.getLogger(__name__)\n+    log.setLevel(logging.INFO if is_verbose else logging.WARNING)\n+    console = logging.StreamHandler(sys.stderr)  # log to stderr\n+    console.setLevel(logging.DEBUG)\n+    formatter = logging.Formatter('[%(levelname)s] %(message)s')\n+    console.setFormatter(formatter)\n+    log.addHandler(console)\n+    return log\n+\n+\n+log = set_up_logger()\n+\n+\n+def indent(output: str) -> str:\n+    return textwrap.indent(output, '  ')\n+\n+\n+def bool_from_env(key, default=False) -> bool:\n+    if key not in os.environ:\n+        return default\n+    raw = os.environ[key]\n+    return raw in ['1', 'True', 'true']\n+\n+\n+VERSION_FORMAT = \"<major>.<minor>[.<patch>][-rc[0-9]][-platform]\"\n+VERSION_EXAMPLE = \"22.0-x86_64 or 0.21.0-rc2-osx\"\n+\n+parser = argparse.ArgumentParser(description=__doc__)\n+parser.add_argument(\n+    'version', type=str, help=(\n+        f'version of the bitcoin release to download; of the format '\n+        f'{VERSION_FORMAT}. Example: {VERSION_EXAMPLE}')\n+)\n+parser.add_argument(\n+    '-v', '--verbose', action='store_true',\n+    default=bool_from_env('BINVERIFY_VERBOSE'),\n+)\n+parser.add_argument(\n+    '-q', '--quiet', action='store_true',\n+    default=bool_from_env('BINVERIFY_QUIET'),\n+)\n+parser.add_argument(\n+    '--cleanup', action='store_true',\n+    default=bool_from_env('BINVERIFY_CLEANUP'),\n+    help='if specified, clean up files afterwards'\n+)\n+parser.add_argument(\n+    '--noninteractive', action='store_true',\n+    default=bool_from_env('BINVERIFY_NONINTERACTIVE'),\n+    help='if specified, do not block for user input'\n+)\n+parser.add_argument(\n+    '--require-all-hosts', action='store_true',\n+    default=bool_from_env('BINVERIFY_REQUIRE_ALL_HOSTS'),\n+    help=(\n+        f'If set, require all hosts ({HOST1}, {HOST2}) to provide signatures. '\n+        '(Sometimes bitcoin.org lags behind bitcoincore.org.)')\n+)\n+parser.add_argument(\n+    '--bitcoin-src-path', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_BITCOIN_SRC_PATH', ''),\n+    help='specify path to bitcoin repository. Used to find builder keys.',\n+)\n+parser.add_argument(\n+    '--skip-import-builders', action='store_true',\n+    default=bool_from_env('BINVERIFY_SKIP_IMPORT_BUILDERS'),\n+    help='If set, do not prompt to import builder pubkeys',\n+)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766119564",
+      "id" : 766119564,
+      "line" : 135,
+      "node_id" : "PRRC_kwDOABII584tqg6M",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 135,
+      "original_position" : 149,
+      "original_start_line" : 131,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 149,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766119564/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 131,
+      "start_side" : "RIGHT",
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766119564",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766123661"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766123661"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Would be good to say this option is ignored when verifying older releases with only one signature.",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T20:16:57Z",
+      "diff_hunk" : "@@ -2,29 +2,164 @@\n # Copyright (c) 2020 The Bitcoin Core developers\n # Distributed under the MIT software license, see the accompanying\n # file COPYING or http://www.opensource.org/licenses/mit-license.php.\n-\"\"\"Script for verifying Bitcoin Core release binaries\n-\n-This script attempts to download the signature file SHA256SUMS.asc from\n-bitcoincore.org and bitcoin.org and compares them.\n-It first checks if the signature passes, and then downloads the files\n-specified in the file, and checks if the hashes of these files match those\n-that are specified in the signature file.\n-The script returns 0 if everything passes the checks. It returns 1 if either\n-the signature check or the hash check doesn't pass. If an error occurs the\n-return value is >= 2.\n+\"\"\"Script for verifying Bitcoin Core release binaries.\n+\n+This script attempts to download the sum file SHA256SUMS and corresponding\n+signature file SHA256SUMS.asc from bitcoincore.org and bitcoin.org and\n+compares them.\n+\n+The sum-signature file is signed by a number of builder keys. This script\n+ensures that there is a minimum threshold of signatures from pubkeys that\n+we trust. This trust is articulated on the basis of configuration options\n+here, but by default is based upon a unionof (i) local GPG trust settings,\n+and (ii) keys which appear in the builder-keys/keys.txt file.\n+\n+If a minimum good, trusted signature threshold is met on the sum file, we then\n+download the files specified in SHA256SUMS, and check if the hashes of these\n+files match those that are specified. The script returns 0 if everything passes\n+the checks. It returns 1 if either the signature check or the hash check\n+doesn't pass. If an error occurs the return value is >= 2.\n+\n+Logging output goes to stderr and final binary verification data goes to stdout.\n+\n+JSON output can by obtained by setting env BINVERIFY_JSON=1.\n \"\"\"\n-from hashlib import sha256\n+import argparse\n+import difflib\n+import json\n+import logging\n import os\n import subprocess\n+import typing as t\n+import re\n import sys\n-from textwrap import indent\n+import shutil\n+import tempfile\n+import textwrap\n+import urllib.request\n+import enum\n+from hashlib import sha256\n+from pathlib import Path\n \n-WORKINGDIR = \"/tmp/bitcoin_verify_binaries\"\n-HASHFILE = \"hashes.tmp\"\n+# The primary host; this will fail if we can't retrieve files from here.\n HOST1 = \"https://bitcoincore.org\"\n HOST2 = \"https://bitcoin.org\"\n VERSIONPREFIX = \"bitcoin-core-\"\n-SIGNATUREFILENAME = \"SHA256SUMS.asc\"\n+SUMS_FILENAME = 'SHA256SUMS'\n+SIGNATUREFILENAME = f\"{SUMS_FILENAME}.asc\"\n+BUILDER_KEYS_GH_URL = (\n+    \"https://raw.githubusercontent.com/bitcoin/bitcoin/master/contrib/builder-keys/keys.txt\"\n+)\n+\n+\n+class ReturnCode(enum.IntEnum):\n+    SUCCESS = 0\n+    INTEGRITY_FAILURE = 1\n+    FILE_GET_FAILED = 4\n+    FILE_MISSING_FROM_ONE_HOST = 5\n+    FILES_NOT_EQUAL = 6\n+    NO_BINARIES_MATCH = 7\n+    NOT_ENOUGH_GOOD_SIGS = 9\n+    BINARY_DOWNLOAD_FAILED = 10\n+\n+\n+def set_up_logger(is_verbose: bool = True) -> logging.Logger:\n+    \"\"\"Set up a logger that writes to stderr.\"\"\"\n+    log = logging.getLogger(__name__)\n+    log.setLevel(logging.INFO if is_verbose else logging.WARNING)\n+    console = logging.StreamHandler(sys.stderr)  # log to stderr\n+    console.setLevel(logging.DEBUG)\n+    formatter = logging.Formatter('[%(levelname)s] %(message)s')\n+    console.setFormatter(formatter)\n+    log.addHandler(console)\n+    return log\n+\n+\n+log = set_up_logger()\n+\n+\n+def indent(output: str) -> str:\n+    return textwrap.indent(output, '  ')\n+\n+\n+def bool_from_env(key, default=False) -> bool:\n+    if key not in os.environ:\n+        return default\n+    raw = os.environ[key]\n+    return raw in ['1', 'True', 'true']\n+\n+\n+VERSION_FORMAT = \"<major>.<minor>[.<patch>][-rc[0-9]][-platform]\"\n+VERSION_EXAMPLE = \"22.0-x86_64 or 0.21.0-rc2-osx\"\n+\n+parser = argparse.ArgumentParser(description=__doc__)\n+parser.add_argument(\n+    'version', type=str, help=(\n+        f'version of the bitcoin release to download; of the format '\n+        f'{VERSION_FORMAT}. Example: {VERSION_EXAMPLE}')\n+)\n+parser.add_argument(\n+    '-v', '--verbose', action='store_true',\n+    default=bool_from_env('BINVERIFY_VERBOSE'),\n+)\n+parser.add_argument(\n+    '-q', '--quiet', action='store_true',\n+    default=bool_from_env('BINVERIFY_QUIET'),\n+)\n+parser.add_argument(\n+    '--cleanup', action='store_true',\n+    default=bool_from_env('BINVERIFY_CLEANUP'),\n+    help='if specified, clean up files afterwards'\n+)\n+parser.add_argument(\n+    '--noninteractive', action='store_true',\n+    default=bool_from_env('BINVERIFY_NONINTERACTIVE'),\n+    help='if specified, do not block for user input'\n+)\n+parser.add_argument(\n+    '--require-all-hosts', action='store_true',\n+    default=bool_from_env('BINVERIFY_REQUIRE_ALL_HOSTS'),\n+    help=(\n+        f'If set, require all hosts ({HOST1}, {HOST2}) to provide signatures. '\n+        '(Sometimes bitcoin.org lags behind bitcoincore.org.)')\n+)\n+parser.add_argument(\n+    '--bitcoin-src-path', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_BITCOIN_SRC_PATH', ''),\n+    help='specify path to bitcoin repository. Used to find builder keys.',\n+)\n+parser.add_argument(\n+    '--skip-import-builders', action='store_true',\n+    default=bool_from_env('BINVERIFY_SKIP_IMPORT_BUILDERS'),\n+    help='If set, do not prompt to import builder pubkeys',\n+)\n+parser.add_argument(\n+    '--min-trusted-sigs', type=int, action='store', nargs='?',\n+    default=int(os.environ.get('BINVERIFY_MIN_TRUSTED_SIGS', 4)),\n+    help=(\n+        'The minimum number of good signatures from recognized keys to '\n+        'require successful termination.'),",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766123661",
+      "id" : 766123661,
+      "line" : 141,
+      "node_id" : "PRRC_kwDOABII584tqh6N",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 141,
+      "original_position" : 155,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 155,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766123661/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766123661",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766126255"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766126255"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Would be good to say this has nothing to with GPG trusted keys\r\n\r\nAlso might be good to say \"separated by commas\" instead of \"specified as CSV\". CSV implies extra complexity around escaping",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T20:21:00Z",
+      "diff_hunk" : "@@ -2,29 +2,164 @@\n # Copyright (c) 2020 The Bitcoin Core developers\n # Distributed under the MIT software license, see the accompanying\n # file COPYING or http://www.opensource.org/licenses/mit-license.php.\n-\"\"\"Script for verifying Bitcoin Core release binaries\n-\n-This script attempts to download the signature file SHA256SUMS.asc from\n-bitcoincore.org and bitcoin.org and compares them.\n-It first checks if the signature passes, and then downloads the files\n-specified in the file, and checks if the hashes of these files match those\n-that are specified in the signature file.\n-The script returns 0 if everything passes the checks. It returns 1 if either\n-the signature check or the hash check doesn't pass. If an error occurs the\n-return value is >= 2.\n+\"\"\"Script for verifying Bitcoin Core release binaries.\n+\n+This script attempts to download the sum file SHA256SUMS and corresponding\n+signature file SHA256SUMS.asc from bitcoincore.org and bitcoin.org and\n+compares them.\n+\n+The sum-signature file is signed by a number of builder keys. This script\n+ensures that there is a minimum threshold of signatures from pubkeys that\n+we trust. This trust is articulated on the basis of configuration options\n+here, but by default is based upon a unionof (i) local GPG trust settings,\n+and (ii) keys which appear in the builder-keys/keys.txt file.\n+\n+If a minimum good, trusted signature threshold is met on the sum file, we then\n+download the files specified in SHA256SUMS, and check if the hashes of these\n+files match those that are specified. The script returns 0 if everything passes\n+the checks. It returns 1 if either the signature check or the hash check\n+doesn't pass. If an error occurs the return value is >= 2.\n+\n+Logging output goes to stderr and final binary verification data goes to stdout.\n+\n+JSON output can by obtained by setting env BINVERIFY_JSON=1.\n \"\"\"\n-from hashlib import sha256\n+import argparse\n+import difflib\n+import json\n+import logging\n import os\n import subprocess\n+import typing as t\n+import re\n import sys\n-from textwrap import indent\n+import shutil\n+import tempfile\n+import textwrap\n+import urllib.request\n+import enum\n+from hashlib import sha256\n+from pathlib import Path\n \n-WORKINGDIR = \"/tmp/bitcoin_verify_binaries\"\n-HASHFILE = \"hashes.tmp\"\n+# The primary host; this will fail if we can't retrieve files from here.\n HOST1 = \"https://bitcoincore.org\"\n HOST2 = \"https://bitcoin.org\"\n VERSIONPREFIX = \"bitcoin-core-\"\n-SIGNATUREFILENAME = \"SHA256SUMS.asc\"\n+SUMS_FILENAME = 'SHA256SUMS'\n+SIGNATUREFILENAME = f\"{SUMS_FILENAME}.asc\"\n+BUILDER_KEYS_GH_URL = (\n+    \"https://raw.githubusercontent.com/bitcoin/bitcoin/master/contrib/builder-keys/keys.txt\"\n+)\n+\n+\n+class ReturnCode(enum.IntEnum):\n+    SUCCESS = 0\n+    INTEGRITY_FAILURE = 1\n+    FILE_GET_FAILED = 4\n+    FILE_MISSING_FROM_ONE_HOST = 5\n+    FILES_NOT_EQUAL = 6\n+    NO_BINARIES_MATCH = 7\n+    NOT_ENOUGH_GOOD_SIGS = 9\n+    BINARY_DOWNLOAD_FAILED = 10\n+\n+\n+def set_up_logger(is_verbose: bool = True) -> logging.Logger:\n+    \"\"\"Set up a logger that writes to stderr.\"\"\"\n+    log = logging.getLogger(__name__)\n+    log.setLevel(logging.INFO if is_verbose else logging.WARNING)\n+    console = logging.StreamHandler(sys.stderr)  # log to stderr\n+    console.setLevel(logging.DEBUG)\n+    formatter = logging.Formatter('[%(levelname)s] %(message)s')\n+    console.setFormatter(formatter)\n+    log.addHandler(console)\n+    return log\n+\n+\n+log = set_up_logger()\n+\n+\n+def indent(output: str) -> str:\n+    return textwrap.indent(output, '  ')\n+\n+\n+def bool_from_env(key, default=False) -> bool:\n+    if key not in os.environ:\n+        return default\n+    raw = os.environ[key]\n+    return raw in ['1', 'True', 'true']\n+\n+\n+VERSION_FORMAT = \"<major>.<minor>[.<patch>][-rc[0-9]][-platform]\"\n+VERSION_EXAMPLE = \"22.0-x86_64 or 0.21.0-rc2-osx\"\n+\n+parser = argparse.ArgumentParser(description=__doc__)\n+parser.add_argument(\n+    'version', type=str, help=(\n+        f'version of the bitcoin release to download; of the format '\n+        f'{VERSION_FORMAT}. Example: {VERSION_EXAMPLE}')\n+)\n+parser.add_argument(\n+    '-v', '--verbose', action='store_true',\n+    default=bool_from_env('BINVERIFY_VERBOSE'),\n+)\n+parser.add_argument(\n+    '-q', '--quiet', action='store_true',\n+    default=bool_from_env('BINVERIFY_QUIET'),\n+)\n+parser.add_argument(\n+    '--cleanup', action='store_true',\n+    default=bool_from_env('BINVERIFY_CLEANUP'),\n+    help='if specified, clean up files afterwards'\n+)\n+parser.add_argument(\n+    '--noninteractive', action='store_true',\n+    default=bool_from_env('BINVERIFY_NONINTERACTIVE'),\n+    help='if specified, do not block for user input'\n+)\n+parser.add_argument(\n+    '--require-all-hosts', action='store_true',\n+    default=bool_from_env('BINVERIFY_REQUIRE_ALL_HOSTS'),\n+    help=(\n+        f'If set, require all hosts ({HOST1}, {HOST2}) to provide signatures. '\n+        '(Sometimes bitcoin.org lags behind bitcoincore.org.)')\n+)\n+parser.add_argument(\n+    '--bitcoin-src-path', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_BITCOIN_SRC_PATH', ''),\n+    help='specify path to bitcoin repository. Used to find builder keys.',\n+)\n+parser.add_argument(\n+    '--skip-import-builders', action='store_true',\n+    default=bool_from_env('BINVERIFY_SKIP_IMPORT_BUILDERS'),\n+    help='If set, do not prompt to import builder pubkeys',\n+)\n+parser.add_argument(\n+    '--min-trusted-sigs', type=int, action='store', nargs='?',\n+    default=int(os.environ.get('BINVERIFY_MIN_TRUSTED_SIGS', 4)),\n+    help=(\n+        'The minimum number of good signatures from recognized keys to '\n+        'require successful termination.'),\n+)\n+parser.add_argument(\n+    '--keyserver', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_KEYSERVER', 'hkp://keyserver.ubuntu.com'),\n+    help='which keyserver to use',\n+)\n+parser.add_argument(\n+    '--trusted-keys', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_TRUSTED_KEYS', ''),\n+    help='A list of trusted builder GPG keys, specified as CSV',",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766126255",
+      "id" : 766126255,
+      "line" : 151,
+      "node_id" : "PRRC_kwDOABII584tqiiv",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 151,
+      "original_position" : 165,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 165,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766126255/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766126255",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766134684"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766134684"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Would call this `--trust-builder-keys` to be consistent with `--trusted-keys` and `--min-trusted-sigs`.\r\n\r\nCurrent double negation and interaction with environment variable also seems awkward and has weird edge cases, like there's no way to set the argument to false if the environment variable sets it to true.\r\n\r\nMaybe this would be better:\r\n\r\n```python\r\nparser.add_argument('--trust-builder-keys', dest='trust_builder_keys', action='store_true', help=\"Treat keys in local builder-keys/keys.txt file as trusted\")\r\nparser.add_argument('--no-trust-builder-keys', dest='trust_builder_keys', action='store_false')\r\nparser.set_defaults(trust_builder_keys=bool_from_env('BINVERIFY_TRUST_BUILDER_KEYS', True))\r\n```",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T20:34:44Z",
+      "diff_hunk" : "@@ -2,29 +2,164 @@\n # Copyright (c) 2020 The Bitcoin Core developers\n # Distributed under the MIT software license, see the accompanying\n # file COPYING or http://www.opensource.org/licenses/mit-license.php.\n-\"\"\"Script for verifying Bitcoin Core release binaries\n-\n-This script attempts to download the signature file SHA256SUMS.asc from\n-bitcoincore.org and bitcoin.org and compares them.\n-It first checks if the signature passes, and then downloads the files\n-specified in the file, and checks if the hashes of these files match those\n-that are specified in the signature file.\n-The script returns 0 if everything passes the checks. It returns 1 if either\n-the signature check or the hash check doesn't pass. If an error occurs the\n-return value is >= 2.\n+\"\"\"Script for verifying Bitcoin Core release binaries.\n+\n+This script attempts to download the sum file SHA256SUMS and corresponding\n+signature file SHA256SUMS.asc from bitcoincore.org and bitcoin.org and\n+compares them.\n+\n+The sum-signature file is signed by a number of builder keys. This script\n+ensures that there is a minimum threshold of signatures from pubkeys that\n+we trust. This trust is articulated on the basis of configuration options\n+here, but by default is based upon a unionof (i) local GPG trust settings,\n+and (ii) keys which appear in the builder-keys/keys.txt file.\n+\n+If a minimum good, trusted signature threshold is met on the sum file, we then\n+download the files specified in SHA256SUMS, and check if the hashes of these\n+files match those that are specified. The script returns 0 if everything passes\n+the checks. It returns 1 if either the signature check or the hash check\n+doesn't pass. If an error occurs the return value is >= 2.\n+\n+Logging output goes to stderr and final binary verification data goes to stdout.\n+\n+JSON output can by obtained by setting env BINVERIFY_JSON=1.\n \"\"\"\n-from hashlib import sha256\n+import argparse\n+import difflib\n+import json\n+import logging\n import os\n import subprocess\n+import typing as t\n+import re\n import sys\n-from textwrap import indent\n+import shutil\n+import tempfile\n+import textwrap\n+import urllib.request\n+import enum\n+from hashlib import sha256\n+from pathlib import Path\n \n-WORKINGDIR = \"/tmp/bitcoin_verify_binaries\"\n-HASHFILE = \"hashes.tmp\"\n+# The primary host; this will fail if we can't retrieve files from here.\n HOST1 = \"https://bitcoincore.org\"\n HOST2 = \"https://bitcoin.org\"\n VERSIONPREFIX = \"bitcoin-core-\"\n-SIGNATUREFILENAME = \"SHA256SUMS.asc\"\n+SUMS_FILENAME = 'SHA256SUMS'\n+SIGNATUREFILENAME = f\"{SUMS_FILENAME}.asc\"\n+BUILDER_KEYS_GH_URL = (\n+    \"https://raw.githubusercontent.com/bitcoin/bitcoin/master/contrib/builder-keys/keys.txt\"\n+)\n+\n+\n+class ReturnCode(enum.IntEnum):\n+    SUCCESS = 0\n+    INTEGRITY_FAILURE = 1\n+    FILE_GET_FAILED = 4\n+    FILE_MISSING_FROM_ONE_HOST = 5\n+    FILES_NOT_EQUAL = 6\n+    NO_BINARIES_MATCH = 7\n+    NOT_ENOUGH_GOOD_SIGS = 9\n+    BINARY_DOWNLOAD_FAILED = 10\n+\n+\n+def set_up_logger(is_verbose: bool = True) -> logging.Logger:\n+    \"\"\"Set up a logger that writes to stderr.\"\"\"\n+    log = logging.getLogger(__name__)\n+    log.setLevel(logging.INFO if is_verbose else logging.WARNING)\n+    console = logging.StreamHandler(sys.stderr)  # log to stderr\n+    console.setLevel(logging.DEBUG)\n+    formatter = logging.Formatter('[%(levelname)s] %(message)s')\n+    console.setFormatter(formatter)\n+    log.addHandler(console)\n+    return log\n+\n+\n+log = set_up_logger()\n+\n+\n+def indent(output: str) -> str:\n+    return textwrap.indent(output, '  ')\n+\n+\n+def bool_from_env(key, default=False) -> bool:\n+    if key not in os.environ:\n+        return default\n+    raw = os.environ[key]\n+    return raw in ['1', 'True', 'true']\n+\n+\n+VERSION_FORMAT = \"<major>.<minor>[.<patch>][-rc[0-9]][-platform]\"\n+VERSION_EXAMPLE = \"22.0-x86_64 or 0.21.0-rc2-osx\"\n+\n+parser = argparse.ArgumentParser(description=__doc__)\n+parser.add_argument(\n+    'version', type=str, help=(\n+        f'version of the bitcoin release to download; of the format '\n+        f'{VERSION_FORMAT}. Example: {VERSION_EXAMPLE}')\n+)\n+parser.add_argument(\n+    '-v', '--verbose', action='store_true',\n+    default=bool_from_env('BINVERIFY_VERBOSE'),\n+)\n+parser.add_argument(\n+    '-q', '--quiet', action='store_true',\n+    default=bool_from_env('BINVERIFY_QUIET'),\n+)\n+parser.add_argument(\n+    '--cleanup', action='store_true',\n+    default=bool_from_env('BINVERIFY_CLEANUP'),\n+    help='if specified, clean up files afterwards'\n+)\n+parser.add_argument(\n+    '--noninteractive', action='store_true',\n+    default=bool_from_env('BINVERIFY_NONINTERACTIVE'),\n+    help='if specified, do not block for user input'\n+)\n+parser.add_argument(\n+    '--require-all-hosts', action='store_true',\n+    default=bool_from_env('BINVERIFY_REQUIRE_ALL_HOSTS'),\n+    help=(\n+        f'If set, require all hosts ({HOST1}, {HOST2}) to provide signatures. '\n+        '(Sometimes bitcoin.org lags behind bitcoincore.org.)')\n+)\n+parser.add_argument(\n+    '--bitcoin-src-path', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_BITCOIN_SRC_PATH', ''),\n+    help='specify path to bitcoin repository. Used to find builder keys.',\n+)\n+parser.add_argument(\n+    '--skip-import-builders', action='store_true',\n+    default=bool_from_env('BINVERIFY_SKIP_IMPORT_BUILDERS'),\n+    help='If set, do not prompt to import builder pubkeys',\n+)\n+parser.add_argument(\n+    '--min-trusted-sigs', type=int, action='store', nargs='?',\n+    default=int(os.environ.get('BINVERIFY_MIN_TRUSTED_SIGS', 4)),\n+    help=(\n+        'The minimum number of good signatures from recognized keys to '\n+        'require successful termination.'),\n+)\n+parser.add_argument(\n+    '--keyserver', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_KEYSERVER', 'hkp://keyserver.ubuntu.com'),\n+    help='which keyserver to use',\n+)\n+parser.add_argument(\n+    '--trusted-keys', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_TRUSTED_KEYS', ''),\n+    help='A list of trusted builder GPG keys, specified as CSV',\n+)\n+parser.add_argument(\n+    '--no-builder-keys', action='store_true',",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766134684",
+      "id" : 766134684,
+      "line" : 154,
+      "node_id" : "PRRC_kwDOABII584tqkmc",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 154,
+      "original_position" : 168,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 168,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766134684/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766134684",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766142230"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766142230"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "There are gaps in numbering here, so maybe would renumber, but I think it would be better to simplify semantics and just return SUCCESS-Verification succeeded, binary is trusted, FAILED-Verification failed, binary is not trusted, or ERROR-Not possible to verify, need to fix errors or retry\r\n\r\nMore detailed errors and status information would seem more appropriate to include in text and json output than condense into a status byte.",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T20:47:15Z",
+      "diff_hunk" : "@@ -2,29 +2,164 @@\n # Copyright (c) 2020 The Bitcoin Core developers\n # Distributed under the MIT software license, see the accompanying\n # file COPYING or http://www.opensource.org/licenses/mit-license.php.\n-\"\"\"Script for verifying Bitcoin Core release binaries\n-\n-This script attempts to download the signature file SHA256SUMS.asc from\n-bitcoincore.org and bitcoin.org and compares them.\n-It first checks if the signature passes, and then downloads the files\n-specified in the file, and checks if the hashes of these files match those\n-that are specified in the signature file.\n-The script returns 0 if everything passes the checks. It returns 1 if either\n-the signature check or the hash check doesn't pass. If an error occurs the\n-return value is >= 2.\n+\"\"\"Script for verifying Bitcoin Core release binaries.\n+\n+This script attempts to download the sum file SHA256SUMS and corresponding\n+signature file SHA256SUMS.asc from bitcoincore.org and bitcoin.org and\n+compares them.\n+\n+The sum-signature file is signed by a number of builder keys. This script\n+ensures that there is a minimum threshold of signatures from pubkeys that\n+we trust. This trust is articulated on the basis of configuration options\n+here, but by default is based upon a unionof (i) local GPG trust settings,\n+and (ii) keys which appear in the builder-keys/keys.txt file.\n+\n+If a minimum good, trusted signature threshold is met on the sum file, we then\n+download the files specified in SHA256SUMS, and check if the hashes of these\n+files match those that are specified. The script returns 0 if everything passes\n+the checks. It returns 1 if either the signature check or the hash check\n+doesn't pass. If an error occurs the return value is >= 2.\n+\n+Logging output goes to stderr and final binary verification data goes to stdout.\n+\n+JSON output can by obtained by setting env BINVERIFY_JSON=1.\n \"\"\"\n-from hashlib import sha256\n+import argparse\n+import difflib\n+import json\n+import logging\n import os\n import subprocess\n+import typing as t\n+import re\n import sys\n-from textwrap import indent\n+import shutil\n+import tempfile\n+import textwrap\n+import urllib.request\n+import enum\n+from hashlib import sha256\n+from pathlib import Path\n \n-WORKINGDIR = \"/tmp/bitcoin_verify_binaries\"\n-HASHFILE = \"hashes.tmp\"\n+# The primary host; this will fail if we can't retrieve files from here.\n HOST1 = \"https://bitcoincore.org\"\n HOST2 = \"https://bitcoin.org\"\n VERSIONPREFIX = \"bitcoin-core-\"\n-SIGNATUREFILENAME = \"SHA256SUMS.asc\"\n+SUMS_FILENAME = 'SHA256SUMS'\n+SIGNATUREFILENAME = f\"{SUMS_FILENAME}.asc\"\n+BUILDER_KEYS_GH_URL = (\n+    \"https://raw.githubusercontent.com/bitcoin/bitcoin/master/contrib/builder-keys/keys.txt\"\n+)\n+\n+\n+class ReturnCode(enum.IntEnum):\n+    SUCCESS = 0\n+    INTEGRITY_FAILURE = 1\n+    FILE_GET_FAILED = 4\n+    FILE_MISSING_FROM_ONE_HOST = 5\n+    FILES_NOT_EQUAL = 6\n+    NO_BINARIES_MATCH = 7\n+    NOT_ENOUGH_GOOD_SIGS = 9\n+    BINARY_DOWNLOAD_FAILED = 10",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766142230",
+      "id" : 766142230,
+      "line" : 63,
+      "node_id" : "PRRC_kwDOABII584tqmcW",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 63,
+      "original_position" : 77,
+      "original_start_line" : 57,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 77,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766142230/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 57,
+      "start_side" : "RIGHT",
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766142230",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766144667"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766144667"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Why is this being called here instead of in main? Would be more straightforward if log.setLevel was just called once in `set_up_logger` instead of changing later in main()",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T20:51:00Z",
+      "diff_hunk" : "@@ -2,29 +2,164 @@\n # Copyright (c) 2020 The Bitcoin Core developers\n # Distributed under the MIT software license, see the accompanying\n # file COPYING or http://www.opensource.org/licenses/mit-license.php.\n-\"\"\"Script for verifying Bitcoin Core release binaries\n-\n-This script attempts to download the signature file SHA256SUMS.asc from\n-bitcoincore.org and bitcoin.org and compares them.\n-It first checks if the signature passes, and then downloads the files\n-specified in the file, and checks if the hashes of these files match those\n-that are specified in the signature file.\n-The script returns 0 if everything passes the checks. It returns 1 if either\n-the signature check or the hash check doesn't pass. If an error occurs the\n-return value is >= 2.\n+\"\"\"Script for verifying Bitcoin Core release binaries.\n+\n+This script attempts to download the sum file SHA256SUMS and corresponding\n+signature file SHA256SUMS.asc from bitcoincore.org and bitcoin.org and\n+compares them.\n+\n+The sum-signature file is signed by a number of builder keys. This script\n+ensures that there is a minimum threshold of signatures from pubkeys that\n+we trust. This trust is articulated on the basis of configuration options\n+here, but by default is based upon a unionof (i) local GPG trust settings,\n+and (ii) keys which appear in the builder-keys/keys.txt file.\n+\n+If a minimum good, trusted signature threshold is met on the sum file, we then\n+download the files specified in SHA256SUMS, and check if the hashes of these\n+files match those that are specified. The script returns 0 if everything passes\n+the checks. It returns 1 if either the signature check or the hash check\n+doesn't pass. If an error occurs the return value is >= 2.\n+\n+Logging output goes to stderr and final binary verification data goes to stdout.\n+\n+JSON output can by obtained by setting env BINVERIFY_JSON=1.\n \"\"\"\n-from hashlib import sha256\n+import argparse\n+import difflib\n+import json\n+import logging\n import os\n import subprocess\n+import typing as t\n+import re\n import sys\n-from textwrap import indent\n+import shutil\n+import tempfile\n+import textwrap\n+import urllib.request\n+import enum\n+from hashlib import sha256\n+from pathlib import Path\n \n-WORKINGDIR = \"/tmp/bitcoin_verify_binaries\"\n-HASHFILE = \"hashes.tmp\"\n+# The primary host; this will fail if we can't retrieve files from here.\n HOST1 = \"https://bitcoincore.org\"\n HOST2 = \"https://bitcoin.org\"\n VERSIONPREFIX = \"bitcoin-core-\"\n-SIGNATUREFILENAME = \"SHA256SUMS.asc\"\n+SUMS_FILENAME = 'SHA256SUMS'\n+SIGNATUREFILENAME = f\"{SUMS_FILENAME}.asc\"\n+BUILDER_KEYS_GH_URL = (\n+    \"https://raw.githubusercontent.com/bitcoin/bitcoin/master/contrib/builder-keys/keys.txt\"\n+)\n+\n+\n+class ReturnCode(enum.IntEnum):\n+    SUCCESS = 0\n+    INTEGRITY_FAILURE = 1\n+    FILE_GET_FAILED = 4\n+    FILE_MISSING_FROM_ONE_HOST = 5\n+    FILES_NOT_EQUAL = 6\n+    NO_BINARIES_MATCH = 7\n+    NOT_ENOUGH_GOOD_SIGS = 9\n+    BINARY_DOWNLOAD_FAILED = 10\n+\n+\n+def set_up_logger(is_verbose: bool = True) -> logging.Logger:\n+    \"\"\"Set up a logger that writes to stderr.\"\"\"\n+    log = logging.getLogger(__name__)\n+    log.setLevel(logging.INFO if is_verbose else logging.WARNING)\n+    console = logging.StreamHandler(sys.stderr)  # log to stderr\n+    console.setLevel(logging.DEBUG)\n+    formatter = logging.Formatter('[%(levelname)s] %(message)s')\n+    console.setFormatter(formatter)\n+    log.addHandler(console)\n+    return log\n+\n+\n+log = set_up_logger()",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766144667",
+      "id" : 766144667,
+      "line" : 78,
+      "node_id" : "PRRC_kwDOABII584tqnCb",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 78,
+      "original_position" : 92,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 92,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766144667/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766144667",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766147623"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766147623"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I guess this is preexisting code but parse_version_string below seems to silently accept len(parts) >= 3 instead of treating it like an error. Would seem more reliable to parse the full string and not silently ignore any parts. Otherwise script might return success while not verifying the thing it was supposed to verify.",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T20:55:47Z",
+      "diff_hunk" : "@@ -2,29 +2,164 @@\n # Copyright (c) 2020 The Bitcoin Core developers\n # Distributed under the MIT software license, see the accompanying\n # file COPYING or http://www.opensource.org/licenses/mit-license.php.\n-\"\"\"Script for verifying Bitcoin Core release binaries\n-\n-This script attempts to download the signature file SHA256SUMS.asc from\n-bitcoincore.org and bitcoin.org and compares them.\n-It first checks if the signature passes, and then downloads the files\n-specified in the file, and checks if the hashes of these files match those\n-that are specified in the signature file.\n-The script returns 0 if everything passes the checks. It returns 1 if either\n-the signature check or the hash check doesn't pass. If an error occurs the\n-return value is >= 2.\n+\"\"\"Script for verifying Bitcoin Core release binaries.\n+\n+This script attempts to download the sum file SHA256SUMS and corresponding\n+signature file SHA256SUMS.asc from bitcoincore.org and bitcoin.org and\n+compares them.\n+\n+The sum-signature file is signed by a number of builder keys. This script\n+ensures that there is a minimum threshold of signatures from pubkeys that\n+we trust. This trust is articulated on the basis of configuration options\n+here, but by default is based upon a unionof (i) local GPG trust settings,\n+and (ii) keys which appear in the builder-keys/keys.txt file.\n+\n+If a minimum good, trusted signature threshold is met on the sum file, we then\n+download the files specified in SHA256SUMS, and check if the hashes of these\n+files match those that are specified. The script returns 0 if everything passes\n+the checks. It returns 1 if either the signature check or the hash check\n+doesn't pass. If an error occurs the return value is >= 2.\n+\n+Logging output goes to stderr and final binary verification data goes to stdout.\n+\n+JSON output can by obtained by setting env BINVERIFY_JSON=1.\n \"\"\"\n-from hashlib import sha256\n+import argparse\n+import difflib\n+import json\n+import logging\n import os\n import subprocess\n+import typing as t\n+import re\n import sys\n-from textwrap import indent\n+import shutil\n+import tempfile\n+import textwrap\n+import urllib.request\n+import enum\n+from hashlib import sha256\n+from pathlib import Path\n \n-WORKINGDIR = \"/tmp/bitcoin_verify_binaries\"\n-HASHFILE = \"hashes.tmp\"\n+# The primary host; this will fail if we can't retrieve files from here.\n HOST1 = \"https://bitcoincore.org\"\n HOST2 = \"https://bitcoin.org\"\n VERSIONPREFIX = \"bitcoin-core-\"\n-SIGNATUREFILENAME = \"SHA256SUMS.asc\"\n+SUMS_FILENAME = 'SHA256SUMS'\n+SIGNATUREFILENAME = f\"{SUMS_FILENAME}.asc\"\n+BUILDER_KEYS_GH_URL = (\n+    \"https://raw.githubusercontent.com/bitcoin/bitcoin/master/contrib/builder-keys/keys.txt\"\n+)\n+\n+\n+class ReturnCode(enum.IntEnum):\n+    SUCCESS = 0\n+    INTEGRITY_FAILURE = 1\n+    FILE_GET_FAILED = 4\n+    FILE_MISSING_FROM_ONE_HOST = 5\n+    FILES_NOT_EQUAL = 6\n+    NO_BINARIES_MATCH = 7\n+    NOT_ENOUGH_GOOD_SIGS = 9\n+    BINARY_DOWNLOAD_FAILED = 10\n+\n+\n+def set_up_logger(is_verbose: bool = True) -> logging.Logger:\n+    \"\"\"Set up a logger that writes to stderr.\"\"\"\n+    log = logging.getLogger(__name__)\n+    log.setLevel(logging.INFO if is_verbose else logging.WARNING)\n+    console = logging.StreamHandler(sys.stderr)  # log to stderr\n+    console.setLevel(logging.DEBUG)\n+    formatter = logging.Formatter('[%(levelname)s] %(message)s')\n+    console.setFormatter(formatter)\n+    log.addHandler(console)\n+    return log\n+\n+\n+log = set_up_logger()\n+\n+\n+def indent(output: str) -> str:\n+    return textwrap.indent(output, '  ')\n+\n+\n+def bool_from_env(key, default=False) -> bool:\n+    if key not in os.environ:\n+        return default\n+    raw = os.environ[key]\n+    return raw in ['1', 'True', 'true']\n+\n+\n+VERSION_FORMAT = \"<major>.<minor>[.<patch>][-rc[0-9]][-platform]\"\n+VERSION_EXAMPLE = \"22.0-x86_64 or 0.21.0-rc2-osx\"\n+\n+parser = argparse.ArgumentParser(description=__doc__)\n+parser.add_argument(\n+    'version', type=str, help=(\n+        f'version of the bitcoin release to download; of the format '\n+        f'{VERSION_FORMAT}. Example: {VERSION_EXAMPLE}')\n+)\n+parser.add_argument(\n+    '-v', '--verbose', action='store_true',\n+    default=bool_from_env('BINVERIFY_VERBOSE'),\n+)\n+parser.add_argument(\n+    '-q', '--quiet', action='store_true',\n+    default=bool_from_env('BINVERIFY_QUIET'),\n+)\n+parser.add_argument(\n+    '--cleanup', action='store_true',\n+    default=bool_from_env('BINVERIFY_CLEANUP'),\n+    help='if specified, clean up files afterwards'\n+)\n+parser.add_argument(\n+    '--noninteractive', action='store_true',\n+    default=bool_from_env('BINVERIFY_NONINTERACTIVE'),\n+    help='if specified, do not block for user input'\n+)\n+parser.add_argument(\n+    '--require-all-hosts', action='store_true',\n+    default=bool_from_env('BINVERIFY_REQUIRE_ALL_HOSTS'),\n+    help=(\n+        f'If set, require all hosts ({HOST1}, {HOST2}) to provide signatures. '\n+        '(Sometimes bitcoin.org lags behind bitcoincore.org.)')\n+)\n+parser.add_argument(\n+    '--bitcoin-src-path', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_BITCOIN_SRC_PATH', ''),\n+    help='specify path to bitcoin repository. Used to find builder keys.',\n+)\n+parser.add_argument(\n+    '--skip-import-builders', action='store_true',\n+    default=bool_from_env('BINVERIFY_SKIP_IMPORT_BUILDERS'),\n+    help='If set, do not prompt to import builder pubkeys',\n+)\n+parser.add_argument(\n+    '--min-trusted-sigs', type=int, action='store', nargs='?',\n+    default=int(os.environ.get('BINVERIFY_MIN_TRUSTED_SIGS', 4)),\n+    help=(\n+        'The minimum number of good signatures from recognized keys to '\n+        'require successful termination.'),\n+)\n+parser.add_argument(\n+    '--keyserver', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_KEYSERVER', 'hkp://keyserver.ubuntu.com'),\n+    help='which keyserver to use',\n+)\n+parser.add_argument(\n+    '--trusted-keys', action='store', nargs='?',\n+    default=os.environ.get('BINVERIFY_TRUSTED_KEYS', ''),\n+    help='A list of trusted builder GPG keys, specified as CSV',\n+)\n+parser.add_argument(\n+    '--no-builder-keys', action='store_true',\n+    default=bool_from_env('BINVERIFY_NO_BUILDER_KEYS'),\n+    help='If set, do not trust the builder-keys from the bitcoin repo by default',\n+)\n+parser.add_argument(\n+    '--json', action='store_true',\n+    default=bool_from_env('BINVERIFY_JSON'),\n+    help='If set, output the result as JSON',\n+)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766147623",
+      "id" : 766147623,
+      "line" : 162,
+      "node_id" : "PRRC_kwDOABII584tqnwn",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 162,
+      "original_position" : 176,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 176,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766147623/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766147623",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766153692"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766153692"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "This is calling wget without `-O` so if wget decides to write a .1, .2 file then then code below will verify the old existing file not the new downloaded file. Would be better to pass `binary_filename` as an explicit second argument to `download_with_wget`",
+      "commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "created_at" : "2021-12-09T21:05:43Z",
+      "diff_hunk" : "@@ -59,124 +194,457 @@ def download_with_wget(remote_file, local_file=None):\n     return result.returncode == 0, result.stdout.decode().rstrip()\n \n \n+def download_lines_with_urllib(url) -> (bool, [str]):\n+    \"\"\"Get (success, text lines of a file) over HTTP.\"\"\"\n+    try:\n+        return True, [\n+            line.strip().decode() for line in urllib.request.urlopen(url).readlines()]\n+    except urllib.request.HTTPError:\n+        log.warning(f\"HTTP request to {url} failed (HTTPError)\")\n+    except Exception as e:\n+        log.warning(f\"HTTP request to {url} failed ({e})\")\n+    return (False, [])\n+\n+\n+def verify_with_gpg(\n+    signature_filename,\n+    output_filename: t.Optional[str] = None\n+) -> t.Tuple[int, str]:\n+    # Enforce English output since we're relying on output that contains natural language.\n+    # Use string-shell form (vs. args as list) because passing LANGUAGE via `env` doesn't\n+    # seem to work.\n+    args = (\n+        'LANGUAGE=en gpg --yes --decrypt '\n+        + (f' --output {output_filename} ' if output_filename else '')\n+        + signature_filename)\n+\n+    result = subprocess.run(args, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n+    return result.returncode, result.stdout.decode().rstrip()\n+\n+\n+def remove_files(filenames):\n+    for filename in filenames:\n+        os.remove(filename)\n+\n+\n+class SigData:\n+    \"\"\"GPG signature data as parsed from GPG stdout.\"\"\"\n+    def __init__(self, key: str, name: str, trusted: bool, status: str):\n+        self.key = key\n+        self.name = name\n+        self.trusted = trusted\n+        self.status = status\n+\n+    def __repr__(self):\n+        return (\n+            \"SigData(%r, %r, trusted=%s, status=%r)\" %\n+            (self.key, self.name, self.trusted, self.status))\n+\n+\n+def parse_gpg_result(output: str) -> ([SigData], [SigData], [SigData]):\n+    \"\"\"Returns good, unknown, and bad signatures from GPG stdout.\"\"\"\n+    good_sigs = []\n+    unknown_sigs = []\n+    bad_sigs = []\n+    total_resolved_sigs = 0\n+    curr_key = None\n+\n+    for i, line in enumerate(output):\n+        if 'using RSA key' in line:\n+            if curr_key:\n+                raise RuntimeError(\n+                    f\"WARNING: encountered a new sig without resolving the last ({curr_key}) - \"\n+                    \"this could mean we have encountered a bad signature! check GPG output!\")\n+            curr_key = line.split('key ')[-1].strip()\n+            assert len(curr_key) == 40 or (len(curr_key) == 18 and curr_key.startswith('0x'))\n+\n+        if \"Can't check signature: No public key\" in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            unknown_sigs.append(SigData(curr_key, '', False, ''))\n+            curr_key = None\n+\n+        if 'Good signature from ' in line:\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+\n+            # It's safe to index output[i + 1] because if we saw a good sig, there should\n+            # always be another line\n+            trusted = (\n+                'This key is not certified with a trusted signature' not in output[i + 1])\n+            good_sigs.append(SigData(curr_key, name, trusted, status))\n+            curr_key = None\n+\n+        if 'bad signature from' in line.lower():\n+            if not curr_key:\n+                raise RuntimeError(\"failed to detect signature being resolved\")\n+            name, status = parse_gpg_from_line(line)\n+            bad_sigs.append(SigData(curr_key, name, False, status))\n+            curr_key = None\n+\n+        # Track total signatures included\n+        if ': Signature made ' in line:\n+            total_resolved_sigs += 1\n+\n+    all_found = len(good_sigs + bad_sigs + unknown_sigs)\n+    if all_found != total_resolved_sigs:\n+        raise RuntimeError(\n+            f\"failed to evaluate all signatures: found {all_found} \"\n+            f\"but expected {total_resolved_sigs}\")\n+\n+    return (good_sigs, unknown_sigs, bad_sigs)\n+\n+\n+def parse_gpg_from_line(line: str) -> (str, str):\n+    \"\"\"Returns name and expiration status.\"\"\"\n+    assert 'signature from' in line\n+\n+    name_end = line.split(' from ')[-1]\n+    m = re.search(r'(?P<name>\".+\") \\[(?P<status>\\w+)\\]', name_end)\n+    assert m\n+    (name, status) = m.groups()\n+    name = name.strip('\"\\'')\n+\n+    return (name, status)\n+\n+\n def files_are_equal(filename1, filename2):\n     with open(filename1, 'rb') as file1:\n         contents1 = file1.read()\n     with open(filename2, 'rb') as file2:\n         contents2 = file2.read()\n-    return contents1 == contents2\n+    eq = contents1 == contents2\n \n+    if not eq:\n+        with open(filename1, 'r', encoding='utf-8') as f1, \\\n+                open(filename2, 'r', encoding='utf-8') as f2:\n+            f1lines = f1.readlines()\n+            f2lines = f2.readlines()\n \n-def verify_with_gpg(signature_filename, output_filename):\n-    result = subprocess.run(['gpg', '--yes', '--decrypt', '--output',\n-                             output_filename, signature_filename],\n-                             stderr=subprocess.STDOUT, stdout=subprocess.PIPE)\n-    return result.returncode, result.stdout.decode().rstrip()\n+            diff = indent(\n+                ''.join(difflib.unified_diff(f1lines, f2lines)))\n+            log.warning(f\"found diff in files ({filename1}, {filename2}):\\n{diff}\\n\")\n \n+    return eq\n \n-def remove_files(filenames):\n-    for filename in filenames:\n-        os.remove(filename)\n+\n+def get_files_from_hosts_and_compare(\n+    hosts: t.List[str], path: str, filename: str, require_all: bool = False\n+) -> ReturnCode:\n+    \"\"\"\n+    Retrieve the same file from a number of hosts and ensure they have the same contents.\n+    The first host given will be treated as the \"primary\" host, and is required to succeed.\n+\n+    Args:\n+        filename: for writing the file locally.\n+    \"\"\"\n+    assert len(hosts) > 1\n+    primary_host = hosts[0]\n+    other_hosts = hosts[1:]\n+    got_files = []\n+\n+    def join_url(host: str) -> str:\n+        return host.rstrip('/') + '/' + path.lstrip('/')\n+\n+    url = join_url(primary_host)\n+    success, output = download_with_wget(url, filename)\n+    if not success:\n+        log.error(\n+            f\"couldn't fetch file ({url}). \"\n+            \"Have you specified the version number in the following format?\\n\"\n+            f\"[{VERSIONPREFIX}]{VERSION_FORMAT} \"\n+            f\"(example: {VERSIONPREFIX}{VERSION_EXAMPLE})\\n\"\n+            f\"wget output:\\n{indent(output)}\")\n+        return ReturnCode.FILE_GET_FAILED\n+    else:\n+        log.info(f\"got file {url} as {filename}\")\n+        got_files.append(filename)\n+\n+    for i, host in enumerate(other_hosts):\n+        url = join_url(host)\n+        fname = filename + f'.{i + 2}'\n+        success, output = download_with_wget(url, fname)\n+\n+        if require_all and not success:\n+            log.error(\n+                f\"{host} failed to provide file ({url}), but {primary_host} did?\\n\"\n+                f\"wget output:\\n{indent(output)}\")\n+            return ReturnCode.FILE_MISSING_FROM_ONE_HOST\n+        elif not success:\n+            log.warning(\n+                f\"{host} failed to provide file ({url}). \"\n+                f\"Continuing based solely upon {primary_host}.\")\n+        else:\n+            log.info(f\"got file {url} as {fname}\")\n+            got_files.append(fname)\n+\n+    for i, got_file in enumerate(got_files):\n+        if got_file == got_files[-1]:\n+            break  # break on last file, nothing after it to compare to\n+\n+        compare_to = got_files[i + 1]\n+        if not files_are_equal(got_file, compare_to):\n+            log.error(f\"files not equal: {got_file} and {compare_to}\")\n+            return ReturnCode.FILES_NOT_EQUAL\n+\n+    return ReturnCode.SUCCESS\n+\n+\n+def get_builder_keys(bitcoin_dir: Path) -> t.Dict[str, str]:\n+    \"\"\"\n+    Return a map of builder key to name from a local or remote source,\n+    in that order of preference.\n+    If we have them locally, compare them to the github repo.\n+    \"\"\"\n+    local_builder_keys = []\n+    local_builder_path = bitcoin_dir / 'contrib' / 'builder-keys' / 'keys.txt'\n+    if local_builder_path.exists():\n+        local_builder_keys = local_builder_path.read_text().splitlines()\n+\n+    success, gh_builder_keys = download_lines_with_urllib(BUILDER_KEYS_GH_URL)\n+    if not success:\n+        log.warning(f\"unable to retrieve builder keys from {BUILDER_KEYS_GH_URL}\")\n+\n+    if not (success or local_builder_keys):\n+        log.error(\"unable to retrieve builder keys locally or remotely\")\n+\n+    # check the local and remote builder keys against each other and report diff\n+    if local_builder_keys and gh_builder_keys:\n+        if local_builder_keys != gh_builder_keys:\n+            diff = indent(\n+                '\\n'.join(difflib.unified_diff(local_builder_keys, gh_builder_keys)))\n+            log.warning(f\"found diff (local vs. GH) in builder keys:\\n{diff}\\n\")\n+\n+    # Prefer local builder keys to those obtained remotely.\n+    builder_keys = local_builder_keys or gh_builder_keys or []\n+\n+    builder_key_map = {}\n+    for i in builder_keys:\n+        key, name = i.split(' ', 1)\n+        builder_key_map[key] = name\n+\n+    return builder_key_map\n+\n+\n+def check_multisig(\n+    sigfilename: str, args: argparse.Namespace, builder_key_map: t.Dict[str, str]\n+):\n+    # check signature\n+    #\n+    # We don't write output to a file because this command will almost certainly\n+    # fail with GPG exit code '2' (and so not writing to --output) because of the\n+    # likely presence of multiple untrusted signatures.\n+    retval, output = verify_with_gpg(sigfilename)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    # Retrieve unknown keys that are in the repo builder list and then try GPG again.\n+    if unknown and not args.noninteractive and not args.skip_import_builders:\n+        for unsig in unknown:\n+            name = builder_key_map.get(unsig.key, '<unknown>')\n+            if input(f\" ? Retrieve key {unsig.key} for {name}? (y/N) \").lower() == \"y\":\n+                ran = subprocess.run(\n+                    f\"gpg --keyserver {args.keyserver} --recv-keys {unsig.key}\", shell=True)\n+\n+                if ran.returncode != 0:\n+                    log.warning(f\"failed to retrieve key {unsig.key} for {name}\")\n+\n+    return retval, output, good, unknown, bad\n+\n+\n+def check_single_sig(sigfilename: str, args: argparse.Namespace):\n+    retval, output = verify_with_gpg(sigfilename, SUMS_FILENAME)\n+\n+    if args.verbose:\n+        log.info(f\"gpg output:\\n{indent(output)}\")\n+\n+    good, unknown, bad = parse_gpg_result(output.splitlines())\n+\n+    return retval, output, good, unknown, bad\n \n \n def main(args):\n-    # sanity check\n-    if len(args) < 1:\n-        print(\"Error: need to specify a version on the command line\")\n-        return 3\n+    args = parser.parse_args()\n+    if args.quiet:\n+        log.setLevel(logging.WARNING)\n+\n+    WORKINGDIR = Path(tempfile.gettempdir()) / f\"bitcoin_verify_binaries.{args.version}\"\n+\n+    def cleanup():\n+        log.info(\"cleaning up files\")\n+        os.chdir(Path.home())\n+        shutil.rmtree(WORKINGDIR)\n \n     # determine remote dir dependent on provided version string\n-    version_base, version_rc, os_filter = parse_version_string(args[0])\n+    version_base, version_rc, os_filter = parse_version_string(args.version)\n     remote_dir = f\"/bin/{VERSIONPREFIX}{version_base}/\"\n     if version_rc:\n         remote_dir += f\"test.{version_rc}/\"\n-    remote_sigfile = remote_dir + SIGNATUREFILENAME\n+    remote_sigs_path = remote_dir + SIGNATUREFILENAME\n+    remote_sums_path = remote_dir + SUMS_FILENAME\n \n+    bitcoin_dir_maybe = Path(args.bitcoin_src_path) if args.bitcoin_src_path else Path.cwd()\n     # create working directory\n     os.makedirs(WORKINGDIR, exist_ok=True)\n     os.chdir(WORKINGDIR)\n \n-    # fetch first signature file\n-    sigfile1 = SIGNATUREFILENAME\n-    success, output = download_with_wget(HOST1 + remote_sigfile, sigfile1)\n-    if not success:\n-        print(\"Error: couldn't fetch signature file. \"\n-              \"Have you specified the version number in the following format?\")\n-        print(f\"[{VERSIONPREFIX}]<version>[-rc[0-9]][-platform] \"\n-              f\"(example: {VERSIONPREFIX}0.21.0-rc3-osx)\")\n-        print(\"wget output:\")\n-        print(indent(output, '\\t'))\n-        return 4\n-\n-    # fetch second signature file\n-    sigfile2 = SIGNATUREFILENAME + \".2\"\n-    success, output = download_with_wget(HOST2 + remote_sigfile, sigfile2)\n-    if not success:\n-        print(\"bitcoin.org failed to provide signature file, \"\n-              \"but bitcoincore.org did?\")\n-        print(\"wget output:\")\n-        print(indent(output, '\\t'))\n-        remove_files([sigfile1])\n-        return 5\n-\n-    # ensure that both signature files are equal\n-    if not files_are_equal(sigfile1, sigfile2):\n-        print(\"bitcoin.org and bitcoincore.org signature files were not equal?\")\n-        print(f\"See files {WORKINGDIR}/{sigfile1} and {WORKINGDIR}/{sigfile2}\")\n-        return 6\n-\n-    # check signature and extract data into file\n-    retval, output = verify_with_gpg(sigfile1, HASHFILE)\n-    if retval != 0:\n-        if retval == 1:\n-            print(\"Bad signature.\")\n-        elif retval == 2:\n-            print(\"gpg error. Do you have the Bitcoin Core binary release \"\n-                  \"signing key installed?\")\n-        print(\"gpg output:\")\n-        print(indent(output, '\\t'))\n-        remove_files([sigfile1, sigfile2, HASHFILE])\n-        return 1\n+    version_tuple = [int(i) for i in version_base.split('.')]\n+    hosts = [HOST1, HOST2]\n+\n+    got_sig_status = get_files_from_hosts_and_compare(\n+        hosts, remote_sigs_path, SIGNATUREFILENAME, args.require_all_hosts)\n+    if got_sig_status != ReturnCode.SUCCESS:\n+        return got_sig_status\n+\n+    # Multi-sig verification is available after 22.0.\n+    MULTISIG_SUPPORTED = version_tuple[0] >= 22\n+\n+    if MULTISIG_SUPPORTED:\n+        min_trusted_sigs = args.min_trusted_sigs\n+        gpg_allowed_codes = [0, 2]  # 2 is returned when untrusted signatures are present.\n+        builder_key_map = get_builder_keys(bitcoin_dir_maybe)\n+\n+        got_sums_status = get_files_from_hosts_and_compare(\n+            hosts, remote_sums_path, SUMS_FILENAME, args.require_all_hosts)\n+        if got_sums_status != ReturnCode.SUCCESS:\n+            return got_sums_status\n+\n+        gpg_retval, gpg_output, good, unknown, bad = check_multisig(\n+            SIGNATUREFILENAME, args, builder_key_map)\n+    else:\n+        # As long as GPG return codes are okay, the sig is valid for pre-22.0.\n+        min_trusted_sigs = 0\n+        gpg_allowed_codes = [0]\n+        builder_key_map = {}\n+\n+        gpg_retval, gpg_output, good, unknown, bad = check_single_sig(\n+            SIGNATUREFILENAME, args)\n+\n+    if gpg_retval not in gpg_allowed_codes:\n+        if gpg_retval == 1:\n+            log.critical(\"Bad signature.\")\n+        if gpg_retval == 2:\n+            log.critical(\n+                \"gpg error. Do you have the Bitcoin Core binary release \"\n+                \"signing key installed?\")\n+        else:\n+            log.critical(\"unexpected GPG exit code\")\n+\n+        log.error(f\"gpg output:\\n{indent(gpg_output)}\")\n+        cleanup()\n+        return ReturnCode.INTEGRITY_FAILURE\n+\n+    # Decide which keys we trust, though not \"trust\" in the GPG sense, but rather\n+    # which pubkeys convince us that this sums file is legitimate. In other words,\n+    # which pubkeys within the Bitcoin community do we trust for the purposes of\n+    # binary verification?\n+    trusted_keys = set()\n+    if not args.no_builder_keys:\n+        trusted_keys |= set(builder_key_map.keys())\n+    if args.trusted_keys:\n+        trusted_keys |= set(args.trusted_keys.split(','))\n+\n+    # Tally signatures and make sure we have enough good, trusted to fulfill\n+    # our threshold.\n+    good_trusted = {sig for sig in good if sig.trusted or sig.key in trusted_keys}\n+    good_untrusted = [sig for sig in good if sig not in good_trusted]\n+    num_trusted = len(good_trusted)\n+    log.info(f\"got {num_trusted} good, trusted signatures\")\n+\n+    if num_trusted < min_trusted_sigs:\n+        log.error(\n+            \"not enough trusted sigs to meet threshold \"\n+            f\"({num_trusted} vs. {min_trusted_sigs})\")\n+        return ReturnCode.NOT_ENOUGH_GOOD_SIGS\n+\n+    for sig in good_trusted:\n+        log.info(f\"GOOD SIGNATURE: {sig}\")\n+\n+    for sig in good_untrusted:\n+        log.info(f\"GOOD SIGNATURE (untrusted): {sig}\")\n+\n+    for sig in [sig for sig in good if sig.status == 'expired']:\n+        log.warning(f\"key {sig.key} for {sig.name} is expired\")\n+\n+    for sig in bad:\n+        log.warning(f\"BAD SIGNATURE: {sig}\")\n+\n+    for sig in unknown:\n+        log.warning(f\"UNKNOWN SIGNATURE: {sig}\")\n \n     # extract hashes/filenames of binaries to verify from hash file;\n     # each line has the following format: \"<hash> <binary_filename>\"\n-    with open(HASHFILE, 'r', encoding='utf8') as hash_file:\n-        hashes_to_verify = [\n-            line.split()[:2] for line in hash_file if os_filter in line]\n-    remove_files([HASHFILE])\n+    with open(SUMS_FILENAME, 'r', encoding='utf8') as hash_file:\n+        hashes_to_verify = [line.split()[:2] for line in hash_file if os_filter in line]\n+    remove_files([SUMS_FILENAME])\n     if not hashes_to_verify:\n-        print(\"error: no files matched the platform specified\")\n-        return 7\n+        log.error(\"no files matched the platform specified\")\n+        return ReturnCode.NO_BINARIES_MATCH\n+\n+    # remove binaries that are known not to be hosted by bitcoincore.org\n+    fragments_to_remove = ['-unsigned', '-debug', '-codesignatures']\n+    for fragment in fragments_to_remove:\n+        nobinaries = [i for i in hashes_to_verify if fragment in i[1]]\n+        if nobinaries:\n+            remove_str = ', '.join(i[1] for i in nobinaries)\n+            log.info(\n+                f\"removing *{fragment} binaries ({remove_str}) from verification \"\n+                f\"since {HOST1} does not host *{fragment} binaries\")\n+            hashes_to_verify = [i for i in hashes_to_verify if fragment not in i[1]]\n \n     # download binaries\n     for _, binary_filename in hashes_to_verify:\n-        print(f\"Downloading {binary_filename}\")\n-        download_with_wget(HOST1 + remote_dir + binary_filename)\n+        log.info(f\"downloading {binary_filename}\")\n+        success, output = download_with_wget(HOST1 + remote_dir + binary_filename)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23020#discussion_r766153692",
+      "id" : 766153692,
+      "line" : 602,
+      "node_id" : "PRRC_kwDOABII584tqpPc",
+      "original_commit_id" : "a92ec88cbc6e153eabf5e809d8960454488cc391",
+      "original_line" : 602,
+      "original_position" : 653,
+      "original_start_line" : null,
+      "path" : "contrib/verifybinaries/verify.py",
+      "position" : 653,
+      "pull_request_review_id" : 828027865,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23020",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766153692/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-09T21:16:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/766153692",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
    }
 ]
