@@ -6614,5 +6614,73 @@
          "type" : "User",
          "url" : "https://api.github.com/users/MarcoFalke"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23443#discussion_r768029084"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23443"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/768029084"
+         }
+      },
+      "author_association" : "NONE",
+      "body" : "Thanks for changing this @naumenkogs. There is still a [reference](https://github.com/bitcoin/bitcoin/pull/23443/files#diff-62e6a7c4c23e68b88bd585db25bb0a10e6ccda2d7fff2f05769bc0a1ad81dcdcR123) to `we_may_respond` in the comments that you probably want to take out too?",
+      "commit_id" : "c125663467ce83ecb36c2686e3200097924deefe",
+      "created_at" : "2021-12-13T18:48:19Z",
+      "diff_hunk" : "@@ -0,0 +1,192 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/txreconciliation.h>\n+\n+#include <unordered_map>\n+\n+namespace {\n+\n+/** Current protocol version */\n+constexpr uint32_t RECON_VERSION = 1;\n+/** Static salt component used to compute short txids for sketch construction, see BIP-330. */\n+const std::string RECON_STATIC_SALT = \"Tx Relay Salting\";\n+\n+/**\n+ * Salt (specified by BIP-330) constructed from contributions from both peers. It is used\n+ * to compute transaction short IDs, which are then used to construct a sketch representing a set\n+ * of transactions we want to announce to the peer.\n+ */\n+static uint256 ComputeSalt(uint64_t local_salt, uint64_t remote_salt)\n+{\n+    // According to BIP-330, salts should be combined in ascending order.\n+    uint64_t salt1 = local_salt, salt2 = remote_salt;\n+    if (salt1 > salt2) std::swap(salt1, salt2);\n+\n+    static const auto RECON_SALT_HASHER = TaggedHash(RECON_STATIC_SALT);\n+    return (CHashWriter(RECON_SALT_HASHER) << salt1 << salt2).GetSHA256();\n+}\n+\n+/**\n+ * Used to keep track of the ongoing reconciliations, the transactions we want to announce to the\n+ * peer when next transaction reconciliation happens, and also all parameters required to perform\n+ * reconciliations.\n+ */\n+class ReconciliationState {\n+\n+    public:\n+\n+    /**\n+     * Reconciliation involves exchanging sketches, which efficiently represent transactions each\n+     * peer wants to announce. Sketches are computed over transaction short IDs.\n+     * These values are used to salt short IDs.\n+     * TODO: These are currently public to overcome compiler warning (-Wunused-private-field).\n+     *       They should be made private once they are used in one of the following commits.\n+     */\n+    const uint64_t m_k0, m_k1;\n+\n+    /**\n+     * Reconciliation protocol assumes using one role consistently: either a reconciliation\n+     * initiator (requesting sketches), or responder (sending sketches). This defines our role.\n+     * */\n+    const bool m_we_initiate;\n+\n+    ReconciliationState(uint64_t k0, uint64_t k1, bool we_initiate) :\n+        m_k0(k0), m_k1(k1), m_we_initiate(we_initiate) {}\n+};\n+\n+} // namespace\n+\n+/** Actual implementation for TxReconciliationTracker's data structure. */\n+class TxReconciliationTracker::Impl {\n+\n+    mutable Mutex m_mutex;\n+\n+    /**\n+     * Per-peer salt is used to compute transaction short IDs, which will be later used to\n+     * construct reconciliation sketches.\n+     * Salt is generated randomly per-peer to prevent:\n+     * - linking of network nodes belonging to the same physical node\n+     * - halting of relay of particular transactions due to short ID collisions (DoS)\n+     */\n+    std::unordered_map<NodeId, uint64_t> m_local_salts GUARDED_BY(m_mutex);\n+\n+    /**\n+     * Keeps track of ongoing reconciliations with a given peer.\n+     */\n+    std::unordered_map<NodeId, ReconciliationState> m_states GUARDED_BY(m_mutex);\n+\n+    public:\n+\n+    std::tuple<bool, bool, uint32_t, uint64_t> PreRegisterPeer(NodeId peer_id, bool peer_inbound)\n+    {\n+        bool we_initiate_recon, we_respond_recon;\n+        // Currently reconciliation roles are defined by the connection direction: only the inbound\n+        // peer initiate reconciliations and the outbound peer is supposed to only respond.\n+        // If the way we assign reconciliation roles is updated, RECON_VERSION should be bumped.\n+        if (peer_inbound) {\n+            we_initiate_recon = false;\n+            we_respond_recon = true;\n+        } else {\n+            we_initiate_recon = true;\n+            we_respond_recon = false;\n+        }\n+\n+        uint64_t m_local_recon_salt(GetRand(UINT64_MAX));\n+        bool added = WITH_LOCK(m_mutex, return m_local_salts.emplace(peer_id, m_local_recon_salt).second);\n+        // We do this exactly once per peer (which are unique by NodeId, see GetNewNodeId) so it's\n+        // safe to assume we don't have this record yet.\n+        assert(added);\n+\n+        LogPrint(BCLog::NET, \"Pre-register peer=%d for reconciling.\\n\", peer_id);\n+        return std::make_tuple(we_initiate_recon, we_respond_recon, RECON_VERSION, m_local_recon_salt);\n+    }\n+\n+    bool RegisterPeer(NodeId peer_id, bool peer_inbound,\n+        bool they_may_initiate, bool they_may_respond, uint32_t recon_version, uint64_t remote_salt)\n+    {\n+        // We do not support reconciliation salt/version updates. We treat an attempt to update\n+        // after a successful registration as a protocol violation.\n+        LOCK(m_mutex);\n+        if (m_states.find(peer_id) != m_states.end()) return false;\n+\n+        // If the peer supports the version which is lower than our, we downgrade to the version\n+        // they support. For now, this only guarantees that nodes with future reconciliation\n+        // versions have the choice of reconciling with this current version. However, they also\n+        // have the choice to refuse supporting reconciliations if the common version is not\n+        // satisfactory (e.g. too low).\n+        recon_version = std::min(recon_version, RECON_VERSION);\n+        // v1 is the lowest version, so suggesting something below must be a protocol violation.\n+        if (recon_version < 1) return false;\n+\n+        auto local_salt = m_local_salts.find(peer_id);\n+\n+        // This function should be called only after generating the local salt.\n+        if (local_salt == m_local_salts.end()) return false;\n+\n+        // Must match SuggestReconciling logic.\n+        bool we_may_initiate = !peer_inbound, we_may_respond = peer_inbound;\n+\n+        bool they_initiate = they_may_initiate && we_may_respond;\n+        bool we_initiate = we_may_initiate && they_may_respond;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23443#discussion_r768029084",
+      "id" : 768029084,
+      "in_reply_to_id" : 765007876,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII584txzGc",
+      "original_commit_id" : "ea3b87af90e1649428cabac83012d6faa8df61f5",
+      "original_line" : 132,
+      "original_position" : 132,
+      "original_start_line" : 129,
+      "path" : "src/node/txreconciliation.cpp",
+      "position" : null,
+      "pull_request_review_id" : 830624832,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23443",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/768029084/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "updated_at" : "2021-12-13T18:48:20Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/768029084",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/69010457?v=4",
+         "events_url" : "https://api.github.com/users/stickies-v/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/stickies-v/followers",
+         "following_url" : "https://api.github.com/users/stickies-v/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/stickies-v/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/stickies-v",
+         "id" : 69010457,
+         "login" : "stickies-v",
+         "node_id" : "MDQ6VXNlcjY5MDEwNDU3",
+         "organizations_url" : "https://api.github.com/users/stickies-v/orgs",
+         "received_events_url" : "https://api.github.com/users/stickies-v/received_events",
+         "repos_url" : "https://api.github.com/users/stickies-v/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/stickies-v/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/stickies-v/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/stickies-v"
+      }
    }
 ]
