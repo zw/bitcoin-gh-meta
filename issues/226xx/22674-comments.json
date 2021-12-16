@@ -232,7 +232,7 @@
    },
    {
       "author_association" : "CONTRIBUTOR",
-      "body" : "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nNo conflicts as of last run.",
+      "body" : "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#23448](https://github.com/bitcoin/bitcoin/pull/23448) (refactor, consensus: remove calls to global `Params()` in validation layer by lsilva01)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.",
       "created_at" : "2021-08-10T18:55:53Z",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/22674#issuecomment-896235448",
       "id" : 896235448,
@@ -251,7 +251,7 @@
          "total_count" : 0,
          "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/896235448/reactions"
       },
-      "updated_at" : "2021-11-10T13:00:09Z",
+      "updated_at" : "2021-12-14T21:02:11Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/896235448",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/39886733?v=4",
@@ -9003,6 +9003,458 @@
          "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770482574"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770482574"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "> However, a package can be valid if parents are in different state than unconfirmed transactions in the mempool, namely already included in the chain tip.\r\n\r\nThis is not the case. If the package contains a parent that is already confirmed, it is an invalid package. This is because we don't want to rescan previous blocks for the parent transaction (we might not have them if we're pruning); we only use the UTXO set.\r\n\r\n> A hurried user could think a package must only be made of unconfirmed parents, a restriction on the utility of the feature.\r\n\r\nThis would be correct. A package must only have unconfirmed parents.",
+      "commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "created_at" : "2021-12-16T12:10:04Z",
+      "diff_hunk" : "@@ -1074,9 +1179,114 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::\n         }\n     }\n \n+    if (args.m_test_accept) return PackageMempoolAcceptResult(package_state, std::move(results));\n+\n+    if (!FinalizePackage(args, workspaces, package_state, results)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_TX, \"submission failed\");\n+        return PackageMempoolAcceptResult(package_state, std::move(results));\n+    }\n+\n     return PackageMempoolAcceptResult(package_state, std::move(results));\n }\n \n+PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, ATMPArgs& args)\n+{\n+    AssertLockHeld(cs_main);\n+    PackageValidationState package_state;\n+\n+    // Check that the package is well-formed. If it isn't, we won't try to validate any of the\n+    // transactions and thus won't return any MempoolAcceptResults, just a package-wide error.\n+\n+    // Context-free package checks.\n+    if (!CheckPackage(package, package_state)) return PackageMempoolAcceptResult(package_state, {});\n+\n+    // All transactions in the package must be a parent of the last transaction. This is just an\n+    // opportunity for us to fail fast on a context-free check without taking the mempool lock.\n+    if (!IsChildWithParents(package)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+\n+    const auto& child = package[package.size() - 1];\n+    // The package must be 1 child with all of its unconfirmed parents. The package is expected to\n+    // be sorted, so the last transaction is the child.\n+    std::unordered_set<uint256, SaltedTxidHasher> unconfirmed_parent_txids;\n+    std::transform(package.cbegin(), package.end() - 1,\n+                   std::inserter(unconfirmed_parent_txids, unconfirmed_parent_txids.end()),\n+                   [](const auto& tx) { return tx->GetHash(); });\n+\n+    // All child inputs must refer to a preceding package transaction or a confirmed UTXO. The only\n+    // way to verify this is to look up the child's inputs in our current coins view (not including\n+    // mempool), and enforce that all parents not present in the package be available at chain tip.\n+    // Since this check can bring new coins into the coins cache, keep track of these coins and\n+    // uncache them if we don't end up submitting this package to the mempool.\n+    const CCoinsViewCache& coins_tip_cache = m_active_chainstate.CoinsTip();\n+    for (const auto& input : child->vin) {\n+        if (!coins_tip_cache.HaveCoinInCache(input.prevout)) {\n+            args.m_coins_to_uncache.push_back(input.prevout);\n+        }\n+    }\n+    // Using the MemPoolAccept m_view cache allows us to look up these same coins faster later.\n+    // This should be connecting directly to CoinsTip, not to m_viewmempool, because we specifically\n+    // require inputs to be confirmed if they aren't in the package.\n+    m_view.SetBackend(m_active_chainstate.CoinsTip());\n+    const auto package_or_confirmed = [this, &unconfirmed_parent_txids](const auto& input) {\n+         return unconfirmed_parent_txids.count(input.prevout.hash) > 0 || m_view.HaveCoin(input.prevout);\n+    };\n+    if (!std::all_of(child->vin.cbegin(), child->vin.cend(), package_or_confirmed)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-unconfirmed-parents\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770482574",
+      "id" : 770482574,
+      "in_reply_to_id" : 770130932,
+      "line" : 1237,
+      "node_id" : "PRRC_kwDOABII584t7KGO",
+      "original_commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "original_line" : 1237,
+      "original_position" : 241,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 241,
+      "pull_request_review_id" : 834007823,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770482574/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-16T12:10:34Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770482574",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770485273"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770485273"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Would this be a more comprehensive comment?\r\n\r\n\"Node operators are free to set their mempool policies however they please, nodes may receive transactions in different orders, and malicious counterparties may try to take advantage of policy differences to pin transactions. As such, it's possible for some package transaction(s) to already be in the mempool, and we don't want to reject the entire package in that case (as that could be a censorship vector).\"\r\n",
+      "commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "created_at" : "2021-12-16T12:14:03Z",
+      "diff_hunk" : "@@ -1074,9 +1179,114 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::\n         }\n     }\n \n+    if (args.m_test_accept) return PackageMempoolAcceptResult(package_state, std::move(results));\n+\n+    if (!FinalizePackage(args, workspaces, package_state, results)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_TX, \"submission failed\");\n+        return PackageMempoolAcceptResult(package_state, std::move(results));\n+    }\n+\n     return PackageMempoolAcceptResult(package_state, std::move(results));\n }\n \n+PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, ATMPArgs& args)\n+{\n+    AssertLockHeld(cs_main);\n+    PackageValidationState package_state;\n+\n+    // Check that the package is well-formed. If it isn't, we won't try to validate any of the\n+    // transactions and thus won't return any MempoolAcceptResults, just a package-wide error.\n+\n+    // Context-free package checks.\n+    if (!CheckPackage(package, package_state)) return PackageMempoolAcceptResult(package_state, {});\n+\n+    // All transactions in the package must be a parent of the last transaction. This is just an\n+    // opportunity for us to fail fast on a context-free check without taking the mempool lock.\n+    if (!IsChildWithParents(package)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+\n+    const auto& child = package[package.size() - 1];\n+    // The package must be 1 child with all of its unconfirmed parents. The package is expected to\n+    // be sorted, so the last transaction is the child.\n+    std::unordered_set<uint256, SaltedTxidHasher> unconfirmed_parent_txids;\n+    std::transform(package.cbegin(), package.end() - 1,\n+                   std::inserter(unconfirmed_parent_txids, unconfirmed_parent_txids.end()),\n+                   [](const auto& tx) { return tx->GetHash(); });\n+\n+    // All child inputs must refer to a preceding package transaction or a confirmed UTXO. The only\n+    // way to verify this is to look up the child's inputs in our current coins view (not including\n+    // mempool), and enforce that all parents not present in the package be available at chain tip.\n+    // Since this check can bring new coins into the coins cache, keep track of these coins and\n+    // uncache them if we don't end up submitting this package to the mempool.\n+    const CCoinsViewCache& coins_tip_cache = m_active_chainstate.CoinsTip();\n+    for (const auto& input : child->vin) {\n+        if (!coins_tip_cache.HaveCoinInCache(input.prevout)) {\n+            args.m_coins_to_uncache.push_back(input.prevout);\n+        }\n+    }\n+    // Using the MemPoolAccept m_view cache allows us to look up these same coins faster later.\n+    // This should be connecting directly to CoinsTip, not to m_viewmempool, because we specifically\n+    // require inputs to be confirmed if they aren't in the package.\n+    m_view.SetBackend(m_active_chainstate.CoinsTip());\n+    const auto package_or_confirmed = [this, &unconfirmed_parent_txids](const auto& input) {\n+         return unconfirmed_parent_txids.count(input.prevout.hash) > 0 || m_view.HaveCoin(input.prevout);\n+    };\n+    if (!std::all_of(child->vin.cbegin(), child->vin.cend(), package_or_confirmed)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-unconfirmed-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+    // Protect against bugs where we pull more inputs from disk that miss being added to\n+    // coins_to_uncache. The backend will be connected again when needed in PreChecks.\n+    m_view.SetBackend(m_dummy);\n+\n+    LOCK(m_pool.cs);\n+    std::map<const uint256, const MempoolAcceptResult> results;\n+    // As node operators are free to set their mempool policies however they please, it's possible\n+    // for package transaction(s) to already be in the mempool, and we don't want to reject the\n+    // entire package in that case (as that could be a censorship vector).  Filter the transactions",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770485273",
+      "id" : 770485273,
+      "in_reply_to_id" : 770156708,
+      "line" : 1248,
+      "node_id" : "PRRC_kwDOABII584t7KwZ",
+      "original_commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "original_line" : 1248,
+      "original_position" : 252,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 252,
+      "pull_request_review_id" : 834011670,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770485273/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-16T12:14:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770485273",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770499498"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770499498"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "> In the context of multi-party protocol, a malicious counterparty broadcast a transaction A' with an inflated witness. When the package A+B issued by a honest participant is entering into the mempool, A' is swapped in place of A. However, A has a far smallest witness, thus swapping for A' effectively downgrades the package feerate.\r\n\r\nAs specified in the [proposal](https://gist.github.com/glozow/dc4e9d5c5b14ade7cdfac40f43adb18a#fee-related-checks-use-package-feerate): \"We use the package feerate of the package _after deduplication_\" which is intended to avoid an issue like this, and others. More rationale is included in the proposal.\r\n\r\n> This breaks the fee-bumping expectation of the honest participant, as a malleated package is now propagating on the network, instead of the higher one.\r\n\r\nGiven that the feerate of A' was sufficient to enter the mempool, this is made no worse or better with the introduction of package mempool accept, as we're treating A' vs A identically to how we treat individual transactions. We will deduplicate A from the package and assess B individually; its package feerate only includes the transactions that are not already in the mempool. Of course this means the ancestor score of B once everything is submitted is lower, but the danger has not been made worse by package mempool acceptance, as **we would have the same result if B was received as an individual transaction.**\r\n\r\n> I assume this behavior should be corrected if witness replacement is implemented.\r\n\r\nYes exactly. I still stipulate that package RBF and witness replacements can be worked on in parallel; both are improvements but neither requires the other. I've tried to document the limitation (known to both single transactions and packages) in the code, as seen in this diff.\r\n",
+      "commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "created_at" : "2021-12-16T12:34:29Z",
+      "diff_hunk" : "@@ -1074,9 +1179,114 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::\n         }\n     }\n \n+    if (args.m_test_accept) return PackageMempoolAcceptResult(package_state, std::move(results));\n+\n+    if (!FinalizePackage(args, workspaces, package_state, results)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_TX, \"submission failed\");\n+        return PackageMempoolAcceptResult(package_state, std::move(results));\n+    }\n+\n     return PackageMempoolAcceptResult(package_state, std::move(results));\n }\n \n+PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, ATMPArgs& args)\n+{\n+    AssertLockHeld(cs_main);\n+    PackageValidationState package_state;\n+\n+    // Check that the package is well-formed. If it isn't, we won't try to validate any of the\n+    // transactions and thus won't return any MempoolAcceptResults, just a package-wide error.\n+\n+    // Context-free package checks.\n+    if (!CheckPackage(package, package_state)) return PackageMempoolAcceptResult(package_state, {});\n+\n+    // All transactions in the package must be a parent of the last transaction. This is just an\n+    // opportunity for us to fail fast on a context-free check without taking the mempool lock.\n+    if (!IsChildWithParents(package)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+\n+    const auto& child = package[package.size() - 1];\n+    // The package must be 1 child with all of its unconfirmed parents. The package is expected to\n+    // be sorted, so the last transaction is the child.\n+    std::unordered_set<uint256, SaltedTxidHasher> unconfirmed_parent_txids;\n+    std::transform(package.cbegin(), package.end() - 1,\n+                   std::inserter(unconfirmed_parent_txids, unconfirmed_parent_txids.end()),\n+                   [](const auto& tx) { return tx->GetHash(); });\n+\n+    // All child inputs must refer to a preceding package transaction or a confirmed UTXO. The only\n+    // way to verify this is to look up the child's inputs in our current coins view (not including\n+    // mempool), and enforce that all parents not present in the package be available at chain tip.\n+    // Since this check can bring new coins into the coins cache, keep track of these coins and\n+    // uncache them if we don't end up submitting this package to the mempool.\n+    const CCoinsViewCache& coins_tip_cache = m_active_chainstate.CoinsTip();\n+    for (const auto& input : child->vin) {\n+        if (!coins_tip_cache.HaveCoinInCache(input.prevout)) {\n+            args.m_coins_to_uncache.push_back(input.prevout);\n+        }\n+    }\n+    // Using the MemPoolAccept m_view cache allows us to look up these same coins faster later.\n+    // This should be connecting directly to CoinsTip, not to m_viewmempool, because we specifically\n+    // require inputs to be confirmed if they aren't in the package.\n+    m_view.SetBackend(m_active_chainstate.CoinsTip());\n+    const auto package_or_confirmed = [this, &unconfirmed_parent_txids](const auto& input) {\n+         return unconfirmed_parent_txids.count(input.prevout.hash) > 0 || m_view.HaveCoin(input.prevout);\n+    };\n+    if (!std::all_of(child->vin.cbegin(), child->vin.cend(), package_or_confirmed)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-unconfirmed-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+    // Protect against bugs where we pull more inputs from disk that miss being added to\n+    // coins_to_uncache. The backend will be connected again when needed in PreChecks.\n+    m_view.SetBackend(m_dummy);\n+\n+    LOCK(m_pool.cs);\n+    std::map<const uint256, const MempoolAcceptResult> results;\n+    // As node operators are free to set their mempool policies however they please, it's possible\n+    // for package transaction(s) to already be in the mempool, and we don't want to reject the\n+    // entire package in that case (as that could be a censorship vector).  Filter the transactions\n+    // that are already in mempool and add their information to results, since we already have them.\n+    std::vector<CTransactionRef> txns_new;\n+    for (const auto& tx : package) {\n+        const auto& wtxid = tx->GetWitnessHash();\n+        const auto& txid = tx->GetHash();\n+        // There are 3 possibilities: already in mempool, same-txid-diff-wtxid already in mempool,\n+        // or not in mempool. An already confirmed tx is treated as one not in mempool, because all\n+        // we know is that the inputs aren't available.\n+        if (m_pool.exists(GenTxid::Wtxid(wtxid))) {\n+            // Exact transaction already exists in the mempool.\n+            auto iter = m_pool.GetIter(wtxid);\n+            assert(iter != std::nullopt);\n+            results.emplace(wtxid, MempoolAcceptResult::MempoolTx(iter.value()->GetTxSize(), iter.value()->GetFee()));\n+        } else if (m_pool.exists(GenTxid::Txid(txid))) {\n+            // Transaction with the same non-witness data but different witness (same txid,\n+            // different wtxid) already exists in the mempool.\n+            //\n+            // We don't allow replacement transactions right now, so just swap the package\n+            // transaction for the mempool one. Note that we are ignoring the validity of the",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770499498",
+      "id" : 770499498,
+      "in_reply_to_id" : 770162566,
+      "line" : 1267,
+      "node_id" : "PRRC_kwDOABII584t7OOq",
+      "original_commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "original_line" : 1267,
+      "original_position" : 271,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 271,
+      "pull_request_review_id" : 834031727,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770499498/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-16T12:34:29Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770499498",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770501747"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770501747"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "> I would say it's better to just fail package acceptance if a same txid, different wtxid already exists in the mempool (same behavior than single-transaction acceptance in PreChecks).\r\n\r\nI think this is worse than the bloated-witness problem acknowledged above. If A' is already in the mempool and:\r\n- A and B are received separately as individual transactions -> A is rejected and B is accepted\r\n- A+B is received as a package -> package fails, B is rejected.\r\n\r\nThis makes package acceptance more strict than individual transaction acceptance, which is something we want to avoid.",
+      "commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "created_at" : "2021-12-16T12:38:04Z",
+      "diff_hunk" : "@@ -1074,9 +1179,114 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::\n         }\n     }\n \n+    if (args.m_test_accept) return PackageMempoolAcceptResult(package_state, std::move(results));\n+\n+    if (!FinalizePackage(args, workspaces, package_state, results)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_TX, \"submission failed\");\n+        return PackageMempoolAcceptResult(package_state, std::move(results));\n+    }\n+\n     return PackageMempoolAcceptResult(package_state, std::move(results));\n }\n \n+PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, ATMPArgs& args)\n+{\n+    AssertLockHeld(cs_main);\n+    PackageValidationState package_state;\n+\n+    // Check that the package is well-formed. If it isn't, we won't try to validate any of the\n+    // transactions and thus won't return any MempoolAcceptResults, just a package-wide error.\n+\n+    // Context-free package checks.\n+    if (!CheckPackage(package, package_state)) return PackageMempoolAcceptResult(package_state, {});\n+\n+    // All transactions in the package must be a parent of the last transaction. This is just an\n+    // opportunity for us to fail fast on a context-free check without taking the mempool lock.\n+    if (!IsChildWithParents(package)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+\n+    const auto& child = package[package.size() - 1];\n+    // The package must be 1 child with all of its unconfirmed parents. The package is expected to\n+    // be sorted, so the last transaction is the child.\n+    std::unordered_set<uint256, SaltedTxidHasher> unconfirmed_parent_txids;\n+    std::transform(package.cbegin(), package.end() - 1,\n+                   std::inserter(unconfirmed_parent_txids, unconfirmed_parent_txids.end()),\n+                   [](const auto& tx) { return tx->GetHash(); });\n+\n+    // All child inputs must refer to a preceding package transaction or a confirmed UTXO. The only\n+    // way to verify this is to look up the child's inputs in our current coins view (not including\n+    // mempool), and enforce that all parents not present in the package be available at chain tip.\n+    // Since this check can bring new coins into the coins cache, keep track of these coins and\n+    // uncache them if we don't end up submitting this package to the mempool.\n+    const CCoinsViewCache& coins_tip_cache = m_active_chainstate.CoinsTip();\n+    for (const auto& input : child->vin) {\n+        if (!coins_tip_cache.HaveCoinInCache(input.prevout)) {\n+            args.m_coins_to_uncache.push_back(input.prevout);\n+        }\n+    }\n+    // Using the MemPoolAccept m_view cache allows us to look up these same coins faster later.\n+    // This should be connecting directly to CoinsTip, not to m_viewmempool, because we specifically\n+    // require inputs to be confirmed if they aren't in the package.\n+    m_view.SetBackend(m_active_chainstate.CoinsTip());\n+    const auto package_or_confirmed = [this, &unconfirmed_parent_txids](const auto& input) {\n+         return unconfirmed_parent_txids.count(input.prevout.hash) > 0 || m_view.HaveCoin(input.prevout);\n+    };\n+    if (!std::all_of(child->vin.cbegin(), child->vin.cend(), package_or_confirmed)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-unconfirmed-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+    // Protect against bugs where we pull more inputs from disk that miss being added to\n+    // coins_to_uncache. The backend will be connected again when needed in PreChecks.\n+    m_view.SetBackend(m_dummy);\n+\n+    LOCK(m_pool.cs);\n+    std::map<const uint256, const MempoolAcceptResult> results;\n+    // As node operators are free to set their mempool policies however they please, it's possible\n+    // for package transaction(s) to already be in the mempool, and we don't want to reject the\n+    // entire package in that case (as that could be a censorship vector).  Filter the transactions\n+    // that are already in mempool and add their information to results, since we already have them.\n+    std::vector<CTransactionRef> txns_new;\n+    for (const auto& tx : package) {\n+        const auto& wtxid = tx->GetWitnessHash();\n+        const auto& txid = tx->GetHash();\n+        // There are 3 possibilities: already in mempool, same-txid-diff-wtxid already in mempool,\n+        // or not in mempool. An already confirmed tx is treated as one not in mempool, because all\n+        // we know is that the inputs aren't available.\n+        if (m_pool.exists(GenTxid::Wtxid(wtxid))) {\n+            // Exact transaction already exists in the mempool.\n+            auto iter = m_pool.GetIter(wtxid);\n+            assert(iter != std::nullopt);\n+            results.emplace(wtxid, MempoolAcceptResult::MempoolTx(iter.value()->GetTxSize(), iter.value()->GetFee()));\n+        } else if (m_pool.exists(GenTxid::Txid(txid))) {\n+            // Transaction with the same non-witness data but different witness (same txid,\n+            // different wtxid) already exists in the mempool.\n+            //\n+            // We don't allow replacement transactions right now, so just swap the package\n+            // transaction for the mempool one. Note that we are ignoring the validity of the",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770501747",
+      "id" : 770501747,
+      "in_reply_to_id" : 770162566,
+      "line" : 1267,
+      "node_id" : "PRRC_kwDOABII584t7Oxz",
+      "original_commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "original_line" : 1267,
+      "original_position" : 271,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 271,
+      "pull_request_review_id" : 834035139,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770501747/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-16T12:38:05Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770501747",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770504569"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770504569"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "> Let's say you have the package A+B+C, where A and B are parents of C, A and C are low-feerate, B is high-feerate. If B is already in the mempool, when the package A+B+C is received, B is dedup, then the union of fees of A+C is realized, it's too low to satisfy the mempool min fee, the packages is rejected.\r\n> To avoid this behavior, we should compute the union of fees pre-dedup in AcceptPackage, then pass down the result to AcceptMultipleTransactions.\r\n\r\nIt is actually incentive-compatible to reject this package. B's fees should not supplement A's fees, because B does not depend on A; including B in the package feerate would be \"sibling-pays-for-sibling\" behavior. I've illustrated this in [examples Q1 and Q2](https://gist.github.com/glozow/dc4e9d5c5b14ade7cdfac40f43adb18a#always-try-individual-submission-first).",
+      "commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "created_at" : "2021-12-16T12:42:02Z",
+      "diff_hunk" : "@@ -1074,9 +1179,114 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::\n         }\n     }\n \n+    if (args.m_test_accept) return PackageMempoolAcceptResult(package_state, std::move(results));\n+\n+    if (!FinalizePackage(args, workspaces, package_state, results)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_TX, \"submission failed\");\n+        return PackageMempoolAcceptResult(package_state, std::move(results));\n+    }\n+\n     return PackageMempoolAcceptResult(package_state, std::move(results));\n }\n \n+PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, ATMPArgs& args)\n+{\n+    AssertLockHeld(cs_main);\n+    PackageValidationState package_state;\n+\n+    // Check that the package is well-formed. If it isn't, we won't try to validate any of the\n+    // transactions and thus won't return any MempoolAcceptResults, just a package-wide error.\n+\n+    // Context-free package checks.\n+    if (!CheckPackage(package, package_state)) return PackageMempoolAcceptResult(package_state, {});\n+\n+    // All transactions in the package must be a parent of the last transaction. This is just an\n+    // opportunity for us to fail fast on a context-free check without taking the mempool lock.\n+    if (!IsChildWithParents(package)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+\n+    const auto& child = package[package.size() - 1];\n+    // The package must be 1 child with all of its unconfirmed parents. The package is expected to\n+    // be sorted, so the last transaction is the child.\n+    std::unordered_set<uint256, SaltedTxidHasher> unconfirmed_parent_txids;\n+    std::transform(package.cbegin(), package.end() - 1,\n+                   std::inserter(unconfirmed_parent_txids, unconfirmed_parent_txids.end()),\n+                   [](const auto& tx) { return tx->GetHash(); });\n+\n+    // All child inputs must refer to a preceding package transaction or a confirmed UTXO. The only\n+    // way to verify this is to look up the child's inputs in our current coins view (not including\n+    // mempool), and enforce that all parents not present in the package be available at chain tip.\n+    // Since this check can bring new coins into the coins cache, keep track of these coins and\n+    // uncache them if we don't end up submitting this package to the mempool.\n+    const CCoinsViewCache& coins_tip_cache = m_active_chainstate.CoinsTip();\n+    for (const auto& input : child->vin) {\n+        if (!coins_tip_cache.HaveCoinInCache(input.prevout)) {\n+            args.m_coins_to_uncache.push_back(input.prevout);\n+        }\n+    }\n+    // Using the MemPoolAccept m_view cache allows us to look up these same coins faster later.\n+    // This should be connecting directly to CoinsTip, not to m_viewmempool, because we specifically\n+    // require inputs to be confirmed if they aren't in the package.\n+    m_view.SetBackend(m_active_chainstate.CoinsTip());\n+    const auto package_or_confirmed = [this, &unconfirmed_parent_txids](const auto& input) {\n+         return unconfirmed_parent_txids.count(input.prevout.hash) > 0 || m_view.HaveCoin(input.prevout);\n+    };\n+    if (!std::all_of(child->vin.cbegin(), child->vin.cend(), package_or_confirmed)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-unconfirmed-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+    // Protect against bugs where we pull more inputs from disk that miss being added to\n+    // coins_to_uncache. The backend will be connected again when needed in PreChecks.\n+    m_view.SetBackend(m_dummy);\n+\n+    LOCK(m_pool.cs);\n+    std::map<const uint256, const MempoolAcceptResult> results;\n+    // As node operators are free to set their mempool policies however they please, it's possible\n+    // for package transaction(s) to already be in the mempool, and we don't want to reject the\n+    // entire package in that case (as that could be a censorship vector).  Filter the transactions\n+    // that are already in mempool and add their information to results, since we already have them.\n+    std::vector<CTransactionRef> txns_new;\n+    for (const auto& tx : package) {\n+        const auto& wtxid = tx->GetWitnessHash();\n+        const auto& txid = tx->GetHash();\n+        // There are 3 possibilities: already in mempool, same-txid-diff-wtxid already in mempool,\n+        // or not in mempool. An already confirmed tx is treated as one not in mempool, because all\n+        // we know is that the inputs aren't available.\n+        if (m_pool.exists(GenTxid::Wtxid(wtxid))) {\n+            // Exact transaction already exists in the mempool.\n+            auto iter = m_pool.GetIter(wtxid);\n+            assert(iter != std::nullopt);\n+            results.emplace(wtxid, MempoolAcceptResult::MempoolTx(iter.value()->GetTxSize(), iter.value()->GetFee()));\n+        } else if (m_pool.exists(GenTxid::Txid(txid))) {\n+            // Transaction with the same non-witness data but different witness (same txid,\n+            // different wtxid) already exists in the mempool.\n+            //\n+            // We don't allow replacement transactions right now, so just swap the package\n+            // transaction for the mempool one. Note that we are ignoring the validity of the\n+            // package transaction passed in.\n+            // TODO: allow witness replacement in packages.\n+            auto iter = m_pool.GetIter(wtxid);\n+            assert(iter != std::nullopt);\n+            results.emplace(txid, MempoolAcceptResult::MempoolTx(iter.value()->GetTxSize(), iter.value()->GetFee()));\n+        } else {\n+            // Transaction does not already exist in the mempool.\n+            txns_new.push_back(tx);\n+        }\n+    }\n+\n+    // Nothing to do if the entire package has already been submitted.\n+    if (txns_new.empty()) return PackageMempoolAcceptResult(package_state, std::move(results));\n+    // Validate the (deduplicated) transactions as a package.\n+    auto submission_result = AcceptMultipleTransactions(txns_new, args);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770504569",
+      "id" : 770504569,
+      "in_reply_to_id" : 770174654,
+      "line" : 1282,
+      "node_id" : "PRRC_kwDOABII584t7Pd5",
+      "original_commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "original_line" : 1282,
+      "original_position" : 286,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 286,
+      "pull_request_review_id" : 834039027,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770504569/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-16T12:42:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770504569",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "Thanks @ariard for the prompt re-review!\r\n\r\n> I think it's better either to revert e12fafd (or past reviewers to look on it)\r\n\r\n(And re: IRC convos): I personally think e12fafda2dfbbdf63f125e5af797ecfaa6488f66 made sense for this PR and would have included it in the next one anyway, but I'm obviously biased as the author. I definitely welcome more review on it and can hold off on opening the next package mempool accept PR until it seems people are comfortable. If you have time @jnewbery @t-bast @stickies-v @achow101, we're requesting a look at e12fafda2dfbbdf63f125e5af797ecfaa6488f66 which was added between your ACKs and the merge. Thanks! :)",
+      "created_at" : "2021-12-16T12:45:02Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22674#issuecomment-995783522",
+      "id" : 995783522,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/22674",
+      "node_id" : "IC_kwDOABII5847WnNi",
+      "performed_via_github_app" : null,
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/995783522/reactions"
+      },
+      "updated_at" : "2021-12-16T12:45:02Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/995783522",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770514854"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770514854"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "> Further, I think deduplication is also introducing issues w.r.t ancestors/descendants limits. If we decide to relay the package on the positive result from AcceptMultipleTransactions, a dedup package might have lower ancestors/descendants limits than the complete one we announce to our peers.\r\n\r\nNo, we'll still enforce ancestor/descendant limits on the package in the same way. The package transactions that are already in the mempool will be included in ancestor counts. The nice thing about a child-with-parents package is that all package transactions are ancestors of the child transaction so we won't under/overestimate :).\r\n\r\nSince we always have _all_ of the unconfirmed parents in the package, mempool contents won't affect whether our package is within the limits specified by the protocol.\r\n\r\nFor example, if we can't have more than 25 in a package but somebody has a package where the child has 30 in-mempool ancestors, regardless of the size of the package after deduplication, the package is defined as child-with-all-unconfirmed-parents. Thus, since it has 30 unconfirmed ancestors, the defined package has a size of 31 and is too big.",
+      "commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "created_at" : "2021-12-16T12:56:55Z",
+      "diff_hunk" : "@@ -1074,9 +1179,114 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::\n         }\n     }\n \n+    if (args.m_test_accept) return PackageMempoolAcceptResult(package_state, std::move(results));\n+\n+    if (!FinalizePackage(args, workspaces, package_state, results)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_TX, \"submission failed\");\n+        return PackageMempoolAcceptResult(package_state, std::move(results));\n+    }\n+\n     return PackageMempoolAcceptResult(package_state, std::move(results));\n }\n \n+PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, ATMPArgs& args)\n+{\n+    AssertLockHeld(cs_main);\n+    PackageValidationState package_state;\n+\n+    // Check that the package is well-formed. If it isn't, we won't try to validate any of the\n+    // transactions and thus won't return any MempoolAcceptResults, just a package-wide error.\n+\n+    // Context-free package checks.\n+    if (!CheckPackage(package, package_state)) return PackageMempoolAcceptResult(package_state, {});\n+\n+    // All transactions in the package must be a parent of the last transaction. This is just an\n+    // opportunity for us to fail fast on a context-free check without taking the mempool lock.\n+    if (!IsChildWithParents(package)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+\n+    const auto& child = package[package.size() - 1];\n+    // The package must be 1 child with all of its unconfirmed parents. The package is expected to\n+    // be sorted, so the last transaction is the child.\n+    std::unordered_set<uint256, SaltedTxidHasher> unconfirmed_parent_txids;\n+    std::transform(package.cbegin(), package.end() - 1,\n+                   std::inserter(unconfirmed_parent_txids, unconfirmed_parent_txids.end()),\n+                   [](const auto& tx) { return tx->GetHash(); });\n+\n+    // All child inputs must refer to a preceding package transaction or a confirmed UTXO. The only\n+    // way to verify this is to look up the child's inputs in our current coins view (not including\n+    // mempool), and enforce that all parents not present in the package be available at chain tip.\n+    // Since this check can bring new coins into the coins cache, keep track of these coins and\n+    // uncache them if we don't end up submitting this package to the mempool.\n+    const CCoinsViewCache& coins_tip_cache = m_active_chainstate.CoinsTip();\n+    for (const auto& input : child->vin) {\n+        if (!coins_tip_cache.HaveCoinInCache(input.prevout)) {\n+            args.m_coins_to_uncache.push_back(input.prevout);\n+        }\n+    }\n+    // Using the MemPoolAccept m_view cache allows us to look up these same coins faster later.\n+    // This should be connecting directly to CoinsTip, not to m_viewmempool, because we specifically\n+    // require inputs to be confirmed if they aren't in the package.\n+    m_view.SetBackend(m_active_chainstate.CoinsTip());\n+    const auto package_or_confirmed = [this, &unconfirmed_parent_txids](const auto& input) {\n+         return unconfirmed_parent_txids.count(input.prevout.hash) > 0 || m_view.HaveCoin(input.prevout);\n+    };\n+    if (!std::all_of(child->vin.cbegin(), child->vin.cend(), package_or_confirmed)) {\n+        package_state.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-unconfirmed-parents\");\n+        return PackageMempoolAcceptResult(package_state, {});\n+    }\n+    // Protect against bugs where we pull more inputs from disk that miss being added to\n+    // coins_to_uncache. The backend will be connected again when needed in PreChecks.\n+    m_view.SetBackend(m_dummy);\n+\n+    LOCK(m_pool.cs);\n+    std::map<const uint256, const MempoolAcceptResult> results;\n+    // As node operators are free to set their mempool policies however they please, it's possible\n+    // for package transaction(s) to already be in the mempool, and we don't want to reject the\n+    // entire package in that case (as that could be a censorship vector).  Filter the transactions\n+    // that are already in mempool and add their information to results, since we already have them.\n+    std::vector<CTransactionRef> txns_new;\n+    for (const auto& tx : package) {\n+        const auto& wtxid = tx->GetWitnessHash();\n+        const auto& txid = tx->GetHash();\n+        // There are 3 possibilities: already in mempool, same-txid-diff-wtxid already in mempool,\n+        // or not in mempool. An already confirmed tx is treated as one not in mempool, because all\n+        // we know is that the inputs aren't available.\n+        if (m_pool.exists(GenTxid::Wtxid(wtxid))) {\n+            // Exact transaction already exists in the mempool.\n+            auto iter = m_pool.GetIter(wtxid);\n+            assert(iter != std::nullopt);\n+            results.emplace(wtxid, MempoolAcceptResult::MempoolTx(iter.value()->GetTxSize(), iter.value()->GetFee()));\n+        } else if (m_pool.exists(GenTxid::Txid(txid))) {\n+            // Transaction with the same non-witness data but different witness (same txid,\n+            // different wtxid) already exists in the mempool.\n+            //\n+            // We don't allow replacement transactions right now, so just swap the package\n+            // transaction for the mempool one. Note that we are ignoring the validity of the\n+            // package transaction passed in.\n+            // TODO: allow witness replacement in packages.\n+            auto iter = m_pool.GetIter(wtxid);\n+            assert(iter != std::nullopt);\n+            results.emplace(txid, MempoolAcceptResult::MempoolTx(iter.value()->GetTxSize(), iter.value()->GetFee()));\n+        } else {\n+            // Transaction does not already exist in the mempool.\n+            txns_new.push_back(tx);\n+        }\n+    }\n+\n+    // Nothing to do if the entire package has already been submitted.\n+    if (txns_new.empty()) return PackageMempoolAcceptResult(package_state, std::move(results));\n+    // Validate the (deduplicated) transactions as a package.\n+    auto submission_result = AcceptMultipleTransactions(txns_new, args);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/22674#discussion_r770514854",
+      "id" : 770514854,
+      "in_reply_to_id" : 770174654,
+      "line" : 1282,
+      "node_id" : "PRRC_kwDOABII584t7R-m",
+      "original_commit_id" : "046e8ff264be6b888c0f9a9d822e32aa74e19b78",
+      "original_line" : 1282,
+      "original_position" : 286,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 286,
+      "pull_request_review_id" : 834053990,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/22674",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770514854/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2021-12-16T12:56:55Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/770514854",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
       }
    }
 ]
