@@ -2145,5 +2145,543 @@
          "type" : "User",
          "url" : "https://api.github.com/users/darosior"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801035751"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801035751"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "In f09f339d483824a40b7aacc7c1449a206d4f79f4 \"Miniscript: conversion from script\"\r\n\r\nThese if statements are almost the same, ISTM this could be de-duplicated so that there is only one really long line to read.",
+      "commit_id" : "fa39084fc47a196e8d5f4b1b7807444ffff60a6b",
+      "created_at" : "2022-02-07T20:34:32Z",
+      "diff_hunk" : "@@ -1007,13 +1008,429 @@ inline NodeRef<Key> Parse(Span<const char> in, const Ctx& ctx)\n     return tl_node;\n }\n \n+/** Decode a script into opcode/push pairs.\n+ *\n+ * Construct a vector with one element per opcode in the script, in reverse order.\n+ * Each element is a pair consisting of the opcode, as well as the data pushed by\n+ * the opcode (including OP_n), if any. OP_CHECKSIGVERIFY, OP_CHECKMULTISIGVERIFY,\n+ * and OP_EQUALVERIFY are decomposed into OP_CHECKSIG, OP_CHECKMULTISIG, OP_EQUAL\n+ * respectively, plus OP_VERIFY.\n+ */\n+bool DecomposeScript(const CScript& script, std::vector<std::pair<opcodetype, std::vector<unsigned char>>>& out);\n+\n+/** Determine whether the passed pair (created by DecomposeScript) is pushing a number. */\n+bool ParseScriptNumber(const std::pair<opcodetype, std::vector<unsigned char>>& in, int64_t& k);\n+\n+enum class DecodeContext {\n+    /** A single expression of type B, K, or V. Specifically, this can't be an\n+     * and_v or an expression of type W (a: and s: wrappers). */\n+    SINGLE_BKV_EXPR,\n+    /** Potentially multiple SINGLE_BKV_EXPRs as children of (potentially multiple)\n+     * and_v expressions. Syntactic sugar for MAYBE_AND_V + SINGLE_BKV_EXPR. */\n+    BKV_EXPR,\n+    /** An expression of type W (a: or s: wrappers). */\n+    W_EXPR,\n+\n+    /** SWAP expects the next element to be OP_SWAP (inside a W-type expression that\n+     * didn't end with FROMALTSTACK), and wraps the top of the constructed stack\n+     * with s: */\n+    SWAP,\n+    /** ALT expects the next element to be TOALTSTACK (we must have already read a\n+     * FROMALTSTACK earlier), and wraps the top of the constructed stack with a: */\n+    ALT,\n+    /** CHECK wraps the top constructed node with c: */\n+    CHECK,\n+    /** DUP_IF wraps the top constructed node with d: */\n+    DUP_IF,\n+    /** VERIFY wraps the top constructed node with v: */\n+    VERIFY,\n+    /** NON_ZERO wraps the top constructed node with j: */\n+    NON_ZERO,\n+    /** ZERO_NOTEQUAL wraps the top constructed node with n: */\n+    ZERO_NOTEQUAL,\n+\n+    /** MAYBE_AND_V will check if the next part of the script could be a valid\n+     * miniscript sub-expression, and if so it will push AND_V and SINGLE_BKV_EXPR\n+     * to decode it and construct the and_v node. This is recursive, to deal with\n+     * multiple and_v nodes inside each other. */\n+    MAYBE_AND_V,\n+    /** AND_V will construct an and_v node from the last two constructed nodes. */\n+    AND_V,\n+    /** AND_B will construct an and_b node from the last two constructed nodes. */\n+    AND_B,\n+    /** ANDOR will construct an andor node from the last three constructed nodes. */\n+    ANDOR,\n+    /** OR_B will construct an or_b node from the last two constructed nodes. */\n+    OR_B,\n+    /** OR_C will construct an or_c node from the last two constructed nodes. */\n+    OR_C,\n+    /** OR_D will construct an or_d node from the last two constructed nodes. */\n+    OR_D,\n+\n+    /** In a thresh expression, all sub-expressions other than the first are W-type,\n+     * and end in OP_ADD. THRESH_W will check for this OP_ADD and either push a W_EXPR\n+     * or a SINGLE_BKV_EXPR and jump to THRESH_E accordingly. */\n+    THRESH_W,\n+    /** THRESH_E constructs a thresh node from the appropriate number of constructed\n+     * children. */\n+    THRESH_E,\n+\n+    /** ENDIF signals that we are inside some sort of OP_IF structure, which could be\n+     * or_d, or_c, or_i, andor, d:, or j: wrapper, depending on what follows. We read\n+     * a BKV_EXPR and then deal with the next opcode case-by-case. */\n+    ENDIF,\n+    /** If, inside an ENDIF context, we find an OP_NOTIF before finding an OP_ELSE,\n+     * we could either be in an or_d or an or_c node. We then check for IFDUP to\n+     * distinguish these cases. */\n+    ENDIF_NOTIF,\n+    /** If, inside an ENDIF context, we find an OP_ELSE, then we could be in either an\n+     * or_i or an andor node. Read the next BKV_EXPR and find either an OP_IF or an\n+     * OP_NOTIF. */\n+    ENDIF_ELSE,\n+};\n+\n+//! Parse a miniscript from a bitcoin script\n+template<typename Key, typename Ctx, typename I>\n+inline NodeRef<Key> DecodeScript(I& in, I last, const Ctx& ctx)\n+{\n+    // The two integers are used to hold state for thresh()\n+    std::vector<std::tuple<DecodeContext, int64_t, int64_t>> to_parse;\n+    std::vector<NodeRef<Key>> constructed;\n+\n+    // This is the top level, so we assume the type is B\n+    // (in particular, disallowing top level W expressions)\n+    to_parse.emplace_back(DecodeContext::BKV_EXPR, -1, -1);\n+\n+    while (!to_parse.empty()) {\n+        // Exit early if the Miniscript is not going to be valid.\n+        if (!constructed.empty() && !constructed.back()->IsValid()) return {};\n+\n+        // Get the current context we are decoding within\n+        auto [cur_context, n, k] = to_parse.back();\n+        to_parse.pop_back();\n+\n+        switch(cur_context) {\n+        case DecodeContext::SINGLE_BKV_EXPR: {\n+            if (in >= last) return {};\n+\n+            // Constants\n+            if (in[0].first == OP_1) {\n+                ++in;\n+                constructed.push_back(MakeNodeRef<Key>(Fragment::JUST_1));\n+            } else if (in[0].first == OP_0) {\n+                ++in;\n+                constructed.push_back(MakeNodeRef<Key>(Fragment::JUST_0));\n+            }\n+            // Public keys\n+            else if (in[0].second.size() == 33) {\n+                Key key;\n+                if (!ctx.FromPKBytes(in[0].second.begin(), in[0].second.end(), key)) return {};\n+                ++in;\n+                constructed.push_back(MakeNodeRef<Key>(Fragment::PK_K, Vector(std::move(key))));\n+            } else if (last - in >= 5 && in[0].first == OP_VERIFY && in[1].first == OP_EQUAL && in[3].first == OP_HASH160 && in[4].first == OP_DUP && in[2].second.size() == 20) {\n+                Key key;\n+                if (!ctx.FromPKHBytes(in[2].second.begin(), in[2].second.end(), key)) return {};\n+                in += 5;\n+                constructed.push_back(MakeNodeRef<Key>(Fragment::PK_H, Vector(std::move(key))));\n+            }\n+            // Time locks\n+            else if (last - in >= 2 && in[0].first == OP_CHECKSEQUENCEVERIFY && ParseScriptNumber(in[1], k)) {\n+                in += 2;\n+                if (k < 1 || k > 0x7FFFFFFFL) return {};\n+                constructed.push_back(MakeNodeRef<Key>(Fragment::OLDER, k));\n+            } else if (last - in >= 2 && in[0].first == OP_CHECKLOCKTIMEVERIFY && ParseScriptNumber(in[1], k)) {\n+                in += 2;\n+                if (k < 1 || k > 0x7FFFFFFFL) return {};\n+                constructed.push_back(MakeNodeRef<Key>(Fragment::AFTER, k));\n+            }\n+            // Hashes\n+            else if (last - in >= 7 && in[0].first == OP_EQUAL && in[1].second.size() == 32 && in[2].first == OP_SHA256 && in[3].first == OP_VERIFY && in[4].first == OP_EQUAL && ParseScriptNumber(in[5], k) && k == 32 && in[6].first == OP_SIZE) {\n+                constructed.push_back(MakeNodeRef<Key>(Fragment::SHA256, in[1].second));\n+                in += 7;\n+            } else if (last - in >= 7 && in[0].first == OP_EQUAL && in[1].second.size() == 20 && in[2].first == OP_RIPEMD160 && in[3].first == OP_VERIFY && in[4].first == OP_EQUAL && ParseScriptNumber(in[5], k) && k == 32 && in[6].first == OP_SIZE) {\n+                constructed.push_back(MakeNodeRef<Key>(Fragment::RIPEMD160, in[1].second));\n+                in += 7;\n+            } else if (last - in >= 7 && in[0].first == OP_EQUAL && in[1].second.size() == 32 && in[2].first == OP_HASH256 && in[3].first == OP_VERIFY && in[4].first == OP_EQUAL && ParseScriptNumber(in[5], k) && k == 32 && in[6].first == OP_SIZE) {\n+                constructed.push_back(MakeNodeRef<Key>(Fragment::HASH256, in[1].second));\n+                in += 7;\n+            } else if (last - in >= 7 && in[0].first == OP_EQUAL && in[1].second.size() == 20 && in[2].first == OP_HASH160 && in[3].first == OP_VERIFY && in[4].first == OP_EQUAL && ParseScriptNumber(in[5], k) && k == 32 && in[6].first == OP_SIZE) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801035751",
+      "id" : 801035751,
+      "line" : 1301,
+      "node_id" : "PRRC_kwDOABII584vvtXn",
+      "original_commit_id" : "f09f339d483824a40b7aacc7c1449a206d4f79f4",
+      "original_line" : 1156,
+      "original_position" : 157,
+      "original_start_line" : 1147,
+      "path" : "src/script/miniscript.h",
+      "position" : 157,
+      "pull_request_review_id" : 875216427,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801035751/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 1292,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-02-07T21:17:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801035751",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801037068"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801037068"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "In 85cf12e20201eee4ed23902e1da151f63663cfab \"Miniscript: ops limit and stack size computation\"\r\n\r\nThis is named very similarly to `sat` on the next line. It is confusing and potentially disastrous if a typo is made.\r\n\r\n```suggestion\r\n    uint32_t ops;\r\n```",
+      "commit_id" : "fa39084fc47a196e8d5f4b1b7807444ffff60a6b",
+      "created_at" : "2022-02-07T20:36:28Z",
+      "diff_hunk" : "@@ -231,6 +231,47 @@ size_t ComputeScriptLen(Fragment nodetype, Type sub0typ, size_t subsize, uint32_\n //! A helper sanitizer/checker for the output of CalcType.\n Type SanitizeType(Type x);\n \n+//! Class whose objects represent the maximum of a list of integers.\n+template<typename I>\n+struct MaxInt {\n+    const bool valid;\n+    const I value;\n+\n+    MaxInt() : valid(false), value(0) {}\n+    MaxInt(I val) : valid(true), value(val) {}\n+\n+    friend MaxInt<I> operator+(const MaxInt<I>& a, const MaxInt<I>& b) {\n+        if (!a.valid || !b.valid) return {};\n+        return a.value + b.value;\n+    }\n+\n+    friend MaxInt<I> Choose(const MaxInt<I>& a, const MaxInt<I>& b) {\n+        if (!a.valid) return b;\n+        if (!b.valid) return a;\n+        return std::max(a.value, b.value);\n+    }\n+};\n+\n+struct Ops {\n+    //! Non-push opcodes.\n+    uint32_t stat;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801037068",
+      "id" : 801037068,
+      "line" : 257,
+      "node_id" : "PRRC_kwDOABII584vvtsM",
+      "original_commit_id" : "85cf12e20201eee4ed23902e1da151f63663cfab",
+      "original_line" : 257,
+      "original_position" : 27,
+      "original_start_line" : null,
+      "path" : "src/script/miniscript.h",
+      "position" : 27,
+      "pull_request_review_id" : 875216427,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801037068/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-02-07T21:17:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801037068",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801056705"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801056705"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "In 85cf12e20201eee4ed23902e1da151f63663cfab \"Miniscript: ops limit and stack size computation\"\r\n\r\nA lot of these are the same, so this could be de-duplicated in the same way that the size calculation was.",
+      "commit_id" : "fa39084fc47a196e8d5f4b1b7807444ffff60a6b",
+      "created_at" : "2022-02-07T21:04:24Z",
+      "diff_hunk" : "@@ -555,10 +600,110 @@ struct Node {\n         return res.has_value();\n     }\n \n+    internal::Ops CalcOps() const {\n+        switch (nodetype) {\n+            case Fragment::PK_K: return {0, 0, 0};\n+            case Fragment::PK_H: return {3, 0, 0};\n+            case Fragment::OLDER: return {1, 0, {}};\n+            case Fragment::AFTER: return {1, 0, {}};\n+            case Fragment::SHA256: return {4, 0, {}};\n+            case Fragment::RIPEMD160: return {4, 0, {}};\n+            case Fragment::HASH256: return {4, 0, {}};\n+            case Fragment::HASH160: return {4, 0, {}};\n+            case Fragment::AND_V: return {subs[0]->ops.stat + subs[1]->ops.stat, subs[0]->ops.sat + subs[1]->ops.sat, {}};\n+            case Fragment::AND_B: return {1 + subs[0]->ops.stat + subs[1]->ops.stat, subs[0]->ops.sat + subs[1]->ops.sat, subs[0]->ops.dsat + subs[1]->ops.dsat};\n+            case Fragment::OR_B: return {1 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat + subs[1]->ops.dsat, subs[1]->ops.sat + subs[0]->ops.dsat), subs[0]->ops.dsat + subs[1]->ops.dsat};\n+            case Fragment::OR_D: return {3 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat, subs[1]->ops.sat + subs[0]->ops.dsat), subs[0]->ops.dsat + subs[1]->ops.dsat};\n+            case Fragment::OR_C: return {2 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat, subs[1]->ops.sat + subs[0]->ops.dsat), {}};\n+            case Fragment::OR_I: return {3 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat, subs[1]->ops.sat), Choose(subs[0]->ops.dsat, subs[1]->ops.dsat)};\n+            case Fragment::ANDOR: return {3 + subs[0]->ops.stat + subs[1]->ops.stat + subs[2]->ops.stat, Choose(subs[1]->ops.sat + subs[0]->ops.sat, subs[0]->ops.dsat + subs[2]->ops.sat), subs[0]->ops.dsat + subs[2]->ops.dsat};\n+            case Fragment::MULTI: return {1, (uint32_t)keys.size(), (uint32_t)keys.size()};\n+            case Fragment::WRAP_A: return {2 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::WRAP_S: return {1 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::WRAP_C: return {1 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::WRAP_D: return {3 + subs[0]->ops.stat, subs[0]->ops.sat, 0};\n+            case Fragment::WRAP_V: return {subs[0]->ops.stat + (subs[0]->GetType() << \"x\"_mst), subs[0]->ops.sat, {}};\n+            case Fragment::WRAP_J: return {4 + subs[0]->ops.stat, subs[0]->ops.sat, 0};\n+            case Fragment::WRAP_N: return {1 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::JUST_1: return {0, 0, {}};\n+            case Fragment::JUST_0: return {0, {}, 0};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801056705",
+      "id" : 801056705,
+      "line" : 629,
+      "node_id" : "PRRC_kwDOABII584vvyfB",
+      "original_commit_id" : "85cf12e20201eee4ed23902e1da151f63663cfab",
+      "original_line" : 629,
+      "original_position" : 89,
+      "original_start_line" : 605,
+      "path" : "src/script/miniscript.h",
+      "position" : 89,
+      "pull_request_review_id" : 875216427,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801056705/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 605,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-02-07T21:17:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801056705",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801057035"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801057035"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "In 85cf12e20201eee4ed23902e1da151f63663cfab \"Miniscript: ops limit and stack size computation\"\r\n\r\nA lot of these are the same, so this can be de-duplicated in the same way that the size calculation was.",
+      "commit_id" : "fa39084fc47a196e8d5f4b1b7807444ffff60a6b",
+      "created_at" : "2022-02-07T21:04:54Z",
+      "diff_hunk" : "@@ -555,10 +600,110 @@ struct Node {\n         return res.has_value();\n     }\n \n+    internal::Ops CalcOps() const {\n+        switch (nodetype) {\n+            case Fragment::PK_K: return {0, 0, 0};\n+            case Fragment::PK_H: return {3, 0, 0};\n+            case Fragment::OLDER: return {1, 0, {}};\n+            case Fragment::AFTER: return {1, 0, {}};\n+            case Fragment::SHA256: return {4, 0, {}};\n+            case Fragment::RIPEMD160: return {4, 0, {}};\n+            case Fragment::HASH256: return {4, 0, {}};\n+            case Fragment::HASH160: return {4, 0, {}};\n+            case Fragment::AND_V: return {subs[0]->ops.stat + subs[1]->ops.stat, subs[0]->ops.sat + subs[1]->ops.sat, {}};\n+            case Fragment::AND_B: return {1 + subs[0]->ops.stat + subs[1]->ops.stat, subs[0]->ops.sat + subs[1]->ops.sat, subs[0]->ops.dsat + subs[1]->ops.dsat};\n+            case Fragment::OR_B: return {1 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat + subs[1]->ops.dsat, subs[1]->ops.sat + subs[0]->ops.dsat), subs[0]->ops.dsat + subs[1]->ops.dsat};\n+            case Fragment::OR_D: return {3 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat, subs[1]->ops.sat + subs[0]->ops.dsat), subs[0]->ops.dsat + subs[1]->ops.dsat};\n+            case Fragment::OR_C: return {2 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat, subs[1]->ops.sat + subs[0]->ops.dsat), {}};\n+            case Fragment::OR_I: return {3 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat, subs[1]->ops.sat), Choose(subs[0]->ops.dsat, subs[1]->ops.dsat)};\n+            case Fragment::ANDOR: return {3 + subs[0]->ops.stat + subs[1]->ops.stat + subs[2]->ops.stat, Choose(subs[1]->ops.sat + subs[0]->ops.sat, subs[0]->ops.dsat + subs[2]->ops.sat), subs[0]->ops.dsat + subs[2]->ops.dsat};\n+            case Fragment::MULTI: return {1, (uint32_t)keys.size(), (uint32_t)keys.size()};\n+            case Fragment::WRAP_A: return {2 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::WRAP_S: return {1 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::WRAP_C: return {1 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::WRAP_D: return {3 + subs[0]->ops.stat, subs[0]->ops.sat, 0};\n+            case Fragment::WRAP_V: return {subs[0]->ops.stat + (subs[0]->GetType() << \"x\"_mst), subs[0]->ops.sat, {}};\n+            case Fragment::WRAP_J: return {4 + subs[0]->ops.stat, subs[0]->ops.sat, 0};\n+            case Fragment::WRAP_N: return {1 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::JUST_1: return {0, 0, {}};\n+            case Fragment::JUST_0: return {0, {}, 0};\n+            case Fragment::THRESH: {\n+                uint32_t stat = 0;\n+                auto sats = Vector(internal::MaxInt<uint32_t>(0));\n+                for (const auto& sub : subs) {\n+                    stat += sub->ops.stat + 1;\n+                    auto next_sats = Vector(sats[0] + sub->ops.dsat);\n+                    for (size_t j = 1; j < sats.size(); ++j) next_sats.push_back(Choose(sats[j] + sub->ops.dsat, sats[j - 1] + sub->ops.sat));\n+                    next_sats.push_back(sats[sats.size() - 1] + sub->ops.sat);\n+                    sats = std::move(next_sats);\n+                }\n+                assert(k <= sats.size());\n+                return {stat, sats[k], sats[0]};\n+            }\n+        }\n+        assert(false);\n+        return {0, {}, {}};\n+    }\n+\n+    internal::StackSize CalcStackSize() const {\n+        switch (nodetype) {\n+            case Fragment::PK_K: return {1, 1};\n+            case Fragment::PK_H: return {2, 2};\n+            case Fragment::OLDER: return {0, {}};\n+            case Fragment::AFTER: return {0, {}};\n+            case Fragment::SHA256: return {1, {}};\n+            case Fragment::RIPEMD160: return {1, {}};\n+            case Fragment::HASH256: return {1, {}};\n+            case Fragment::HASH160: return {1, {}};\n+            case Fragment::ANDOR: return {Choose(subs[0]->ss.sat + subs[1]->ss.sat, subs[0]->ss.dsat + subs[2]->ss.sat), subs[0]->ss.dsat + subs[2]->ss.dsat};\n+            case Fragment::AND_V: return {subs[0]->ss.sat + subs[1]->ss.sat, {}};\n+            case Fragment::AND_B: return {subs[0]->ss.sat + subs[1]->ss.sat, subs[0]->ss.dsat + subs[1]->ss.dsat};\n+            case Fragment::OR_B: return {Choose(subs[0]->ss.dsat + subs[1]->ss.sat, subs[0]->ss.sat + subs[1]->ss.dsat), subs[0]->ss.dsat + subs[1]->ss.dsat};\n+            case Fragment::OR_C: return {Choose(subs[0]->ss.sat, subs[0]->ss.dsat + subs[1]->ss.sat), {}};\n+            case Fragment::OR_D: return {Choose(subs[0]->ss.sat, subs[0]->ss.dsat + subs[1]->ss.sat), subs[0]->ss.dsat + subs[1]->ss.dsat};\n+            case Fragment::OR_I: return {Choose(subs[0]->ss.sat + 1, subs[1]->ss.sat + 1), Choose(subs[0]->ss.dsat + 1, subs[1]->ss.dsat + 1)};\n+            case Fragment::MULTI: return {(uint32_t)keys.size() + 1, (uint32_t)keys.size() + 1};\n+            case Fragment::WRAP_A: return subs[0]->ss;\n+            case Fragment::WRAP_S: return subs[0]->ss;\n+            case Fragment::WRAP_C: return subs[0]->ss;\n+            case Fragment::WRAP_D: return {1 + subs[0]->ss.sat, 1};\n+            case Fragment::WRAP_V: return {subs[0]->ss.sat, {}};\n+            case Fragment::WRAP_J: return {subs[0]->ss.sat, 1};\n+            case Fragment::WRAP_N: return subs[0]->ss;\n+            case Fragment::JUST_1: return {0, {}};\n+            case Fragment::JUST_0: return {{}, 0};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801057035",
+      "id" : 801057035,
+      "line" : 674,
+      "node_id" : "PRRC_kwDOABII584vvykL",
+      "original_commit_id" : "85cf12e20201eee4ed23902e1da151f63663cfab",
+      "original_line" : 674,
+      "original_position" : 134,
+      "original_start_line" : 649,
+      "path" : "src/script/miniscript.h",
+      "position" : 134,
+      "pull_request_review_id" : 875216427,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801057035/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 649,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-02-07T21:17:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801057035",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801058088"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801058088"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "In 85cf12e20201eee4ed23902e1da151f63663cfab \"Miniscript: ops limit and stack size computation\"\r\n\r\nWhat is the distinction between `{}` and `0`? How com some fragments use 0, and others use `{}`?\r\n\r\nIt seems like `{}` is being used for fragments that have no dis/satisfaction. However it is used for the hashing fragments and those have a dissatisfaction.",
+      "commit_id" : "fa39084fc47a196e8d5f4b1b7807444ffff60a6b",
+      "created_at" : "2022-02-07T21:06:27Z",
+      "diff_hunk" : "@@ -555,10 +600,110 @@ struct Node {\n         return res.has_value();\n     }\n \n+    internal::Ops CalcOps() const {\n+        switch (nodetype) {\n+            case Fragment::PK_K: return {0, 0, 0};\n+            case Fragment::PK_H: return {3, 0, 0};\n+            case Fragment::OLDER: return {1, 0, {}};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801058088",
+      "id" : 801058088,
+      "line" : 607,
+      "node_id" : "PRRC_kwDOABII584vvy0o",
+      "original_commit_id" : "85cf12e20201eee4ed23902e1da151f63663cfab",
+      "original_line" : 607,
+      "original_position" : 67,
+      "original_start_line" : null,
+      "path" : "src/script/miniscript.h",
+      "position" : 67,
+      "pull_request_review_id" : 875216427,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801058088/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-02-07T21:17:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801058088",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801058856"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801058856"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "In 85cf12e20201eee4ed23902e1da151f63663cfab \"Miniscript: ops limit and stack size computation\"\r\n\r\nIt was not immediately obvious to me that this includes the script itself as a stack item, perhaps mention that in the docstring?",
+      "commit_id" : "fa39084fc47a196e8d5f4b1b7807444ffff60a6b",
+      "created_at" : "2022-02-07T21:07:39Z",
+      "diff_hunk" : "@@ -555,10 +600,110 @@ struct Node {\n         return res.has_value();\n     }\n \n+    internal::Ops CalcOps() const {\n+        switch (nodetype) {\n+            case Fragment::PK_K: return {0, 0, 0};\n+            case Fragment::PK_H: return {3, 0, 0};\n+            case Fragment::OLDER: return {1, 0, {}};\n+            case Fragment::AFTER: return {1, 0, {}};\n+            case Fragment::SHA256: return {4, 0, {}};\n+            case Fragment::RIPEMD160: return {4, 0, {}};\n+            case Fragment::HASH256: return {4, 0, {}};\n+            case Fragment::HASH160: return {4, 0, {}};\n+            case Fragment::AND_V: return {subs[0]->ops.stat + subs[1]->ops.stat, subs[0]->ops.sat + subs[1]->ops.sat, {}};\n+            case Fragment::AND_B: return {1 + subs[0]->ops.stat + subs[1]->ops.stat, subs[0]->ops.sat + subs[1]->ops.sat, subs[0]->ops.dsat + subs[1]->ops.dsat};\n+            case Fragment::OR_B: return {1 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat + subs[1]->ops.dsat, subs[1]->ops.sat + subs[0]->ops.dsat), subs[0]->ops.dsat + subs[1]->ops.dsat};\n+            case Fragment::OR_D: return {3 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat, subs[1]->ops.sat + subs[0]->ops.dsat), subs[0]->ops.dsat + subs[1]->ops.dsat};\n+            case Fragment::OR_C: return {2 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat, subs[1]->ops.sat + subs[0]->ops.dsat), {}};\n+            case Fragment::OR_I: return {3 + subs[0]->ops.stat + subs[1]->ops.stat, Choose(subs[0]->ops.sat, subs[1]->ops.sat), Choose(subs[0]->ops.dsat, subs[1]->ops.dsat)};\n+            case Fragment::ANDOR: return {3 + subs[0]->ops.stat + subs[1]->ops.stat + subs[2]->ops.stat, Choose(subs[1]->ops.sat + subs[0]->ops.sat, subs[0]->ops.dsat + subs[2]->ops.sat), subs[0]->ops.dsat + subs[2]->ops.dsat};\n+            case Fragment::MULTI: return {1, (uint32_t)keys.size(), (uint32_t)keys.size()};\n+            case Fragment::WRAP_A: return {2 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::WRAP_S: return {1 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::WRAP_C: return {1 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::WRAP_D: return {3 + subs[0]->ops.stat, subs[0]->ops.sat, 0};\n+            case Fragment::WRAP_V: return {subs[0]->ops.stat + (subs[0]->GetType() << \"x\"_mst), subs[0]->ops.sat, {}};\n+            case Fragment::WRAP_J: return {4 + subs[0]->ops.stat, subs[0]->ops.sat, 0};\n+            case Fragment::WRAP_N: return {1 + subs[0]->ops.stat, subs[0]->ops.sat, subs[0]->ops.dsat};\n+            case Fragment::JUST_1: return {0, 0, {}};\n+            case Fragment::JUST_0: return {0, {}, 0};\n+            case Fragment::THRESH: {\n+                uint32_t stat = 0;\n+                auto sats = Vector(internal::MaxInt<uint32_t>(0));\n+                for (const auto& sub : subs) {\n+                    stat += sub->ops.stat + 1;\n+                    auto next_sats = Vector(sats[0] + sub->ops.dsat);\n+                    for (size_t j = 1; j < sats.size(); ++j) next_sats.push_back(Choose(sats[j] + sub->ops.dsat, sats[j - 1] + sub->ops.sat));\n+                    next_sats.push_back(sats[sats.size() - 1] + sub->ops.sat);\n+                    sats = std::move(next_sats);\n+                }\n+                assert(k <= sats.size());\n+                return {stat, sats[k], sats[0]};\n+            }\n+        }\n+        assert(false);\n+        return {0, {}, {}};\n+    }\n+\n+    internal::StackSize CalcStackSize() const {\n+        switch (nodetype) {\n+            case Fragment::PK_K: return {1, 1};\n+            case Fragment::PK_H: return {2, 2};\n+            case Fragment::OLDER: return {0, {}};\n+            case Fragment::AFTER: return {0, {}};\n+            case Fragment::SHA256: return {1, {}};\n+            case Fragment::RIPEMD160: return {1, {}};\n+            case Fragment::HASH256: return {1, {}};\n+            case Fragment::HASH160: return {1, {}};\n+            case Fragment::ANDOR: return {Choose(subs[0]->ss.sat + subs[1]->ss.sat, subs[0]->ss.dsat + subs[2]->ss.sat), subs[0]->ss.dsat + subs[2]->ss.dsat};\n+            case Fragment::AND_V: return {subs[0]->ss.sat + subs[1]->ss.sat, {}};\n+            case Fragment::AND_B: return {subs[0]->ss.sat + subs[1]->ss.sat, subs[0]->ss.dsat + subs[1]->ss.dsat};\n+            case Fragment::OR_B: return {Choose(subs[0]->ss.dsat + subs[1]->ss.sat, subs[0]->ss.sat + subs[1]->ss.dsat), subs[0]->ss.dsat + subs[1]->ss.dsat};\n+            case Fragment::OR_C: return {Choose(subs[0]->ss.sat, subs[0]->ss.dsat + subs[1]->ss.sat), {}};\n+            case Fragment::OR_D: return {Choose(subs[0]->ss.sat, subs[0]->ss.dsat + subs[1]->ss.sat), subs[0]->ss.dsat + subs[1]->ss.dsat};\n+            case Fragment::OR_I: return {Choose(subs[0]->ss.sat + 1, subs[1]->ss.sat + 1), Choose(subs[0]->ss.dsat + 1, subs[1]->ss.dsat + 1)};\n+            case Fragment::MULTI: return {(uint32_t)keys.size() + 1, (uint32_t)keys.size() + 1};\n+            case Fragment::WRAP_A: return subs[0]->ss;\n+            case Fragment::WRAP_S: return subs[0]->ss;\n+            case Fragment::WRAP_C: return subs[0]->ss;\n+            case Fragment::WRAP_D: return {1 + subs[0]->ss.sat, 1};\n+            case Fragment::WRAP_V: return {subs[0]->ss.sat, {}};\n+            case Fragment::WRAP_J: return {subs[0]->ss.sat, 1};\n+            case Fragment::WRAP_N: return subs[0]->ss;\n+            case Fragment::JUST_1: return {0, {}};\n+            case Fragment::JUST_0: return {{}, 0};\n+            case Fragment::THRESH: {\n+                auto sats = Vector(internal::MaxInt<uint32_t>(0));\n+                for (const auto& sub : subs) {\n+                    auto next_sats = Vector(sats[0] + sub->ss.dsat);\n+                    for (size_t j = 1; j < sats.size(); ++j) next_sats.push_back(Choose(sats[j] + sub->ss.dsat, sats[j - 1] + sub->ss.sat));\n+                    next_sats.push_back(sats[sats.size() - 1] + sub->ss.sat);\n+                    sats = std::move(next_sats);\n+                }\n+                assert(k <= sats.size());\n+                return {sats[k], sats[0]};\n+            }\n+        }\n+        assert(false);\n+        return {{}, {}};\n+    }\n+\n public:\n     //! Return the size of the script for this expression (faster than ToScript().size()).\n     size_t ScriptSize() const { return scriptlen; }\n \n+    //! Return the maximum number of ops needed to satisfy this script non-malleably.\n+    uint32_t GetOps() const { return ops.stat + ops.sat.value; }\n+\n+    //! Check the ops limit of this script against the consensus limit.\n+    bool CheckOpsLimit() const { return GetOps() <= MAX_OPS_PER_SCRIPT; }\n+\n+    //! Return the maximum number of stack elements needed to satisfy this script non-malleably.\n+    uint32_t GetStackSize() const { return ss.sat.value + 1; }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801058856",
+      "id" : 801058856,
+      "line" : 702,
+      "node_id" : "PRRC_kwDOABII584vvzAo",
+      "original_commit_id" : "85cf12e20201eee4ed23902e1da151f63663cfab",
+      "original_line" : 702,
+      "original_position" : 162,
+      "original_start_line" : null,
+      "path" : "src/script/miniscript.h",
+      "position" : 162,
+      "pull_request_review_id" : 875216427,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801058856/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-02-07T21:17:46Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801058856",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801067445"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801067445"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "While hashes do have dissatisfactions, they are always malleable. The ops counting algorithm only works for non-malleable signing, which will never use these.\r\n\r\n(Just mentioning this to explain it to you; if it's not clear from the code that this is the case it should be documented of course)",
+      "commit_id" : "fa39084fc47a196e8d5f4b1b7807444ffff60a6b",
+      "created_at" : "2022-02-07T21:20:14Z",
+      "diff_hunk" : "@@ -555,10 +600,110 @@ struct Node {\n         return res.has_value();\n     }\n \n+    internal::Ops CalcOps() const {\n+        switch (nodetype) {\n+            case Fragment::PK_K: return {0, 0, 0};\n+            case Fragment::PK_H: return {3, 0, 0};\n+            case Fragment::OLDER: return {1, 0, {}};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r801067445",
+      "id" : 801067445,
+      "in_reply_to_id" : 801058088,
+      "line" : 607,
+      "node_id" : "PRRC_kwDOABII584vv1G1",
+      "original_commit_id" : "85cf12e20201eee4ed23902e1da151f63663cfab",
+      "original_line" : 607,
+      "original_position" : 67,
+      "original_start_line" : null,
+      "path" : "src/script/miniscript.h",
+      "position" : 67,
+      "pull_request_review_id" : 875259476,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801067445/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-02-07T21:29:13Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/801067445",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r803802945"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/803802945"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Naming a field of `Ops` \"`ops`\" is a bit weird, went with `count` instead.",
+      "commit_id" : "fa39084fc47a196e8d5f4b1b7807444ffff60a6b",
+      "created_at" : "2022-02-10T15:34:06Z",
+      "diff_hunk" : "@@ -231,6 +231,47 @@ size_t ComputeScriptLen(Fragment nodetype, Type sub0typ, size_t subsize, uint32_\n //! A helper sanitizer/checker for the output of CalcType.\n Type SanitizeType(Type x);\n \n+//! Class whose objects represent the maximum of a list of integers.\n+template<typename I>\n+struct MaxInt {\n+    const bool valid;\n+    const I value;\n+\n+    MaxInt() : valid(false), value(0) {}\n+    MaxInt(I val) : valid(true), value(val) {}\n+\n+    friend MaxInt<I> operator+(const MaxInt<I>& a, const MaxInt<I>& b) {\n+        if (!a.valid || !b.valid) return {};\n+        return a.value + b.value;\n+    }\n+\n+    friend MaxInt<I> Choose(const MaxInt<I>& a, const MaxInt<I>& b) {\n+        if (!a.valid) return b;\n+        if (!b.valid) return a;\n+        return std::max(a.value, b.value);\n+    }\n+};\n+\n+struct Ops {\n+    //! Non-push opcodes.\n+    uint32_t stat;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r803802945",
+      "id" : 803802945,
+      "in_reply_to_id" : 801037068,
+      "line" : 257,
+      "node_id" : "PRRC_kwDOABII584v6Q9B",
+      "original_commit_id" : "85cf12e20201eee4ed23902e1da151f63663cfab",
+      "original_line" : 257,
+      "original_position" : 27,
+      "original_start_line" : null,
+      "path" : "src/script/miniscript.h",
+      "position" : 27,
+      "pull_request_review_id" : 879020861,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/803802945/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-02-10T15:34:07Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/803802945",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/22457751?v=4",
+         "events_url" : "https://api.github.com/users/darosior/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/darosior/followers",
+         "following_url" : "https://api.github.com/users/darosior/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/darosior/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/darosior",
+         "id" : 22457751,
+         "login" : "darosior",
+         "node_id" : "MDQ6VXNlcjIyNDU3NzUx",
+         "organizations_url" : "https://api.github.com/users/darosior/orgs",
+         "received_events_url" : "https://api.github.com/users/darosior/received_events",
+         "repos_url" : "https://api.github.com/users/darosior/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/darosior/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/darosior/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/darosior"
+      }
    }
 ]
