@@ -4744,5 +4744,208 @@
          "type" : "User",
          "url" : "https://api.github.com/users/sipa"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r873081915"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/873081915"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Isn't it the other way around, where if `true` then the right hand's properties are a superset of the left's?",
+      "commit_id" : "2da94a4c6f55f7a3621f4a6f70902c52f735c868",
+      "created_at" : "2022-05-14T22:39:24Z",
+      "diff_hunk" : "@@ -0,0 +1,1652 @@\n+// Copyright (c) 2019 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_SCRIPT_MINISCRIPT_H\n+#define BITCOIN_SCRIPT_MINISCRIPT_H\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <memory>\n+#include <optional>\n+#include <string>\n+#include <vector>\n+\n+#include <stdlib.h>\n+#include <assert.h>\n+\n+#include <policy/policy.h>\n+#include <primitives/transaction.h>\n+#include <script/script.h>\n+#include <span.h>\n+#include <util/spanparsing.h>\n+#include <util/strencodings.h>\n+#include <util/string.h>\n+#include <util/vector.h>\n+\n+namespace miniscript {\n+\n+/** This type encapsulates the miniscript type system properties.\n+ *\n+ * Every miniscript expression is one of 4 basic types, and additionally has\n+ * a number of boolean type properties.\n+ *\n+ * The basic types are:\n+ * - \"B\" Base:\n+ *   - Takes its inputs from the top of the stack.\n+ *   - When satisfied, pushes a nonzero value of up to 4 bytes onto the stack.\n+ *   - When dissatisfied, pushes a 0 onto the stack.\n+ *   - This is used for most expressions, and required for the top level one.\n+ *   - For example: older(n) = <n> OP_CHECKSEQUENCEVERIFY.\n+ * - \"V\" Verify:\n+ *   - Takes its inputs from the top of the stack.\n+ *   - When satisfactied, pushes nothing.\n+ *   - Cannot be dissatisfied.\n+ *   - This can be obtained by adding an OP_VERIFY to a B, modifying the last opcode\n+ *     of a B to its -VERIFY version (only for OP_CHECKSIG, OP_CHECKSIGVERIFY\n+ *     and OP_EQUAL), or by combining a V fragment under some conditions.\n+ *   - For example vc:pk_k(key) = <key> OP_CHECKSIGVERIFY\n+ * - \"K\" Key:\n+ *   - Takes its inputs from the top of the stack.\n+ *   - Becomes a B when followed by OP_CHECKSIG.\n+ *   - Always pushes a public key onto the stack, for which a signature is to be\n+ *     provided to satisfy the expression.\n+ *   - For example pk_h(key) = OP_DUP OP_HASH160 <Hash160(key)> OP_EQUALVERIFY\n+ * - \"W\" Wrapped:\n+ *   - Takes its input from one below the top of the stack.\n+ *   - When satisfied, pushes a nonzero value (like B) on top of the stack, or one below.\n+ *   - When dissatisfied, pushes 0 op top of the stack or one below.\n+ *   - Is always \"OP_SWAP [B]\" or \"OP_TOALTSTACK [B] OP_FROMALTSTACK\".\n+ *   - For example sc:pk_k(key) = OP_SWAP <key> OP_CHECKSIG\n+ *\n+ * There a type properties that help reasoning about correctness:\n+ * - \"z\" Zero-arg:\n+ *   - Is known to always consume exactly 0 stack elements.\n+ *   - For example after(n) = <n> OP_CHECKLOCKTIMEVERIFY\n+ * - \"o\" One-arg:\n+ *   - Is known to always consume exactly 1 stack element.\n+ *   - Conflicts with property 'z'\n+ *   - For example sha256(hash) = OP_SIZE 32 OP_EQUALVERIFY OP_SHA256 <hash> OP_EQUAL\n+ * - \"n\" Nonzero:\n+ *   - For every way this expression can be satisfied, a satisfaction exists that never needs\n+ *     a zero top stack element.\n+ *   - Conflicts with property 'z' and with type 'W'.\n+ * - \"d\" Dissatisfiable:\n+ *   - There is an easy way to construct a dissatisfaction for this expression.\n+ *   - Conflicts with type 'V'.\n+ * - \"u\" Unit:\n+ *   - In case of satisfaction, an exact 1 is put on the stack (rather than just nonzero).\n+ *   - Conflicts with type 'V'.\n+ *\n+ * Additional type properties help reasoning about nonmalleability:\n+ * - \"e\" Expression:\n+ *   - This implies property 'd', but the dissatisfaction is nonmalleable.\n+ *   - This generally requires 'e' for all subexpressions which are invoked for that\n+ *     dissatifsaction, and property 'f' for the unexecuted subexpressions in that case.\n+ *   - Conflicts with type 'V'.\n+ * - \"f\" Forced:\n+ *   - Dissatisfactions (if any) for this expression always involve at least one signature.\n+ *   - Is always true for type 'V'.\n+ * - \"s\" Safe:\n+ *   - Satisfactions for this expression always involve at least one signature.\n+ * - \"m\" Nonmalleable:\n+ *   - For every way this expression can be satisfied (which may be none),\n+ *     a nonmalleable satisfaction exists.\n+ *   - This generally requires 'm' for all subexpressions, and 'e' for all subexpressions\n+ *     which are dissatisfied when satisfying the parent.\n+ *\n+ * One type property is an implementation detail:\n+ * - \"x\" Expensive verify:\n+ *   - Expressions with this property have a script whose last opcode is not EQUAL, CHECKSIG, or CHECKMULTISIG.\n+ *   - Not having this property means that it can be converted to a V at no cost (by switching to the\n+ *     -VERIFY version of the last opcode).\n+ *\n+ * Five more type properties for representing timelock information. Spend paths\n+ * in miniscripts containing conflicting timelocks and heightlocks cannot be spent together.\n+ * This helps users detect if miniscript does not match the semantic behaviour the\n+ * user expects.\n+ * - \"g\" Whether the branch contains a relative time timelock\n+ * - \"h\" Whether the branch contains a relative height timelock\n+ * - \"i\" Whether the branch contains an absolute time timelock\n+ * - \"j\" Whether the branch contains an absolute height timelock\n+ * - \"k\"\n+ *   - Whether all satisfactions of this expression don't contain a mix of heightlock and timelock\n+ *     of the same type.\n+ *   - If the miniscript does not have the \"k\" property, the miniscript template will not match\n+ *     the user expectation of the corresponding spending policy.\n+ * For each of these properties the subset rule holds: an expression with properties X, Y, and Z, is also\n+ * valid in places where an X, a Y, a Z, an XY, ... is expected.\n+*/\n+class Type {\n+    //! Internal bitmap of properties (see \"\"_mst operator for details).\n+    uint32_t m_flags;\n+\n+    //! Internal constructor used by the \"\"_mst operator.\n+    explicit constexpr Type(uint32_t flags) : m_flags(flags) {}\n+\n+public:\n+    //! The only way to publicly construct a Type is using this literal operator.\n+    friend constexpr Type operator\"\" _mst(const char* c, size_t l);\n+\n+    //! Compute the type with the union of properties.\n+    constexpr Type operator|(Type x) const { return Type(m_flags | x.m_flags); }\n+\n+    //! Compute the type with the intersection of properties.\n+    constexpr Type operator&(Type x) const { return Type(m_flags & x.m_flags); }\n+\n+    //! Check whether the left hand's properties are superset of the right's (= left is a subtype of right).",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r873081915",
+      "id" : 873081915,
+      "line" : 137,
+      "node_id" : "PRRC_kwDOABII5840Ciw7",
+      "original_commit_id" : "2da94a4c6f55f7a3621f4a6f70902c52f735c868",
+      "original_line" : 137,
+      "original_position" : 137,
+      "original_start_line" : null,
+      "path" : "src/script/miniscript.h",
+      "position" : 137,
+      "pull_request_review_id" : 973104889,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/873081915/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-05-14T22:39:24Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/873081915",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/69010457?v=4",
+         "events_url" : "https://api.github.com/users/stickies-v/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/stickies-v/followers",
+         "following_url" : "https://api.github.com/users/stickies-v/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/stickies-v/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/stickies-v",
+         "id" : 69010457,
+         "login" : "stickies-v",
+         "node_id" : "MDQ6VXNlcjY5MDEwNDU3",
+         "organizations_url" : "https://api.github.com/users/stickies-v/orgs",
+         "received_events_url" : "https://api.github.com/users/stickies-v/received_events",
+         "repos_url" : "https://api.github.com/users/stickies-v/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/stickies-v/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/stickies-v/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/stickies-v"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r873082324"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/873082324"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Sorry of course right after posting I see that the order of `m_flags` and `x.m_flags` is switched up for this operator compared to the other operators, which makes the docstring correct so please disregard my previous comment. The inconsistent order is maybe a bit confusing but no problem.",
+      "commit_id" : "2da94a4c6f55f7a3621f4a6f70902c52f735c868",
+      "created_at" : "2022-05-14T22:45:47Z",
+      "diff_hunk" : "@@ -0,0 +1,1652 @@\n+// Copyright (c) 2019 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_SCRIPT_MINISCRIPT_H\n+#define BITCOIN_SCRIPT_MINISCRIPT_H\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <memory>\n+#include <optional>\n+#include <string>\n+#include <vector>\n+\n+#include <stdlib.h>\n+#include <assert.h>\n+\n+#include <policy/policy.h>\n+#include <primitives/transaction.h>\n+#include <script/script.h>\n+#include <span.h>\n+#include <util/spanparsing.h>\n+#include <util/strencodings.h>\n+#include <util/string.h>\n+#include <util/vector.h>\n+\n+namespace miniscript {\n+\n+/** This type encapsulates the miniscript type system properties.\n+ *\n+ * Every miniscript expression is one of 4 basic types, and additionally has\n+ * a number of boolean type properties.\n+ *\n+ * The basic types are:\n+ * - \"B\" Base:\n+ *   - Takes its inputs from the top of the stack.\n+ *   - When satisfied, pushes a nonzero value of up to 4 bytes onto the stack.\n+ *   - When dissatisfied, pushes a 0 onto the stack.\n+ *   - This is used for most expressions, and required for the top level one.\n+ *   - For example: older(n) = <n> OP_CHECKSEQUENCEVERIFY.\n+ * - \"V\" Verify:\n+ *   - Takes its inputs from the top of the stack.\n+ *   - When satisfactied, pushes nothing.\n+ *   - Cannot be dissatisfied.\n+ *   - This can be obtained by adding an OP_VERIFY to a B, modifying the last opcode\n+ *     of a B to its -VERIFY version (only for OP_CHECKSIG, OP_CHECKSIGVERIFY\n+ *     and OP_EQUAL), or by combining a V fragment under some conditions.\n+ *   - For example vc:pk_k(key) = <key> OP_CHECKSIGVERIFY\n+ * - \"K\" Key:\n+ *   - Takes its inputs from the top of the stack.\n+ *   - Becomes a B when followed by OP_CHECKSIG.\n+ *   - Always pushes a public key onto the stack, for which a signature is to be\n+ *     provided to satisfy the expression.\n+ *   - For example pk_h(key) = OP_DUP OP_HASH160 <Hash160(key)> OP_EQUALVERIFY\n+ * - \"W\" Wrapped:\n+ *   - Takes its input from one below the top of the stack.\n+ *   - When satisfied, pushes a nonzero value (like B) on top of the stack, or one below.\n+ *   - When dissatisfied, pushes 0 op top of the stack or one below.\n+ *   - Is always \"OP_SWAP [B]\" or \"OP_TOALTSTACK [B] OP_FROMALTSTACK\".\n+ *   - For example sc:pk_k(key) = OP_SWAP <key> OP_CHECKSIG\n+ *\n+ * There a type properties that help reasoning about correctness:\n+ * - \"z\" Zero-arg:\n+ *   - Is known to always consume exactly 0 stack elements.\n+ *   - For example after(n) = <n> OP_CHECKLOCKTIMEVERIFY\n+ * - \"o\" One-arg:\n+ *   - Is known to always consume exactly 1 stack element.\n+ *   - Conflicts with property 'z'\n+ *   - For example sha256(hash) = OP_SIZE 32 OP_EQUALVERIFY OP_SHA256 <hash> OP_EQUAL\n+ * - \"n\" Nonzero:\n+ *   - For every way this expression can be satisfied, a satisfaction exists that never needs\n+ *     a zero top stack element.\n+ *   - Conflicts with property 'z' and with type 'W'.\n+ * - \"d\" Dissatisfiable:\n+ *   - There is an easy way to construct a dissatisfaction for this expression.\n+ *   - Conflicts with type 'V'.\n+ * - \"u\" Unit:\n+ *   - In case of satisfaction, an exact 1 is put on the stack (rather than just nonzero).\n+ *   - Conflicts with type 'V'.\n+ *\n+ * Additional type properties help reasoning about nonmalleability:\n+ * - \"e\" Expression:\n+ *   - This implies property 'd', but the dissatisfaction is nonmalleable.\n+ *   - This generally requires 'e' for all subexpressions which are invoked for that\n+ *     dissatifsaction, and property 'f' for the unexecuted subexpressions in that case.\n+ *   - Conflicts with type 'V'.\n+ * - \"f\" Forced:\n+ *   - Dissatisfactions (if any) for this expression always involve at least one signature.\n+ *   - Is always true for type 'V'.\n+ * - \"s\" Safe:\n+ *   - Satisfactions for this expression always involve at least one signature.\n+ * - \"m\" Nonmalleable:\n+ *   - For every way this expression can be satisfied (which may be none),\n+ *     a nonmalleable satisfaction exists.\n+ *   - This generally requires 'm' for all subexpressions, and 'e' for all subexpressions\n+ *     which are dissatisfied when satisfying the parent.\n+ *\n+ * One type property is an implementation detail:\n+ * - \"x\" Expensive verify:\n+ *   - Expressions with this property have a script whose last opcode is not EQUAL, CHECKSIG, or CHECKMULTISIG.\n+ *   - Not having this property means that it can be converted to a V at no cost (by switching to the\n+ *     -VERIFY version of the last opcode).\n+ *\n+ * Five more type properties for representing timelock information. Spend paths\n+ * in miniscripts containing conflicting timelocks and heightlocks cannot be spent together.\n+ * This helps users detect if miniscript does not match the semantic behaviour the\n+ * user expects.\n+ * - \"g\" Whether the branch contains a relative time timelock\n+ * - \"h\" Whether the branch contains a relative height timelock\n+ * - \"i\" Whether the branch contains an absolute time timelock\n+ * - \"j\" Whether the branch contains an absolute height timelock\n+ * - \"k\"\n+ *   - Whether all satisfactions of this expression don't contain a mix of heightlock and timelock\n+ *     of the same type.\n+ *   - If the miniscript does not have the \"k\" property, the miniscript template will not match\n+ *     the user expectation of the corresponding spending policy.\n+ * For each of these properties the subset rule holds: an expression with properties X, Y, and Z, is also\n+ * valid in places where an X, a Y, a Z, an XY, ... is expected.\n+*/\n+class Type {\n+    //! Internal bitmap of properties (see \"\"_mst operator for details).\n+    uint32_t m_flags;\n+\n+    //! Internal constructor used by the \"\"_mst operator.\n+    explicit constexpr Type(uint32_t flags) : m_flags(flags) {}\n+\n+public:\n+    //! The only way to publicly construct a Type is using this literal operator.\n+    friend constexpr Type operator\"\" _mst(const char* c, size_t l);\n+\n+    //! Compute the type with the union of properties.\n+    constexpr Type operator|(Type x) const { return Type(m_flags | x.m_flags); }\n+\n+    //! Compute the type with the intersection of properties.\n+    constexpr Type operator&(Type x) const { return Type(m_flags & x.m_flags); }\n+\n+    //! Check whether the left hand's properties are superset of the right's (= left is a subtype of right).",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r873082324",
+      "id" : 873082324,
+      "in_reply_to_id" : 873081915,
+      "line" : 137,
+      "node_id" : "PRRC_kwDOABII5840Ci3U",
+      "original_commit_id" : "2da94a4c6f55f7a3621f4a6f70902c52f735c868",
+      "original_line" : 137,
+      "original_position" : 137,
+      "original_start_line" : null,
+      "path" : "src/script/miniscript.h",
+      "position" : 137,
+      "pull_request_review_id" : 973105144,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/873082324/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-05-14T22:45:47Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/873082324",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/69010457?v=4",
+         "events_url" : "https://api.github.com/users/stickies-v/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/stickies-v/followers",
+         "following_url" : "https://api.github.com/users/stickies-v/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/stickies-v/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/stickies-v",
+         "id" : 69010457,
+         "login" : "stickies-v",
+         "node_id" : "MDQ6VXNlcjY5MDEwNDU3",
+         "organizations_url" : "https://api.github.com/users/stickies-v/orgs",
+         "received_events_url" : "https://api.github.com/users/stickies-v/received_events",
+         "repos_url" : "https://api.github.com/users/stickies-v/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/stickies-v/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/stickies-v/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/stickies-v"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r873082346"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/873082346"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "No, the comment is correct I believe.\n\n(x.m_flags & ~m_flags) is zero when every flag set in x.m_flags is also set in m_flags. In other words, where this's flags (=left hand) are a superset of x's flags.",
+      "commit_id" : "2da94a4c6f55f7a3621f4a6f70902c52f735c868",
+      "created_at" : "2022-05-14T22:46:20Z",
+      "diff_hunk" : "@@ -0,0 +1,1652 @@\n+// Copyright (c) 2019 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_SCRIPT_MINISCRIPT_H\n+#define BITCOIN_SCRIPT_MINISCRIPT_H\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <memory>\n+#include <optional>\n+#include <string>\n+#include <vector>\n+\n+#include <stdlib.h>\n+#include <assert.h>\n+\n+#include <policy/policy.h>\n+#include <primitives/transaction.h>\n+#include <script/script.h>\n+#include <span.h>\n+#include <util/spanparsing.h>\n+#include <util/strencodings.h>\n+#include <util/string.h>\n+#include <util/vector.h>\n+\n+namespace miniscript {\n+\n+/** This type encapsulates the miniscript type system properties.\n+ *\n+ * Every miniscript expression is one of 4 basic types, and additionally has\n+ * a number of boolean type properties.\n+ *\n+ * The basic types are:\n+ * - \"B\" Base:\n+ *   - Takes its inputs from the top of the stack.\n+ *   - When satisfied, pushes a nonzero value of up to 4 bytes onto the stack.\n+ *   - When dissatisfied, pushes a 0 onto the stack.\n+ *   - This is used for most expressions, and required for the top level one.\n+ *   - For example: older(n) = <n> OP_CHECKSEQUENCEVERIFY.\n+ * - \"V\" Verify:\n+ *   - Takes its inputs from the top of the stack.\n+ *   - When satisfactied, pushes nothing.\n+ *   - Cannot be dissatisfied.\n+ *   - This can be obtained by adding an OP_VERIFY to a B, modifying the last opcode\n+ *     of a B to its -VERIFY version (only for OP_CHECKSIG, OP_CHECKSIGVERIFY\n+ *     and OP_EQUAL), or by combining a V fragment under some conditions.\n+ *   - For example vc:pk_k(key) = <key> OP_CHECKSIGVERIFY\n+ * - \"K\" Key:\n+ *   - Takes its inputs from the top of the stack.\n+ *   - Becomes a B when followed by OP_CHECKSIG.\n+ *   - Always pushes a public key onto the stack, for which a signature is to be\n+ *     provided to satisfy the expression.\n+ *   - For example pk_h(key) = OP_DUP OP_HASH160 <Hash160(key)> OP_EQUALVERIFY\n+ * - \"W\" Wrapped:\n+ *   - Takes its input from one below the top of the stack.\n+ *   - When satisfied, pushes a nonzero value (like B) on top of the stack, or one below.\n+ *   - When dissatisfied, pushes 0 op top of the stack or one below.\n+ *   - Is always \"OP_SWAP [B]\" or \"OP_TOALTSTACK [B] OP_FROMALTSTACK\".\n+ *   - For example sc:pk_k(key) = OP_SWAP <key> OP_CHECKSIG\n+ *\n+ * There a type properties that help reasoning about correctness:\n+ * - \"z\" Zero-arg:\n+ *   - Is known to always consume exactly 0 stack elements.\n+ *   - For example after(n) = <n> OP_CHECKLOCKTIMEVERIFY\n+ * - \"o\" One-arg:\n+ *   - Is known to always consume exactly 1 stack element.\n+ *   - Conflicts with property 'z'\n+ *   - For example sha256(hash) = OP_SIZE 32 OP_EQUALVERIFY OP_SHA256 <hash> OP_EQUAL\n+ * - \"n\" Nonzero:\n+ *   - For every way this expression can be satisfied, a satisfaction exists that never needs\n+ *     a zero top stack element.\n+ *   - Conflicts with property 'z' and with type 'W'.\n+ * - \"d\" Dissatisfiable:\n+ *   - There is an easy way to construct a dissatisfaction for this expression.\n+ *   - Conflicts with type 'V'.\n+ * - \"u\" Unit:\n+ *   - In case of satisfaction, an exact 1 is put on the stack (rather than just nonzero).\n+ *   - Conflicts with type 'V'.\n+ *\n+ * Additional type properties help reasoning about nonmalleability:\n+ * - \"e\" Expression:\n+ *   - This implies property 'd', but the dissatisfaction is nonmalleable.\n+ *   - This generally requires 'e' for all subexpressions which are invoked for that\n+ *     dissatifsaction, and property 'f' for the unexecuted subexpressions in that case.\n+ *   - Conflicts with type 'V'.\n+ * - \"f\" Forced:\n+ *   - Dissatisfactions (if any) for this expression always involve at least one signature.\n+ *   - Is always true for type 'V'.\n+ * - \"s\" Safe:\n+ *   - Satisfactions for this expression always involve at least one signature.\n+ * - \"m\" Nonmalleable:\n+ *   - For every way this expression can be satisfied (which may be none),\n+ *     a nonmalleable satisfaction exists.\n+ *   - This generally requires 'm' for all subexpressions, and 'e' for all subexpressions\n+ *     which are dissatisfied when satisfying the parent.\n+ *\n+ * One type property is an implementation detail:\n+ * - \"x\" Expensive verify:\n+ *   - Expressions with this property have a script whose last opcode is not EQUAL, CHECKSIG, or CHECKMULTISIG.\n+ *   - Not having this property means that it can be converted to a V at no cost (by switching to the\n+ *     -VERIFY version of the last opcode).\n+ *\n+ * Five more type properties for representing timelock information. Spend paths\n+ * in miniscripts containing conflicting timelocks and heightlocks cannot be spent together.\n+ * This helps users detect if miniscript does not match the semantic behaviour the\n+ * user expects.\n+ * - \"g\" Whether the branch contains a relative time timelock\n+ * - \"h\" Whether the branch contains a relative height timelock\n+ * - \"i\" Whether the branch contains an absolute time timelock\n+ * - \"j\" Whether the branch contains an absolute height timelock\n+ * - \"k\"\n+ *   - Whether all satisfactions of this expression don't contain a mix of heightlock and timelock\n+ *     of the same type.\n+ *   - If the miniscript does not have the \"k\" property, the miniscript template will not match\n+ *     the user expectation of the corresponding spending policy.\n+ * For each of these properties the subset rule holds: an expression with properties X, Y, and Z, is also\n+ * valid in places where an X, a Y, a Z, an XY, ... is expected.\n+*/\n+class Type {\n+    //! Internal bitmap of properties (see \"\"_mst operator for details).\n+    uint32_t m_flags;\n+\n+    //! Internal constructor used by the \"\"_mst operator.\n+    explicit constexpr Type(uint32_t flags) : m_flags(flags) {}\n+\n+public:\n+    //! The only way to publicly construct a Type is using this literal operator.\n+    friend constexpr Type operator\"\" _mst(const char* c, size_t l);\n+\n+    //! Compute the type with the union of properties.\n+    constexpr Type operator|(Type x) const { return Type(m_flags | x.m_flags); }\n+\n+    //! Compute the type with the intersection of properties.\n+    constexpr Type operator&(Type x) const { return Type(m_flags & x.m_flags); }\n+\n+    //! Check whether the left hand's properties are superset of the right's (= left is a subtype of right).",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24147#discussion_r873082346",
+      "id" : 873082346,
+      "in_reply_to_id" : 873081915,
+      "line" : 137,
+      "node_id" : "PRRC_kwDOABII5840Ci3q",
+      "original_commit_id" : "2da94a4c6f55f7a3621f4a6f70902c52f735c868",
+      "original_line" : 137,
+      "original_position" : 137,
+      "original_start_line" : null,
+      "path" : "src/script/miniscript.h",
+      "position" : 137,
+      "pull_request_review_id" : 973105162,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24147",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/873082346/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-05-14T22:46:20Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/873082346",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
    }
 ]
