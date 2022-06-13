@@ -4042,5 +4042,73 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jamesob"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24008#discussion_r895298321"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24008"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/895298321"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "> The consensus has been that we want as few parts of the system as possible knowing about \"snapshots\" per se.\r\n\r\nSure; but the map already means the code needs to know about snapshots per se.\r\n\r\n> if we were ever to further parallelize validation with more than one background validation chainstate, we could keep this structure.\r\n\r\nThat seems crazy to me; managing two utxo sets is already a lot of space, increasing that is costly, and I don't think validating the chain at many points would help with any bottlenecks.\r\n\r\nBut you shouldn't even need the bool; the fact that the snapshots are all at different points in the same chain should let you just say: `last_common_block_for_this_chainstate = min(tip, last_common_block)` when picking where to start, and `if (last_common_block->nHeight < pindex->nHeight) last_common_block = pindex` when updating.\r\n\r\n<details>\r\n<summary>(click for suggestion)</summary>\r\n\r\n```diff\r\n--- a/src/net_processing.cpp\r\n+++ b/src/net_processing.cpp\r\n@@ -391,7 +391,7 @@ struct CNodeState {\r\n     //! any CChainState objects which were in use at any point (e.g. a background\r\n     //! validation chainstate which has completed) until the end of\r\n     //! init.cpp:Shutdown(), else we'll have bad pointers here.\r\n-    std::map<const CChainState*, const CBlockIndex*> chainstate_to_last_common_block = {};\r\n+    const CBlockIndex* last_common_block = nullptr;\r\n \r\n     //! The best header we have sent our peer.\r\n     const CBlockIndex* pindexBestHeaderSent{nullptr};\r\n@@ -757,7 +757,7 @@ private:\r\n \r\n     bool TipMayBeStale() EXCLUSIVE_LOCKS_REQUIRED(cs_main);\r\n \r\n-    /** Update chainstate_to_last_common_block and add not-in-flight missing successors\r\n+    /** Update last_common_block and add not-in-flight missing successors\r\n      * to vBlocks, until it has at most count entries.\r\n      */\r\n     void FindNextBlocksToDownload(\r\n@@ -1140,6 +1140,13 @@ void PeerManagerImpl::UpdateBlockAvailability(NodeId nodeid, const uint256 &hash\r\n     }\r\n }\r\n \r\n+static const CBlockIndex* GetLastCommonBlock(const CBlockIndex* tip, const CBlockIndex* last_common_block) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)\r\n+{\r\n+    if (last_common_block == nullptr || tip == nullptr) return nullptr;\r\n+    if (tip->nHeight <= last_common_block->nHeight) return tip;\r\n+    return last_common_block;\r\n+}\r\n+\r\n void PeerManagerImpl::FindNextBlocksToDownload(\r\n     const CChainState* const chainstate,\r\n     NodeId nodeid,\r\n@@ -1167,27 +1174,22 @@ void PeerManagerImpl::FindNextBlocksToDownload(\r\n         return;\r\n     }\r\n \r\n-    if (!state->chainstate_to_last_common_block.count(chainstate)) {\r\n+    if (!state->last_common_block) {\r\n         // Bootstrap quickly by guessing a parent of our best tip is the forking point.\r\n         // Guessing wrong in either direction is not a problem.\r\n-        //\r\n-        // Namespace this by chainstate so that we can simultaneously sync two\r\n-        // separate chainstates at different heights.\r\n-        state->chainstate_to_last_common_block[chainstate] = our_chain[\r\n-            std::min(state->pindexBestKnownBlock->nHeight, our_chain.Height())];\r\n+        state->last_common_block = our_chain[std::min(state->pindexBestKnownBlock->nHeight, our_chain.Height())];\r\n     }\r\n \r\n     // If the peer reorganized, our previous chainstate_to_last_common_block may not be an ancestor\r\n     // of its current tip anymore. Go back enough to fix that.\r\n-    state->chainstate_to_last_common_block[chainstate] = LastCommonAncestor(\r\n-        state->chainstate_to_last_common_block[chainstate], state->pindexBestKnownBlock);\r\n+    state->last_common_block = LastCommonAncestor(state->last_common_block, state->pindexBestKnownBlock);\r\n \r\n-    if (state->chainstate_to_last_common_block[chainstate] == state->pindexBestKnownBlock) {\r\n+    if (state->last_common_block == state->pindexBestKnownBlock) {\r\n         return;\r\n     }\r\n \r\n     std::vector<const CBlockIndex*> vToFetch;\r\n-    const CBlockIndex *pindexWalk = state->chainstate_to_last_common_block[chainstate];\r\n+    const CBlockIndex* pindexWalk = GetLastCommonBlock(our_tip, state->last_common_block);\r\n     // Never fetch further than the best block we know the peer has, or more than BLOCK_DOWNLOAD_WINDOW + 1 beyond the last\r\n     // linked block we have in common with this peer. The +1 is so we can detect stalling, namely if we would be able to\r\n     // download that next block if the window were 1 larger.\r\n@@ -1209,7 +1211,7 @@ void PeerManagerImpl::FindNextBlocksToDownload(\r\n \r\n         // Iterate over those blocks in vToFetch (in forward direction), adding the ones that\r\n         // are not yet downloaded and not in flight to vBlocks. In the meantime, update\r\n-        // chainstate_to_last_common_block as long as all ancestors are already downloaded, or if it's\r\n+        // last_common_block as long as all ancestors are already downloaded, or if it's\r\n         // already part of our chain (and therefore don't need it even if pruned).\r\n         for (const CBlockIndex* pindex : vToFetch) {\r\n             if (!pindex->IsValid(BLOCK_VALID_TREE)) {\r\n@@ -1221,8 +1223,11 @@ void PeerManagerImpl::FindNextBlocksToDownload(\r\n                 return;\r\n             }\r\n             if (pindex->nStatus & BLOCK_HAVE_DATA || our_chain.Contains(pindex)) {\r\n-                if (pindex->HaveTxsDownloaded())\r\n-                    state->chainstate_to_last_common_block[chainstate] = pindex;\r\n+                if (pindex->HaveTxsDownloaded()) {\r\n+                    if (state->last_common_block == nullptr || pindex->nHeight > state->last_common_block->nHeight) {\r\n+                        state->last_common_block = pindex;\r\n+                    }\r\n+                }\r\n             } else if (!IsBlockRequested(pindex->GetBlockHash())) {\r\n                 // The block is not already downloaded, and not yet in flight.\r\n                 if (pindex->nHeight > nWindowEnd) {\r\n@@ -1434,13 +1439,8 @@ bool PeerManagerImpl::GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) c\r\n         stats.nSyncHeight = state->pindexBestKnownBlock ? state->pindexBestKnownBlock->nHeight : -1;\r\n         stats.nCommonHeight = -1;\r\n \r\n-        // Take the max common height with this peer across chainstates.\r\n-        for (const auto& it : state->chainstate_to_last_common_block) {\r\n-            const CBlockIndex* block = it.second;\r\n-            if (block && block->nHeight > stats.nCommonHeight) {\r\n-                stats.nCommonHeight = block->nHeight;\r\n-            }\r\n-        }\r\n+        if (state->last_common_block) stats.nCommonHeight = state->last_common_block->nHeight;\r\n+\r\n         for (const QueuedBlock& queue : state->vBlocksInFlight) {\r\n             if (queue.pindex)\r\n                 stats.vHeightInFlight.push_back(queue.pindex->nHeight);\r\n```\r\n</details>",
+      "commit_id" : "54d04d1f09bfbc933b06e74ece325bf05e838848",
+      "created_at" : "2022-06-13T03:23:15Z",
+      "diff_hunk" : "@@ -380,8 +380,18 @@ struct CNodeState {\n     const CBlockIndex* pindexBestKnownBlock{nullptr};\n     //! The hash of the last unknown block this peer has announced.\n     uint256 hashLastUnknownBlock{};\n-    //! The last full block we both have.\n-    const CBlockIndex* pindexLastCommonBlock{nullptr};\n+\n+    //! The last full block we both have (per chainstate).\n+    //!\n+    //! This is namespaced by chainstate to allow syncing two separate chainstates\n+    //! simultaneously from a single peer.\n+    //!\n+    //! Nota bene: this is contingent on the ChainstateManager not destructing\n+    //! any CChainState objects which were in use at any point (e.g. a background\n+    //! validation chainstate which has completed) until the end of\n+    //! init.cpp:Shutdown(), else we'll have bad pointers here.\n+    std::map<const CChainState*, const CBlockIndex*> chainstate_to_last_common_block = {};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24008#discussion_r895298321",
+      "id" : 895298321,
+      "in_reply_to_id" : 888474234,
+      "line" : 394,
+      "node_id" : "PRRC_kwDOABII5841XSsR",
+      "original_commit_id" : "56cae81ed7fe59170a4413444d509e1a3c7b132d",
+      "original_line" : 394,
+      "original_position" : 16,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : 16,
+      "pull_request_review_id" : 1003746458,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24008",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/895298321/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-06-13T03:23:16Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/895298321",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/127186?v=4",
+         "events_url" : "https://api.github.com/users/ajtowns/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ajtowns/followers",
+         "following_url" : "https://api.github.com/users/ajtowns/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ajtowns/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ajtowns",
+         "id" : 127186,
+         "login" : "ajtowns",
+         "node_id" : "MDQ6VXNlcjEyNzE4Ng==",
+         "organizations_url" : "https://api.github.com/users/ajtowns/orgs",
+         "received_events_url" : "https://api.github.com/users/ajtowns/received_events",
+         "repos_url" : "https://api.github.com/users/ajtowns/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ajtowns/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ajtowns/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ajtowns"
+      }
    }
 ]
