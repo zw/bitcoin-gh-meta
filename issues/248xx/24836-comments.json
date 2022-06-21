@@ -5005,5 +5005,206 @@
          "type" : "User",
          "url" : "https://api.github.com/users/ariard"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24836#discussion_r902595822"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24836"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/902595822"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "If we're hitting this error condition it seems more useful to get back some usable information about the transactions that already were broadcasted in this loop.",
+      "commit_id" : "980464989449b3b703c9a11e398b2b246dee163a",
+      "created_at" : "2022-06-21T13:06:43Z",
+      "diff_hunk" : "@@ -729,6 +730,147 @@ static RPCHelpMan savemempool()\n     };\n }\n \n+static RPCHelpMan submitpackage()\n+{\n+    return RPCHelpMan{\"submitpackage\",\n+        \"Submit a package of raw transactions (serialized, hex-encoded) to local node (-regtest only).\\n\"\n+        \"The package will be validated according to consensus and mempool policy rules. If all transactions pass, they will be accepted to mempool.\\n\"\n+        \"This RPC is experimental and the interface may be unstable. Refer to doc/policy/packages.md for documentation on package policies.\\n\"\n+        \"Warning: until package relay is in use, successful submission does not mean the transaction will propagate to other nodes on the network.\\n\"\n+        \"Currently, each transaction is broadcasted individually after submission, which means they must meet other nodes' feerate requirements alone.\\n\"\n+        ,\n+        {\n+            {\"package\", RPCArg::Type::ARR, RPCArg::Optional::NO, \"An array of raw transactions.\",\n+                {\n+                    {\"rawtx\", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, \"\"},\n+                },\n+            },\n+        },\n+        RPCResult{\n+            RPCResult::Type::OBJ, \"\", \"\",\n+            {\n+                {RPCResult::Type::OBJ_DYN, \"tx-results\", \"transaction results keyed by wtxid\",\n+                {\n+                    {RPCResult::Type::OBJ, \"wtxid\", \"transaction wtxid\", {\n+                        {RPCResult::Type::STR_HEX, \"txid\", \"The transaction hash in hex\"},\n+                        {RPCResult::Type::STR_HEX, \"other-wtxid\", /*optional=*/true, \"The wtxid of a different transaction with the same txid but different witness found in the mempool. This means the submitted transaction was ignored.\"},\n+                        {RPCResult::Type::NUM, \"vsize\", \"Virtual transaction size as defined in BIP 141.\"},\n+                        {RPCResult::Type::OBJ, \"fees\", \"Transaction fees\", {\n+                            {RPCResult::Type::STR_AMOUNT, \"base\", \"transaction fee in \" + CURRENCY_UNIT},\n+                        }},\n+                    }}\n+                }},\n+                {RPCResult::Type::STR_AMOUNT, \"package-feerate\", /*optional=*/true, \"package feerate used for feerate checks in \" + CURRENCY_UNIT + \" per KvB. Excludes transactions which were deduplicated or accepted individually.\"},\n+                {RPCResult::Type::ARR, \"replaced-transactions\", /*optional=*/true, \"List of txids of replaced transactions\",\n+                {\n+                    {RPCResult::Type::STR_HEX, \"\", \"The transaction id\"},\n+                }},\n+            },\n+        },\n+        RPCExamples{\n+            HelpExampleCli(\"testmempoolaccept\", \"[rawtx1, rawtx2]\") +\n+            HelpExampleCli(\"sendrawtransaction\", \"[rawtx1, rawtx2]\")\n+        },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+        {\n+            if (!Params().IsMockableChain()) {\n+                throw std::runtime_error(\"submitpackage is for regression testing (-regtest mode) only\");\n+            }\n+            RPCTypeCheck(request.params, {\n+                UniValue::VARR,\n+            });\n+            const UniValue raw_transactions = request.params[0].get_array();\n+            if (raw_transactions.size() < 1 || raw_transactions.size() > MAX_PACKAGE_COUNT) {\n+                throw JSONRPCError(RPC_INVALID_PARAMETER,\n+                                   \"Array must contain between 1 and \" + ToString(MAX_PACKAGE_COUNT) + \" transactions.\");\n+            }\n+\n+            std::vector<CTransactionRef> txns;\n+            txns.reserve(raw_transactions.size());\n+            for (const auto& rawtx : raw_transactions.getValues()) {\n+                CMutableTransaction mtx;\n+                if (!DecodeHexTx(mtx, rawtx.get_str())) {\n+                    throw JSONRPCError(RPC_DESERIALIZATION_ERROR,\n+                                       \"TX decode failed: \" + rawtx.get_str() + \" Make sure the tx has at least one input.\");\n+                }\n+                txns.emplace_back(MakeTransactionRef(std::move(mtx)));\n+            }\n+\n+            NodeContext& node = EnsureAnyNodeContext(request.context);\n+            CTxMemPool& mempool = EnsureMemPool(node);\n+            CChainState& chainstate = EnsureChainman(node).ActiveChainstate();\n+            const auto package_result = WITH_LOCK(::cs_main, return ProcessNewPackage(chainstate, mempool, txns, /*test_accept=*/ false));\n+\n+            // First catch any errors.\n+            switch(package_result.m_state.GetResult()) {\n+                case PackageValidationResult::PCKG_RESULT_UNSET: break;\n+                case PackageValidationResult::PCKG_POLICY:\n+                {\n+                    throw JSONRPCTransactionError(TransactionError::INVALID_PACKAGE,\n+                        package_result.m_state.GetRejectReason());\n+                }\n+                case PackageValidationResult::PCKG_MEMPOOL_ERROR:\n+                {\n+                    throw JSONRPCTransactionError(TransactionError::MEMPOOL_ERROR,\n+                        package_result.m_state.GetRejectReason());\n+                }\n+                case PackageValidationResult::PCKG_TX:\n+                {\n+                    for (const auto& tx : txns) {\n+                        auto it = package_result.m_tx_results.find(tx->GetWitnessHash());\n+                        if (it != package_result.m_tx_results.end() && it->second.m_state.IsInvalid()) {\n+                            throw JSONRPCTransactionError(TransactionError::MEMPOOL_REJECTED,\n+                                strprintf(\"%s failed: %s\", tx->GetHash().ToString(), it->second.m_state.GetRejectReason()));\n+                        }\n+                    }\n+                    // If a PCKG_TX error was returned, there must have been an invalid transaction.\n+                    NONFATAL_UNREACHABLE();\n+                }\n+            }\n+            for (const auto& tx : txns) {\n+                std::string err_string;\n+                const auto err = BroadcastTransaction(node, tx, err_string, 0, true, true);\n+                if (err != TransactionError::OK) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24836#discussion_r902595822",
+      "id" : 902595822,
+      "line" : 833,
+      "node_id" : "PRRC_kwDOABII5841zITu",
+      "original_commit_id" : "421f28661500de1ce38d429d1a93da32350c0296",
+      "original_line" : 833,
+      "original_position" : 112,
+      "original_start_line" : null,
+      "path" : "src/rpc/mempool.cpp",
+      "position" : 112,
+      "pull_request_review_id" : 1013569261,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24836",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/902595822/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-06-21T13:18:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/902595822",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24836#discussion_r902599382"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24836"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/902599382"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "some places we're using wtxid for indexing, others txid(replaced txns), is there a guiding principle here?",
+      "commit_id" : "980464989449b3b703c9a11e398b2b246dee163a",
+      "created_at" : "2022-06-21T13:10:06Z",
+      "diff_hunk" : "@@ -729,6 +730,147 @@ static RPCHelpMan savemempool()\n     };\n }\n \n+static RPCHelpMan submitpackage()\n+{\n+    return RPCHelpMan{\"submitpackage\",\n+        \"Submit a package of raw transactions (serialized, hex-encoded) to local node (-regtest only).\\n\"\n+        \"The package will be validated according to consensus and mempool policy rules. If all transactions pass, they will be accepted to mempool.\\n\"\n+        \"This RPC is experimental and the interface may be unstable. Refer to doc/policy/packages.md for documentation on package policies.\\n\"\n+        \"Warning: until package relay is in use, successful submission does not mean the transaction will propagate to other nodes on the network.\\n\"\n+        \"Currently, each transaction is broadcasted individually after submission, which means they must meet other nodes' feerate requirements alone.\\n\"\n+        ,\n+        {\n+            {\"package\", RPCArg::Type::ARR, RPCArg::Optional::NO, \"An array of raw transactions.\",\n+                {\n+                    {\"rawtx\", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, \"\"},\n+                },\n+            },\n+        },\n+        RPCResult{\n+            RPCResult::Type::OBJ, \"\", \"\",\n+            {\n+                {RPCResult::Type::OBJ_DYN, \"tx-results\", \"transaction results keyed by wtxid\",\n+                {\n+                    {RPCResult::Type::OBJ, \"wtxid\", \"transaction wtxid\", {\n+                        {RPCResult::Type::STR_HEX, \"txid\", \"The transaction hash in hex\"},\n+                        {RPCResult::Type::STR_HEX, \"other-wtxid\", /*optional=*/true, \"The wtxid of a different transaction with the same txid but different witness found in the mempool. This means the submitted transaction was ignored.\"},\n+                        {RPCResult::Type::NUM, \"vsize\", \"Virtual transaction size as defined in BIP 141.\"},\n+                        {RPCResult::Type::OBJ, \"fees\", \"Transaction fees\", {\n+                            {RPCResult::Type::STR_AMOUNT, \"base\", \"transaction fee in \" + CURRENCY_UNIT},\n+                        }},\n+                    }}\n+                }},\n+                {RPCResult::Type::STR_AMOUNT, \"package-feerate\", /*optional=*/true, \"package feerate used for feerate checks in \" + CURRENCY_UNIT + \" per KvB. Excludes transactions which were deduplicated or accepted individually.\"},\n+                {RPCResult::Type::ARR, \"replaced-transactions\", /*optional=*/true, \"List of txids of replaced transactions\",\n+                {\n+                    {RPCResult::Type::STR_HEX, \"\", \"The transaction id\"},\n+                }},\n+            },\n+        },\n+        RPCExamples{\n+            HelpExampleCli(\"testmempoolaccept\", \"[rawtx1, rawtx2]\") +\n+            HelpExampleCli(\"sendrawtransaction\", \"[rawtx1, rawtx2]\")\n+        },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+        {\n+            if (!Params().IsMockableChain()) {\n+                throw std::runtime_error(\"submitpackage is for regression testing (-regtest mode) only\");\n+            }\n+            RPCTypeCheck(request.params, {\n+                UniValue::VARR,\n+            });\n+            const UniValue raw_transactions = request.params[0].get_array();\n+            if (raw_transactions.size() < 1 || raw_transactions.size() > MAX_PACKAGE_COUNT) {\n+                throw JSONRPCError(RPC_INVALID_PARAMETER,\n+                                   \"Array must contain between 1 and \" + ToString(MAX_PACKAGE_COUNT) + \" transactions.\");\n+            }\n+\n+            std::vector<CTransactionRef> txns;\n+            txns.reserve(raw_transactions.size());\n+            for (const auto& rawtx : raw_transactions.getValues()) {\n+                CMutableTransaction mtx;\n+                if (!DecodeHexTx(mtx, rawtx.get_str())) {\n+                    throw JSONRPCError(RPC_DESERIALIZATION_ERROR,\n+                                       \"TX decode failed: \" + rawtx.get_str() + \" Make sure the tx has at least one input.\");\n+                }\n+                txns.emplace_back(MakeTransactionRef(std::move(mtx)));\n+            }\n+\n+            NodeContext& node = EnsureAnyNodeContext(request.context);\n+            CTxMemPool& mempool = EnsureMemPool(node);\n+            CChainState& chainstate = EnsureChainman(node).ActiveChainstate();\n+            const auto package_result = WITH_LOCK(::cs_main, return ProcessNewPackage(chainstate, mempool, txns, /*test_accept=*/ false));\n+\n+            // First catch any errors.\n+            switch(package_result.m_state.GetResult()) {\n+                case PackageValidationResult::PCKG_RESULT_UNSET: break;\n+                case PackageValidationResult::PCKG_POLICY:\n+                {\n+                    throw JSONRPCTransactionError(TransactionError::INVALID_PACKAGE,\n+                        package_result.m_state.GetRejectReason());\n+                }\n+                case PackageValidationResult::PCKG_MEMPOOL_ERROR:\n+                {\n+                    throw JSONRPCTransactionError(TransactionError::MEMPOOL_ERROR,\n+                        package_result.m_state.GetRejectReason());\n+                }\n+                case PackageValidationResult::PCKG_TX:\n+                {\n+                    for (const auto& tx : txns) {\n+                        auto it = package_result.m_tx_results.find(tx->GetWitnessHash());\n+                        if (it != package_result.m_tx_results.end() && it->second.m_state.IsInvalid()) {\n+                            throw JSONRPCTransactionError(TransactionError::MEMPOOL_REJECTED,\n+                                strprintf(\"%s failed: %s\", tx->GetHash().ToString(), it->second.m_state.GetRejectReason()));\n+                        }\n+                    }\n+                    // If a PCKG_TX error was returned, there must have been an invalid transaction.\n+                    NONFATAL_UNREACHABLE();\n+                }\n+            }\n+            for (const auto& tx : txns) {\n+                std::string err_string;\n+                const auto err = BroadcastTransaction(node, tx, err_string, 0, true, true);\n+                if (err != TransactionError::OK) {\n+                    throw JSONRPCTransactionError(err, err_string);\n+                }\n+            }\n+            UniValue rpc_result{UniValue::VOBJ};\n+            UniValue tx_result_map{UniValue::VOBJ};\n+            std::set<uint256> replaced_txids;\n+            for (const auto& tx : txns) {\n+                auto it = package_result.m_tx_results.find(tx->GetWitnessHash());\n+                CHECK_NONFATAL(it != package_result.m_tx_results.end());\n+                UniValue result_inner{UniValue::VOBJ};\n+                result_inner.pushKV(\"txid\", tx->GetHash().GetHex());\n+                if (it->second.m_result_type == MempoolAcceptResult::ResultType::DIFFERENT_WITNESS) {\n+                    result_inner.pushKV(\"other-wtxid\", it->second.m_other_wtxid.value().GetHex());\n+                }\n+                if (it->second.m_result_type == MempoolAcceptResult::ResultType::VALID ||\n+                    it->second.m_result_type == MempoolAcceptResult::ResultType::MEMPOOL_ENTRY) {\n+                    result_inner.pushKV(\"vsize\", int64_t{it->second.m_vsize.value()});\n+                    UniValue fees(UniValue::VOBJ);\n+                    fees.pushKV(\"base\", ValueFromAmount(it->second.m_base_fees.value()));\n+                    result_inner.pushKV(\"fees\", fees);\n+                    if (it->second.m_replaced_transactions.has_value()) {\n+                        for (const auto& ptx : it->second.m_replaced_transactions.value()) {\n+                            replaced_txids.insert(ptx->GetHash());\n+                        }\n+                    }\n+                }\n+                tx_result_map.pushKV(tx->GetWitnessHash().GetHex(), result_inner);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24836#discussion_r902599382",
+      "id" : 902599382,
+      "line" : 860,
+      "node_id" : "PRRC_kwDOABII5841zJLW",
+      "original_commit_id" : "421f28661500de1ce38d429d1a93da32350c0296",
+      "original_line" : 860,
+      "original_position" : 139,
+      "original_start_line" : null,
+      "path" : "src/rpc/mempool.cpp",
+      "position" : 139,
+      "pull_request_review_id" : 1013569261,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24836",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/902599382/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-06-21T13:18:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/902599382",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24836#discussion_r902607877"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24836"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/902607877"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "could we assert this condition is the case when \"package-feerate\" doesn't exist, rather than have a comment to the effect?",
+      "commit_id" : "980464989449b3b703c9a11e398b2b246dee163a",
+      "created_at" : "2022-06-21T13:17:40Z",
+      "diff_hunk" : "@@ -306,5 +306,86 @@ def test_rbf(self):\n         }]\n         self.assert_testres_equal(self.independent_txns_hex + [signed_replacement_tx[\"hex\"]], testres_rbf_package)\n \n+    def assert_equal_package_results(self, node, testmempoolaccept_result, submitpackage_result):\n+        \"\"\"Assert that a successful submitpackage result is consistent with testmempoolaccept\n+        results and getmempoolentry info. Note that the result structs are different and, due to\n+        policy differences between testmempoolaccept and submitpackage (i.e. package feerate),\n+        some information may be different.\n+        \"\"\"\n+        for testres_tx in testmempoolaccept_result:\n+            # Grab this result from the submitpackage_result\n+            submitres_tx = submitpackage_result[\"tx-results\"][testres_tx[\"wtxid\"]]\n+            assert_equal(submitres_tx[\"txid\"], testres_tx[\"txid\"])\n+            # No \"allowed\" if the tx was already in the mempool\n+            if \"allowed\" in testres_tx and testres_tx[\"allowed\"]:\n+                assert_equal(submitres_tx[\"vsize\"], testres_tx[\"vsize\"])\n+                assert_equal(submitres_tx[\"fees\"][\"base\"], testres_tx[\"fees\"][\"base\"])\n+            entry_info = node.getmempoolentry(submitres_tx[\"txid\"])\n+            assert_equal(submitres_tx[\"vsize\"], entry_info[\"vsize\"])\n+            assert_equal(submitres_tx[\"fees\"][\"base\"], entry_info[\"fees\"][\"base\"])\n+\n+    def test_submit_child_with_parents(self, num_parents, partial_submit):\n+        node = self.nodes[0]\n+        # Test a package with num_parents parents and 1 child transaction.\n+        package_hex = []\n+        package_txns = []\n+        values = []\n+        scripts = []\n+        for _ in range(num_parents):\n+            parent_coin = self.coins.pop()\n+            value = parent_coin[\"amount\"]\n+            (tx, txhex, value, spk) = make_chain(node, self.address, self.privkeys, parent_coin[\"txid\"], value)\n+            package_hex.append(txhex)\n+            package_txns.append(tx)\n+            values.append(value)\n+            scripts.append(spk)\n+            if partial_submit and random.choice([True, False]):\n+                node.sendrawtransaction(txhex)\n+        child_hex = create_child_with_parents(node, self.address, self.privkeys, package_txns, values, scripts)\n+        package_hex.append(child_hex)\n+        package_txns.append(tx_from_hex(child_hex))\n+\n+        testmempoolaccept_result = node.testmempoolaccept(rawtxs=package_hex)\n+        submitpackage_result = node.submitpackage(package=package_hex)\n+\n+        # Check that each result is present, with the correct size and fees\n+        for i in range(num_parents + 1):\n+            tx = package_txns[i]\n+            wtxid = tx.getwtxid()\n+            assert wtxid in submitpackage_result[\"tx-results\"]\n+            tx_result = submitpackage_result[\"tx-results\"][wtxid]\n+            expected_fee = Decimal(\"0.0001\")\n+            assert_equal(tx_result, {\n+                \"txid\": tx.rehash(),\n+                \"vsize\": tx.get_vsize(),\n+                \"fees\": {\n+                    \"base\": expected_fee,\n+                }\n+            })\n+\n+        # submitpackage result should be consistent with testmempoolaccept and getmempoolentry\n+        self.assert_equal_package_results(node, testmempoolaccept_result, submitpackage_result)\n+\n+        # Package feerate is calculated for the remaining transactions after deduplication and\n+        # individual submission.  If only 0 or 1 transaction is left, e.g. because all transactions",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24836#discussion_r902607877",
+      "id" : 902607877,
+      "line" : 370,
+      "node_id" : "PRRC_kwDOABII5841zLQF",
+      "original_commit_id" : "980464989449b3b703c9a11e398b2b246dee163a",
+      "original_line" : 370,
+      "original_position" : 101,
+      "original_start_line" : null,
+      "path" : "test/functional/rpc_packages.py",
+      "position" : 101,
+      "pull_request_review_id" : 1013569261,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24836",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/902607877/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-06-21T13:18:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/902607877",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
    }
 ]
