@@ -487,5 +487,73 @@
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25234#discussion_r906879843"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25234"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/906879843"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Hmm, wouldn't we be having the same benchmark times for all the cases if that would be the case? (we are adding the same amount of txs and outputs to each of them).\r\n\r\nI mean, your #24699 improves exactly this. The time difference there is for the solving provider and `IsMine` related calls.",
+      "commit_id" : "fd583c8184ef2a270e7df13360f78fd9dda258a0",
+      "created_at" : "2022-06-26T22:36:21Z",
+      "diff_hunk" : "@@ -0,0 +1,128 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <bench/bench.h>\n+#include <chainparams.h>\n+#include <consensus/merkle.h>\n+#include <node/context.h>\n+#include <test/util/setup_common.h>\n+#include <test/util/wallet.h>\n+#include <validation.h>\n+#include <wallet/spend.h>\n+#include <wallet/wallet.h>\n+\n+using wallet::CWallet;\n+using wallet::CreateMockWalletDatabase;\n+using wallet::DBErrors;\n+using wallet::WALLET_FLAG_DESCRIPTORS;\n+\n+struct TipBlock\n+{\n+    uint256 prev_block_hash;\n+    int64_t prev_block_time;\n+    int tip_height;\n+};\n+\n+TipBlock getTip(const CChainParams& params, const node::NodeContext& context)\n+{\n+    auto tip = context.chainman->ActiveTip();\n+    return (tip) ? TipBlock{tip->GetBlockHash(), tip->GetBlockTime(), tip->nHeight} :\n+           TipBlock{params.GenesisBlock().GetHash(), params.GenesisBlock().GetBlockTime(), 0};\n+}\n+\n+void generateFakeBlock(const CChainParams& params,\n+                       const node::NodeContext& context,\n+                       CWallet& wallet,\n+                       const CScript& coinbase_out_script)\n+{\n+    TipBlock tip{getTip(params, context)};\n+\n+    // Create block\n+    CBlock block;\n+    CMutableTransaction coinbase_tx;\n+    coinbase_tx.vin.resize(1);\n+    coinbase_tx.vin[0].prevout.SetNull();\n+    coinbase_tx.vout.resize(2);\n+    coinbase_tx.vout[0].scriptPubKey = coinbase_out_script;\n+    coinbase_tx.vout[0].nValue = 49 * COIN;\n+    coinbase_tx.vin[0].scriptSig = CScript() << ++tip.tip_height << OP_0;\n+    coinbase_tx.vout[1].scriptPubKey = coinbase_out_script; // extra output\n+    coinbase_tx.vout[1].nValue = 1 * COIN;\n+    block.vtx = {MakeTransactionRef(std::move(coinbase_tx))};\n+\n+    block.nVersion = VERSIONBITS_LAST_OLD_BLOCK_VERSION;\n+    block.hashPrevBlock = tip.prev_block_hash;\n+    block.hashMerkleRoot = BlockMerkleRoot(block);\n+    block.nTime = ++tip.prev_block_time;\n+    block.nBits = params.GenesisBlock().nBits;\n+    block.nNonce = 0;\n+\n+    {\n+        LOCK(::cs_main);\n+        // Add it to the index\n+        CBlockIndex *pindex{context.chainman->m_blockman.AddToBlockIndex(block, context.chainman->m_best_header)};\n+        // add it to the chain\n+        context.chainman->ActiveChain().SetTip(pindex);\n+    }\n+\n+    // notify wallet\n+    wallet.blockConnected(block, tip.tip_height);\n+}\n+\n+static void WalletAvailableCoins(benchmark::Bench& bench, const std::vector<OutputType>& output_type)\n+{\n+    const auto test_setup = MakeNoLogFileContext<const TestingSetup>();\n+\n+    CWallet wallet{test_setup->m_node.chain.get(), \"\", gArgs, CreateMockWalletDatabase()};\n+    {\n+        LOCK(wallet.cs_wallet);\n+        if (std::any_of(output_type.begin(), output_type.end(), [](OutputType type){return type > OutputType::LEGACY;})) {\n+            wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);\n+            wallet.SetupDescriptorScriptPubKeyMans();\n+        }\n+        if (std::any_of(output_type.begin(), output_type.end(), [](OutputType type){return type == OutputType::LEGACY;})) {\n+            wallet.SetupLegacyScriptPubKeyMan();\n+        }\n+        if (wallet.LoadWallet() != DBErrors::LOAD_OK) assert(false);\n+    }\n+\n+    // Generate destinations\n+    std::vector<CScript> dest_wallet;\n+    for (auto type : output_type) {\n+        dest_wallet.emplace_back(GetScriptForDestination(getNewDestination(wallet, type)));\n+    }\n+\n+    // Generate chain; each coinbase will have two outputs to fill-up the wallet\n+    const auto& params = Params();\n+    unsigned int chain_size = 1000;\n+    for (unsigned int i = 0; i < chain_size / dest_wallet.size(); ++i) {\n+        for (auto dest : dest_wallet) {\n+            generateFakeBlock(params, test_setup->m_node, wallet, dest);\n+        }\n+    }\n+\n+    // Check available balance\n+    auto bal = wallet::GetAvailableBalance(wallet); // Cache\n+    assert(bal == 50 * COIN * (chain_size - COINBASE_MATURITY));\n+\n+    bench.epochIterations(2).run([&] {\n+        LOCK(wallet.cs_wallet);\n+        std::vector<wallet::COutput> vCoins;\n+        wallet::AvailableCoins(wallet, vCoins);\n+\n+        assert(vCoins.size() == (chain_size - COINBASE_MATURITY) * 2);\n+    });\n+}\n+\n+static void WalletAvailableCoinsOnlyBech32M(benchmark::Bench& bench) { WalletAvailableCoins(bench, {OutputType::BECH32M}); }\n+static void WalletAvailableCoinsOnlyBech32(benchmark::Bench& bench) { WalletAvailableCoins(bench, {OutputType::BECH32}); }\n+static void WalletAvailableCoinsOnlyP2SH_SEGWIT(benchmark::Bench& bench) { WalletAvailableCoins(bench, {OutputType::P2SH_SEGWIT}); }\n+static void WalletAvailableCoinsOnlyLegacy(benchmark::Bench& bench) { WalletAvailableCoins(bench, {OutputType::LEGACY}); }\n+static void WalletAvailableCoinsMulti(benchmark::Bench& bench) { WalletAvailableCoins(bench, {OutputType::LEGACY, OutputType::BECH32M, OutputType::BECH32, OutputType::P2SH_SEGWIT}); }\n+\n+BENCHMARK(WalletAvailableCoinsOnlyBech32M);\n+BENCHMARK(WalletAvailableCoinsOnlyBech32);\n+BENCHMARK(WalletAvailableCoinsOnlyP2SH_SEGWIT);\n+BENCHMARK(WalletAvailableCoinsOnlyLegacy);\n+BENCHMARK(WalletAvailableCoinsMulti);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25234#discussion_r906879843",
+      "id" : 906879843,
+      "in_reply_to_id" : 888279929,
+      "line" : 127,
+      "node_id" : "PRRC_kwDOABII5842DeNj",
+      "original_commit_id" : "4029293e8c70c15eb7f64fe5a98e4d96e7de942a",
+      "original_line" : 127,
+      "original_position" : 128,
+      "original_start_line" : 118,
+      "path" : "src/bench/wallet_available_coins.cpp",
+      "position" : 127,
+      "pull_request_review_id" : 1019485448,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25234",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/906879843/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 117,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-06-26T22:36:22Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/906879843",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5377650?v=4",
+         "events_url" : "https://api.github.com/users/furszy/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/furszy/followers",
+         "following_url" : "https://api.github.com/users/furszy/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/furszy/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/furszy",
+         "id" : 5377650,
+         "login" : "furszy",
+         "node_id" : "MDQ6VXNlcjUzNzc2NTA=",
+         "organizations_url" : "https://api.github.com/users/furszy/orgs",
+         "received_events_url" : "https://api.github.com/users/furszy/received_events",
+         "repos_url" : "https://api.github.com/users/furszy/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/furszy/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/furszy/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/furszy"
+      }
    }
 ]
