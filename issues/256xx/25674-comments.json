@@ -421,5 +421,277 @@
          "type" : "User",
          "url" : "https://api.github.com/users/DrahtBot"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25674#discussion_r928564065"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25674"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928564065"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Yeah looking back I should have named it `incremental_relay_feerate`.\r\n\r\nThis should always be called with the incremental relay feerate. The reason it's parameterizable instead of having the function use `::incrementalRelayFee` is to avoid using globals within this module (see https://github.com/bitcoin/bitcoin/pull/22675#discussion_r702737511).",
+      "commit_id" : "433411ac98c0e6ea08defe27913ed9d06482f64c",
+      "created_at" : "2022-07-25T07:44:15Z",
+      "diff_hunk" : "@@ -0,0 +1,211 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+#include <policy/policy.h>\n+#include <policy/rbf.h>\n+#include <random.h>\n+#include <txmempool.h>\n+#include <util/system.h>\n+#include <util/time.h>\n+\n+#include <test/util/setup_common.h>\n+\n+#include <boost/test/unit_test.hpp>\n+#include <optional>\n+#include <vector>\n+\n+BOOST_FIXTURE_TEST_SUITE(rbf_tests, TestingSetup)\n+\n+inline CTransactionRef make_tx(const std::vector<CAmount>& output_values,\n+                               const std::vector<CTransactionRef>& inputs)\n+{\n+    CMutableTransaction tx = CMutableTransaction();\n+    tx.vin.resize(inputs.size());\n+    tx.vout.resize(output_values.size());\n+    for (size_t i = 0; i < inputs.size(); ++i) {\n+        tx.vin[i].prevout.hash = inputs[i]->GetHash();\n+        tx.vin[i].prevout.n = 0;\n+        // Add a witness so wtxid != txid\n+        CScriptWitness witness;\n+        witness.stack.push_back(std::vector<unsigned char>(i + 10));\n+        tx.vin[i].scriptWitness = witness;\n+    }\n+    for (size_t i = 0; i < output_values.size(); ++i) {\n+        tx.vout[i].scriptPubKey = CScript() << OP_11 << OP_EQUAL;\n+        tx.vout[i].nValue = output_values[i];\n+    }\n+    return MakeTransactionRef(tx);\n+}\n+\n+void add_descendants(const CTransactionRef& tx, CTxMemPool& pool, int32_t num_descendants)\n+    EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs)\n+{\n+    AssertLockHeld(cs_main);\n+    AssertLockHeld(pool.cs);\n+    TestMemPoolEntryHelper entry;\n+    // Assumes this isn't already spent in mempool\n+    auto tx_to_spend = tx;\n+    for (int32_t i{0}; i < num_descendants; ++i) {\n+        auto next_tx = make_tx(/*output_values=*/ {(50 - i) * CENT}, /*inputs=*/ {tx_to_spend});\n+        pool.addUnchecked(entry.FromTx(next_tx));\n+        tx_to_spend = next_tx;\n+    }\n+}\n+\n+BOOST_FIXTURE_TEST_CASE(rbf_helper_functions, TestChain100Setup)\n+{\n+    CTxMemPool& pool = *Assert(m_node.mempool);\n+    LOCK2(cs_main, pool.cs);\n+    TestMemPoolEntryHelper entry;\n+\n+    const CAmount low_fee{100};\n+    const CAmount normal_fee{10000};\n+    const CAmount high_fee{1 * COIN};\n+\n+    // Create a parent tx1 and child tx2 with normal fees:\n+    CTransactionRef tx1 = make_tx(/*output_values=*/ {10 * COIN}, /*inputs=*/ {m_coinbase_txns[0]});\n+    pool.addUnchecked(entry.Fee(normal_fee).FromTx(tx1));\n+    CTransactionRef tx2 = make_tx(/*output_values=*/ {995 * CENT}, /*inputs=*/ {tx1});\n+    pool.addUnchecked(entry.Fee(normal_fee).FromTx(tx2));\n+\n+    // Create a low-feerate parent tx3 and high-feerate child tx4 (cpfp)\n+    CTransactionRef tx3 = make_tx(/*output_values=*/ {1099 * CENT}, /*inputs=*/ {m_coinbase_txns[1]});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx3));\n+    CTransactionRef tx4 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {tx3});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx4));\n+\n+    // Create a parent tx5 and child tx6 where both have very low fees\n+    CTransactionRef tx5 = make_tx(/*output_values=*/ {1099 * CENT}, /*inputs=*/ {m_coinbase_txns[2]});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx5));\n+    CTransactionRef tx6 = make_tx(/*output_values=*/ {1098 * CENT}, /*inputs=*/ {tx3});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx6));\n+\n+    // Two independent high-feerate transactions, tx7 and tx8\n+    CTransactionRef tx7 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {m_coinbase_txns[3]});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx7));\n+    CTransactionRef tx8 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {m_coinbase_txns[4]});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx8));\n+    pool.PrioritiseTransaction(tx6->GetHash(), 1 * COIN);\n+\n+    const auto entry1 = pool.GetIter(tx1->GetHash()).value();\n+    const auto entry2 = pool.GetIter(tx2->GetHash()).value();\n+    const auto entry3 = pool.GetIter(tx3->GetHash()).value();\n+    const auto entry4 = pool.GetIter(tx4->GetHash()).value();\n+    const auto entry5 = pool.GetIter(tx5->GetHash()).value();\n+    const auto entry6 = pool.GetIter(tx6->GetHash()).value();\n+    const auto entry7 = pool.GetIter(tx7->GetHash()).value();\n+    const auto entry8 = pool.GetIter(tx8->GetHash()).value();\n+\n+    BOOST_CHECK_EQUAL(entry1->GetFee(), normal_fee);\n+    BOOST_CHECK_EQUAL(entry2->GetFee(), normal_fee);\n+    BOOST_CHECK_EQUAL(entry3->GetFee(), low_fee);\n+    BOOST_CHECK_EQUAL(entry4->GetFee(), high_fee);\n+    BOOST_CHECK_EQUAL(entry5->GetFee(), low_fee);\n+    BOOST_CHECK_EQUAL(entry6->GetFee(), low_fee);\n+    BOOST_CHECK_EQUAL(entry7->GetFee(), high_fee);\n+    BOOST_CHECK_EQUAL(entry8->GetFee(), high_fee);\n+\n+    CTxMemPool::setEntries set_12_normal{entry1, entry2};\n+    CTxMemPool::setEntries set_34_cpfp{entry3, entry4};\n+    CTxMemPool::setEntries set_56_low{entry5, entry6};\n+    CTxMemPool::setEntries all_entries{entry1, entry2, entry3, entry4, entry5, entry6, entry7, entry8};\n+    CTxMemPool::setEntries empty_set;\n+\n+    const auto unused_txid{GetRandHash()};\n+\n+    // Tests for PaysMoreThanConflicts\n+    // These tests use feerate, not absolute fee.\n+    BOOST_CHECK(PaysMoreThanConflicts(/*iters_conflicting=*/set_12_normal,\n+                                      /*replacement_feerate=*/CFeeRate(entry1->GetModifiedFee() + 1, entry1->GetTxSize() + 2),\n+                                      /*txid=*/unused_txid).has_value());\n+    // Replacement must be strictly greater than the originals.\n+    BOOST_CHECK(PaysMoreThanConflicts(set_12_normal, CFeeRate(entry1->GetModifiedFee(), entry1->GetTxSize()), unused_txid).has_value());\n+    BOOST_CHECK(PaysMoreThanConflicts(set_12_normal, CFeeRate(entry1->GetModifiedFee() + 1, entry1->GetTxSize()), unused_txid) == std::nullopt);\n+    // These tests use modified fees (including prioritisation), not base fees.\n+    BOOST_CHECK(PaysMoreThanConflicts({entry5}, CFeeRate(entry5->GetModifiedFee() + 1, entry5->GetTxSize()), unused_txid) == std::nullopt);\n+    BOOST_CHECK(PaysMoreThanConflicts({entry6}, CFeeRate(entry6->GetFee() + 1, entry6->GetTxSize()), unused_txid).has_value());\n+    BOOST_CHECK(PaysMoreThanConflicts({entry6}, CFeeRate(entry6->GetModifiedFee() + 1, entry6->GetTxSize()), unused_txid) == std::nullopt);\n+    // These tests only check individual feerate. Ancestor feerate does not matter.\n+    BOOST_CHECK(PaysMoreThanConflicts(set_34_cpfp, CFeeRate(entry4->GetModifiedFee(), entry4->GetTxSize()), unused_txid).has_value());\n+\n+    // Tests for EntriesAndTxidsDisjoint\n+    BOOST_CHECK(EntriesAndTxidsDisjoint(empty_set, {tx1->GetHash()}, unused_txid) == std::nullopt);\n+    BOOST_CHECK(EntriesAndTxidsDisjoint(set_12_normal, {tx3->GetHash()}, unused_txid) == std::nullopt);\n+    // EntriesAndTxidsDisjoint uses txids, not wtxids.\n+    BOOST_CHECK(EntriesAndTxidsDisjoint({entry2}, {tx2->GetWitnessHash()}, unused_txid) == std::nullopt);\n+    // If entry2 is an ancestor of a tx, that tx cannot replace entry1.  However,\n+    // EntriesAndTxidsDisjoint uses the ancestors directly. It does not calculate descendants.\n+    BOOST_CHECK(EntriesAndTxidsDisjoint(set_12_normal, {tx1->GetHash()}, unused_txid).has_value());\n+    BOOST_CHECK(EntriesAndTxidsDisjoint(set_12_normal, {tx2->GetHash()}, unused_txid).has_value());\n+    BOOST_CHECK(EntriesAndTxidsDisjoint({entry2}, {tx1->GetHash()}, unused_txid) == std::nullopt);\n+\n+    // Tests for PaysForRBF\n+    const auto incremental_relay_feerate{CFeeRate(DEFAULT_INCREMENTAL_RELAY_FEE)};\n+    const auto higher_relay_feerate{CFeeRate(2, 1)};\n+    // Must pay at least as much as the original.\n+    BOOST_CHECK(PaysForRBF(/*original_fees=*/high_fee,\n+                           /*replacement_fees=*/high_fee,\n+                           /*replacement_vsize=*/1,\n+                           /*relay_fee=*/CFeeRate(0),",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25674#discussion_r928564065",
+      "id" : 928564065,
+      "in_reply_to_id" : 927895019,
+      "line" : 152,
+      "node_id" : "PRRC_kwDOABII5843WMNh",
+      "original_commit_id" : "645c593a6027e7939c00d70f185ccbd0f381b7b5",
+      "original_line" : 152,
+      "original_position" : 149,
+      "original_start_line" : null,
+      "path" : "src/test/rbf_tests.cpp",
+      "position" : 152,
+      "pull_request_review_id" : 1048999401,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25674",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928564065/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-07-25T07:50:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928564065",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25674#discussion_r928568171"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25674"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928568171"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done",
+      "commit_id" : "433411ac98c0e6ea08defe27913ed9d06482f64c",
+      "created_at" : "2022-07-25T07:49:02Z",
+      "diff_hunk" : "@@ -0,0 +1,211 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+#include <policy/policy.h>\n+#include <policy/rbf.h>\n+#include <random.h>\n+#include <txmempool.h>\n+#include <util/system.h>\n+#include <util/time.h>\n+\n+#include <test/util/setup_common.h>\n+\n+#include <boost/test/unit_test.hpp>\n+#include <optional>\n+#include <vector>\n+\n+BOOST_FIXTURE_TEST_SUITE(rbf_tests, TestingSetup)\n+\n+inline CTransactionRef make_tx(const std::vector<CAmount>& output_values,\n+                               const std::vector<CTransactionRef>& inputs)\n+{\n+    CMutableTransaction tx = CMutableTransaction();\n+    tx.vin.resize(inputs.size());\n+    tx.vout.resize(output_values.size());\n+    for (size_t i = 0; i < inputs.size(); ++i) {\n+        tx.vin[i].prevout.hash = inputs[i]->GetHash();\n+        tx.vin[i].prevout.n = 0;\n+        // Add a witness so wtxid != txid\n+        CScriptWitness witness;\n+        witness.stack.push_back(std::vector<unsigned char>(i + 10));\n+        tx.vin[i].scriptWitness = witness;\n+    }\n+    for (size_t i = 0; i < output_values.size(); ++i) {\n+        tx.vout[i].scriptPubKey = CScript() << OP_11 << OP_EQUAL;\n+        tx.vout[i].nValue = output_values[i];\n+    }\n+    return MakeTransactionRef(tx);\n+}\n+\n+void add_descendants(const CTransactionRef& tx, CTxMemPool& pool, int32_t num_descendants)\n+    EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs)\n+{\n+    AssertLockHeld(cs_main);\n+    AssertLockHeld(pool.cs);\n+    TestMemPoolEntryHelper entry;\n+    // Assumes this isn't already spent in mempool\n+    auto tx_to_spend = tx;\n+    for (int32_t i{0}; i < num_descendants; ++i) {\n+        auto next_tx = make_tx(/*output_values=*/ {(50 - i) * CENT}, /*inputs=*/ {tx_to_spend});\n+        pool.addUnchecked(entry.FromTx(next_tx));\n+        tx_to_spend = next_tx;\n+    }\n+}\n+\n+BOOST_FIXTURE_TEST_CASE(rbf_helper_functions, TestChain100Setup)\n+{\n+    CTxMemPool& pool = *Assert(m_node.mempool);\n+    LOCK2(cs_main, pool.cs);\n+    TestMemPoolEntryHelper entry;\n+\n+    const CAmount low_fee{100};\n+    const CAmount normal_fee{10000};\n+    const CAmount high_fee{1 * COIN};\n+\n+    // Create a parent tx1 and child tx2 with normal fees:\n+    CTransactionRef tx1 = make_tx(/*output_values=*/ {10 * COIN}, /*inputs=*/ {m_coinbase_txns[0]});\n+    pool.addUnchecked(entry.Fee(normal_fee).FromTx(tx1));\n+    CTransactionRef tx2 = make_tx(/*output_values=*/ {995 * CENT}, /*inputs=*/ {tx1});\n+    pool.addUnchecked(entry.Fee(normal_fee).FromTx(tx2));\n+\n+    // Create a low-feerate parent tx3 and high-feerate child tx4 (cpfp)\n+    CTransactionRef tx3 = make_tx(/*output_values=*/ {1099 * CENT}, /*inputs=*/ {m_coinbase_txns[1]});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx3));\n+    CTransactionRef tx4 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {tx3});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx4));\n+\n+    // Create a parent tx5 and child tx6 where both have very low fees\n+    CTransactionRef tx5 = make_tx(/*output_values=*/ {1099 * CENT}, /*inputs=*/ {m_coinbase_txns[2]});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx5));\n+    CTransactionRef tx6 = make_tx(/*output_values=*/ {1098 * CENT}, /*inputs=*/ {tx3});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx6));\n+\n+    // Two independent high-feerate transactions, tx7 and tx8\n+    CTransactionRef tx7 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {m_coinbase_txns[3]});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx7));\n+    CTransactionRef tx8 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {m_coinbase_txns[4]});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx8));\n+    pool.PrioritiseTransaction(tx6->GetHash(), 1 * COIN);\n+\n+    const auto entry1 = pool.GetIter(tx1->GetHash()).value();\n+    const auto entry2 = pool.GetIter(tx2->GetHash()).value();\n+    const auto entry3 = pool.GetIter(tx3->GetHash()).value();\n+    const auto entry4 = pool.GetIter(tx4->GetHash()).value();\n+    const auto entry5 = pool.GetIter(tx5->GetHash()).value();\n+    const auto entry6 = pool.GetIter(tx6->GetHash()).value();\n+    const auto entry7 = pool.GetIter(tx7->GetHash()).value();\n+    const auto entry8 = pool.GetIter(tx8->GetHash()).value();\n+\n+    BOOST_CHECK_EQUAL(entry1->GetFee(), normal_fee);\n+    BOOST_CHECK_EQUAL(entry2->GetFee(), normal_fee);\n+    BOOST_CHECK_EQUAL(entry3->GetFee(), low_fee);\n+    BOOST_CHECK_EQUAL(entry4->GetFee(), high_fee);\n+    BOOST_CHECK_EQUAL(entry5->GetFee(), low_fee);\n+    BOOST_CHECK_EQUAL(entry6->GetFee(), low_fee);\n+    BOOST_CHECK_EQUAL(entry7->GetFee(), high_fee);\n+    BOOST_CHECK_EQUAL(entry8->GetFee(), high_fee);\n+\n+    CTxMemPool::setEntries set_12_normal{entry1, entry2};\n+    CTxMemPool::setEntries set_34_cpfp{entry3, entry4};\n+    CTxMemPool::setEntries set_56_low{entry5, entry6};\n+    CTxMemPool::setEntries all_entries{entry1, entry2, entry3, entry4, entry5, entry6, entry7, entry8};\n+    CTxMemPool::setEntries empty_set;\n+\n+    const auto unused_txid{GetRandHash()};\n+\n+    // Tests for PaysMoreThanConflicts\n+    // These tests use feerate, not absolute fee.\n+    BOOST_CHECK(PaysMoreThanConflicts(/*iters_conflicting=*/set_12_normal,\n+                                      /*replacement_feerate=*/CFeeRate(entry1->GetModifiedFee() + 1, entry1->GetTxSize() + 2),\n+                                      /*txid=*/unused_txid).has_value());\n+    // Replacement must be strictly greater than the originals.\n+    BOOST_CHECK(PaysMoreThanConflicts(set_12_normal, CFeeRate(entry1->GetModifiedFee(), entry1->GetTxSize()), unused_txid).has_value());\n+    BOOST_CHECK(PaysMoreThanConflicts(set_12_normal, CFeeRate(entry1->GetModifiedFee() + 1, entry1->GetTxSize()), unused_txid) == std::nullopt);\n+    // These tests use modified fees (including prioritisation), not base fees.\n+    BOOST_CHECK(PaysMoreThanConflicts({entry5}, CFeeRate(entry5->GetModifiedFee() + 1, entry5->GetTxSize()), unused_txid) == std::nullopt);\n+    BOOST_CHECK(PaysMoreThanConflicts({entry6}, CFeeRate(entry6->GetFee() + 1, entry6->GetTxSize()), unused_txid).has_value());\n+    BOOST_CHECK(PaysMoreThanConflicts({entry6}, CFeeRate(entry6->GetModifiedFee() + 1, entry6->GetTxSize()), unused_txid) == std::nullopt);\n+    // These tests only check individual feerate. Ancestor feerate does not matter.\n+    BOOST_CHECK(PaysMoreThanConflicts(set_34_cpfp, CFeeRate(entry4->GetModifiedFee(), entry4->GetTxSize()), unused_txid).has_value());\n+\n+    // Tests for EntriesAndTxidsDisjoint\n+    BOOST_CHECK(EntriesAndTxidsDisjoint(empty_set, {tx1->GetHash()}, unused_txid) == std::nullopt);\n+    BOOST_CHECK(EntriesAndTxidsDisjoint(set_12_normal, {tx3->GetHash()}, unused_txid) == std::nullopt);\n+    // EntriesAndTxidsDisjoint uses txids, not wtxids.\n+    BOOST_CHECK(EntriesAndTxidsDisjoint({entry2}, {tx2->GetWitnessHash()}, unused_txid) == std::nullopt);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25674#discussion_r928568171",
+      "id" : 928568171,
+      "in_reply_to_id" : 927887590,
+      "line" : 137,
+      "node_id" : "PRRC_kwDOABII5843WNNr",
+      "original_commit_id" : "645c593a6027e7939c00d70f185ccbd0f381b7b5",
+      "original_line" : 137,
+      "original_position" : 135,
+      "original_start_line" : null,
+      "path" : "src/test/rbf_tests.cpp",
+      "position" : 137,
+      "pull_request_review_id" : 1049005234,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25674",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928568171/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-07-25T07:49:43Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928568171",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25674#discussion_r928568272"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25674"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928568272"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done",
+      "commit_id" : "433411ac98c0e6ea08defe27913ed9d06482f64c",
+      "created_at" : "2022-07-25T07:49:09Z",
+      "diff_hunk" : "@@ -0,0 +1,211 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+#include <policy/policy.h>\n+#include <policy/rbf.h>\n+#include <random.h>\n+#include <txmempool.h>\n+#include <util/system.h>\n+#include <util/time.h>\n+\n+#include <test/util/setup_common.h>\n+\n+#include <boost/test/unit_test.hpp>\n+#include <optional>\n+#include <vector>\n+\n+BOOST_FIXTURE_TEST_SUITE(rbf_tests, TestingSetup)\n+\n+inline CTransactionRef make_tx(const std::vector<CAmount>& output_values,\n+                               const std::vector<CTransactionRef>& inputs)\n+{\n+    CMutableTransaction tx = CMutableTransaction();\n+    tx.vin.resize(inputs.size());\n+    tx.vout.resize(output_values.size());\n+    for (size_t i = 0; i < inputs.size(); ++i) {\n+        tx.vin[i].prevout.hash = inputs[i]->GetHash();\n+        tx.vin[i].prevout.n = 0;\n+        // Add a witness so wtxid != txid\n+        CScriptWitness witness;\n+        witness.stack.push_back(std::vector<unsigned char>(i + 10));\n+        tx.vin[i].scriptWitness = witness;\n+    }\n+    for (size_t i = 0; i < output_values.size(); ++i) {\n+        tx.vout[i].scriptPubKey = CScript() << OP_11 << OP_EQUAL;\n+        tx.vout[i].nValue = output_values[i];\n+    }\n+    return MakeTransactionRef(tx);\n+}\n+\n+void add_descendants(const CTransactionRef& tx, CTxMemPool& pool, int32_t num_descendants)\n+    EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs)\n+{\n+    AssertLockHeld(cs_main);\n+    AssertLockHeld(pool.cs);\n+    TestMemPoolEntryHelper entry;\n+    // Assumes this isn't already spent in mempool\n+    auto tx_to_spend = tx;\n+    for (int32_t i{0}; i < num_descendants; ++i) {\n+        auto next_tx = make_tx(/*output_values=*/ {(50 - i) * CENT}, /*inputs=*/ {tx_to_spend});\n+        pool.addUnchecked(entry.FromTx(next_tx));\n+        tx_to_spend = next_tx;\n+    }\n+}\n+\n+BOOST_FIXTURE_TEST_CASE(rbf_helper_functions, TestChain100Setup)\n+{\n+    CTxMemPool& pool = *Assert(m_node.mempool);\n+    LOCK2(cs_main, pool.cs);\n+    TestMemPoolEntryHelper entry;\n+\n+    const CAmount low_fee{100};\n+    const CAmount normal_fee{10000};\n+    const CAmount high_fee{1 * COIN};\n+\n+    // Create a parent tx1 and child tx2 with normal fees:\n+    CTransactionRef tx1 = make_tx(/*output_values=*/ {10 * COIN}, /*inputs=*/ {m_coinbase_txns[0]});\n+    pool.addUnchecked(entry.Fee(normal_fee).FromTx(tx1));\n+    CTransactionRef tx2 = make_tx(/*output_values=*/ {995 * CENT}, /*inputs=*/ {tx1});\n+    pool.addUnchecked(entry.Fee(normal_fee).FromTx(tx2));\n+\n+    // Create a low-feerate parent tx3 and high-feerate child tx4 (cpfp)\n+    CTransactionRef tx3 = make_tx(/*output_values=*/ {1099 * CENT}, /*inputs=*/ {m_coinbase_txns[1]});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx3));\n+    CTransactionRef tx4 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {tx3});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx4));\n+\n+    // Create a parent tx5 and child tx6 where both have very low fees\n+    CTransactionRef tx5 = make_tx(/*output_values=*/ {1099 * CENT}, /*inputs=*/ {m_coinbase_txns[2]});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx5));\n+    CTransactionRef tx6 = make_tx(/*output_values=*/ {1098 * CENT}, /*inputs=*/ {tx3});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx6));\n+\n+    // Two independent high-feerate transactions, tx7 and tx8\n+    CTransactionRef tx7 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {m_coinbase_txns[3]});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx7));\n+    CTransactionRef tx8 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {m_coinbase_txns[4]});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx8));\n+    pool.PrioritiseTransaction(tx6->GetHash(), 1 * COIN);\n+\n+    const auto entry1 = pool.GetIter(tx1->GetHash()).value();\n+    const auto entry2 = pool.GetIter(tx2->GetHash()).value();\n+    const auto entry3 = pool.GetIter(tx3->GetHash()).value();\n+    const auto entry4 = pool.GetIter(tx4->GetHash()).value();\n+    const auto entry5 = pool.GetIter(tx5->GetHash()).value();\n+    const auto entry6 = pool.GetIter(tx6->GetHash()).value();\n+    const auto entry7 = pool.GetIter(tx7->GetHash()).value();\n+    const auto entry8 = pool.GetIter(tx8->GetHash()).value();\n+\n+    BOOST_CHECK_EQUAL(entry1->GetFee(), normal_fee);\n+    BOOST_CHECK_EQUAL(entry2->GetFee(), normal_fee);\n+    BOOST_CHECK_EQUAL(entry3->GetFee(), low_fee);\n+    BOOST_CHECK_EQUAL(entry4->GetFee(), high_fee);\n+    BOOST_CHECK_EQUAL(entry5->GetFee(), low_fee);\n+    BOOST_CHECK_EQUAL(entry6->GetFee(), low_fee);\n+    BOOST_CHECK_EQUAL(entry7->GetFee(), high_fee);\n+    BOOST_CHECK_EQUAL(entry8->GetFee(), high_fee);\n+\n+    CTxMemPool::setEntries set_12_normal{entry1, entry2};\n+    CTxMemPool::setEntries set_34_cpfp{entry3, entry4};\n+    CTxMemPool::setEntries set_56_low{entry5, entry6};\n+    CTxMemPool::setEntries all_entries{entry1, entry2, entry3, entry4, entry5, entry6, entry7, entry8};\n+    CTxMemPool::setEntries empty_set;\n+\n+    const auto unused_txid{GetRandHash()};\n+\n+    // Tests for PaysMoreThanConflicts\n+    // These tests use feerate, not absolute fee.\n+    BOOST_CHECK(PaysMoreThanConflicts(/*iters_conflicting=*/set_12_normal,\n+                                      /*replacement_feerate=*/CFeeRate(entry1->GetModifiedFee() + 1, entry1->GetTxSize() + 2),\n+                                      /*txid=*/unused_txid).has_value());\n+    // Replacement must be strictly greater than the originals.\n+    BOOST_CHECK(PaysMoreThanConflicts(set_12_normal, CFeeRate(entry1->GetModifiedFee(), entry1->GetTxSize()), unused_txid).has_value());\n+    BOOST_CHECK(PaysMoreThanConflicts(set_12_normal, CFeeRate(entry1->GetModifiedFee() + 1, entry1->GetTxSize()), unused_txid) == std::nullopt);\n+    // These tests use modified fees (including prioritisation), not base fees.\n+    BOOST_CHECK(PaysMoreThanConflicts({entry5}, CFeeRate(entry5->GetModifiedFee() + 1, entry5->GetTxSize()), unused_txid) == std::nullopt);\n+    BOOST_CHECK(PaysMoreThanConflicts({entry6}, CFeeRate(entry6->GetFee() + 1, entry6->GetTxSize()), unused_txid).has_value());\n+    BOOST_CHECK(PaysMoreThanConflicts({entry6}, CFeeRate(entry6->GetModifiedFee() + 1, entry6->GetTxSize()), unused_txid) == std::nullopt);\n+    // These tests only check individual feerate. Ancestor feerate does not matter.\n+    BOOST_CHECK(PaysMoreThanConflicts(set_34_cpfp, CFeeRate(entry4->GetModifiedFee(), entry4->GetTxSize()), unused_txid).has_value());\n+\n+    // Tests for EntriesAndTxidsDisjoint\n+    BOOST_CHECK(EntriesAndTxidsDisjoint(empty_set, {tx1->GetHash()}, unused_txid) == std::nullopt);\n+    BOOST_CHECK(EntriesAndTxidsDisjoint(set_12_normal, {tx3->GetHash()}, unused_txid) == std::nullopt);\n+    // EntriesAndTxidsDisjoint uses txids, not wtxids.\n+    BOOST_CHECK(EntriesAndTxidsDisjoint({entry2}, {tx2->GetWitnessHash()}, unused_txid) == std::nullopt);\n+    // If entry2 is an ancestor of a tx, that tx cannot replace entry1.  However,\n+    // EntriesAndTxidsDisjoint uses the ancestors directly. It does not calculate descendants.\n+    BOOST_CHECK(EntriesAndTxidsDisjoint(set_12_normal, {tx1->GetHash()}, unused_txid).has_value());\n+    BOOST_CHECK(EntriesAndTxidsDisjoint(set_12_normal, {tx2->GetHash()}, unused_txid).has_value());\n+    BOOST_CHECK(EntriesAndTxidsDisjoint({entry2}, {tx1->GetHash()}, unused_txid) == std::nullopt);\n+\n+    // Tests for PaysForRBF\n+    const auto incremental_relay_feerate{CFeeRate(DEFAULT_INCREMENTAL_RELAY_FEE)};\n+    const auto higher_relay_feerate{CFeeRate(2, 1)};\n+    // Must pay at least as much as the original.\n+    BOOST_CHECK(PaysForRBF(/*original_fees=*/high_fee,\n+                           /*replacement_fees=*/high_fee,\n+                           /*replacement_vsize=*/1,\n+                           /*relay_fee=*/CFeeRate(0),\n+                           /*txid=*/unused_txid)\n+                           == std::nullopt);\n+    BOOST_CHECK(PaysForRBF(high_fee, high_fee - 1, 1, CFeeRate(0), unused_txid).has_value());\n+    BOOST_CHECK(PaysForRBF(high_fee + 1, high_fee, 1, CFeeRate(0), unused_txid).has_value());\n+    // Additional fees must cover the replacement's vsize at incremental relay fee\n+    BOOST_CHECK(PaysForRBF(high_fee, high_fee + 1, 2, incremental_relay_feerate, unused_txid).has_value());\n+    BOOST_CHECK(PaysForRBF(high_fee, high_fee + 2, 2, incremental_relay_feerate, unused_txid) == std::nullopt);\n+    BOOST_CHECK(PaysForRBF(high_fee, high_fee + 2, 2, higher_relay_feerate, unused_txid).has_value());\n+    BOOST_CHECK(PaysForRBF(high_fee, high_fee + 4, 2, higher_relay_feerate, unused_txid) == std::nullopt);\n+    BOOST_CHECK(PaysForRBF(low_fee, high_fee, 99999999, incremental_relay_feerate, unused_txid).has_value());\n+\n+    // Tests for GetEntriesForConflicts\n+    CTxMemPool::setEntries all_parents{entry1, entry3, entry5, entry7, entry8};\n+    CTxMemPool::setEntries all_children{entry2, entry4, entry6};\n+    std::vector<CTransactionRef> parent_inputs({m_coinbase_txns[0], m_coinbase_txns[1], m_coinbase_txns[2],\n+                                                m_coinbase_txns[3], m_coinbase_txns[4]});\n+    CTransactionRef conflicts_with_parents = make_tx({50 * CENT}, parent_inputs);\n+    CTxMemPool::setEntries all_conflicts;\n+    BOOST_CHECK(GetEntriesForConflicts(/*tx=*/ *conflicts_with_parents.get(),\n+                                       /*pool=*/ pool,\n+                                       /*iters_conflicting=*/ all_parents,\n+                                       /*all_conflicts=*/ all_conflicts) == std::nullopt);\n+    BOOST_CHECK(all_conflicts == all_entries);\n+    all_conflicts.clear();\n+\n+    add_descendants(tx2, pool, 23);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25674#discussion_r928568272",
+      "id" : 928568272,
+      "in_reply_to_id" : 927900263,
+      "line" : 179,
+      "node_id" : "PRRC_kwDOABII5843WNPQ",
+      "original_commit_id" : "645c593a6027e7939c00d70f185ccbd0f381b7b5",
+      "original_line" : 179,
+      "original_position" : 175,
+      "original_start_line" : null,
+      "path" : "src/test/rbf_tests.cpp",
+      "position" : 179,
+      "pull_request_review_id" : 1049005234,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25674",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928568272/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-07-25T07:49:43Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928568272",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25674#discussion_r928568622"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25674"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928568622"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Added comment, hopefully clearer now",
+      "commit_id" : "433411ac98c0e6ea08defe27913ed9d06482f64c",
+      "created_at" : "2022-07-25T07:49:32Z",
+      "diff_hunk" : "@@ -0,0 +1,211 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+#include <policy/policy.h>\n+#include <policy/rbf.h>\n+#include <random.h>\n+#include <txmempool.h>\n+#include <util/system.h>\n+#include <util/time.h>\n+\n+#include <test/util/setup_common.h>\n+\n+#include <boost/test/unit_test.hpp>\n+#include <optional>\n+#include <vector>\n+\n+BOOST_FIXTURE_TEST_SUITE(rbf_tests, TestingSetup)\n+\n+inline CTransactionRef make_tx(const std::vector<CAmount>& output_values,\n+                               const std::vector<CTransactionRef>& inputs)\n+{\n+    CMutableTransaction tx = CMutableTransaction();\n+    tx.vin.resize(inputs.size());\n+    tx.vout.resize(output_values.size());\n+    for (size_t i = 0; i < inputs.size(); ++i) {\n+        tx.vin[i].prevout.hash = inputs[i]->GetHash();\n+        tx.vin[i].prevout.n = 0;\n+        // Add a witness so wtxid != txid\n+        CScriptWitness witness;\n+        witness.stack.push_back(std::vector<unsigned char>(i + 10));\n+        tx.vin[i].scriptWitness = witness;\n+    }\n+    for (size_t i = 0; i < output_values.size(); ++i) {\n+        tx.vout[i].scriptPubKey = CScript() << OP_11 << OP_EQUAL;\n+        tx.vout[i].nValue = output_values[i];\n+    }\n+    return MakeTransactionRef(tx);\n+}\n+\n+void add_descendants(const CTransactionRef& tx, CTxMemPool& pool, int32_t num_descendants)\n+    EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs)\n+{\n+    AssertLockHeld(cs_main);\n+    AssertLockHeld(pool.cs);\n+    TestMemPoolEntryHelper entry;\n+    // Assumes this isn't already spent in mempool\n+    auto tx_to_spend = tx;\n+    for (int32_t i{0}; i < num_descendants; ++i) {\n+        auto next_tx = make_tx(/*output_values=*/ {(50 - i) * CENT}, /*inputs=*/ {tx_to_spend});\n+        pool.addUnchecked(entry.FromTx(next_tx));\n+        tx_to_spend = next_tx;\n+    }\n+}\n+\n+BOOST_FIXTURE_TEST_CASE(rbf_helper_functions, TestChain100Setup)\n+{\n+    CTxMemPool& pool = *Assert(m_node.mempool);\n+    LOCK2(cs_main, pool.cs);\n+    TestMemPoolEntryHelper entry;\n+\n+    const CAmount low_fee{100};\n+    const CAmount normal_fee{10000};\n+    const CAmount high_fee{1 * COIN};\n+\n+    // Create a parent tx1 and child tx2 with normal fees:\n+    CTransactionRef tx1 = make_tx(/*output_values=*/ {10 * COIN}, /*inputs=*/ {m_coinbase_txns[0]});\n+    pool.addUnchecked(entry.Fee(normal_fee).FromTx(tx1));\n+    CTransactionRef tx2 = make_tx(/*output_values=*/ {995 * CENT}, /*inputs=*/ {tx1});\n+    pool.addUnchecked(entry.Fee(normal_fee).FromTx(tx2));\n+\n+    // Create a low-feerate parent tx3 and high-feerate child tx4 (cpfp)\n+    CTransactionRef tx3 = make_tx(/*output_values=*/ {1099 * CENT}, /*inputs=*/ {m_coinbase_txns[1]});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx3));\n+    CTransactionRef tx4 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {tx3});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx4));\n+\n+    // Create a parent tx5 and child tx6 where both have very low fees\n+    CTransactionRef tx5 = make_tx(/*output_values=*/ {1099 * CENT}, /*inputs=*/ {m_coinbase_txns[2]});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx5));\n+    CTransactionRef tx6 = make_tx(/*output_values=*/ {1098 * CENT}, /*inputs=*/ {tx3});\n+    pool.addUnchecked(entry.Fee(low_fee).FromTx(tx6));\n+\n+    // Two independent high-feerate transactions, tx7 and tx8\n+    CTransactionRef tx7 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {m_coinbase_txns[3]});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx7));\n+    CTransactionRef tx8 = make_tx(/*output_values=*/ {999 * CENT}, /*inputs=*/ {m_coinbase_txns[4]});\n+    pool.addUnchecked(entry.Fee(high_fee).FromTx(tx8));\n+    pool.PrioritiseTransaction(tx6->GetHash(), 1 * COIN);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25674#discussion_r928568622",
+      "id" : 928568622,
+      "in_reply_to_id" : 927846036,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII5843WNUu",
+      "original_commit_id" : "645c593a6027e7939c00d70f185ccbd0f381b7b5",
+      "original_line" : 88,
+      "original_position" : 88,
+      "original_start_line" : null,
+      "path" : "src/test/rbf_tests.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1049005234,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25674",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928568622/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-07-25T07:49:43Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/928568622",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
    }
 ]
