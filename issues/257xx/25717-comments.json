@@ -4036,5 +4036,141 @@
          "type" : "User",
          "url" : "https://api.github.com/users/sdaftuar"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25717#discussion_r934021719"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25717"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/934021719"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Now that I think about it, it's possible that if the peer's chain has grown (and the sync takes very long) that you could get to this condition; the right thing to do in that scenario (assuming our peer has an actually more work chain) is to try to sync with this peer again later.  (Obviously this is a pathological case, but I think we should still be able to sync such a chain anyway, eventually.)\r\n\r\nI'll update the comment.",
+      "commit_id" : "e3260960add016aeb43d0be4c5b735418e37c4a7",
+      "created_at" : "2022-07-31T18:14:03Z",
+      "diff_hunk" : "@@ -0,0 +1,318 @@\n+#include <headerssync.h>\n+#include <logging.h>\n+#include <util/check.h>\n+#include <pow.h>\n+#include <timedata.h>\n+\n+// Store a commitment to a header every HEADER_COMMITMENT_FREQUENCY blocks\n+constexpr size_t HEADER_COMMITMENT_FREQUENCY = 571;\n+// Pull out headers for acceptance during redownload once our buffer exceeds this amount\n+constexpr size_t REDOWNLOAD_HEADERS_THRESHOLD = 25*HEADER_COMMITMENT_FREQUENCY;\n+// Ensure that the redownload buffer is a multiple of the header commitment\n+// frequency, so that we aren't wasting memory.\n+static_assert(REDOWNLOAD_HEADERS_THRESHOLD % HEADER_COMMITMENT_FREQUENCY == 0);\n+\n+// Our memory analysis assumes 48 bytes for a CompressedHeader (so we should\n+// re-calculate parameters if we compress further)\n+static_assert(sizeof(CompressedHeader) == 48);\n+\n+HeadersSyncState::HeadersSyncState(NodeId id, const Consensus::Params& consensus_params) :\n+    m_id(id), m_consensus_params(consensus_params)\n+{ }\n+\n+// Free any memory in use, and mark this object as no longer usable.\n+void HeadersSyncState::Finalize()\n+{\n+    Assume(m_download_state != State::FINAL);\n+    m_header_commitments.clear();\n+    m_last_header_received.SetNull();\n+    m_blockhash_with_sufficient_work.SetNull();\n+    std::deque<CompressedHeader>().swap(m_redownloaded_headers);\n+    m_redownload_buffer_last_hash.SetNull();\n+    m_redownload_buffer_first_prev_hash.SetNull();\n+    m_process_all_remaining_headers = false;\n+    m_current_height = 0;\n+\n+    m_download_state = State::FINAL;\n+}\n+\n+// Initialize the parameters for this headers download, validate this first\n+// batch, and request more headers.\n+std::optional<CBlockLocator> HeadersSyncState::StartInitialDownload(const CBlockIndex* chain_start,\n+        const std::vector<CBlockHeader>& initial_headers, const arith_uint256&\n+        minimum_required_work, CBlockLocator&& chain_start_locator)\n+{\n+    // A new instance of this object should be instantiated for every headers\n+    // sync, so that we don't reuse our salted hasher between syncs.\n+    assert(m_download_state == State::INITIAL_DOWNLOAD);\n+\n+    m_chain_start = chain_start;\n+    m_minimum_required_work = minimum_required_work;\n+    m_current_chain_work = chain_start->nChainWork;\n+    m_current_height = chain_start->nHeight;\n+    m_chain_start_locator = std::move(chain_start_locator);\n+\n+    // Overestimate the number of blocks that could possibly exist on this\n+    // chain using 6 blocks/second (fastest blockrate given the MTP rule) times\n+    // the number of seconds from the last allowed block until today. This\n+    // serves as a memory bound on how many commitments we might store from\n+    // this peer, and we can safely give up syncing if the peer exceeds this\n+    // bound, because it's not possible for a consensus-valid chain to be\n+    // longer than this.\n+    m_max_commitments = 6*(GetAdjustedTime() - chain_start->GetMedianTimePast() + MAX_FUTURE_BLOCK_TIME) / HEADER_COMMITMENT_FREQUENCY;\n+\n+    if (!ValidateAndStoreHeadersCommitments(initial_headers)) {\n+        return std::nullopt;\n+    }\n+    return MakeNextHeadersRequest();\n+}\n+\n+// Process the next batch of headers received from our peer.\n+// Validate and store commitments, and compare total chainwork to our target to\n+// see if we can switch to REDOWNLOAD mode.\n+std::optional<CBlockLocator> HeadersSyncState::ProcessNextHeaders(const std::vector<CBlockHeader>&\n+        headers, bool full_headers_message, std::vector<CBlockHeader>&\n+        headers_to_process, bool& processing_success)\n+{\n+    processing_success = false;\n+\n+    Assume(!headers.empty());\n+    if (headers.empty()) return std::nullopt;\n+\n+    Assume(m_download_state != State::FINAL);\n+    if (m_download_state == State::FINAL) return std::nullopt;\n+\n+    if (m_download_state == State::INITIAL_DOWNLOAD) {\n+        // During INITIAL_DOWNLOAD, we minimally validate block headers and\n+        // occasionally add commitments to them, until we reach our work\n+        // threshold.\n+        if (headers[0].hashPrevBlock != m_last_header_received.GetHash()) {\n+            // Somehow our peer gave us a header that doesn't connect.\n+            // This might be benign -- perhaps we issued an extra getheaders\n+            // message, such as after a block INV was received.\n+            // Or it could be that our peer is broken or malicious. If broken,\n+            // sending a new getheaders immediately could trigger an infinite\n+            // loop. Just give up for now; if our peer ever gives us an block\n+            // INV later we will fetch headers then, and likely retrigger this\n+            // logic.\n+            Finalize();\n+            return std::nullopt;\n+        }\n+        if (!ValidateAndStoreHeadersCommitments(headers)) {\n+            // The headers didn't pass validation; give up on the sync.\n+            return std::nullopt;\n+        }\n+        processing_success = true;\n+        if (full_headers_message || m_download_state == State::REDOWNLOAD) {\n+            // A full headers message means the peer may have more to give us;\n+            // also if we just switched to REDOWNLOAD then we need to re-request\n+            // headers from the beginning.\n+            return MakeNextHeadersRequest();\n+        } else {\n+            // If we're in INITIAL_DOWNLOAD and we get a non-full headers\n+            // message, then the peer's chain has ended and definitely doesn't\n+            // have enough work, so we can stop our sync.\n+            Finalize();\n+            return std::nullopt;\n+        }\n+    } else if (m_download_state == State::REDOWNLOAD) {\n+        // During REDOWNLOAD, we compare our stored commitments to what we\n+        // receive, and add headers to our redownload buffer. When the buffer\n+        // gets big enough (meaning that we've checked enough commitments),\n+        // we'll return a batch of headers to the caller for processing.\n+        for (const auto& hdr : headers) {\n+            if (!ValidateAndStoreRedownloadedHeader(hdr)) {\n+                // Something went wrong -- the peer gave us an unexpected chain.\n+                // We could consider looking at the reason for failure and\n+                // punishing the peer, but for now just give up on sync.\n+                Finalize();\n+                return std::nullopt;\n+            }\n+        }\n+\n+        processing_success = true;\n+        // Return any headers that are ready for acceptance.\n+        headers_to_process = RemoveHeadersReadyForAcceptance();\n+\n+        // If we hit our target blockhash, then all remaining headers will be\n+        // returned and we can clear any leftover internal state.\n+        if (m_redownloaded_headers.empty() && m_process_all_remaining_headers) {\n+            Finalize();\n+            return std::nullopt;\n+        }\n+\n+        // If the headers message is full, we need to request more.\n+        if (full_headers_message) {\n+            return MakeNextHeadersRequest();\n+        } else {\n+            // For some reason our peer gave us a high-work chain, but is now\n+            // declining to serve us that full chain again. Give up.\n+            // Note that there's no more processing to be done with these\n+            // headers, so we can still return success.\n+            Finalize();\n+            return std::nullopt;\n+        }\n+    }\n+    return std::nullopt;\n+}\n+\n+bool HeadersSyncState::ValidateAndStoreHeadersCommitments(const std::vector<CBlockHeader>& headers)\n+{\n+    // The caller should not give us an empty set of headers.\n+    Assume(headers.size() > 0);\n+    if (headers.size() == 0) return true;\n+\n+    Assume(m_download_state != State::FINAL);\n+    if (m_download_state == State::FINAL) return false;\n+\n+    if (m_last_header_received.IsNull()) {\n+        m_last_header_received = m_chain_start->GetBlockHeader();\n+        m_current_height = m_chain_start->nHeight;\n+    }\n+\n+    if (headers[0].hashPrevBlock != m_last_header_received.GetHash()) {\n+        // Doesn't connect to what we expect\n+        Finalize();\n+        return false;\n+    }\n+\n+    // If it does connect, (minimally) validate and store a commitment to each one.\n+    for (const auto& hdr : headers) {\n+        if (!ValidateAndProcessSingleHeader(m_last_header_received, hdr, m_current_height+1)) {\n+            Finalize();\n+            return false;\n+        }\n+    }\n+\n+    if (m_current_chain_work >= m_minimum_required_work) {\n+        m_blockhash_with_sufficient_work = headers.back().GetHash();\n+        m_redownloaded_headers.clear();\n+        m_redownload_buffer_last_height = m_chain_start->nHeight;\n+        m_redownload_buffer_first_prev_hash = m_chain_start->GetBlockHash();\n+        m_redownload_buffer_last_hash.SetNull();\n+        m_download_state = State::REDOWNLOAD;\n+    }\n+    return true;\n+}\n+\n+bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& previous, const CBlockHeader& current, int64_t current_height)\n+{\n+    Assume(m_download_state != State::FINAL);\n+    if (m_download_state == State::FINAL) return false;\n+\n+    // Verify that the difficulty isn't growing too fast; an adversary with\n+    // limited hashing capability has a greater chance of producing a high\n+    // work chain if they compress the work into as few blocks as possible,\n+    // so don't let anyone give a chain that would violate the difficulty\n+    // adjustment maximum.\n+    if (!PermittedDifficultyTransition(m_consensus_params, current_height,\n+                previous.nBits, current.nBits)) {\n+        return false;\n+    }\n+\n+    if (!CheckProofOfWork(current.GetHash(), current.nBits, m_consensus_params)) return false;\n+\n+    if ((current_height - m_chain_start->nHeight) % HEADER_COMMITMENT_FREQUENCY == 0) {\n+        // Try to add a commitment.\n+        m_header_commitments.push_back(m_hasher(current.GetHash()) & 1);\n+        if (m_header_commitments.size() > m_max_commitments) {\n+            // The peer's chain is too long; give up.\n+            // TODO: disconnect this peer.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25717#discussion_r934021719",
+      "id" : 934021719,
+      "in_reply_to_id" : 932186749,
+      "line" : 225,
+      "node_id" : "PRRC_kwDOABII5843rApX",
+      "original_commit_id" : "7bed25cbd3776189d47f3771ab3abc180ff34077",
+      "original_line" : 225,
+      "original_position" : 220,
+      "original_start_line" : null,
+      "path" : "src/headerssync.cpp",
+      "position" : 225,
+      "pull_request_review_id" : 1056600826,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25717",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/934021719/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-07-31T18:14:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/934021719",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=4",
+         "events_url" : "https://api.github.com/users/sdaftuar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sdaftuar/followers",
+         "following_url" : "https://api.github.com/users/sdaftuar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sdaftuar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sdaftuar",
+         "id" : 7463573,
+         "login" : "sdaftuar",
+         "node_id" : "MDQ6VXNlcjc0NjM1NzM=",
+         "organizations_url" : "https://api.github.com/users/sdaftuar/orgs",
+         "received_events_url" : "https://api.github.com/users/sdaftuar/received_events",
+         "repos_url" : "https://api.github.com/users/sdaftuar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sdaftuar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sdaftuar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sdaftuar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25717#discussion_r934021892"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25717"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/934021892"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done.",
+      "commit_id" : "e3260960add016aeb43d0be4c5b735418e37c4a7",
+      "created_at" : "2022-07-31T18:15:39Z",
+      "diff_hunk" : "@@ -0,0 +1,68 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2019-2021 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test that we reject low difficulty headers to prevent our block tree from filling up with useless bloat\"\"\"\n+\n+from test_framework.test_framework import BitcoinTestFramework\n+\n+import time\n+\n+NODE1_BLOCKS_REQUIRED = 16\n+NODE2_BLOCKS_REQUIRED = 2047\n+\n+\n+class RejectLowDifficultyHeadersTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.setup_clean_chain = True\n+        self.num_nodes = 3\n+        # Node0 has no required chainwork; node1 requires 16 blocks; node2 requires 2048 blocks\n+        self.extra_args = [[\"-minimumchainwork=0x0\"], [\"-minimumchainwork=0x1f\"], [\"-minimumchainwork=0x1000\"]]\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+\n+    def test_chains_sync_when_long_enough(self):\n+        self.log.info(\"Generate blocks on the node with no required chainwork\")\n+        self.generate(self.nodes[0], NODE1_BLOCKS_REQUIRED-2, sync_fun=self.no_op)\n+\n+        self.log.info(\"Verify nodes 1 and 2 have no new headers in their headers tree\")",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25717#discussion_r934021892",
+      "id" : 934021892,
+      "in_reply_to_id" : 932282250,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII5843rAsE",
+      "original_commit_id" : "7bed25cbd3776189d47f3771ab3abc180ff34077",
+      "original_line" : 29,
+      "original_position" : 29,
+      "original_start_line" : null,
+      "path" : "test/functional/p2p_headers_sync_with_minchainwork.py",
+      "position" : null,
+      "pull_request_review_id" : 1056600977,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25717",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/934021892/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-07-31T18:15:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/934021892",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7463573?v=4",
+         "events_url" : "https://api.github.com/users/sdaftuar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sdaftuar/followers",
+         "following_url" : "https://api.github.com/users/sdaftuar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sdaftuar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sdaftuar",
+         "id" : 7463573,
+         "login" : "sdaftuar",
+         "node_id" : "MDQ6VXNlcjc0NjM1NzM=",
+         "organizations_url" : "https://api.github.com/users/sdaftuar/orgs",
+         "received_events_url" : "https://api.github.com/users/sdaftuar/received_events",
+         "repos_url" : "https://api.github.com/users/sdaftuar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sdaftuar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sdaftuar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sdaftuar"
+      }
    }
 ]
