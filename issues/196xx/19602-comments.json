@@ -6905,5 +6905,276 @@
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r955378613"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955378613"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "But can we really rule out that this happens in production on some obscure old weird wallet? If not, it would be better to have the RPC throw and maybe provide some info about the scripts that are left.",
+      "commit_id" : "fb10bae0e68a38b7db833b1d16a2b478c371b375",
+      "created_at" : "2022-08-25T20:12:26Z",
+      "diff_hunk" : "@@ -1711,6 +1711,242 @@ const std::unordered_set<CScript, SaltedSipHasher> LegacyScriptPubKeyMan::GetScr\n     return spks;\n }\n \n+std::optional<MigrationData> LegacyScriptPubKeyMan::MigrateToDescriptor()\n+{\n+    LOCK(cs_KeyStore);\n+    if (m_storage.IsLocked()) {\n+        return std::nullopt;\n+    }\n+\n+    MigrationData out;\n+\n+    std::unordered_set<CScript, SaltedSipHasher> spks{GetScriptPubKeys()};\n+\n+    // Get all key ids\n+    std::set<CKeyID> keyids;\n+    for (const auto& key_pair : mapKeys) {\n+        keyids.insert(key_pair.first);\n+    }\n+    for (const auto& key_pair : mapCryptedKeys) {\n+        keyids.insert(key_pair.first);\n+    }\n+\n+    // Get key metadata and figure out which keys don't have a seed\n+    // Note that we do not ignore the seeds themselves because they are considered IsMine!\n+    for (auto keyid_it = keyids.begin(); keyid_it != keyids.end();) {\n+        const CKeyID& keyid = *keyid_it;\n+        const auto& it = mapKeyMetadata.find(keyid);\n+        if (it != mapKeyMetadata.end()) {\n+            const CKeyMetadata& meta = it->second;\n+            if (meta.hdKeypath == \"s\" || meta.hdKeypath == \"m\") {\n+                keyid_it++;\n+                continue;\n+            }\n+            if (m_hd_chain.seed_id == meta.hd_seed_id || m_inactive_hd_chains.count(meta.hd_seed_id) > 0) {\n+                keyid_it = keyids.erase(keyid_it);\n+                continue;\n+            }\n+        }\n+        keyid_it++;\n+    }\n+\n+    // keyids is now all non-HD keys. Each key will have its own combo descriptor\n+    for (const CKeyID& keyid : keyids) {\n+        CKey key;\n+        if (!GetKey(keyid, key)) {\n+            assert(false);\n+        }\n+\n+        // Get birthdate from key meta\n+        uint64_t creation_time = 0;\n+        const auto& it = mapKeyMetadata.find(keyid);\n+        if (it != mapKeyMetadata.end()) {\n+            creation_time = it->second.nCreateTime;\n+        }\n+\n+        // Get the key origin\n+        // Maybe this doesn't matter because floating keys here shouldn't have origins\n+        KeyOriginInfo info;\n+        bool has_info = GetKeyOrigin(keyid, info);\n+        std::string origin_str = \"[\" + HexStr(info.fingerprint) + FormatHDKeypath(info.path) + \"]\";\n+\n+        // Construct the combo descriptor\n+        std::string desc_str = \"combo(\" + (has_info ? origin_str : \"\") + HexStr(key.GetPubKey()) + \")\";\n+        FlatSigningProvider keys;\n+        std::string error;\n+        std::unique_ptr<Descriptor> desc = Parse(desc_str, keys, error, false);\n+        WalletDescriptor w_desc(std::move(desc), creation_time, 0, 0, 0);\n+\n+        // Make the DescriptorScriptPubKeyMan and get the scriptPubKeys\n+        auto desc_spk_man = std::unique_ptr<DescriptorScriptPubKeyMan>(new DescriptorScriptPubKeyMan(m_storage, w_desc));\n+        desc_spk_man->AddDescriptorKey(key, key.GetPubKey());\n+        desc_spk_man->TopUp();\n+        auto desc_spks = desc_spk_man->GetScriptPubKeys();\n+\n+        // Remove the scriptPubKeys from our current set\n+        for (const CScript& spk : desc_spks) {\n+            size_t erased = spks.erase(spk);\n+            assert(erased == 1);\n+            assert(IsMine(spk) == ISMINE_SPENDABLE);\n+        }\n+\n+        out.desc_spkms.push_back(std::move(desc_spk_man));\n+    }\n+\n+    // Handle HD keys by using the CHDChains\n+    std::vector<CHDChain> chains;\n+    chains.push_back(m_hd_chain);\n+    for (const auto& chain_pair : m_inactive_hd_chains) {\n+        chains.push_back(chain_pair.second);\n+    }\n+    for (const CHDChain& chain : chains) {\n+        for (int i = 0; i < 2; ++i) {\n+            // Skip if doing internal chain and split chain is not supported\n+            if (chain.seed_id.IsNull() || (i == 1 && !m_storage.CanSupportFeature(FEATURE_HD_SPLIT))) {\n+                continue;\n+            }\n+            // Get the master xprv\n+            CKey seed_key;\n+            if (!GetKey(chain.seed_id, seed_key)) {\n+                assert(false);\n+            }\n+            CExtKey master_key;\n+            master_key.SetSeed(seed_key);\n+\n+            // Make the combo descriptor\n+            std::string xpub = EncodeExtPubKey(master_key.Neuter());\n+            std::string desc_str = \"combo(\" + xpub + \"/0'/\" + ToString(i) + \"'/*')\";\n+            FlatSigningProvider keys;\n+            std::string error;\n+            std::unique_ptr<Descriptor> desc = Parse(desc_str, keys, error, false);\n+            uint32_t chain_counter = std::max((i == 1 ? chain.nInternalChainCounter : chain.nExternalChainCounter), (uint32_t)0);\n+            WalletDescriptor w_desc(std::move(desc), 0, 0, chain_counter, 0);\n+\n+            // Make the DescriptorScriptPubKeyMan and get the scriptPubKeys\n+            auto desc_spk_man = std::unique_ptr<DescriptorScriptPubKeyMan>(new DescriptorScriptPubKeyMan(m_storage, w_desc));\n+            desc_spk_man->AddDescriptorKey(master_key.key, master_key.key.GetPubKey());\n+            desc_spk_man->TopUp();\n+            auto desc_spks = desc_spk_man->GetScriptPubKeys();\n+\n+            // Remove the scriptPubKeys from our current set\n+            for (const CScript& spk : desc_spks) {\n+                size_t erased = spks.erase(spk);\n+                assert(erased == 1);\n+                assert(IsMine(spk) == ISMINE_SPENDABLE);\n+            }\n+\n+            out.desc_spkms.push_back(std::move(desc_spk_man));\n+        }\n+    }\n+    // Add the current master seed to the migration data\n+    if (!m_hd_chain.seed_id.IsNull()) {\n+        CKey seed_key;\n+        if (!GetKey(m_hd_chain.seed_id, seed_key)) {\n+            assert(false);\n+        }\n+        out.master_key.SetSeed(seed_key);\n+    }\n+\n+    // Handle the rest of the scriptPubKeys which must be imports and may not have all info\n+    for (auto it = spks.begin(); it != spks.end();) {\n+        const CScript& spk = *it;\n+        // InferDescriptor as that will get us all the solving info if it is there\n+        std::unique_ptr<Descriptor> desc = InferDescriptor(spk, *GetSolvingProvider(spk));\n+        // Get the private keys for this descriptor\n+        std::vector<CScript> scripts;\n+        FlatSigningProvider keys;\n+        if (!desc->Expand(0, DUMMY_SIGNING_PROVIDER, scripts, keys)) {\n+            assert(false);\n+        }\n+        std::set<CKeyID> privkeyids;\n+        for (const auto& key_orig_pair : keys.origins) {\n+            privkeyids.insert(key_orig_pair.first);\n+        }\n+\n+        std::vector<CScript> desc_spks;\n+\n+        // Make the descriptor string with private keys\n+        std::string desc_str;\n+        bool watchonly = !desc->ToPrivateString(*this, desc_str);\n+        if (watchonly && !m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {\n+            out.watch_descs.push_back(desc->ToString());\n+\n+            // Get the scriptPubKeys without writing this to the wallet\n+            FlatSigningProvider provider;\n+            desc->Expand(0, provider, desc_spks, provider);\n+        } else {\n+            // Make the DescriptorScriptPubKeyMan and get the scriptPubKeys\n+            WalletDescriptor w_desc(std::move(desc), 0, 0, 0, 0);\n+            auto desc_spk_man = std::unique_ptr<DescriptorScriptPubKeyMan>(new DescriptorScriptPubKeyMan(m_storage, w_desc));\n+            for (const auto& keyid : privkeyids) {\n+                CKey key;\n+                if (!GetKey(keyid, key)) {\n+                    continue;\n+                }\n+                desc_spk_man->AddDescriptorKey(key, key.GetPubKey());\n+            }\n+            desc_spk_man->TopUp();\n+            auto desc_spks_set = desc_spk_man->GetScriptPubKeys();\n+            desc_spks.insert(desc_spks.end(), desc_spks_set.begin(), desc_spks_set.end());\n+\n+            out.desc_spkms.push_back(std::move(desc_spk_man));\n+        }\n+\n+        // Remove the scriptPubKeys from our current set\n+        for (const CScript& desc_spk : desc_spks) {\n+            auto del_it = spks.find(desc_spk);\n+            assert(del_it != spks.end());\n+            assert(IsMine(desc_spk) != ISMINE_NO);\n+            it = spks.erase(del_it);\n+        }\n+    }\n+\n+    // Multisigs are special. They don't show up as ISMINE_SPENDABLE unless they are in a P2SH\n+    // So we have to check if any of our scripts are a multisig and if so, add the P2SH\n+    for (const auto& script_pair : mapScripts) {\n+        const CScript script = script_pair.second;\n+        std::vector<std::vector<unsigned char>> sols;\n+        TxoutType type = Solver(script, sols);\n+        if (type == TxoutType::MULTISIG) {\n+            CScript sh_spk = GetScriptForDestination(ScriptHash(script));\n+            CTxDestination witdest = WitnessV0ScriptHash(script);\n+            CScript witprog = GetScriptForDestination(witdest);\n+            CScript sh_wsh_spk = GetScriptForDestination(ScriptHash(witprog));\n+\n+            // We only want the multisigs that we have not already seen, i.e. they are not watchonly and not spendable\n+            // For P2SH, a multisig is not ISMINE_NO when:\n+            // * All keys are in the wallet\n+            // * The multisig itself is watch only\n+            // * The P2SH is watch only\n+            // For P2SH-P2WSH, if the script is in the wallet, then it will have the same conditions as P2SH.\n+            // For P2WSH, a multisig is not ISMINE_NO when, other than the P2SH conditions:\n+            // * The P2WSH script is in the wallet and it is being watched\n+            std::vector<std::vector<unsigned char>> keys(sols.begin() + 1, sols.begin() + sols.size() - 1);\n+            if (HaveWatchOnly(sh_spk) || HaveWatchOnly(script) || HaveKeys(keys, *this) || (HaveCScript(CScriptID(witprog)) && HaveWatchOnly(witprog))) {\n+                // The above emulates IsMine for these 3 scriptPubKeys, so double check that by running IsMine\n+                assert(IsMine(sh_spk) != ISMINE_NO || IsMine(witprog) != ISMINE_NO || IsMine(sh_wsh_spk) != ISMINE_NO);\n+                continue;\n+            }\n+            assert(IsMine(sh_spk) == ISMINE_NO && IsMine(witprog) == ISMINE_NO && IsMine(sh_wsh_spk) == ISMINE_NO);\n+\n+            std::unique_ptr<Descriptor> sh_desc = InferDescriptor(sh_spk, *GetSolvingProvider(sh_spk));\n+            out.solvable_descs.push_back(sh_desc->ToString());\n+\n+            const auto desc = InferDescriptor(witprog, *this);\n+            if (desc->IsSolvable()) {\n+                std::unique_ptr<Descriptor> wsh_desc = InferDescriptor(witprog, *GetSolvingProvider(witprog));\n+                out.solvable_descs.push_back(wsh_desc->ToString());\n+                std::unique_ptr<Descriptor> sh_wsh_desc = InferDescriptor(sh_wsh_spk, *GetSolvingProvider(sh_wsh_spk));\n+                out.solvable_descs.push_back(sh_wsh_desc->ToString());\n+            }\n+        }\n+    }\n+\n+    // Make sure that we have accounted for all scriptPubKeys\n+    assert(spks.size() == 0);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r955378613",
+      "id" : 955378613,
+      "in_reply_to_id" : 955317714,
+      "line" : 1963,
+      "node_id" : "PRRC_kwDOABII58448eu1",
+      "original_commit_id" : "fc33d306874ec3bca38c34ff5ac49cbcfa7d832f",
+      "original_line" : 1963,
+      "original_position" : 236,
+      "original_start_line" : null,
+      "path" : "src/wallet/scriptpubkeyman.cpp",
+      "position" : 318,
+      "pull_request_review_id" : 1086049860,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955378613/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-08-25T20:12:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955378613",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r955380467"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955380467"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Sad, not even when they were first put in the keypool? Though perhaps that's too risky if we're upgrading a wallet that was itself restored from a backup. The downside of setting 0 is that if a user were to dump the descriptors and restore them into a fresh wallet, they'd have to rescan from genesis. Though that's not the  backup / recovery flow atm.",
+      "commit_id" : "fb10bae0e68a38b7db833b1d16a2b478c371b375",
+      "created_at" : "2022-08-25T20:15:06Z",
+      "diff_hunk" : "@@ -1711,6 +1711,242 @@ const std::unordered_set<CScript, SaltedSipHasher> LegacyScriptPubKeyMan::GetScr\n     return spks;\n }\n \n+std::optional<MigrationData> LegacyScriptPubKeyMan::MigrateToDescriptor()\n+{\n+    LOCK(cs_KeyStore);\n+    if (m_storage.IsLocked()) {\n+        return std::nullopt;\n+    }\n+\n+    MigrationData out;\n+\n+    std::unordered_set<CScript, SaltedSipHasher> spks{GetScriptPubKeys()};\n+\n+    // Get all key ids\n+    std::set<CKeyID> keyids;\n+    for (const auto& key_pair : mapKeys) {\n+        keyids.insert(key_pair.first);\n+    }\n+    for (const auto& key_pair : mapCryptedKeys) {\n+        keyids.insert(key_pair.first);\n+    }\n+\n+    // Get key metadata and figure out which keys don't have a seed\n+    // Note that we do not ignore the seeds themselves because they are considered IsMine!\n+    for (auto keyid_it = keyids.begin(); keyid_it != keyids.end();) {\n+        const CKeyID& keyid = *keyid_it;\n+        const auto& it = mapKeyMetadata.find(keyid);\n+        if (it != mapKeyMetadata.end()) {\n+            const CKeyMetadata& meta = it->second;\n+            if (meta.hdKeypath == \"s\" || meta.hdKeypath == \"m\") {\n+                keyid_it++;\n+                continue;\n+            }\n+            if (m_hd_chain.seed_id == meta.hd_seed_id || m_inactive_hd_chains.count(meta.hd_seed_id) > 0) {\n+                keyid_it = keyids.erase(keyid_it);\n+                continue;\n+            }\n+        }\n+        keyid_it++;\n+    }\n+\n+    // keyids is now all non-HD keys. Each key will have its own combo descriptor\n+    for (const CKeyID& keyid : keyids) {\n+        CKey key;\n+        if (!GetKey(keyid, key)) {\n+            assert(false);\n+        }\n+\n+        // Get birthdate from key meta\n+        uint64_t creation_time = 0;\n+        const auto& it = mapKeyMetadata.find(keyid);\n+        if (it != mapKeyMetadata.end()) {\n+            creation_time = it->second.nCreateTime;\n+        }\n+\n+        // Get the key origin\n+        // Maybe this doesn't matter because floating keys here shouldn't have origins\n+        KeyOriginInfo info;\n+        bool has_info = GetKeyOrigin(keyid, info);\n+        std::string origin_str = \"[\" + HexStr(info.fingerprint) + FormatHDKeypath(info.path) + \"]\";\n+\n+        // Construct the combo descriptor\n+        std::string desc_str = \"combo(\" + (has_info ? origin_str : \"\") + HexStr(key.GetPubKey()) + \")\";\n+        FlatSigningProvider keys;\n+        std::string error;\n+        std::unique_ptr<Descriptor> desc = Parse(desc_str, keys, error, false);\n+        WalletDescriptor w_desc(std::move(desc), creation_time, 0, 0, 0);\n+\n+        // Make the DescriptorScriptPubKeyMan and get the scriptPubKeys\n+        auto desc_spk_man = std::unique_ptr<DescriptorScriptPubKeyMan>(new DescriptorScriptPubKeyMan(m_storage, w_desc));\n+        desc_spk_man->AddDescriptorKey(key, key.GetPubKey());\n+        desc_spk_man->TopUp();\n+        auto desc_spks = desc_spk_man->GetScriptPubKeys();\n+\n+        // Remove the scriptPubKeys from our current set\n+        for (const CScript& spk : desc_spks) {\n+            size_t erased = spks.erase(spk);\n+            assert(erased == 1);\n+            assert(IsMine(spk) == ISMINE_SPENDABLE);\n+        }\n+\n+        out.desc_spkms.push_back(std::move(desc_spk_man));\n+    }\n+\n+    // Handle HD keys by using the CHDChains\n+    std::vector<CHDChain> chains;\n+    chains.push_back(m_hd_chain);\n+    for (const auto& chain_pair : m_inactive_hd_chains) {\n+        chains.push_back(chain_pair.second);\n+    }\n+    for (const CHDChain& chain : chains) {\n+        for (int i = 0; i < 2; ++i) {\n+            // Skip if doing internal chain and split chain is not supported\n+            if (chain.seed_id.IsNull() || (i == 1 && !m_storage.CanSupportFeature(FEATURE_HD_SPLIT))) {\n+                continue;\n+            }\n+            // Get the master xprv\n+            CKey seed_key;\n+            if (!GetKey(chain.seed_id, seed_key)) {\n+                assert(false);\n+            }\n+            CExtKey master_key;\n+            master_key.SetSeed(seed_key);\n+\n+            // Make the combo descriptor\n+            std::string xpub = EncodeExtPubKey(master_key.Neuter());\n+            std::string desc_str = \"combo(\" + xpub + \"/0'/\" + ToString(i) + \"'/*')\";\n+            FlatSigningProvider keys;\n+            std::string error;\n+            std::unique_ptr<Descriptor> desc = Parse(desc_str, keys, error, false);\n+            uint32_t chain_counter = std::max((i == 1 ? chain.nInternalChainCounter : chain.nExternalChainCounter), (uint32_t)0);\n+            WalletDescriptor w_desc(std::move(desc), 0, 0, chain_counter, 0);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r955380467",
+      "id" : 955380467,
+      "in_reply_to_id" : 955312216,
+      "line" : 1824,
+      "node_id" : "PRRC_kwDOABII58448fLz",
+      "original_commit_id" : "fc33d306874ec3bca38c34ff5ac49cbcfa7d832f",
+      "original_line" : 1824,
+      "original_position" : 113,
+      "original_start_line" : null,
+      "path" : "src/wallet/scriptpubkeyman.cpp",
+      "position" : 179,
+      "pull_request_review_id" : 1086052588,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955380467/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-08-25T20:15:07Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955380467",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r955407752"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955407752"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I'm pretty confident that we can.",
+      "commit_id" : "fb10bae0e68a38b7db833b1d16a2b478c371b375",
+      "created_at" : "2022-08-25T20:45:40Z",
+      "diff_hunk" : "@@ -1711,6 +1711,242 @@ const std::unordered_set<CScript, SaltedSipHasher> LegacyScriptPubKeyMan::GetScr\n     return spks;\n }\n \n+std::optional<MigrationData> LegacyScriptPubKeyMan::MigrateToDescriptor()\n+{\n+    LOCK(cs_KeyStore);\n+    if (m_storage.IsLocked()) {\n+        return std::nullopt;\n+    }\n+\n+    MigrationData out;\n+\n+    std::unordered_set<CScript, SaltedSipHasher> spks{GetScriptPubKeys()};\n+\n+    // Get all key ids\n+    std::set<CKeyID> keyids;\n+    for (const auto& key_pair : mapKeys) {\n+        keyids.insert(key_pair.first);\n+    }\n+    for (const auto& key_pair : mapCryptedKeys) {\n+        keyids.insert(key_pair.first);\n+    }\n+\n+    // Get key metadata and figure out which keys don't have a seed\n+    // Note that we do not ignore the seeds themselves because they are considered IsMine!\n+    for (auto keyid_it = keyids.begin(); keyid_it != keyids.end();) {\n+        const CKeyID& keyid = *keyid_it;\n+        const auto& it = mapKeyMetadata.find(keyid);\n+        if (it != mapKeyMetadata.end()) {\n+            const CKeyMetadata& meta = it->second;\n+            if (meta.hdKeypath == \"s\" || meta.hdKeypath == \"m\") {\n+                keyid_it++;\n+                continue;\n+            }\n+            if (m_hd_chain.seed_id == meta.hd_seed_id || m_inactive_hd_chains.count(meta.hd_seed_id) > 0) {\n+                keyid_it = keyids.erase(keyid_it);\n+                continue;\n+            }\n+        }\n+        keyid_it++;\n+    }\n+\n+    // keyids is now all non-HD keys. Each key will have its own combo descriptor\n+    for (const CKeyID& keyid : keyids) {\n+        CKey key;\n+        if (!GetKey(keyid, key)) {\n+            assert(false);\n+        }\n+\n+        // Get birthdate from key meta\n+        uint64_t creation_time = 0;\n+        const auto& it = mapKeyMetadata.find(keyid);\n+        if (it != mapKeyMetadata.end()) {\n+            creation_time = it->second.nCreateTime;\n+        }\n+\n+        // Get the key origin\n+        // Maybe this doesn't matter because floating keys here shouldn't have origins\n+        KeyOriginInfo info;\n+        bool has_info = GetKeyOrigin(keyid, info);\n+        std::string origin_str = \"[\" + HexStr(info.fingerprint) + FormatHDKeypath(info.path) + \"]\";\n+\n+        // Construct the combo descriptor\n+        std::string desc_str = \"combo(\" + (has_info ? origin_str : \"\") + HexStr(key.GetPubKey()) + \")\";\n+        FlatSigningProvider keys;\n+        std::string error;\n+        std::unique_ptr<Descriptor> desc = Parse(desc_str, keys, error, false);\n+        WalletDescriptor w_desc(std::move(desc), creation_time, 0, 0, 0);\n+\n+        // Make the DescriptorScriptPubKeyMan and get the scriptPubKeys\n+        auto desc_spk_man = std::unique_ptr<DescriptorScriptPubKeyMan>(new DescriptorScriptPubKeyMan(m_storage, w_desc));\n+        desc_spk_man->AddDescriptorKey(key, key.GetPubKey());\n+        desc_spk_man->TopUp();\n+        auto desc_spks = desc_spk_man->GetScriptPubKeys();\n+\n+        // Remove the scriptPubKeys from our current set\n+        for (const CScript& spk : desc_spks) {\n+            size_t erased = spks.erase(spk);\n+            assert(erased == 1);\n+            assert(IsMine(spk) == ISMINE_SPENDABLE);\n+        }\n+\n+        out.desc_spkms.push_back(std::move(desc_spk_man));\n+    }\n+\n+    // Handle HD keys by using the CHDChains\n+    std::vector<CHDChain> chains;\n+    chains.push_back(m_hd_chain);\n+    for (const auto& chain_pair : m_inactive_hd_chains) {\n+        chains.push_back(chain_pair.second);\n+    }\n+    for (const CHDChain& chain : chains) {\n+        for (int i = 0; i < 2; ++i) {\n+            // Skip if doing internal chain and split chain is not supported\n+            if (chain.seed_id.IsNull() || (i == 1 && !m_storage.CanSupportFeature(FEATURE_HD_SPLIT))) {\n+                continue;\n+            }\n+            // Get the master xprv\n+            CKey seed_key;\n+            if (!GetKey(chain.seed_id, seed_key)) {\n+                assert(false);\n+            }\n+            CExtKey master_key;\n+            master_key.SetSeed(seed_key);\n+\n+            // Make the combo descriptor\n+            std::string xpub = EncodeExtPubKey(master_key.Neuter());\n+            std::string desc_str = \"combo(\" + xpub + \"/0'/\" + ToString(i) + \"'/*')\";\n+            FlatSigningProvider keys;\n+            std::string error;\n+            std::unique_ptr<Descriptor> desc = Parse(desc_str, keys, error, false);\n+            uint32_t chain_counter = std::max((i == 1 ? chain.nInternalChainCounter : chain.nExternalChainCounter), (uint32_t)0);\n+            WalletDescriptor w_desc(std::move(desc), 0, 0, chain_counter, 0);\n+\n+            // Make the DescriptorScriptPubKeyMan and get the scriptPubKeys\n+            auto desc_spk_man = std::unique_ptr<DescriptorScriptPubKeyMan>(new DescriptorScriptPubKeyMan(m_storage, w_desc));\n+            desc_spk_man->AddDescriptorKey(master_key.key, master_key.key.GetPubKey());\n+            desc_spk_man->TopUp();\n+            auto desc_spks = desc_spk_man->GetScriptPubKeys();\n+\n+            // Remove the scriptPubKeys from our current set\n+            for (const CScript& spk : desc_spks) {\n+                size_t erased = spks.erase(spk);\n+                assert(erased == 1);\n+                assert(IsMine(spk) == ISMINE_SPENDABLE);\n+            }\n+\n+            out.desc_spkms.push_back(std::move(desc_spk_man));\n+        }\n+    }\n+    // Add the current master seed to the migration data\n+    if (!m_hd_chain.seed_id.IsNull()) {\n+        CKey seed_key;\n+        if (!GetKey(m_hd_chain.seed_id, seed_key)) {\n+            assert(false);\n+        }\n+        out.master_key.SetSeed(seed_key);\n+    }\n+\n+    // Handle the rest of the scriptPubKeys which must be imports and may not have all info\n+    for (auto it = spks.begin(); it != spks.end();) {\n+        const CScript& spk = *it;\n+        // InferDescriptor as that will get us all the solving info if it is there\n+        std::unique_ptr<Descriptor> desc = InferDescriptor(spk, *GetSolvingProvider(spk));\n+        // Get the private keys for this descriptor\n+        std::vector<CScript> scripts;\n+        FlatSigningProvider keys;\n+        if (!desc->Expand(0, DUMMY_SIGNING_PROVIDER, scripts, keys)) {\n+            assert(false);\n+        }\n+        std::set<CKeyID> privkeyids;\n+        for (const auto& key_orig_pair : keys.origins) {\n+            privkeyids.insert(key_orig_pair.first);\n+        }\n+\n+        std::vector<CScript> desc_spks;\n+\n+        // Make the descriptor string with private keys\n+        std::string desc_str;\n+        bool watchonly = !desc->ToPrivateString(*this, desc_str);\n+        if (watchonly && !m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {\n+            out.watch_descs.push_back(desc->ToString());\n+\n+            // Get the scriptPubKeys without writing this to the wallet\n+            FlatSigningProvider provider;\n+            desc->Expand(0, provider, desc_spks, provider);\n+        } else {\n+            // Make the DescriptorScriptPubKeyMan and get the scriptPubKeys\n+            WalletDescriptor w_desc(std::move(desc), 0, 0, 0, 0);\n+            auto desc_spk_man = std::unique_ptr<DescriptorScriptPubKeyMan>(new DescriptorScriptPubKeyMan(m_storage, w_desc));\n+            for (const auto& keyid : privkeyids) {\n+                CKey key;\n+                if (!GetKey(keyid, key)) {\n+                    continue;\n+                }\n+                desc_spk_man->AddDescriptorKey(key, key.GetPubKey());\n+            }\n+            desc_spk_man->TopUp();\n+            auto desc_spks_set = desc_spk_man->GetScriptPubKeys();\n+            desc_spks.insert(desc_spks.end(), desc_spks_set.begin(), desc_spks_set.end());\n+\n+            out.desc_spkms.push_back(std::move(desc_spk_man));\n+        }\n+\n+        // Remove the scriptPubKeys from our current set\n+        for (const CScript& desc_spk : desc_spks) {\n+            auto del_it = spks.find(desc_spk);\n+            assert(del_it != spks.end());\n+            assert(IsMine(desc_spk) != ISMINE_NO);\n+            it = spks.erase(del_it);\n+        }\n+    }\n+\n+    // Multisigs are special. They don't show up as ISMINE_SPENDABLE unless they are in a P2SH\n+    // So we have to check if any of our scripts are a multisig and if so, add the P2SH\n+    for (const auto& script_pair : mapScripts) {\n+        const CScript script = script_pair.second;\n+        std::vector<std::vector<unsigned char>> sols;\n+        TxoutType type = Solver(script, sols);\n+        if (type == TxoutType::MULTISIG) {\n+            CScript sh_spk = GetScriptForDestination(ScriptHash(script));\n+            CTxDestination witdest = WitnessV0ScriptHash(script);\n+            CScript witprog = GetScriptForDestination(witdest);\n+            CScript sh_wsh_spk = GetScriptForDestination(ScriptHash(witprog));\n+\n+            // We only want the multisigs that we have not already seen, i.e. they are not watchonly and not spendable\n+            // For P2SH, a multisig is not ISMINE_NO when:\n+            // * All keys are in the wallet\n+            // * The multisig itself is watch only\n+            // * The P2SH is watch only\n+            // For P2SH-P2WSH, if the script is in the wallet, then it will have the same conditions as P2SH.\n+            // For P2WSH, a multisig is not ISMINE_NO when, other than the P2SH conditions:\n+            // * The P2WSH script is in the wallet and it is being watched\n+            std::vector<std::vector<unsigned char>> keys(sols.begin() + 1, sols.begin() + sols.size() - 1);\n+            if (HaveWatchOnly(sh_spk) || HaveWatchOnly(script) || HaveKeys(keys, *this) || (HaveCScript(CScriptID(witprog)) && HaveWatchOnly(witprog))) {\n+                // The above emulates IsMine for these 3 scriptPubKeys, so double check that by running IsMine\n+                assert(IsMine(sh_spk) != ISMINE_NO || IsMine(witprog) != ISMINE_NO || IsMine(sh_wsh_spk) != ISMINE_NO);\n+                continue;\n+            }\n+            assert(IsMine(sh_spk) == ISMINE_NO && IsMine(witprog) == ISMINE_NO && IsMine(sh_wsh_spk) == ISMINE_NO);\n+\n+            std::unique_ptr<Descriptor> sh_desc = InferDescriptor(sh_spk, *GetSolvingProvider(sh_spk));\n+            out.solvable_descs.push_back(sh_desc->ToString());\n+\n+            const auto desc = InferDescriptor(witprog, *this);\n+            if (desc->IsSolvable()) {\n+                std::unique_ptr<Descriptor> wsh_desc = InferDescriptor(witprog, *GetSolvingProvider(witprog));\n+                out.solvable_descs.push_back(wsh_desc->ToString());\n+                std::unique_ptr<Descriptor> sh_wsh_desc = InferDescriptor(sh_wsh_spk, *GetSolvingProvider(sh_wsh_spk));\n+                out.solvable_descs.push_back(sh_wsh_desc->ToString());\n+            }\n+        }\n+    }\n+\n+    // Make sure that we have accounted for all scriptPubKeys\n+    assert(spks.size() == 0);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r955407752",
+      "id" : 955407752,
+      "in_reply_to_id" : 955317714,
+      "line" : 1963,
+      "node_id" : "PRRC_kwDOABII58448l2I",
+      "original_commit_id" : "fc33d306874ec3bca38c34ff5ac49cbcfa7d832f",
+      "original_line" : 1963,
+      "original_position" : 236,
+      "original_start_line" : null,
+      "path" : "src/wallet/scriptpubkeyman.cpp",
+      "position" : 318,
+      "pull_request_review_id" : 1086090954,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955407752/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-08-25T20:45:40Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955407752",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r955452249"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955452249"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: makes the purpose of the function clearer.\r\n\r\n```suggestion\r\n    def create_legacy_wallet(self, wallet_name):\r\n```",
+      "commit_id" : "fb10bae0e68a38b7db833b1d16a2b478c371b375",
+      "created_at" : "2022-08-25T21:52:37Z",
+      "diff_hunk" : "@@ -0,0 +1,407 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2020 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test Migrating a wallet from legacy to descriptor.\"\"\"\n+\n+import os\n+import random\n+from test_framework.descriptors import descsum_create\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+    assert_equal,\n+    assert_raises_rpc_error,\n+    find_vout_for_address,\n+)\n+from test_framework.wallet_util import (\n+    get_generate_key,\n+)\n+\n+\n+class WalletMigrationTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.setup_clean_chain = True\n+        self.num_nodes = 1\n+        self.extra_args = [[]]\n+        self.supports_cli = False\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+        self.skip_if_no_sqlite()\n+        self.skip_if_no_bdb()\n+\n+    def assert_is_sqlite(self, wallet_name):\n+        wallet_file_path = os.path.join(self.nodes[0].datadir, \"regtest/wallets\", wallet_name, self.wallet_data_filename)\n+        with open(wallet_file_path, 'rb') as f:\n+            file_magic = f.read(16)\n+            assert_equal(file_magic, b'SQLite format 3\\x00')\n+        assert_equal(self.nodes[0].get_wallet_rpc(wallet_name).getwalletinfo()[\"format\"], \"sqlite\")\n+\n+    def create_wallet(self, wallet_name):",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r955452249",
+      "id" : 955452249,
+      "line" : 40,
+      "node_id" : "PRRC_kwDOABII58448wtZ",
+      "original_commit_id" : "fb10bae0e68a38b7db833b1d16a2b478c371b375",
+      "original_line" : 40,
+      "original_position" : 40,
+      "original_start_line" : null,
+      "path" : "test/functional/wallet_migration.py",
+      "position" : 40,
+      "pull_request_review_id" : 1086153023,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955452249/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-08-25T21:52:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/955452249",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/94266259?v=4",
+         "events_url" : "https://api.github.com/users/w0xlt/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/w0xlt/followers",
+         "following_url" : "https://api.github.com/users/w0xlt/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/w0xlt/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/w0xlt",
+         "id" : 94266259,
+         "login" : "w0xlt",
+         "node_id" : "U_kgDOBZ5jkw",
+         "organizations_url" : "https://api.github.com/users/w0xlt/orgs",
+         "received_events_url" : "https://api.github.com/users/w0xlt/received_events",
+         "repos_url" : "https://api.github.com/users/w0xlt/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/w0xlt/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/w0xlt/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/w0xlt"
+      }
    }
 ]
