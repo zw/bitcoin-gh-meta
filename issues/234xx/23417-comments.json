@@ -4335,5 +4335,752 @@
          "type" : "User",
          "url" : "https://api.github.com/users/aureleoules"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977881343"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977881343"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Assertions should not have side effects, hence the separation here.",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T16:46:00Z",
+      "diff_hunk" : "@@ -0,0 +1,278 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <key.h>\n+#include <logging.h>\n+#include <pubkey.h>\n+#include <random.h>\n+#include <wallet/crypter.h>\n+#include <wallet/keyman.h>\n+#include <wallet/walletdb.h>\n+\n+namespace wallet {\n+void KeyManager::GenerateAndSetHDKey()\n+{\n+    LOCK(cs_keyman);\n+    CKey key;\n+    key.MakeNewKey(true);\n+    CPubKey seed_pub = key.GetPubKey();\n+    assert(key.VerifyPubKey(seed_pub));\n+\n+    CExtKey master_key;\n+    master_key.SetSeed(key);\n+    CExtPubKey master_xpub = master_key.Neuter();\n+\n+    WalletBatch batch(m_storage.GetDatabase());\n+    AddHDKey(batch, master_key, master_xpub);\n+    SetActiveHDKey(master_xpub);\n+}\n+\n+void KeyManager::LoadActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    m_active_xpub = extpub;\n+}\n+\n+void KeyManager::SetActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    LoadActiveHDKey(extpub);\n+    WalletBatch batch(m_storage.GetDatabase());\n+    batch.WriteActiveHDKey(extpub);\n+}\n+\n+std::optional<CExtKey> KeyManager::GetActiveHDKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+\n+    CKey key;\n+    if (m_storage.HasEncryptionKeys()) {\n+        if (m_storage.IsLocked()) {\n+            return std::nullopt;\n+        }\n+        const auto& it = m_map_crypted_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_crypted_keys.end());\n+        const auto& [pubkey, ckey] = it->second;\n+\n+        if (!DecryptKey(m_storage.GetEncryptionKey(), ckey, pubkey, key)) {\n+            return std::nullopt;\n+        }\n+    } else {\n+        const auto& it = m_map_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_keys.end());\n+        key = it->second;\n+    }\n+    assert(key.IsValid());\n+\n+    CExtKey master_key;\n+    master_key.nDepth = m_active_xpub.nDepth;\n+    std::copy(m_active_xpub.vchFingerprint, m_active_xpub.vchFingerprint + sizeof(master_key.vchFingerprint), master_key.vchFingerprint);\n+    master_key.nChild = m_active_xpub.nChild;\n+    master_key.chaincode = m_active_xpub.chaincode;\n+    master_key.key = key;\n+    return master_key;\n+}\n+\n+std::optional<CExtPubKey> KeyManager::GetActiveHDPubKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+    return m_active_xpub;\n+}\n+\n+bool KeyManager::AddKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+    assert(!m_storage.HasEncryptionKeys());\n+\n+    const CKeyID& id = pubkey.GetID();\n+    if (m_map_keys.find(id) != m_map_keys.end()) {\n+        return true;\n+    }\n+\n+    m_map_keys[id] = key;\n+    return batch.WriteKeyManKey(pubkey, key.GetPrivKey());\n+}\n+\n+std::vector<unsigned char> KeyManager::AddCryptedKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+\n+    assert(m_storage.HasEncryptionKeys());\n+    if (m_storage.IsLocked()) {\n+        return {};\n+    }\n+\n+    const CKeyID& id = pubkey.GetID();\n+    const auto& it = m_map_crypted_keys.find(id);\n+    if (it != m_map_crypted_keys.end()) {\n+        return it->second.second;\n+    }\n+\n+    std::vector<unsigned char> crypted_secret;\n+    CKeyingMaterial secret(key.begin(), key.end());\n+    if (!EncryptSecret(m_storage.GetEncryptionKey(), secret, pubkey.GetHash(), crypted_secret)) {\n+        return {};\n+    }\n+\n+    m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+\n+    if (!batch.WriteCryptedKeyManKey(pubkey, crypted_secret)) {\n+        return {};\n+    }\n+\n+    return crypted_secret;\n+}\n+\n+bool KeyManager::AddDescriptorKey(WalletBatch& batch, const uint256& desc_id, const CKey& key, const CPubKey& pubkey)\n+{\n+    LOCK(cs_keyman);\n+    assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, key, pubkey);\n+        if (ckey.empty()) {\n+            return false;\n+        }\n+        return batch.WriteCryptedDescriptorKey(desc_id, pubkey, ckey);\n+    } else {\n+        return AddKeyInner(batch, key, pubkey) && batch.WriteDescriptorKey(desc_id, pubkey, key.GetPrivKey());\n+    }\n+}\n+\n+bool KeyManager::AddHDKey(WalletBatch& batch, const CExtKey& extkey, const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    const CKeyID& id = extpub.pubkey.GetID();\n+    m_map_xpubs[id] = extpub;\n+    batch.WriteHDPubKey(extpub);\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, extkey.key, extpub.pubkey);\n+        return !ckey.empty();\n+    } else {\n+        return AddKeyInner(batch, extkey.key, extpub.pubkey);\n+    }\n+}\n+\n+void KeyManager::LoadKey(const CKeyID& key_id, const CKey& key)\n+{\n+    LOCK(cs_keyman);\n+    m_map_keys[key_id] = key;\n+}\n+\n+bool KeyManager::LoadCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& ckey)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    m_map_crypted_keys[key_id] = make_pair(pubkey, ckey);\n+    return true;\n+}\n+\n+void KeyManager::LoadHDKey(const CKeyID& key_id, const CExtPubKey& xpub)\n+{\n+    LOCK(cs_keyman);\n+    m_map_xpubs[key_id] = xpub;\n+}\n+\n+bool KeyManager::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n+    bool keyFail = false;\n+    for (const auto& mi : m_map_crypted_keys) {\n+        const CPubKey& pubkey = mi.second.first;\n+        const std::vector<unsigned char>& crypted_secret = mi.second.second;\n+        CKey key;\n+        if (!DecryptKey(master_key, crypted_secret, pubkey, key)) {\n+            keyFail = true;\n+            break;\n+        }\n+        keyPass = true;\n+        if (m_decryption_thoroughly_checked) {\n+            break;\n+        }\n+    }\n+    if (keyPass && keyFail) {\n+        LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n+        throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n+    }\n+    if (keyFail || (!keyPass && !accept_no_keys)) {\n+        return false;\n+    }\n+    m_decryption_thoroughly_checked = true;\n+    return true;\n+}\n+\n+bool KeyManager::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n+{\n+    LOCK(cs_keyman);\n+\n+    // Nothing to encrypt\n+    if (m_map_keys.empty()) {\n+        return true;\n+    }\n+\n+    if (!m_map_crypted_keys.empty()) {\n+        return false;\n+    }\n+\n+    for (const auto& [id, key] : m_map_keys)\n+    {\n+        CPubKey pubkey = key.GetPubKey();\n+        CKeyingMaterial secret(key.begin(), key.end());\n+        std::vector<unsigned char> crypted_secret;\n+        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n+            return false;\n+        }\n+        m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+        batch->WriteCryptedKeyManKey(pubkey, crypted_secret);\n+    }\n+    m_map_keys.clear();\n+    return true;\n+}\n+\n+std::map<CKeyID, CKey> KeyManager::GetKeys() const\n+{\n+    AssertLockHeld(cs_keyman);\n+    if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {\n+        std::map<CKeyID, CKey> keys;\n+        for (const auto& [id, key_pair] : m_map_crypted_keys) {\n+            const auto& [pubkey, crypted_secret] = key_pair;\n+            CKey key;\n+            bool ok = DecryptKey(m_storage.GetEncryptionKey(), crypted_secret, pubkey, key);\n+            assert(ok);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977881343",
+      "id" : 977881343,
+      "in_reply_to_id" : 977715219,
+      "line" : 255,
+      "node_id" : "PRRC_kwDOABII5846SUj_",
+      "original_commit_id" : "8c5ddf432dceb084be6612b378dacf9211e8cf08",
+      "original_line" : 255,
+      "original_position" : 255,
+      "original_start_line" : 254,
+      "path" : "src/wallet/keyman.cpp",
+      "position" : 255,
+      "pull_request_review_id" : 1117383819,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977881343/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 254,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-09-22T16:46:00Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977881343",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977896023"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977896023"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "this is true for `assert` but `Assert` is a macro defined in `util/check.h` that always executes and returns the statement, but doesn't always verify the assertion\r\nhttps://github.com/bitcoin/bitcoin/blob/100949af0e2551f22c02a73355f2c64710b68ef1/src/util/check.h#L57-L71",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T17:02:44Z",
+      "diff_hunk" : "@@ -0,0 +1,278 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <key.h>\n+#include <logging.h>\n+#include <pubkey.h>\n+#include <random.h>\n+#include <wallet/crypter.h>\n+#include <wallet/keyman.h>\n+#include <wallet/walletdb.h>\n+\n+namespace wallet {\n+void KeyManager::GenerateAndSetHDKey()\n+{\n+    LOCK(cs_keyman);\n+    CKey key;\n+    key.MakeNewKey(true);\n+    CPubKey seed_pub = key.GetPubKey();\n+    assert(key.VerifyPubKey(seed_pub));\n+\n+    CExtKey master_key;\n+    master_key.SetSeed(key);\n+    CExtPubKey master_xpub = master_key.Neuter();\n+\n+    WalletBatch batch(m_storage.GetDatabase());\n+    AddHDKey(batch, master_key, master_xpub);\n+    SetActiveHDKey(master_xpub);\n+}\n+\n+void KeyManager::LoadActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    m_active_xpub = extpub;\n+}\n+\n+void KeyManager::SetActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    LoadActiveHDKey(extpub);\n+    WalletBatch batch(m_storage.GetDatabase());\n+    batch.WriteActiveHDKey(extpub);\n+}\n+\n+std::optional<CExtKey> KeyManager::GetActiveHDKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+\n+    CKey key;\n+    if (m_storage.HasEncryptionKeys()) {\n+        if (m_storage.IsLocked()) {\n+            return std::nullopt;\n+        }\n+        const auto& it = m_map_crypted_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_crypted_keys.end());\n+        const auto& [pubkey, ckey] = it->second;\n+\n+        if (!DecryptKey(m_storage.GetEncryptionKey(), ckey, pubkey, key)) {\n+            return std::nullopt;\n+        }\n+    } else {\n+        const auto& it = m_map_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_keys.end());\n+        key = it->second;\n+    }\n+    assert(key.IsValid());\n+\n+    CExtKey master_key;\n+    master_key.nDepth = m_active_xpub.nDepth;\n+    std::copy(m_active_xpub.vchFingerprint, m_active_xpub.vchFingerprint + sizeof(master_key.vchFingerprint), master_key.vchFingerprint);\n+    master_key.nChild = m_active_xpub.nChild;\n+    master_key.chaincode = m_active_xpub.chaincode;\n+    master_key.key = key;\n+    return master_key;\n+}\n+\n+std::optional<CExtPubKey> KeyManager::GetActiveHDPubKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+    return m_active_xpub;\n+}\n+\n+bool KeyManager::AddKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+    assert(!m_storage.HasEncryptionKeys());\n+\n+    const CKeyID& id = pubkey.GetID();\n+    if (m_map_keys.find(id) != m_map_keys.end()) {\n+        return true;\n+    }\n+\n+    m_map_keys[id] = key;\n+    return batch.WriteKeyManKey(pubkey, key.GetPrivKey());\n+}\n+\n+std::vector<unsigned char> KeyManager::AddCryptedKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+\n+    assert(m_storage.HasEncryptionKeys());\n+    if (m_storage.IsLocked()) {\n+        return {};\n+    }\n+\n+    const CKeyID& id = pubkey.GetID();\n+    const auto& it = m_map_crypted_keys.find(id);\n+    if (it != m_map_crypted_keys.end()) {\n+        return it->second.second;\n+    }\n+\n+    std::vector<unsigned char> crypted_secret;\n+    CKeyingMaterial secret(key.begin(), key.end());\n+    if (!EncryptSecret(m_storage.GetEncryptionKey(), secret, pubkey.GetHash(), crypted_secret)) {\n+        return {};\n+    }\n+\n+    m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+\n+    if (!batch.WriteCryptedKeyManKey(pubkey, crypted_secret)) {\n+        return {};\n+    }\n+\n+    return crypted_secret;\n+}\n+\n+bool KeyManager::AddDescriptorKey(WalletBatch& batch, const uint256& desc_id, const CKey& key, const CPubKey& pubkey)\n+{\n+    LOCK(cs_keyman);\n+    assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, key, pubkey);\n+        if (ckey.empty()) {\n+            return false;\n+        }\n+        return batch.WriteCryptedDescriptorKey(desc_id, pubkey, ckey);\n+    } else {\n+        return AddKeyInner(batch, key, pubkey) && batch.WriteDescriptorKey(desc_id, pubkey, key.GetPrivKey());\n+    }\n+}\n+\n+bool KeyManager::AddHDKey(WalletBatch& batch, const CExtKey& extkey, const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    const CKeyID& id = extpub.pubkey.GetID();\n+    m_map_xpubs[id] = extpub;\n+    batch.WriteHDPubKey(extpub);\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, extkey.key, extpub.pubkey);\n+        return !ckey.empty();\n+    } else {\n+        return AddKeyInner(batch, extkey.key, extpub.pubkey);\n+    }\n+}\n+\n+void KeyManager::LoadKey(const CKeyID& key_id, const CKey& key)\n+{\n+    LOCK(cs_keyman);\n+    m_map_keys[key_id] = key;\n+}\n+\n+bool KeyManager::LoadCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& ckey)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    m_map_crypted_keys[key_id] = make_pair(pubkey, ckey);\n+    return true;\n+}\n+\n+void KeyManager::LoadHDKey(const CKeyID& key_id, const CExtPubKey& xpub)\n+{\n+    LOCK(cs_keyman);\n+    m_map_xpubs[key_id] = xpub;\n+}\n+\n+bool KeyManager::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n+    bool keyFail = false;\n+    for (const auto& mi : m_map_crypted_keys) {\n+        const CPubKey& pubkey = mi.second.first;\n+        const std::vector<unsigned char>& crypted_secret = mi.second.second;\n+        CKey key;\n+        if (!DecryptKey(master_key, crypted_secret, pubkey, key)) {\n+            keyFail = true;\n+            break;\n+        }\n+        keyPass = true;\n+        if (m_decryption_thoroughly_checked) {\n+            break;\n+        }\n+    }\n+    if (keyPass && keyFail) {\n+        LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n+        throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n+    }\n+    if (keyFail || (!keyPass && !accept_no_keys)) {\n+        return false;\n+    }\n+    m_decryption_thoroughly_checked = true;\n+    return true;\n+}\n+\n+bool KeyManager::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n+{\n+    LOCK(cs_keyman);\n+\n+    // Nothing to encrypt\n+    if (m_map_keys.empty()) {\n+        return true;\n+    }\n+\n+    if (!m_map_crypted_keys.empty()) {\n+        return false;\n+    }\n+\n+    for (const auto& [id, key] : m_map_keys)\n+    {\n+        CPubKey pubkey = key.GetPubKey();\n+        CKeyingMaterial secret(key.begin(), key.end());\n+        std::vector<unsigned char> crypted_secret;\n+        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n+            return false;\n+        }\n+        m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+        batch->WriteCryptedKeyManKey(pubkey, crypted_secret);\n+    }\n+    m_map_keys.clear();\n+    return true;\n+}\n+\n+std::map<CKeyID, CKey> KeyManager::GetKeys() const\n+{\n+    AssertLockHeld(cs_keyman);\n+    if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {\n+        std::map<CKeyID, CKey> keys;\n+        for (const auto& [id, key_pair] : m_map_crypted_keys) {\n+            const auto& [pubkey, crypted_secret] = key_pair;\n+            CKey key;\n+            bool ok = DecryptKey(m_storage.GetEncryptionKey(), crypted_secret, pubkey, key);\n+            assert(ok);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977896023",
+      "id" : 977896023,
+      "in_reply_to_id" : 977715219,
+      "line" : 255,
+      "node_id" : "PRRC_kwDOABII5846SYJX",
+      "original_commit_id" : "8c5ddf432dceb084be6612b378dacf9211e8cf08",
+      "original_line" : 255,
+      "original_position" : 255,
+      "original_start_line" : 254,
+      "path" : "src/wallet/keyman.cpp",
+      "position" : 255,
+      "pull_request_review_id" : 1117404808,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977896023/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 254,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-09-22T17:02:44Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977896023",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/22493292?v=4",
+         "events_url" : "https://api.github.com/users/aureleoules/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/aureleoules/followers",
+         "following_url" : "https://api.github.com/users/aureleoules/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/aureleoules/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/aureleoules",
+         "id" : 22493292,
+         "login" : "aureleoules",
+         "node_id" : "MDQ6VXNlcjIyNDkzMjky",
+         "organizations_url" : "https://api.github.com/users/aureleoules/orgs",
+         "received_events_url" : "https://api.github.com/users/aureleoules/received_events",
+         "repos_url" : "https://api.github.com/users/aureleoules/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/aureleoules/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/aureleoules/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/aureleoules"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977903474"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903474"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T17:11:31Z",
+      "diff_hunk" : "@@ -0,0 +1,278 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <key.h>\n+#include <logging.h>\n+#include <pubkey.h>\n+#include <random.h>\n+#include <wallet/crypter.h>\n+#include <wallet/keyman.h>\n+#include <wallet/walletdb.h>\n+\n+namespace wallet {\n+void KeyManager::GenerateAndSetHDKey()\n+{\n+    LOCK(cs_keyman);\n+    CKey key;\n+    key.MakeNewKey(true);\n+    CPubKey seed_pub = key.GetPubKey();\n+    assert(key.VerifyPubKey(seed_pub));\n+\n+    CExtKey master_key;\n+    master_key.SetSeed(key);\n+    CExtPubKey master_xpub = master_key.Neuter();\n+\n+    WalletBatch batch(m_storage.GetDatabase());\n+    AddHDKey(batch, master_key, master_xpub);\n+    SetActiveHDKey(master_xpub);\n+}\n+\n+void KeyManager::LoadActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    m_active_xpub = extpub;\n+}\n+\n+void KeyManager::SetActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    LoadActiveHDKey(extpub);\n+    WalletBatch batch(m_storage.GetDatabase());\n+    batch.WriteActiveHDKey(extpub);\n+}\n+\n+std::optional<CExtKey> KeyManager::GetActiveHDKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+\n+    CKey key;\n+    if (m_storage.HasEncryptionKeys()) {\n+        if (m_storage.IsLocked()) {\n+            return std::nullopt;\n+        }\n+        const auto& it = m_map_crypted_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_crypted_keys.end());\n+        const auto& [pubkey, ckey] = it->second;\n+\n+        if (!DecryptKey(m_storage.GetEncryptionKey(), ckey, pubkey, key)) {\n+            return std::nullopt;\n+        }\n+    } else {\n+        const auto& it = m_map_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_keys.end());\n+        key = it->second;\n+    }\n+    assert(key.IsValid());\n+\n+    CExtKey master_key;\n+    master_key.nDepth = m_active_xpub.nDepth;\n+    std::copy(m_active_xpub.vchFingerprint, m_active_xpub.vchFingerprint + sizeof(master_key.vchFingerprint), master_key.vchFingerprint);\n+    master_key.nChild = m_active_xpub.nChild;\n+    master_key.chaincode = m_active_xpub.chaincode;\n+    master_key.key = key;\n+    return master_key;\n+}\n+\n+std::optional<CExtPubKey> KeyManager::GetActiveHDPubKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+    return m_active_xpub;\n+}\n+\n+bool KeyManager::AddKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+    assert(!m_storage.HasEncryptionKeys());\n+\n+    const CKeyID& id = pubkey.GetID();\n+    if (m_map_keys.find(id) != m_map_keys.end()) {\n+        return true;\n+    }\n+\n+    m_map_keys[id] = key;\n+    return batch.WriteKeyManKey(pubkey, key.GetPrivKey());\n+}\n+\n+std::vector<unsigned char> KeyManager::AddCryptedKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+\n+    assert(m_storage.HasEncryptionKeys());\n+    if (m_storage.IsLocked()) {\n+        return {};\n+    }\n+\n+    const CKeyID& id = pubkey.GetID();\n+    const auto& it = m_map_crypted_keys.find(id);\n+    if (it != m_map_crypted_keys.end()) {\n+        return it->second.second;\n+    }\n+\n+    std::vector<unsigned char> crypted_secret;\n+    CKeyingMaterial secret(key.begin(), key.end());\n+    if (!EncryptSecret(m_storage.GetEncryptionKey(), secret, pubkey.GetHash(), crypted_secret)) {\n+        return {};\n+    }\n+\n+    m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+\n+    if (!batch.WriteCryptedKeyManKey(pubkey, crypted_secret)) {\n+        return {};\n+    }\n+\n+    return crypted_secret;\n+}\n+\n+bool KeyManager::AddDescriptorKey(WalletBatch& batch, const uint256& desc_id, const CKey& key, const CPubKey& pubkey)\n+{\n+    LOCK(cs_keyman);\n+    assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, key, pubkey);\n+        if (ckey.empty()) {\n+            return false;\n+        }\n+        return batch.WriteCryptedDescriptorKey(desc_id, pubkey, ckey);\n+    } else {\n+        return AddKeyInner(batch, key, pubkey) && batch.WriteDescriptorKey(desc_id, pubkey, key.GetPrivKey());\n+    }\n+}\n+\n+bool KeyManager::AddHDKey(WalletBatch& batch, const CExtKey& extkey, const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    const CKeyID& id = extpub.pubkey.GetID();\n+    m_map_xpubs[id] = extpub;\n+    batch.WriteHDPubKey(extpub);\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, extkey.key, extpub.pubkey);\n+        return !ckey.empty();\n+    } else {\n+        return AddKeyInner(batch, extkey.key, extpub.pubkey);\n+    }\n+}\n+\n+void KeyManager::LoadKey(const CKeyID& key_id, const CKey& key)\n+{\n+    LOCK(cs_keyman);\n+    m_map_keys[key_id] = key;\n+}\n+\n+bool KeyManager::LoadCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& ckey)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    m_map_crypted_keys[key_id] = make_pair(pubkey, ckey);\n+    return true;\n+}\n+\n+void KeyManager::LoadHDKey(const CKeyID& key_id, const CExtPubKey& xpub)\n+{\n+    LOCK(cs_keyman);\n+    m_map_xpubs[key_id] = xpub;\n+}\n+\n+bool KeyManager::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n+    bool keyFail = false;\n+    for (const auto& mi : m_map_crypted_keys) {\n+        const CPubKey& pubkey = mi.second.first;\n+        const std::vector<unsigned char>& crypted_secret = mi.second.second;\n+        CKey key;\n+        if (!DecryptKey(master_key, crypted_secret, pubkey, key)) {\n+            keyFail = true;\n+            break;\n+        }\n+        keyPass = true;\n+        if (m_decryption_thoroughly_checked) {\n+            break;\n+        }\n+    }\n+    if (keyPass && keyFail) {\n+        LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n+        throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n+    }\n+    if (keyFail || (!keyPass && !accept_no_keys)) {\n+        return false;\n+    }\n+    m_decryption_thoroughly_checked = true;\n+    return true;\n+}\n+\n+bool KeyManager::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n+{\n+    LOCK(cs_keyman);\n+\n+    // Nothing to encrypt\n+    if (m_map_keys.empty()) {\n+        return true;\n+    }\n+\n+    if (!m_map_crypted_keys.empty()) {\n+        return false;\n+    }\n+\n+    for (const auto& [id, key] : m_map_keys)\n+    {\n+        CPubKey pubkey = key.GetPubKey();\n+        CKeyingMaterial secret(key.begin(), key.end());\n+        std::vector<unsigned char> crypted_secret;\n+        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n+            return false;\n+        }\n+        m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+        batch->WriteCryptedKeyManKey(pubkey, crypted_secret);\n+    }\n+    m_map_keys.clear();\n+    return true;\n+}\n+\n+std::map<CKeyID, CKey> KeyManager::GetKeys() const\n+{\n+    AssertLockHeld(cs_keyman);\n+    if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {\n+        std::map<CKeyID, CKey> keys;\n+        for (const auto& [id, key_pair] : m_map_crypted_keys) {\n+            const auto& [pubkey, crypted_secret] = key_pair;\n+            CKey key;\n+            bool ok = DecryptKey(m_storage.GetEncryptionKey(), crypted_secret, pubkey, key);\n+            assert(ok);\n+            keys[id] = key;\n+        }\n+        return keys;\n+    }\n+    // If the wallet is encrypted and locked, then this will just be an empty map\n+    return m_map_keys;\n+}\n+\n+bool KeyManager::HavePrivateKeys() const\n+{\n+    LOCK(cs_keyman);\n+    return m_map_keys.size() > 0 || m_map_crypted_keys.size() > 0;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977903474",
+      "id" : 977903474,
+      "in_reply_to_id" : 977685609,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII5846SZ9y",
+      "original_commit_id" : "8c5ddf432dceb084be6612b378dacf9211e8cf08",
+      "original_line" : 267,
+      "original_position" : 267,
+      "original_start_line" : null,
+      "path" : "src/wallet/keyman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1117415638,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903474/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-09-22T17:11:31Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903474",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977903521"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903521"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T17:11:35Z",
+      "diff_hunk" : "@@ -0,0 +1,278 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <key.h>\n+#include <logging.h>\n+#include <pubkey.h>\n+#include <random.h>\n+#include <wallet/crypter.h>\n+#include <wallet/keyman.h>\n+#include <wallet/walletdb.h>\n+\n+namespace wallet {\n+void KeyManager::GenerateAndSetHDKey()\n+{\n+    LOCK(cs_keyman);\n+    CKey key;\n+    key.MakeNewKey(true);\n+    CPubKey seed_pub = key.GetPubKey();\n+    assert(key.VerifyPubKey(seed_pub));\n+\n+    CExtKey master_key;\n+    master_key.SetSeed(key);\n+    CExtPubKey master_xpub = master_key.Neuter();\n+\n+    WalletBatch batch(m_storage.GetDatabase());\n+    AddHDKey(batch, master_key, master_xpub);\n+    SetActiveHDKey(master_xpub);\n+}\n+\n+void KeyManager::LoadActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    m_active_xpub = extpub;\n+}\n+\n+void KeyManager::SetActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    LoadActiveHDKey(extpub);\n+    WalletBatch batch(m_storage.GetDatabase());\n+    batch.WriteActiveHDKey(extpub);\n+}\n+\n+std::optional<CExtKey> KeyManager::GetActiveHDKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+\n+    CKey key;\n+    if (m_storage.HasEncryptionKeys()) {\n+        if (m_storage.IsLocked()) {\n+            return std::nullopt;\n+        }\n+        const auto& it = m_map_crypted_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_crypted_keys.end());\n+        const auto& [pubkey, ckey] = it->second;\n+\n+        if (!DecryptKey(m_storage.GetEncryptionKey(), ckey, pubkey, key)) {\n+            return std::nullopt;\n+        }\n+    } else {\n+        const auto& it = m_map_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_keys.end());\n+        key = it->second;\n+    }\n+    assert(key.IsValid());\n+\n+    CExtKey master_key;\n+    master_key.nDepth = m_active_xpub.nDepth;\n+    std::copy(m_active_xpub.vchFingerprint, m_active_xpub.vchFingerprint + sizeof(master_key.vchFingerprint), master_key.vchFingerprint);\n+    master_key.nChild = m_active_xpub.nChild;\n+    master_key.chaincode = m_active_xpub.chaincode;\n+    master_key.key = key;\n+    return master_key;\n+}\n+\n+std::optional<CExtPubKey> KeyManager::GetActiveHDPubKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+    return m_active_xpub;\n+}\n+\n+bool KeyManager::AddKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+    assert(!m_storage.HasEncryptionKeys());\n+\n+    const CKeyID& id = pubkey.GetID();\n+    if (m_map_keys.find(id) != m_map_keys.end()) {\n+        return true;\n+    }\n+\n+    m_map_keys[id] = key;\n+    return batch.WriteKeyManKey(pubkey, key.GetPrivKey());\n+}\n+\n+std::vector<unsigned char> KeyManager::AddCryptedKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+\n+    assert(m_storage.HasEncryptionKeys());\n+    if (m_storage.IsLocked()) {\n+        return {};\n+    }\n+\n+    const CKeyID& id = pubkey.GetID();\n+    const auto& it = m_map_crypted_keys.find(id);\n+    if (it != m_map_crypted_keys.end()) {\n+        return it->second.second;\n+    }\n+\n+    std::vector<unsigned char> crypted_secret;\n+    CKeyingMaterial secret(key.begin(), key.end());\n+    if (!EncryptSecret(m_storage.GetEncryptionKey(), secret, pubkey.GetHash(), crypted_secret)) {\n+        return {};\n+    }\n+\n+    m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+\n+    if (!batch.WriteCryptedKeyManKey(pubkey, crypted_secret)) {\n+        return {};\n+    }\n+\n+    return crypted_secret;\n+}\n+\n+bool KeyManager::AddDescriptorKey(WalletBatch& batch, const uint256& desc_id, const CKey& key, const CPubKey& pubkey)\n+{\n+    LOCK(cs_keyman);\n+    assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, key, pubkey);\n+        if (ckey.empty()) {\n+            return false;\n+        }\n+        return batch.WriteCryptedDescriptorKey(desc_id, pubkey, ckey);\n+    } else {\n+        return AddKeyInner(batch, key, pubkey) && batch.WriteDescriptorKey(desc_id, pubkey, key.GetPrivKey());\n+    }\n+}\n+\n+bool KeyManager::AddHDKey(WalletBatch& batch, const CExtKey& extkey, const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    const CKeyID& id = extpub.pubkey.GetID();\n+    m_map_xpubs[id] = extpub;\n+    batch.WriteHDPubKey(extpub);\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, extkey.key, extpub.pubkey);\n+        return !ckey.empty();\n+    } else {\n+        return AddKeyInner(batch, extkey.key, extpub.pubkey);\n+    }\n+}\n+\n+void KeyManager::LoadKey(const CKeyID& key_id, const CKey& key)\n+{\n+    LOCK(cs_keyman);\n+    m_map_keys[key_id] = key;\n+}\n+\n+bool KeyManager::LoadCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& ckey)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    m_map_crypted_keys[key_id] = make_pair(pubkey, ckey);\n+    return true;\n+}\n+\n+void KeyManager::LoadHDKey(const CKeyID& key_id, const CExtPubKey& xpub)\n+{\n+    LOCK(cs_keyman);\n+    m_map_xpubs[key_id] = xpub;\n+}\n+\n+bool KeyManager::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n+    bool keyFail = false;\n+    for (const auto& mi : m_map_crypted_keys) {\n+        const CPubKey& pubkey = mi.second.first;\n+        const std::vector<unsigned char>& crypted_secret = mi.second.second;\n+        CKey key;\n+        if (!DecryptKey(master_key, crypted_secret, pubkey, key)) {\n+            keyFail = true;\n+            break;\n+        }\n+        keyPass = true;\n+        if (m_decryption_thoroughly_checked) {\n+            break;\n+        }\n+    }\n+    if (keyPass && keyFail) {\n+        LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n+        throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n+    }\n+    if (keyFail || (!keyPass && !accept_no_keys)) {\n+        return false;\n+    }\n+    m_decryption_thoroughly_checked = true;\n+    return true;\n+}\n+\n+bool KeyManager::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n+{\n+    LOCK(cs_keyman);\n+\n+    // Nothing to encrypt\n+    if (m_map_keys.empty()) {\n+        return true;\n+    }\n+\n+    if (!m_map_crypted_keys.empty()) {\n+        return false;\n+    }\n+\n+    for (const auto& [id, key] : m_map_keys)\n+    {\n+        CPubKey pubkey = key.GetPubKey();\n+        CKeyingMaterial secret(key.begin(), key.end());\n+        std::vector<unsigned char> crypted_secret;\n+        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n+            return false;\n+        }\n+        m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+        batch->WriteCryptedKeyManKey(pubkey, crypted_secret);\n+    }\n+    m_map_keys.clear();\n+    return true;\n+}\n+\n+std::map<CKeyID, CKey> KeyManager::GetKeys() const\n+{\n+    AssertLockHeld(cs_keyman);\n+    if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {\n+        std::map<CKeyID, CKey> keys;\n+        for (const auto& [id, key_pair] : m_map_crypted_keys) {\n+            const auto& [pubkey, crypted_secret] = key_pair;\n+            CKey key;\n+            bool ok = DecryptKey(m_storage.GetEncryptionKey(), crypted_secret, pubkey, key);\n+            assert(ok);\n+            keys[id] = key;\n+        }\n+        return keys;\n+    }\n+    // If the wallet is encrypted and locked, then this will just be an empty map\n+    return m_map_keys;\n+}\n+\n+bool KeyManager::HavePrivateKeys() const\n+{\n+    LOCK(cs_keyman);\n+    return m_map_keys.size() > 0 || m_map_crypted_keys.size() > 0;\n+}\n+\n+const std::optional<std::pair<CPubKey, std::vector<unsigned char>>> KeyManager::GetCryptedKey(const CKeyID& id) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977903521",
+      "id" : 977903521,
+      "in_reply_to_id" : 977686311,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII5846SZ-h",
+      "original_commit_id" : "8c5ddf432dceb084be6612b378dacf9211e8cf08",
+      "original_line" : 270,
+      "original_position" : 270,
+      "original_start_line" : null,
+      "path" : "src/wallet/keyman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1117415725,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903521/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-09-22T17:11:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903521",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977903602"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903602"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T17:11:40Z",
+      "diff_hunk" : "@@ -3434,53 +3437,41 @@ void CWallet::ConnectScriptPubKeyManNotifiers()\n void CWallet::LoadDescriptorScriptPubKeyMan(uint256 id, WalletDescriptor& desc)\n {\n     if (IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {\n-        auto spk_manager = std::unique_ptr<ScriptPubKeyMan>(new ExternalSignerScriptPubKeyMan(*this, desc));\n+        auto spk_manager = std::unique_ptr<ScriptPubKeyMan>(new ExternalSignerScriptPubKeyMan(*this, desc, m_keyman));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977903602",
+      "id" : 977903602,
+      "in_reply_to_id" : 977694027,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII5846SZ_y",
+      "original_commit_id" : "8c5ddf432dceb084be6612b378dacf9211e8cf08",
+      "original_line" : 3440,
+      "original_position" : 15,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1117415834,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903602/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-09-22T17:11:40Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903602",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977903903"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903903"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Assertions shouldn't have side effects, hence the separation.",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T17:12:00Z",
+      "diff_hunk" : "@@ -2024,56 +2024,24 @@ isminetype DescriptorScriptPubKeyMan::IsMine(const CScript& script) const\n \n bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n {\n-    LOCK(cs_desc_man);\n-    if (!m_map_keys.empty()) {\n-        return false;\n-    }\n-\n-    bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n-    bool keyFail = false;\n-    for (const auto& mi : m_map_crypted_keys) {\n-        const CPubKey &pubkey = mi.second.first;\n-        const std::vector<unsigned char> &crypted_secret = mi.second.second;\n-        CKey key;\n-        if (!DecryptKey(master_key, crypted_secret, pubkey, key)) {\n-            keyFail = true;\n-            break;\n-        }\n-        keyPass = true;\n-        if (m_decryption_thoroughly_checked)\n-            break;\n-    }\n-    if (keyPass && keyFail) {\n-        LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n-        throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n-    }\n-    if (keyFail || (!keyPass && !accept_no_keys)) {\n-        return false;\n-    }\n-    m_decryption_thoroughly_checked = true;\n-    return true;\n+    return m_keyman.CheckDecryptionKey(master_key, accept_no_keys);\n }\n \n bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n {\n-    LOCK(cs_desc_man);\n-    if (!m_map_crypted_keys.empty()) {\n+    LOCK2(cs_desc_man, m_keyman.cs_keyman);\n+\n+    if (!m_keyman.Encrypt(master_key, batch)) {\n         return false;\n     }\n \n-    for (const KeyMap::value_type& key_in : m_map_keys)\n-    {\n-        const CKey &key = key_in.second;\n-        CPubKey pubkey = key.GetPubKey();\n-        CKeyingMaterial secret(key.begin(), key.end());\n-        std::vector<unsigned char> crypted_secret;\n-        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n-            return false;\n-        }\n-        m_map_crypted_keys[pubkey.GetID()] = make_pair(pubkey, crypted_secret);\n-        batch->WriteCryptedDescriptorKey(GetID(), pubkey, crypted_secret);\n+    for (const CKeyID& id : m_set_stored_keys) {\n+        const auto& ckey_pair = m_keyman.GetCryptedKey(id);\n+        assert(ckey_pair != std::nullopt);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977903903",
+      "id" : 977903903,
+      "in_reply_to_id" : 977716285,
+      "line" : 2040,
+      "node_id" : "PRRC_kwDOABII5846SaEf",
+      "original_commit_id" : "8c5ddf432dceb084be6612b378dacf9211e8cf08",
+      "original_line" : 2040,
+      "original_position" : 94,
+      "original_start_line" : 2039,
+      "path" : "src/wallet/scriptpubkeyman.cpp",
+      "position" : 94,
+      "pull_request_review_id" : 1117416234,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903903/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 2039,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-09-22T17:12:00Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977903903",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977926979"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977926979"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "i think you meant \r\n```suggestion\r\n    return !m_map_keys.empty() || !m_map_crypted_keys.empty();\r\n```\r\n",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T17:39:16Z",
+      "diff_hunk" : "@@ -0,0 +1,278 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <key.h>\n+#include <logging.h>\n+#include <pubkey.h>\n+#include <random.h>\n+#include <wallet/crypter.h>\n+#include <wallet/keyman.h>\n+#include <wallet/walletdb.h>\n+\n+namespace wallet {\n+void KeyManager::GenerateAndSetHDKey()\n+{\n+    LOCK(cs_keyman);\n+    CKey key;\n+    key.MakeNewKey(true);\n+    CPubKey seed_pub = key.GetPubKey();\n+    assert(key.VerifyPubKey(seed_pub));\n+\n+    CExtKey master_key;\n+    master_key.SetSeed(key);\n+    CExtPubKey master_xpub = master_key.Neuter();\n+\n+    WalletBatch batch(m_storage.GetDatabase());\n+    AddHDKey(batch, master_key, master_xpub);\n+    SetActiveHDKey(master_xpub);\n+}\n+\n+void KeyManager::LoadActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    m_active_xpub = extpub;\n+}\n+\n+void KeyManager::SetActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    LoadActiveHDKey(extpub);\n+    WalletBatch batch(m_storage.GetDatabase());\n+    batch.WriteActiveHDKey(extpub);\n+}\n+\n+std::optional<CExtKey> KeyManager::GetActiveHDKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+\n+    CKey key;\n+    if (m_storage.HasEncryptionKeys()) {\n+        if (m_storage.IsLocked()) {\n+            return std::nullopt;\n+        }\n+        const auto& it = m_map_crypted_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_crypted_keys.end());\n+        const auto& [pubkey, ckey] = it->second;\n+\n+        if (!DecryptKey(m_storage.GetEncryptionKey(), ckey, pubkey, key)) {\n+            return std::nullopt;\n+        }\n+    } else {\n+        const auto& it = m_map_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_keys.end());\n+        key = it->second;\n+    }\n+    assert(key.IsValid());\n+\n+    CExtKey master_key;\n+    master_key.nDepth = m_active_xpub.nDepth;\n+    std::copy(m_active_xpub.vchFingerprint, m_active_xpub.vchFingerprint + sizeof(master_key.vchFingerprint), master_key.vchFingerprint);\n+    master_key.nChild = m_active_xpub.nChild;\n+    master_key.chaincode = m_active_xpub.chaincode;\n+    master_key.key = key;\n+    return master_key;\n+}\n+\n+std::optional<CExtPubKey> KeyManager::GetActiveHDPubKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+    return m_active_xpub;\n+}\n+\n+bool KeyManager::AddKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+    assert(!m_storage.HasEncryptionKeys());\n+\n+    const CKeyID& id = pubkey.GetID();\n+    if (m_map_keys.find(id) != m_map_keys.end()) {\n+        return true;\n+    }\n+\n+    m_map_keys[id] = key;\n+    return batch.WriteKeyManKey(pubkey, key.GetPrivKey());\n+}\n+\n+std::vector<unsigned char> KeyManager::AddCryptedKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+\n+    assert(m_storage.HasEncryptionKeys());\n+    if (m_storage.IsLocked()) {\n+        return {};\n+    }\n+\n+    const CKeyID& id = pubkey.GetID();\n+    const auto& it = m_map_crypted_keys.find(id);\n+    if (it != m_map_crypted_keys.end()) {\n+        return it->second.second;\n+    }\n+\n+    std::vector<unsigned char> crypted_secret;\n+    CKeyingMaterial secret(key.begin(), key.end());\n+    if (!EncryptSecret(m_storage.GetEncryptionKey(), secret, pubkey.GetHash(), crypted_secret)) {\n+        return {};\n+    }\n+\n+    m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+\n+    if (!batch.WriteCryptedKeyManKey(pubkey, crypted_secret)) {\n+        return {};\n+    }\n+\n+    return crypted_secret;\n+}\n+\n+bool KeyManager::AddDescriptorKey(WalletBatch& batch, const uint256& desc_id, const CKey& key, const CPubKey& pubkey)\n+{\n+    LOCK(cs_keyman);\n+    assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, key, pubkey);\n+        if (ckey.empty()) {\n+            return false;\n+        }\n+        return batch.WriteCryptedDescriptorKey(desc_id, pubkey, ckey);\n+    } else {\n+        return AddKeyInner(batch, key, pubkey) && batch.WriteDescriptorKey(desc_id, pubkey, key.GetPrivKey());\n+    }\n+}\n+\n+bool KeyManager::AddHDKey(WalletBatch& batch, const CExtKey& extkey, const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    const CKeyID& id = extpub.pubkey.GetID();\n+    m_map_xpubs[id] = extpub;\n+    batch.WriteHDPubKey(extpub);\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, extkey.key, extpub.pubkey);\n+        return !ckey.empty();\n+    } else {\n+        return AddKeyInner(batch, extkey.key, extpub.pubkey);\n+    }\n+}\n+\n+void KeyManager::LoadKey(const CKeyID& key_id, const CKey& key)\n+{\n+    LOCK(cs_keyman);\n+    m_map_keys[key_id] = key;\n+}\n+\n+bool KeyManager::LoadCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& ckey)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    m_map_crypted_keys[key_id] = make_pair(pubkey, ckey);\n+    return true;\n+}\n+\n+void KeyManager::LoadHDKey(const CKeyID& key_id, const CExtPubKey& xpub)\n+{\n+    LOCK(cs_keyman);\n+    m_map_xpubs[key_id] = xpub;\n+}\n+\n+bool KeyManager::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n+    bool keyFail = false;\n+    for (const auto& mi : m_map_crypted_keys) {\n+        const CPubKey& pubkey = mi.second.first;\n+        const std::vector<unsigned char>& crypted_secret = mi.second.second;\n+        CKey key;\n+        if (!DecryptKey(master_key, crypted_secret, pubkey, key)) {\n+            keyFail = true;\n+            break;\n+        }\n+        keyPass = true;\n+        if (m_decryption_thoroughly_checked) {\n+            break;\n+        }\n+    }\n+    if (keyPass && keyFail) {\n+        LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n+        throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n+    }\n+    if (keyFail || (!keyPass && !accept_no_keys)) {\n+        return false;\n+    }\n+    m_decryption_thoroughly_checked = true;\n+    return true;\n+}\n+\n+bool KeyManager::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n+{\n+    LOCK(cs_keyman);\n+\n+    // Nothing to encrypt\n+    if (m_map_keys.empty()) {\n+        return true;\n+    }\n+\n+    if (!m_map_crypted_keys.empty()) {\n+        return false;\n+    }\n+\n+    for (const auto& [id, key] : m_map_keys)\n+    {\n+        CPubKey pubkey = key.GetPubKey();\n+        CKeyingMaterial secret(key.begin(), key.end());\n+        std::vector<unsigned char> crypted_secret;\n+        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n+            return false;\n+        }\n+        m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+        batch->WriteCryptedKeyManKey(pubkey, crypted_secret);\n+    }\n+    m_map_keys.clear();\n+    return true;\n+}\n+\n+std::map<CKeyID, CKey> KeyManager::GetKeys() const\n+{\n+    AssertLockHeld(cs_keyman);\n+    if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {\n+        std::map<CKeyID, CKey> keys;\n+        for (const auto& [id, key_pair] : m_map_crypted_keys) {\n+            const auto& [pubkey, crypted_secret] = key_pair;\n+            CKey key;\n+            bool ok = DecryptKey(m_storage.GetEncryptionKey(), crypted_secret, pubkey, key);\n+            assert(ok);\n+            keys[id] = key;\n+        }\n+        return keys;\n+    }\n+    // If the wallet is encrypted and locked, then this will just be an empty map\n+    return m_map_keys;\n+}\n+\n+bool KeyManager::HavePrivateKeys() const\n+{\n+    LOCK(cs_keyman);\n+    return m_map_keys.empty() || m_map_crypted_keys.empty();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977926979",
+      "id" : 977926979,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII5846SftD",
+      "original_commit_id" : "d750754d5b73aae8d0ac15ef26b1c88dc369f921",
+      "original_line" : 267,
+      "original_position" : 267,
+      "original_start_line" : null,
+      "path" : "src/wallet/keyman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1117449606,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977926979/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-09-22T17:39:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977926979",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/22493292?v=4",
+         "events_url" : "https://api.github.com/users/aureleoules/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/aureleoules/followers",
+         "following_url" : "https://api.github.com/users/aureleoules/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/aureleoules/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/aureleoules",
+         "id" : 22493292,
+         "login" : "aureleoules",
+         "node_id" : "MDQ6VXNlcjIyNDkzMjky",
+         "organizations_url" : "https://api.github.com/users/aureleoules/orgs",
+         "received_events_url" : "https://api.github.com/users/aureleoules/received_events",
+         "repos_url" : "https://api.github.com/users/aureleoules/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/aureleoules/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/aureleoules/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/aureleoules"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977930811"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977930811"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "also, maybe `HasPrivateKeys` is better than `HavePrivateKeys` ?",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T17:43:55Z",
+      "diff_hunk" : "@@ -0,0 +1,278 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <key.h>\n+#include <logging.h>\n+#include <pubkey.h>\n+#include <random.h>\n+#include <wallet/crypter.h>\n+#include <wallet/keyman.h>\n+#include <wallet/walletdb.h>\n+\n+namespace wallet {\n+void KeyManager::GenerateAndSetHDKey()\n+{\n+    LOCK(cs_keyman);\n+    CKey key;\n+    key.MakeNewKey(true);\n+    CPubKey seed_pub = key.GetPubKey();\n+    assert(key.VerifyPubKey(seed_pub));\n+\n+    CExtKey master_key;\n+    master_key.SetSeed(key);\n+    CExtPubKey master_xpub = master_key.Neuter();\n+\n+    WalletBatch batch(m_storage.GetDatabase());\n+    AddHDKey(batch, master_key, master_xpub);\n+    SetActiveHDKey(master_xpub);\n+}\n+\n+void KeyManager::LoadActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    m_active_xpub = extpub;\n+}\n+\n+void KeyManager::SetActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    LoadActiveHDKey(extpub);\n+    WalletBatch batch(m_storage.GetDatabase());\n+    batch.WriteActiveHDKey(extpub);\n+}\n+\n+std::optional<CExtKey> KeyManager::GetActiveHDKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+\n+    CKey key;\n+    if (m_storage.HasEncryptionKeys()) {\n+        if (m_storage.IsLocked()) {\n+            return std::nullopt;\n+        }\n+        const auto& it = m_map_crypted_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_crypted_keys.end());\n+        const auto& [pubkey, ckey] = it->second;\n+\n+        if (!DecryptKey(m_storage.GetEncryptionKey(), ckey, pubkey, key)) {\n+            return std::nullopt;\n+        }\n+    } else {\n+        const auto& it = m_map_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_keys.end());\n+        key = it->second;\n+    }\n+    assert(key.IsValid());\n+\n+    CExtKey master_key;\n+    master_key.nDepth = m_active_xpub.nDepth;\n+    std::copy(m_active_xpub.vchFingerprint, m_active_xpub.vchFingerprint + sizeof(master_key.vchFingerprint), master_key.vchFingerprint);\n+    master_key.nChild = m_active_xpub.nChild;\n+    master_key.chaincode = m_active_xpub.chaincode;\n+    master_key.key = key;\n+    return master_key;\n+}\n+\n+std::optional<CExtPubKey> KeyManager::GetActiveHDPubKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+    return m_active_xpub;\n+}\n+\n+bool KeyManager::AddKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+    assert(!m_storage.HasEncryptionKeys());\n+\n+    const CKeyID& id = pubkey.GetID();\n+    if (m_map_keys.find(id) != m_map_keys.end()) {\n+        return true;\n+    }\n+\n+    m_map_keys[id] = key;\n+    return batch.WriteKeyManKey(pubkey, key.GetPrivKey());\n+}\n+\n+std::vector<unsigned char> KeyManager::AddCryptedKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+\n+    assert(m_storage.HasEncryptionKeys());\n+    if (m_storage.IsLocked()) {\n+        return {};\n+    }\n+\n+    const CKeyID& id = pubkey.GetID();\n+    const auto& it = m_map_crypted_keys.find(id);\n+    if (it != m_map_crypted_keys.end()) {\n+        return it->second.second;\n+    }\n+\n+    std::vector<unsigned char> crypted_secret;\n+    CKeyingMaterial secret(key.begin(), key.end());\n+    if (!EncryptSecret(m_storage.GetEncryptionKey(), secret, pubkey.GetHash(), crypted_secret)) {\n+        return {};\n+    }\n+\n+    m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+\n+    if (!batch.WriteCryptedKeyManKey(pubkey, crypted_secret)) {\n+        return {};\n+    }\n+\n+    return crypted_secret;\n+}\n+\n+bool KeyManager::AddDescriptorKey(WalletBatch& batch, const uint256& desc_id, const CKey& key, const CPubKey& pubkey)\n+{\n+    LOCK(cs_keyman);\n+    assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, key, pubkey);\n+        if (ckey.empty()) {\n+            return false;\n+        }\n+        return batch.WriteCryptedDescriptorKey(desc_id, pubkey, ckey);\n+    } else {\n+        return AddKeyInner(batch, key, pubkey) && batch.WriteDescriptorKey(desc_id, pubkey, key.GetPrivKey());\n+    }\n+}\n+\n+bool KeyManager::AddHDKey(WalletBatch& batch, const CExtKey& extkey, const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    const CKeyID& id = extpub.pubkey.GetID();\n+    m_map_xpubs[id] = extpub;\n+    batch.WriteHDPubKey(extpub);\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, extkey.key, extpub.pubkey);\n+        return !ckey.empty();\n+    } else {\n+        return AddKeyInner(batch, extkey.key, extpub.pubkey);\n+    }\n+}\n+\n+void KeyManager::LoadKey(const CKeyID& key_id, const CKey& key)\n+{\n+    LOCK(cs_keyman);\n+    m_map_keys[key_id] = key;\n+}\n+\n+bool KeyManager::LoadCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& ckey)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    m_map_crypted_keys[key_id] = make_pair(pubkey, ckey);\n+    return true;\n+}\n+\n+void KeyManager::LoadHDKey(const CKeyID& key_id, const CExtPubKey& xpub)\n+{\n+    LOCK(cs_keyman);\n+    m_map_xpubs[key_id] = xpub;\n+}\n+\n+bool KeyManager::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n+    bool keyFail = false;\n+    for (const auto& mi : m_map_crypted_keys) {\n+        const CPubKey& pubkey = mi.second.first;\n+        const std::vector<unsigned char>& crypted_secret = mi.second.second;\n+        CKey key;\n+        if (!DecryptKey(master_key, crypted_secret, pubkey, key)) {\n+            keyFail = true;\n+            break;\n+        }\n+        keyPass = true;\n+        if (m_decryption_thoroughly_checked) {\n+            break;\n+        }\n+    }\n+    if (keyPass && keyFail) {\n+        LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n+        throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n+    }\n+    if (keyFail || (!keyPass && !accept_no_keys)) {\n+        return false;\n+    }\n+    m_decryption_thoroughly_checked = true;\n+    return true;\n+}\n+\n+bool KeyManager::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n+{\n+    LOCK(cs_keyman);\n+\n+    // Nothing to encrypt\n+    if (m_map_keys.empty()) {\n+        return true;\n+    }\n+\n+    if (!m_map_crypted_keys.empty()) {\n+        return false;\n+    }\n+\n+    for (const auto& [id, key] : m_map_keys)\n+    {\n+        CPubKey pubkey = key.GetPubKey();\n+        CKeyingMaterial secret(key.begin(), key.end());\n+        std::vector<unsigned char> crypted_secret;\n+        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n+            return false;\n+        }\n+        m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+        batch->WriteCryptedKeyManKey(pubkey, crypted_secret);\n+    }\n+    m_map_keys.clear();\n+    return true;\n+}\n+\n+std::map<CKeyID, CKey> KeyManager::GetKeys() const\n+{\n+    AssertLockHeld(cs_keyman);\n+    if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {\n+        std::map<CKeyID, CKey> keys;\n+        for (const auto& [id, key_pair] : m_map_crypted_keys) {\n+            const auto& [pubkey, crypted_secret] = key_pair;\n+            CKey key;\n+            bool ok = DecryptKey(m_storage.GetEncryptionKey(), crypted_secret, pubkey, key);\n+            assert(ok);\n+            keys[id] = key;\n+        }\n+        return keys;\n+    }\n+    // If the wallet is encrypted and locked, then this will just be an empty map\n+    return m_map_keys;\n+}\n+\n+bool KeyManager::HavePrivateKeys() const\n+{\n+    LOCK(cs_keyman);\n+    return m_map_keys.empty() || m_map_crypted_keys.empty();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977930811",
+      "id" : 977930811,
+      "in_reply_to_id" : 977926979,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII5846Sgo7",
+      "original_commit_id" : "d750754d5b73aae8d0ac15ef26b1c88dc369f921",
+      "original_line" : 267,
+      "original_position" : 267,
+      "original_start_line" : null,
+      "path" : "src/wallet/keyman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1117455204,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977930811/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-09-22T17:43:55Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977930811",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/22493292?v=4",
+         "events_url" : "https://api.github.com/users/aureleoules/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/aureleoules/followers",
+         "following_url" : "https://api.github.com/users/aureleoules/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/aureleoules/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/aureleoules",
+         "id" : 22493292,
+         "login" : "aureleoules",
+         "node_id" : "MDQ6VXNlcjIyNDkzMjky",
+         "organizations_url" : "https://api.github.com/users/aureleoules/orgs",
+         "received_events_url" : "https://api.github.com/users/aureleoules/received_events",
+         "repos_url" : "https://api.github.com/users/aureleoules/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/aureleoules/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/aureleoules/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/aureleoules"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977935613"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977935613"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Even so, it is more confusing to read be inlining as assertions are expected to be checking invariants rather than doing something.",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T17:49:43Z",
+      "diff_hunk" : "@@ -0,0 +1,278 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <key.h>\n+#include <logging.h>\n+#include <pubkey.h>\n+#include <random.h>\n+#include <wallet/crypter.h>\n+#include <wallet/keyman.h>\n+#include <wallet/walletdb.h>\n+\n+namespace wallet {\n+void KeyManager::GenerateAndSetHDKey()\n+{\n+    LOCK(cs_keyman);\n+    CKey key;\n+    key.MakeNewKey(true);\n+    CPubKey seed_pub = key.GetPubKey();\n+    assert(key.VerifyPubKey(seed_pub));\n+\n+    CExtKey master_key;\n+    master_key.SetSeed(key);\n+    CExtPubKey master_xpub = master_key.Neuter();\n+\n+    WalletBatch batch(m_storage.GetDatabase());\n+    AddHDKey(batch, master_key, master_xpub);\n+    SetActiveHDKey(master_xpub);\n+}\n+\n+void KeyManager::LoadActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    m_active_xpub = extpub;\n+}\n+\n+void KeyManager::SetActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    LoadActiveHDKey(extpub);\n+    WalletBatch batch(m_storage.GetDatabase());\n+    batch.WriteActiveHDKey(extpub);\n+}\n+\n+std::optional<CExtKey> KeyManager::GetActiveHDKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+\n+    CKey key;\n+    if (m_storage.HasEncryptionKeys()) {\n+        if (m_storage.IsLocked()) {\n+            return std::nullopt;\n+        }\n+        const auto& it = m_map_crypted_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_crypted_keys.end());\n+        const auto& [pubkey, ckey] = it->second;\n+\n+        if (!DecryptKey(m_storage.GetEncryptionKey(), ckey, pubkey, key)) {\n+            return std::nullopt;\n+        }\n+    } else {\n+        const auto& it = m_map_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_keys.end());\n+        key = it->second;\n+    }\n+    assert(key.IsValid());\n+\n+    CExtKey master_key;\n+    master_key.nDepth = m_active_xpub.nDepth;\n+    std::copy(m_active_xpub.vchFingerprint, m_active_xpub.vchFingerprint + sizeof(master_key.vchFingerprint), master_key.vchFingerprint);\n+    master_key.nChild = m_active_xpub.nChild;\n+    master_key.chaincode = m_active_xpub.chaincode;\n+    master_key.key = key;\n+    return master_key;\n+}\n+\n+std::optional<CExtPubKey> KeyManager::GetActiveHDPubKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+    return m_active_xpub;\n+}\n+\n+bool KeyManager::AddKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+    assert(!m_storage.HasEncryptionKeys());\n+\n+    const CKeyID& id = pubkey.GetID();\n+    if (m_map_keys.find(id) != m_map_keys.end()) {\n+        return true;\n+    }\n+\n+    m_map_keys[id] = key;\n+    return batch.WriteKeyManKey(pubkey, key.GetPrivKey());\n+}\n+\n+std::vector<unsigned char> KeyManager::AddCryptedKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+\n+    assert(m_storage.HasEncryptionKeys());\n+    if (m_storage.IsLocked()) {\n+        return {};\n+    }\n+\n+    const CKeyID& id = pubkey.GetID();\n+    const auto& it = m_map_crypted_keys.find(id);\n+    if (it != m_map_crypted_keys.end()) {\n+        return it->second.second;\n+    }\n+\n+    std::vector<unsigned char> crypted_secret;\n+    CKeyingMaterial secret(key.begin(), key.end());\n+    if (!EncryptSecret(m_storage.GetEncryptionKey(), secret, pubkey.GetHash(), crypted_secret)) {\n+        return {};\n+    }\n+\n+    m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+\n+    if (!batch.WriteCryptedKeyManKey(pubkey, crypted_secret)) {\n+        return {};\n+    }\n+\n+    return crypted_secret;\n+}\n+\n+bool KeyManager::AddDescriptorKey(WalletBatch& batch, const uint256& desc_id, const CKey& key, const CPubKey& pubkey)\n+{\n+    LOCK(cs_keyman);\n+    assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, key, pubkey);\n+        if (ckey.empty()) {\n+            return false;\n+        }\n+        return batch.WriteCryptedDescriptorKey(desc_id, pubkey, ckey);\n+    } else {\n+        return AddKeyInner(batch, key, pubkey) && batch.WriteDescriptorKey(desc_id, pubkey, key.GetPrivKey());\n+    }\n+}\n+\n+bool KeyManager::AddHDKey(WalletBatch& batch, const CExtKey& extkey, const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    const CKeyID& id = extpub.pubkey.GetID();\n+    m_map_xpubs[id] = extpub;\n+    batch.WriteHDPubKey(extpub);\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, extkey.key, extpub.pubkey);\n+        return !ckey.empty();\n+    } else {\n+        return AddKeyInner(batch, extkey.key, extpub.pubkey);\n+    }\n+}\n+\n+void KeyManager::LoadKey(const CKeyID& key_id, const CKey& key)\n+{\n+    LOCK(cs_keyman);\n+    m_map_keys[key_id] = key;\n+}\n+\n+bool KeyManager::LoadCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& ckey)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    m_map_crypted_keys[key_id] = make_pair(pubkey, ckey);\n+    return true;\n+}\n+\n+void KeyManager::LoadHDKey(const CKeyID& key_id, const CExtPubKey& xpub)\n+{\n+    LOCK(cs_keyman);\n+    m_map_xpubs[key_id] = xpub;\n+}\n+\n+bool KeyManager::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n+    bool keyFail = false;\n+    for (const auto& mi : m_map_crypted_keys) {\n+        const CPubKey& pubkey = mi.second.first;\n+        const std::vector<unsigned char>& crypted_secret = mi.second.second;\n+        CKey key;\n+        if (!DecryptKey(master_key, crypted_secret, pubkey, key)) {\n+            keyFail = true;\n+            break;\n+        }\n+        keyPass = true;\n+        if (m_decryption_thoroughly_checked) {\n+            break;\n+        }\n+    }\n+    if (keyPass && keyFail) {\n+        LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n+        throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n+    }\n+    if (keyFail || (!keyPass && !accept_no_keys)) {\n+        return false;\n+    }\n+    m_decryption_thoroughly_checked = true;\n+    return true;\n+}\n+\n+bool KeyManager::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n+{\n+    LOCK(cs_keyman);\n+\n+    // Nothing to encrypt\n+    if (m_map_keys.empty()) {\n+        return true;\n+    }\n+\n+    if (!m_map_crypted_keys.empty()) {\n+        return false;\n+    }\n+\n+    for (const auto& [id, key] : m_map_keys)\n+    {\n+        CPubKey pubkey = key.GetPubKey();\n+        CKeyingMaterial secret(key.begin(), key.end());\n+        std::vector<unsigned char> crypted_secret;\n+        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n+            return false;\n+        }\n+        m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+        batch->WriteCryptedKeyManKey(pubkey, crypted_secret);\n+    }\n+    m_map_keys.clear();\n+    return true;\n+}\n+\n+std::map<CKeyID, CKey> KeyManager::GetKeys() const\n+{\n+    AssertLockHeld(cs_keyman);\n+    if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {\n+        std::map<CKeyID, CKey> keys;\n+        for (const auto& [id, key_pair] : m_map_crypted_keys) {\n+            const auto& [pubkey, crypted_secret] = key_pair;\n+            CKey key;\n+            bool ok = DecryptKey(m_storage.GetEncryptionKey(), crypted_secret, pubkey, key);\n+            assert(ok);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977935613",
+      "id" : 977935613,
+      "in_reply_to_id" : 977715219,
+      "line" : 255,
+      "node_id" : "PRRC_kwDOABII5846Shz9",
+      "original_commit_id" : "8c5ddf432dceb084be6612b378dacf9211e8cf08",
+      "original_line" : 255,
+      "original_position" : 255,
+      "original_start_line" : 254,
+      "path" : "src/wallet/keyman.cpp",
+      "position" : 255,
+      "pull_request_review_id" : 1117462134,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977935613/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 254,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-09-22T17:49:43Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977935613",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977936677"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977936677"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Oops, yes.\r\n\r\n> also, maybe `HasPrivateKeys` is better than `HavePrivateKeys` ?\r\n\r\nI prefer to keep it the same for consistent naming.",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T17:50:58Z",
+      "diff_hunk" : "@@ -0,0 +1,278 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <key.h>\n+#include <logging.h>\n+#include <pubkey.h>\n+#include <random.h>\n+#include <wallet/crypter.h>\n+#include <wallet/keyman.h>\n+#include <wallet/walletdb.h>\n+\n+namespace wallet {\n+void KeyManager::GenerateAndSetHDKey()\n+{\n+    LOCK(cs_keyman);\n+    CKey key;\n+    key.MakeNewKey(true);\n+    CPubKey seed_pub = key.GetPubKey();\n+    assert(key.VerifyPubKey(seed_pub));\n+\n+    CExtKey master_key;\n+    master_key.SetSeed(key);\n+    CExtPubKey master_xpub = master_key.Neuter();\n+\n+    WalletBatch batch(m_storage.GetDatabase());\n+    AddHDKey(batch, master_key, master_xpub);\n+    SetActiveHDKey(master_xpub);\n+}\n+\n+void KeyManager::LoadActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    m_active_xpub = extpub;\n+}\n+\n+void KeyManager::SetActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    LoadActiveHDKey(extpub);\n+    WalletBatch batch(m_storage.GetDatabase());\n+    batch.WriteActiveHDKey(extpub);\n+}\n+\n+std::optional<CExtKey> KeyManager::GetActiveHDKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+\n+    CKey key;\n+    if (m_storage.HasEncryptionKeys()) {\n+        if (m_storage.IsLocked()) {\n+            return std::nullopt;\n+        }\n+        const auto& it = m_map_crypted_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_crypted_keys.end());\n+        const auto& [pubkey, ckey] = it->second;\n+\n+        if (!DecryptKey(m_storage.GetEncryptionKey(), ckey, pubkey, key)) {\n+            return std::nullopt;\n+        }\n+    } else {\n+        const auto& it = m_map_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_keys.end());\n+        key = it->second;\n+    }\n+    assert(key.IsValid());\n+\n+    CExtKey master_key;\n+    master_key.nDepth = m_active_xpub.nDepth;\n+    std::copy(m_active_xpub.vchFingerprint, m_active_xpub.vchFingerprint + sizeof(master_key.vchFingerprint), master_key.vchFingerprint);\n+    master_key.nChild = m_active_xpub.nChild;\n+    master_key.chaincode = m_active_xpub.chaincode;\n+    master_key.key = key;\n+    return master_key;\n+}\n+\n+std::optional<CExtPubKey> KeyManager::GetActiveHDPubKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+    return m_active_xpub;\n+}\n+\n+bool KeyManager::AddKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+    assert(!m_storage.HasEncryptionKeys());\n+\n+    const CKeyID& id = pubkey.GetID();\n+    if (m_map_keys.find(id) != m_map_keys.end()) {\n+        return true;\n+    }\n+\n+    m_map_keys[id] = key;\n+    return batch.WriteKeyManKey(pubkey, key.GetPrivKey());\n+}\n+\n+std::vector<unsigned char> KeyManager::AddCryptedKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+\n+    assert(m_storage.HasEncryptionKeys());\n+    if (m_storage.IsLocked()) {\n+        return {};\n+    }\n+\n+    const CKeyID& id = pubkey.GetID();\n+    const auto& it = m_map_crypted_keys.find(id);\n+    if (it != m_map_crypted_keys.end()) {\n+        return it->second.second;\n+    }\n+\n+    std::vector<unsigned char> crypted_secret;\n+    CKeyingMaterial secret(key.begin(), key.end());\n+    if (!EncryptSecret(m_storage.GetEncryptionKey(), secret, pubkey.GetHash(), crypted_secret)) {\n+        return {};\n+    }\n+\n+    m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+\n+    if (!batch.WriteCryptedKeyManKey(pubkey, crypted_secret)) {\n+        return {};\n+    }\n+\n+    return crypted_secret;\n+}\n+\n+bool KeyManager::AddDescriptorKey(WalletBatch& batch, const uint256& desc_id, const CKey& key, const CPubKey& pubkey)\n+{\n+    LOCK(cs_keyman);\n+    assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, key, pubkey);\n+        if (ckey.empty()) {\n+            return false;\n+        }\n+        return batch.WriteCryptedDescriptorKey(desc_id, pubkey, ckey);\n+    } else {\n+        return AddKeyInner(batch, key, pubkey) && batch.WriteDescriptorKey(desc_id, pubkey, key.GetPrivKey());\n+    }\n+}\n+\n+bool KeyManager::AddHDKey(WalletBatch& batch, const CExtKey& extkey, const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    const CKeyID& id = extpub.pubkey.GetID();\n+    m_map_xpubs[id] = extpub;\n+    batch.WriteHDPubKey(extpub);\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, extkey.key, extpub.pubkey);\n+        return !ckey.empty();\n+    } else {\n+        return AddKeyInner(batch, extkey.key, extpub.pubkey);\n+    }\n+}\n+\n+void KeyManager::LoadKey(const CKeyID& key_id, const CKey& key)\n+{\n+    LOCK(cs_keyman);\n+    m_map_keys[key_id] = key;\n+}\n+\n+bool KeyManager::LoadCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& ckey)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    m_map_crypted_keys[key_id] = make_pair(pubkey, ckey);\n+    return true;\n+}\n+\n+void KeyManager::LoadHDKey(const CKeyID& key_id, const CExtPubKey& xpub)\n+{\n+    LOCK(cs_keyman);\n+    m_map_xpubs[key_id] = xpub;\n+}\n+\n+bool KeyManager::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n+    bool keyFail = false;\n+    for (const auto& mi : m_map_crypted_keys) {\n+        const CPubKey& pubkey = mi.second.first;\n+        const std::vector<unsigned char>& crypted_secret = mi.second.second;\n+        CKey key;\n+        if (!DecryptKey(master_key, crypted_secret, pubkey, key)) {\n+            keyFail = true;\n+            break;\n+        }\n+        keyPass = true;\n+        if (m_decryption_thoroughly_checked) {\n+            break;\n+        }\n+    }\n+    if (keyPass && keyFail) {\n+        LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n+        throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n+    }\n+    if (keyFail || (!keyPass && !accept_no_keys)) {\n+        return false;\n+    }\n+    m_decryption_thoroughly_checked = true;\n+    return true;\n+}\n+\n+bool KeyManager::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n+{\n+    LOCK(cs_keyman);\n+\n+    // Nothing to encrypt\n+    if (m_map_keys.empty()) {\n+        return true;\n+    }\n+\n+    if (!m_map_crypted_keys.empty()) {\n+        return false;\n+    }\n+\n+    for (const auto& [id, key] : m_map_keys)\n+    {\n+        CPubKey pubkey = key.GetPubKey();\n+        CKeyingMaterial secret(key.begin(), key.end());\n+        std::vector<unsigned char> crypted_secret;\n+        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n+            return false;\n+        }\n+        m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+        batch->WriteCryptedKeyManKey(pubkey, crypted_secret);\n+    }\n+    m_map_keys.clear();\n+    return true;\n+}\n+\n+std::map<CKeyID, CKey> KeyManager::GetKeys() const\n+{\n+    AssertLockHeld(cs_keyman);\n+    if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {\n+        std::map<CKeyID, CKey> keys;\n+        for (const auto& [id, key_pair] : m_map_crypted_keys) {\n+            const auto& [pubkey, crypted_secret] = key_pair;\n+            CKey key;\n+            bool ok = DecryptKey(m_storage.GetEncryptionKey(), crypted_secret, pubkey, key);\n+            assert(ok);\n+            keys[id] = key;\n+        }\n+        return keys;\n+    }\n+    // If the wallet is encrypted and locked, then this will just be an empty map\n+    return m_map_keys;\n+}\n+\n+bool KeyManager::HavePrivateKeys() const\n+{\n+    LOCK(cs_keyman);\n+    return m_map_keys.empty() || m_map_crypted_keys.empty();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977936677",
+      "id" : 977936677,
+      "in_reply_to_id" : 977926979,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII5846SiEl",
+      "original_commit_id" : "d750754d5b73aae8d0ac15ef26b1c88dc369f921",
+      "original_line" : 267,
+      "original_position" : 267,
+      "original_start_line" : null,
+      "path" : "src/wallet/keyman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1117463676,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977936677/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-09-22T17:50:58Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977936677",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977941552"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977941552"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Well the `Assert` macro has been used extensively already in the codebase so I don't think it's confusing anymore.\r\nBut this is a small nit so if you prefer it this way it's fine.",
+      "commit_id" : "5145d1610202356676e5a031c68d4af0b16a62d9",
+      "created_at" : "2022-09-22T17:56:59Z",
+      "diff_hunk" : "@@ -0,0 +1,278 @@\n+// Copyright (c) 2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <key.h>\n+#include <logging.h>\n+#include <pubkey.h>\n+#include <random.h>\n+#include <wallet/crypter.h>\n+#include <wallet/keyman.h>\n+#include <wallet/walletdb.h>\n+\n+namespace wallet {\n+void KeyManager::GenerateAndSetHDKey()\n+{\n+    LOCK(cs_keyman);\n+    CKey key;\n+    key.MakeNewKey(true);\n+    CPubKey seed_pub = key.GetPubKey();\n+    assert(key.VerifyPubKey(seed_pub));\n+\n+    CExtKey master_key;\n+    master_key.SetSeed(key);\n+    CExtPubKey master_xpub = master_key.Neuter();\n+\n+    WalletBatch batch(m_storage.GetDatabase());\n+    AddHDKey(batch, master_key, master_xpub);\n+    SetActiveHDKey(master_xpub);\n+}\n+\n+void KeyManager::LoadActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    m_active_xpub = extpub;\n+}\n+\n+void KeyManager::SetActiveHDKey(const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    LoadActiveHDKey(extpub);\n+    WalletBatch batch(m_storage.GetDatabase());\n+    batch.WriteActiveHDKey(extpub);\n+}\n+\n+std::optional<CExtKey> KeyManager::GetActiveHDKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+\n+    CKey key;\n+    if (m_storage.HasEncryptionKeys()) {\n+        if (m_storage.IsLocked()) {\n+            return std::nullopt;\n+        }\n+        const auto& it = m_map_crypted_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_crypted_keys.end());\n+        const auto& [pubkey, ckey] = it->second;\n+\n+        if (!DecryptKey(m_storage.GetEncryptionKey(), ckey, pubkey, key)) {\n+            return std::nullopt;\n+        }\n+    } else {\n+        const auto& it = m_map_keys.find(m_active_xpub.pubkey.GetID());\n+        assert(it != m_map_keys.end());\n+        key = it->second;\n+    }\n+    assert(key.IsValid());\n+\n+    CExtKey master_key;\n+    master_key.nDepth = m_active_xpub.nDepth;\n+    std::copy(m_active_xpub.vchFingerprint, m_active_xpub.vchFingerprint + sizeof(master_key.vchFingerprint), master_key.vchFingerprint);\n+    master_key.nChild = m_active_xpub.nChild;\n+    master_key.chaincode = m_active_xpub.chaincode;\n+    master_key.key = key;\n+    return master_key;\n+}\n+\n+std::optional<CExtPubKey> KeyManager::GetActiveHDPubKey() const\n+{\n+    if (!m_active_xpub.pubkey.IsValid()) {\n+        return std::nullopt;\n+    }\n+    return m_active_xpub;\n+}\n+\n+bool KeyManager::AddKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+    assert(!m_storage.HasEncryptionKeys());\n+\n+    const CKeyID& id = pubkey.GetID();\n+    if (m_map_keys.find(id) != m_map_keys.end()) {\n+        return true;\n+    }\n+\n+    m_map_keys[id] = key;\n+    return batch.WriteKeyManKey(pubkey, key.GetPrivKey());\n+}\n+\n+std::vector<unsigned char> KeyManager::AddCryptedKeyInner(WalletBatch& batch, const CKey& key, const CPubKey& pubkey)\n+{\n+    AssertLockHeld(cs_keyman);\n+\n+    assert(m_storage.HasEncryptionKeys());\n+    if (m_storage.IsLocked()) {\n+        return {};\n+    }\n+\n+    const CKeyID& id = pubkey.GetID();\n+    const auto& it = m_map_crypted_keys.find(id);\n+    if (it != m_map_crypted_keys.end()) {\n+        return it->second.second;\n+    }\n+\n+    std::vector<unsigned char> crypted_secret;\n+    CKeyingMaterial secret(key.begin(), key.end());\n+    if (!EncryptSecret(m_storage.GetEncryptionKey(), secret, pubkey.GetHash(), crypted_secret)) {\n+        return {};\n+    }\n+\n+    m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+\n+    if (!batch.WriteCryptedKeyManKey(pubkey, crypted_secret)) {\n+        return {};\n+    }\n+\n+    return crypted_secret;\n+}\n+\n+bool KeyManager::AddDescriptorKey(WalletBatch& batch, const uint256& desc_id, const CKey& key, const CPubKey& pubkey)\n+{\n+    LOCK(cs_keyman);\n+    assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, key, pubkey);\n+        if (ckey.empty()) {\n+            return false;\n+        }\n+        return batch.WriteCryptedDescriptorKey(desc_id, pubkey, ckey);\n+    } else {\n+        return AddKeyInner(batch, key, pubkey) && batch.WriteDescriptorKey(desc_id, pubkey, key.GetPrivKey());\n+    }\n+}\n+\n+bool KeyManager::AddHDKey(WalletBatch& batch, const CExtKey& extkey, const CExtPubKey& extpub)\n+{\n+    LOCK(cs_keyman);\n+    const CKeyID& id = extpub.pubkey.GetID();\n+    m_map_xpubs[id] = extpub;\n+    batch.WriteHDPubKey(extpub);\n+\n+    if (m_storage.HasEncryptionKeys()) {\n+        std::vector<unsigned char> ckey = AddCryptedKeyInner(batch, extkey.key, extpub.pubkey);\n+        return !ckey.empty();\n+    } else {\n+        return AddKeyInner(batch, extkey.key, extpub.pubkey);\n+    }\n+}\n+\n+void KeyManager::LoadKey(const CKeyID& key_id, const CKey& key)\n+{\n+    LOCK(cs_keyman);\n+    m_map_keys[key_id] = key;\n+}\n+\n+bool KeyManager::LoadCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& ckey)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    m_map_crypted_keys[key_id] = make_pair(pubkey, ckey);\n+    return true;\n+}\n+\n+void KeyManager::LoadHDKey(const CKeyID& key_id, const CExtPubKey& xpub)\n+{\n+    LOCK(cs_keyman);\n+    m_map_xpubs[key_id] = xpub;\n+}\n+\n+bool KeyManager::CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys)\n+{\n+    LOCK(cs_keyman);\n+    if (!m_map_keys.empty()) {\n+        return false;\n+    }\n+\n+    bool keyPass = m_map_crypted_keys.empty(); // Always pass when there are no encrypted keys\n+    bool keyFail = false;\n+    for (const auto& mi : m_map_crypted_keys) {\n+        const CPubKey& pubkey = mi.second.first;\n+        const std::vector<unsigned char>& crypted_secret = mi.second.second;\n+        CKey key;\n+        if (!DecryptKey(master_key, crypted_secret, pubkey, key)) {\n+            keyFail = true;\n+            break;\n+        }\n+        keyPass = true;\n+        if (m_decryption_thoroughly_checked) {\n+            break;\n+        }\n+    }\n+    if (keyPass && keyFail) {\n+        LogPrintf(\"The wallet is probably corrupted: Some keys decrypt but not all.\\n\");\n+        throw std::runtime_error(\"Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt.\");\n+    }\n+    if (keyFail || (!keyPass && !accept_no_keys)) {\n+        return false;\n+    }\n+    m_decryption_thoroughly_checked = true;\n+    return true;\n+}\n+\n+bool KeyManager::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)\n+{\n+    LOCK(cs_keyman);\n+\n+    // Nothing to encrypt\n+    if (m_map_keys.empty()) {\n+        return true;\n+    }\n+\n+    if (!m_map_crypted_keys.empty()) {\n+        return false;\n+    }\n+\n+    for (const auto& [id, key] : m_map_keys)\n+    {\n+        CPubKey pubkey = key.GetPubKey();\n+        CKeyingMaterial secret(key.begin(), key.end());\n+        std::vector<unsigned char> crypted_secret;\n+        if (!EncryptSecret(master_key, secret, pubkey.GetHash(), crypted_secret)) {\n+            return false;\n+        }\n+        m_map_crypted_keys[id] = make_pair(pubkey, crypted_secret);\n+        batch->WriteCryptedKeyManKey(pubkey, crypted_secret);\n+    }\n+    m_map_keys.clear();\n+    return true;\n+}\n+\n+std::map<CKeyID, CKey> KeyManager::GetKeys() const\n+{\n+    AssertLockHeld(cs_keyman);\n+    if (m_storage.HasEncryptionKeys() && !m_storage.IsLocked()) {\n+        std::map<CKeyID, CKey> keys;\n+        for (const auto& [id, key_pair] : m_map_crypted_keys) {\n+            const auto& [pubkey, crypted_secret] = key_pair;\n+            CKey key;\n+            bool ok = DecryptKey(m_storage.GetEncryptionKey(), crypted_secret, pubkey, key);\n+            assert(ok);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23417#discussion_r977941552",
+      "id" : 977941552,
+      "in_reply_to_id" : 977715219,
+      "line" : 255,
+      "node_id" : "PRRC_kwDOABII5846SjQw",
+      "original_commit_id" : "8c5ddf432dceb084be6612b378dacf9211e8cf08",
+      "original_line" : 255,
+      "original_position" : 255,
+      "original_start_line" : 254,
+      "path" : "src/wallet/keyman.cpp",
+      "position" : 255,
+      "pull_request_review_id" : 1117470735,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23417",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977941552/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 254,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-09-22T17:56:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/977941552",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/22493292?v=4",
+         "events_url" : "https://api.github.com/users/aureleoules/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/aureleoules/followers",
+         "following_url" : "https://api.github.com/users/aureleoules/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/aureleoules/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/aureleoules",
+         "id" : 22493292,
+         "login" : "aureleoules",
+         "node_id" : "MDQ6VXNlcjIyNDkzMjky",
+         "organizations_url" : "https://api.github.com/users/aureleoules/orgs",
+         "received_events_url" : "https://api.github.com/users/aureleoules/received_events",
+         "repos_url" : "https://api.github.com/users/aureleoules/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/aureleoules/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/aureleoules/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/aureleoules"
+      }
    }
 ]
