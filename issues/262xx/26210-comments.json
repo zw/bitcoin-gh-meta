@@ -42,5 +42,49 @@
          "type" : "User",
          "url" : "https://api.github.com/users/ryanofsky"
       }
+   },
+   {
+      "author_association" : "CONTRIBUTOR",
+      "body" : "> `shared_ptr` exists with the purpose of resolving that problem exactly.\r\n\r\nI don't actually think `shared_ptr` is a good solution for allowing clients to unregister from validationinterface generally. It works ok for the wallet, because wallet is already using shared_ptr. But for validationinterface clients that aren't already using shared_ptr, it means they have to start using it, and still have to deal with complications of having notifications arrive after unregistering, even if they don't have to deal with the use-after-free complication anymore.\r\n\r\nI also don't think current solution of having clients call `SyncWithValidationInterfaceQueue` is optimal either. It works ok as long as clients only need to unregister during shutdown. But if they want to unregister other times this could make them wait for a backlog notifications they don't actually depend on.\r\n\r\nJust out of curiousity I looked into whether it would be possible to implement a blocking unregister call that would prevent any notification from arriving after unregistering, and it doesn't look so complicated, so maybe it could be helpful in the future:\r\n\r\n<details><summary>Diff</summary>\r\n<p>\r\n\r\n```diff\r\ndiff --git a/src/validationinterface.cpp b/src/validationinterface.cpp\r\nindex 613c5b65ef6..4f8e88e13e0 100644\r\n--- a/src/validationinterface.cpp\r\n+++ b/src/validationinterface.cpp\r\n@@ -33,9 +33,18 @@ private:\r\n     //! count is equal to the number of current executions of that entry, plus 1\r\n     //! if it's registered. It cannot be 0 because that would imply it is\r\n     //! unregistered and also not being executed (so shouldn't exist).\r\n-    struct ListEntry { std::shared_ptr<CValidationInterface> callbacks; int count = 1; };\r\n+    struct ListEntry { std::shared_ptr<CValidationInterface> callbacks; int count = 1; std::function<void()> on_erase; };\r\n     std::list<ListEntry> m_list GUARDED_BY(m_mutex);\r\n     std::unordered_map<CValidationInterface*, std::list<ListEntry>::iterator> m_map GUARDED_BY(m_mutex);\r\n+    //! Condition variable triggered when callback unregistered and freed.\r\n+    std::condition_variable m_erased;\r\n+\r\n+    std::list<ListEntry>::iterator ListErase(std::list<ListEntry>::iterator it) EXCLUSIVE_LOCKS_REQUIRED(m_mutex)\r\n+    {\r\n+        m_erased.notify_all();\r\n+        if (it->on_erase) it->on_erase();\r\n+        return m_list.erase(it);\r\n+    }\r\n \r\n public:\r\n     // We are not allowed to assume the scheduler only runs in one thread,\r\n@@ -53,13 +62,20 @@ public:\r\n         inserted.first->second->callbacks = std::move(callbacks);\r\n     }\r\n \r\n-    void Unregister(CValidationInterface* callbacks) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\r\n+    void Unregister(CValidationInterface* callbacks, bool block) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\r\n     {\r\n-        LOCK(m_mutex);\r\n+        WAIT_LOCK(m_mutex, lock);\r\n         auto it = m_map.find(callbacks);\r\n         if (it != m_map.end()) {\r\n-            if (!--it->second->count) m_list.erase(it->second);\r\n+            bool free = !--it->second->count;\r\n+            if (free) ListErase(it->second);\r\n             m_map.erase(it);\r\n+            if (!free && block) {\r\n+                bool erased = false;\r\n+                assert(!it->second->on_erase);\r\n+                it->second->on_erase = [&] EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { erased = true; };\r\n+                m_erased.wait(lock, [&] { return erased; });\r\n+            }\r\n         }\r\n     }\r\n \r\n@@ -71,7 +87,7 @@ public:\r\n     {\r\n         LOCK(m_mutex);\r\n         for (const auto& entry : m_map) {\r\n-            if (!--entry.second->count) m_list.erase(entry.second);\r\n+            if (!--entry.second->count) ListErase(entry.second);\r\n         }\r\n         m_map.clear();\r\n     }\r\n@@ -85,7 +101,7 @@ public:\r\n                 REVERSE_LOCK(lock);\r\n                 f(*it->callbacks);\r\n             }\r\n-            it = --it->count ? std::next(it) : m_list.erase(it);\r\n+            it = --it->count ? std::next(it) : ListErase(it);\r\n         }\r\n     }\r\n };\r\n@@ -140,10 +156,10 @@ void UnregisterSharedValidationInterface(std::shared_ptr<CValidationInterface> c\r\n     UnregisterValidationInterface(callbacks.get());\r\n }\r\n \r\n-void UnregisterValidationInterface(CValidationInterface* callbacks)\r\n+void UnregisterValidationInterface(CValidationInterface* callbacks, bool block)\r\n {\r\n     if (g_signals.m_internals) {\r\n-        g_signals.m_internals->Unregister(callbacks);\r\n+        g_signals.m_internals->Unregister(callbacks, block);\r\n     }\r\n }\r\n \r\ndiff --git a/src/validationinterface.h b/src/validationinterface.h\r\nindex a929a3d56bf..75907e89ced 100644\r\n--- a/src/validationinterface.h\r\n+++ b/src/validationinterface.h\r\n@@ -24,7 +24,7 @@ enum class MemPoolRemovalReason;\r\n /** Register subscriber */\r\n void RegisterValidationInterface(CValidationInterface* callbacks);\r\n /** Unregister subscriber. DEPRECATED. This is not safe to use when the RPC server or main message handler thread is running. */\r\n-void UnregisterValidationInterface(CValidationInterface* callbacks);\r\n+void UnregisterValidationInterface(CValidationInterface* callbacks, bool block = false);\r\n /** Unregister all subscribers */\r\n void UnregisterAllValidationInterfaces();\r\n \r\n@@ -181,7 +181,7 @@ private:\r\n     std::unique_ptr<MainSignalsImpl> m_internals;\r\n \r\n     friend void ::RegisterSharedValidationInterface(std::shared_ptr<CValidationInterface>);\r\n-    friend void ::UnregisterValidationInterface(CValidationInterface*);\r\n+    friend void ::UnregisterValidationInterface(CValidationInterface*, bool);\r\n     friend void ::UnregisterAllValidationInterfaces();\r\n     friend void ::CallFunctionInValidationInterfaceQueue(std::function<void ()> func);\r\n \r\n```\r\n\r\n</p>\r\n</details>\r\n\r\nI guess I'm not sure what next steps should be. I'd like to move forward with #26215 and #26188 to fix immediate race and TSAN problems with indexes. And I'd like to move forward with #24230 to switch from indexes from using `RegisterValidationInterface` to `RegisterSharedValidationInterface` without requiring indexes themselves to be `shared_ptrs` with unpredictable lifetimes. After that I do think having a blocking `UnregisterValidationInterface` that stops sending notifications after unregistering could be useful to clean up other problems that may be remaining or that come up in the future.",
+      "created_at" : "2022-09-30T15:00:45Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/issues/26210#issuecomment-1263687952",
+      "id" : 1263687952,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/26210",
+      "node_id" : "IC_kwDOABII585LUlkQ",
+      "performed_via_github_app" : null,
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1263687952/reactions"
+      },
+      "updated_at" : "2022-09-30T15:00:45Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1263687952",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
    }
 ]
