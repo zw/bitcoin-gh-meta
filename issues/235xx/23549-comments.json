@@ -2539,5 +2539,274 @@
          "type" : "User",
          "url" : "https://api.github.com/users/Sjors"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23549#discussion_r987196230"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23549"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/987196230"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "not sure about unconditional logging here. This will fill the disk and there is no way for a user to disable it, unless they turn off all logging.\r\n\r\nIs there a reason to log as opposed to return something to the rpc user?",
+      "commit_id" : "626b7c8493ea1063f30ae4f62e1b36eb87adf685",
+      "created_at" : "2022-10-04T18:14:37Z",
+      "diff_hunk" : "@@ -2186,6 +2204,203 @@ static RPCHelpMan scantxoutset()\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve{false};\n+public:\n+    explicit BlockFiltersScanReserver() = default;\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+        \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+        \"This call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+        {\n+            scan_action_arg_desc,\n+            scan_objects_arg_desc,\n+            RPCArg{\"start_height\", RPCArg::Type::NUM, RPCArg::Default{0}, \"Height to start to scan from\"},\n+            RPCArg{\"stop_height\", RPCArg::Type::NUM, RPCArg::DefaultHint{\"chain tip\"}, \"Height to stop to scan\"},\n+            RPCArg{\"filtertype\", RPCArg::Type::STR, RPCArg::Default{BlockFilterTypeName(BlockFilterType::BASIC)}, \"The type name of the filter\"}\n+        },\n+        {\n+            scan_result_status_none,\n+            RPCResult{\"When action=='start'\", RPCResult::Type::OBJ, \"\", \"\", {\n+                {RPCResult::Type::NUM, \"from_height\", \"The height we started the scan from\"},\n+                {RPCResult::Type::NUM, \"to_height\", \"The height we ended the scan at\"},\n+                {RPCResult::Type::ARR, \"relevant_blocks\", \"\", {{RPCResult::Type::STR_HEX, \"blockhash\", \"A relevant blockhash\"},}},\n+                },\n+            },\n+            RPCResult{\"when action=='status' and a scan is currently in progress\", RPCResult::Type::OBJ, \"\", \"\", {\n+                    {RPCResult::Type::NUM, \"progress\", \"Approximate percent complete\"},\n+                    {RPCResult::Type::NUM, \"current_height\", \"Height of the block currently being scanned\"},\n+                },\n+            },\n+            scan_result_abort,\n+        },\n+        RPCExamples{\n+            HelpExampleCli(\"scanblocks\", \"start '[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]' 300000\") +\n+            HelpExampleCli(\"scanblocks\", \"start '[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]' 100 150 basic\") +\n+            HelpExampleCli(\"scanblocks\", \"status\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"start\\\", [\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"], 300000\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"start\\\", [\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"], 100, 150, \\\"basic\\\"\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"status\\\"\")\n+        },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+{\n+    UniValue ret(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // no scan in progress\n+            return NullUniValue;\n+        }\n+        ret.pushKV(\"progress\", g_scanfilter_progress.load());\n+        ret.pushKV(\"current_height\", g_scanfilter_progress_height.load());\n+        return ret;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // reserve was possible which means no scan was running\n+            return false;\n+        }\n+        // set the abort flag\n+        g_scanfilter_should_abort_scan = true;\n+        return true;\n+    }\n+    else if (request.params[0].get_str() == \"start\") {\n+        BlockFiltersScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        const std::string filtertype_name{request.params[4].isNull() ? \"basic\" : request.params[4].get_str()};\n+\n+        BlockFilterType filtertype;\n+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Unknown filtertype\");\n+        }\n+\n+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);\n+        if (!index) {\n+            throw JSONRPCError(RPC_MISC_ERROR, \"Index is not enabled for filtertype \" + filtertype_name);\n+        }\n+\n+        NodeContext& node = EnsureAnyNodeContext(request.context);\n+        ChainstateManager& chainman = EnsureChainman(node);\n+\n+        // set the start-height\n+        const CBlockIndex* block = nullptr;\n+        const CBlockIndex* stop_block = nullptr;\n+        {\n+            LOCK(cs_main);\n+            CChain& active_chain = chainman.ActiveChain();\n+            block = active_chain.Genesis();\n+            stop_block = active_chain.Tip();\n+            if (!request.params[2].isNull()) {\n+                block = active_chain[request.params[2].getInt<int>()];\n+                if (!block) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid start_height\");\n+                }\n+            }\n+            if (!request.params[3].isNull()) {\n+                stop_block = active_chain[request.params[3].getInt<int>()];\n+                if (!stop_block || stop_block->nHeight < block->nHeight) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid stop_height\");\n+                }\n+            }\n+        }\n+        CHECK_NONFATAL(block);\n+\n+        // loop through the scan objects, add scripts to the needle_set\n+        GCSFilter::ElementSet needle_set;\n+        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {\n+            FlatSigningProvider provider;\n+            std::vector<CScript> scripts = EvalDescriptorStringOrObject(scanobject, provider);\n+            for (const CScript& script : scripts) {\n+                needle_set.emplace(script.begin(), script.end());\n+            }\n+        }\n+        UniValue blocks(UniValue::VARR);\n+        const int amount_per_chunk = 10000;\n+        const CBlockIndex* start_index = block; // for remembering the start of a blockfilter range\n+        std::vector<BlockFilter> filters;\n+        const CBlockIndex* start_block = block; // for progress reporting\n+        const int total_blocks_to_process = stop_block->nHeight - start_block->nHeight;\n+\n+        g_scanfilter_should_abort_scan = false;\n+        g_scanfilter_progress = 0;\n+        g_scanfilter_progress_height = start_block->nHeight;\n+\n+        while (block) {\n+            node.rpc_interruption_point(); // allow a clean shutdown\n+            if (g_scanfilter_should_abort_scan) {\n+                LogPrintf(\"scanblocks RPC aborted at height %d.\\n\", block->nHeight);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23549#discussion_r987196230",
+      "id" : 987196230,
+      "line" : 2358,
+      "node_id" : "PRRC_kwDOABII584612tG",
+      "original_commit_id" : "626b7c8493ea1063f30ae4f62e1b36eb87adf685",
+      "original_line" : 2358,
+      "original_position" : 236,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 236,
+      "pull_request_review_id" : 1130417346,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23549",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/987196230/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-10-04T18:18:37Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/987196230",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23549#discussion_r987197781"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23549"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/987197781"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit: If this logging is for debugging, maybe put this in the debug category?\r\n\r\nThough, I wonder what the use is, given that this will be returned to the RPC user anyway, so there would be no need to persist this in the debug log?",
+      "commit_id" : "626b7c8493ea1063f30ae4f62e1b36eb87adf685",
+      "created_at" : "2022-10-04T18:16:27Z",
+      "diff_hunk" : "@@ -2186,6 +2204,203 @@ static RPCHelpMan scantxoutset()\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve{false};\n+public:\n+    explicit BlockFiltersScanReserver() = default;\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+        \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+        \"This call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+        {\n+            scan_action_arg_desc,\n+            scan_objects_arg_desc,\n+            RPCArg{\"start_height\", RPCArg::Type::NUM, RPCArg::Default{0}, \"Height to start to scan from\"},\n+            RPCArg{\"stop_height\", RPCArg::Type::NUM, RPCArg::DefaultHint{\"chain tip\"}, \"Height to stop to scan\"},\n+            RPCArg{\"filtertype\", RPCArg::Type::STR, RPCArg::Default{BlockFilterTypeName(BlockFilterType::BASIC)}, \"The type name of the filter\"}\n+        },\n+        {\n+            scan_result_status_none,\n+            RPCResult{\"When action=='start'\", RPCResult::Type::OBJ, \"\", \"\", {\n+                {RPCResult::Type::NUM, \"from_height\", \"The height we started the scan from\"},\n+                {RPCResult::Type::NUM, \"to_height\", \"The height we ended the scan at\"},\n+                {RPCResult::Type::ARR, \"relevant_blocks\", \"\", {{RPCResult::Type::STR_HEX, \"blockhash\", \"A relevant blockhash\"},}},\n+                },\n+            },\n+            RPCResult{\"when action=='status' and a scan is currently in progress\", RPCResult::Type::OBJ, \"\", \"\", {\n+                    {RPCResult::Type::NUM, \"progress\", \"Approximate percent complete\"},\n+                    {RPCResult::Type::NUM, \"current_height\", \"Height of the block currently being scanned\"},\n+                },\n+            },\n+            scan_result_abort,\n+        },\n+        RPCExamples{\n+            HelpExampleCli(\"scanblocks\", \"start '[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]' 300000\") +\n+            HelpExampleCli(\"scanblocks\", \"start '[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]' 100 150 basic\") +\n+            HelpExampleCli(\"scanblocks\", \"status\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"start\\\", [\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"], 300000\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"start\\\", [\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"], 100, 150, \\\"basic\\\"\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"status\\\"\")\n+        },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+{\n+    UniValue ret(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // no scan in progress\n+            return NullUniValue;\n+        }\n+        ret.pushKV(\"progress\", g_scanfilter_progress.load());\n+        ret.pushKV(\"current_height\", g_scanfilter_progress_height.load());\n+        return ret;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // reserve was possible which means no scan was running\n+            return false;\n+        }\n+        // set the abort flag\n+        g_scanfilter_should_abort_scan = true;\n+        return true;\n+    }\n+    else if (request.params[0].get_str() == \"start\") {\n+        BlockFiltersScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        const std::string filtertype_name{request.params[4].isNull() ? \"basic\" : request.params[4].get_str()};\n+\n+        BlockFilterType filtertype;\n+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Unknown filtertype\");\n+        }\n+\n+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);\n+        if (!index) {\n+            throw JSONRPCError(RPC_MISC_ERROR, \"Index is not enabled for filtertype \" + filtertype_name);\n+        }\n+\n+        NodeContext& node = EnsureAnyNodeContext(request.context);\n+        ChainstateManager& chainman = EnsureChainman(node);\n+\n+        // set the start-height\n+        const CBlockIndex* block = nullptr;\n+        const CBlockIndex* stop_block = nullptr;\n+        {\n+            LOCK(cs_main);\n+            CChain& active_chain = chainman.ActiveChain();\n+            block = active_chain.Genesis();\n+            stop_block = active_chain.Tip();\n+            if (!request.params[2].isNull()) {\n+                block = active_chain[request.params[2].getInt<int>()];\n+                if (!block) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid start_height\");\n+                }\n+            }\n+            if (!request.params[3].isNull()) {\n+                stop_block = active_chain[request.params[3].getInt<int>()];\n+                if (!stop_block || stop_block->nHeight < block->nHeight) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid stop_height\");\n+                }\n+            }\n+        }\n+        CHECK_NONFATAL(block);\n+\n+        // loop through the scan objects, add scripts to the needle_set\n+        GCSFilter::ElementSet needle_set;\n+        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {\n+            FlatSigningProvider provider;\n+            std::vector<CScript> scripts = EvalDescriptorStringOrObject(scanobject, provider);\n+            for (const CScript& script : scripts) {\n+                needle_set.emplace(script.begin(), script.end());\n+            }\n+        }\n+        UniValue blocks(UniValue::VARR);\n+        const int amount_per_chunk = 10000;\n+        const CBlockIndex* start_index = block; // for remembering the start of a blockfilter range\n+        std::vector<BlockFilter> filters;\n+        const CBlockIndex* start_block = block; // for progress reporting\n+        const int total_blocks_to_process = stop_block->nHeight - start_block->nHeight;\n+\n+        g_scanfilter_should_abort_scan = false;\n+        g_scanfilter_progress = 0;\n+        g_scanfilter_progress_height = start_block->nHeight;\n+\n+        while (block) {\n+            node.rpc_interruption_point(); // allow a clean shutdown\n+            if (g_scanfilter_should_abort_scan) {\n+                LogPrintf(\"scanblocks RPC aborted at height %d.\\n\", block->nHeight);\n+                break;\n+            }\n+            const CBlockIndex* next = nullptr;\n+            {\n+                LOCK(cs_main);\n+                CChain& active_chain = chainman.ActiveChain();\n+                next = active_chain.Next(block);\n+                if (block == stop_block) next = nullptr;\n+            }\n+            if (start_index->nHeight + amount_per_chunk == block->nHeight || next == nullptr) {\n+                LogPrint(BCLog::RPC, \"Fetching blockfilters from height %d to height %d.\\n\", start_index->nHeight, block->nHeight);\n+                if (index->LookupFilterRange(start_index->nHeight, block, filters)) {\n+                    for (const BlockFilter& filter : filters) {\n+                        // compare the elements-set with each filter\n+                        if (filter.GetFilter().MatchAny(needle_set)) {\n+                            blocks.push_back(filter.GetBlockHash().GetHex());\n+                            LogPrint(BCLog::RPC, \"scanblocks: found match in %s\\n\", filter.GetBlockHash().GetHex());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23549#discussion_r987197781",
+      "id" : 987197781,
+      "line" : 2375,
+      "node_id" : "PRRC_kwDOABII584613FV",
+      "original_commit_id" : "626b7c8493ea1063f30ae4f62e1b36eb87adf685",
+      "original_line" : 2375,
+      "original_position" : 253,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 253,
+      "pull_request_review_id" : 1130417346,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23549",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/987197781/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-10-04T18:19:19Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/987197781",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23549#discussion_r987197873"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23549"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/987197873"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "same?",
+      "commit_id" : "626b7c8493ea1063f30ae4f62e1b36eb87adf685",
+      "created_at" : "2022-10-04T18:16:36Z",
+      "diff_hunk" : "@@ -2186,6 +2204,203 @@ static RPCHelpMan scantxoutset()\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve{false};\n+public:\n+    explicit BlockFiltersScanReserver() = default;\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+        \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+        \"This call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+        {\n+            scan_action_arg_desc,\n+            scan_objects_arg_desc,\n+            RPCArg{\"start_height\", RPCArg::Type::NUM, RPCArg::Default{0}, \"Height to start to scan from\"},\n+            RPCArg{\"stop_height\", RPCArg::Type::NUM, RPCArg::DefaultHint{\"chain tip\"}, \"Height to stop to scan\"},\n+            RPCArg{\"filtertype\", RPCArg::Type::STR, RPCArg::Default{BlockFilterTypeName(BlockFilterType::BASIC)}, \"The type name of the filter\"}\n+        },\n+        {\n+            scan_result_status_none,\n+            RPCResult{\"When action=='start'\", RPCResult::Type::OBJ, \"\", \"\", {\n+                {RPCResult::Type::NUM, \"from_height\", \"The height we started the scan from\"},\n+                {RPCResult::Type::NUM, \"to_height\", \"The height we ended the scan at\"},\n+                {RPCResult::Type::ARR, \"relevant_blocks\", \"\", {{RPCResult::Type::STR_HEX, \"blockhash\", \"A relevant blockhash\"},}},\n+                },\n+            },\n+            RPCResult{\"when action=='status' and a scan is currently in progress\", RPCResult::Type::OBJ, \"\", \"\", {\n+                    {RPCResult::Type::NUM, \"progress\", \"Approximate percent complete\"},\n+                    {RPCResult::Type::NUM, \"current_height\", \"Height of the block currently being scanned\"},\n+                },\n+            },\n+            scan_result_abort,\n+        },\n+        RPCExamples{\n+            HelpExampleCli(\"scanblocks\", \"start '[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]' 300000\") +\n+            HelpExampleCli(\"scanblocks\", \"start '[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]' 100 150 basic\") +\n+            HelpExampleCli(\"scanblocks\", \"status\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"start\\\", [\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"], 300000\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"start\\\", [\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"], 100, 150, \\\"basic\\\"\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"status\\\"\")\n+        },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+{\n+    UniValue ret(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // no scan in progress\n+            return NullUniValue;\n+        }\n+        ret.pushKV(\"progress\", g_scanfilter_progress.load());\n+        ret.pushKV(\"current_height\", g_scanfilter_progress_height.load());\n+        return ret;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // reserve was possible which means no scan was running\n+            return false;\n+        }\n+        // set the abort flag\n+        g_scanfilter_should_abort_scan = true;\n+        return true;\n+    }\n+    else if (request.params[0].get_str() == \"start\") {\n+        BlockFiltersScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        const std::string filtertype_name{request.params[4].isNull() ? \"basic\" : request.params[4].get_str()};\n+\n+        BlockFilterType filtertype;\n+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Unknown filtertype\");\n+        }\n+\n+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);\n+        if (!index) {\n+            throw JSONRPCError(RPC_MISC_ERROR, \"Index is not enabled for filtertype \" + filtertype_name);\n+        }\n+\n+        NodeContext& node = EnsureAnyNodeContext(request.context);\n+        ChainstateManager& chainman = EnsureChainman(node);\n+\n+        // set the start-height\n+        const CBlockIndex* block = nullptr;\n+        const CBlockIndex* stop_block = nullptr;\n+        {\n+            LOCK(cs_main);\n+            CChain& active_chain = chainman.ActiveChain();\n+            block = active_chain.Genesis();\n+            stop_block = active_chain.Tip();\n+            if (!request.params[2].isNull()) {\n+                block = active_chain[request.params[2].getInt<int>()];\n+                if (!block) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid start_height\");\n+                }\n+            }\n+            if (!request.params[3].isNull()) {\n+                stop_block = active_chain[request.params[3].getInt<int>()];\n+                if (!stop_block || stop_block->nHeight < block->nHeight) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid stop_height\");\n+                }\n+            }\n+        }\n+        CHECK_NONFATAL(block);\n+\n+        // loop through the scan objects, add scripts to the needle_set\n+        GCSFilter::ElementSet needle_set;\n+        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {\n+            FlatSigningProvider provider;\n+            std::vector<CScript> scripts = EvalDescriptorStringOrObject(scanobject, provider);\n+            for (const CScript& script : scripts) {\n+                needle_set.emplace(script.begin(), script.end());\n+            }\n+        }\n+        UniValue blocks(UniValue::VARR);\n+        const int amount_per_chunk = 10000;\n+        const CBlockIndex* start_index = block; // for remembering the start of a blockfilter range\n+        std::vector<BlockFilter> filters;\n+        const CBlockIndex* start_block = block; // for progress reporting\n+        const int total_blocks_to_process = stop_block->nHeight - start_block->nHeight;\n+\n+        g_scanfilter_should_abort_scan = false;\n+        g_scanfilter_progress = 0;\n+        g_scanfilter_progress_height = start_block->nHeight;\n+\n+        while (block) {\n+            node.rpc_interruption_point(); // allow a clean shutdown\n+            if (g_scanfilter_should_abort_scan) {\n+                LogPrintf(\"scanblocks RPC aborted at height %d.\\n\", block->nHeight);\n+                break;\n+            }\n+            const CBlockIndex* next = nullptr;\n+            {\n+                LOCK(cs_main);\n+                CChain& active_chain = chainman.ActiveChain();\n+                next = active_chain.Next(block);\n+                if (block == stop_block) next = nullptr;\n+            }\n+            if (start_index->nHeight + amount_per_chunk == block->nHeight || next == nullptr) {\n+                LogPrint(BCLog::RPC, \"Fetching blockfilters from height %d to height %d.\\n\", start_index->nHeight, block->nHeight);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23549#discussion_r987197873",
+      "id" : 987197873,
+      "line" : 2369,
+      "node_id" : "PRRC_kwDOABII584613Gx",
+      "original_commit_id" : "626b7c8493ea1063f30ae4f62e1b36eb87adf685",
+      "original_line" : 2369,
+      "original_position" : 247,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 247,
+      "pull_request_review_id" : 1130417346,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23549",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/987197873/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-10-04T18:18:37Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/987197873",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/23549#discussion_r993571833"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23549"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/993571833"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "yeah, wouldn't be bad to return a \"completed\" flag inside the return object.",
+      "commit_id" : "626b7c8493ea1063f30ae4f62e1b36eb87adf685",
+      "created_at" : "2022-10-12T14:53:17Z",
+      "diff_hunk" : "@@ -2186,6 +2204,203 @@ static RPCHelpMan scantxoutset()\n     };\n }\n \n+/** RAII object to prevent concurrency issue when scanning blockfilters */\n+static std::atomic<int> g_scanfilter_progress;\n+static std::atomic<int> g_scanfilter_progress_height;\n+static std::atomic<bool> g_scanfilter_in_progress;\n+static std::atomic<bool> g_scanfilter_should_abort_scan;\n+class BlockFiltersScanReserver\n+{\n+private:\n+    bool m_could_reserve{false};\n+public:\n+    explicit BlockFiltersScanReserver() = default;\n+\n+    bool reserve() {\n+        CHECK_NONFATAL(!m_could_reserve);\n+        if (g_scanfilter_in_progress.exchange(true)) {\n+            return false;\n+        }\n+        m_could_reserve = true;\n+        return true;\n+    }\n+\n+    ~BlockFiltersScanReserver() {\n+        if (m_could_reserve) {\n+            g_scanfilter_in_progress = false;\n+        }\n+    }\n+};\n+\n+static RPCHelpMan scanblocks()\n+{\n+    return RPCHelpMan{\"scanblocks\",\n+        \"\\nReturn relevant blockhashes for given descriptors.\\n\"\n+        \"This call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)\",\n+        {\n+            scan_action_arg_desc,\n+            scan_objects_arg_desc,\n+            RPCArg{\"start_height\", RPCArg::Type::NUM, RPCArg::Default{0}, \"Height to start to scan from\"},\n+            RPCArg{\"stop_height\", RPCArg::Type::NUM, RPCArg::DefaultHint{\"chain tip\"}, \"Height to stop to scan\"},\n+            RPCArg{\"filtertype\", RPCArg::Type::STR, RPCArg::Default{BlockFilterTypeName(BlockFilterType::BASIC)}, \"The type name of the filter\"}\n+        },\n+        {\n+            scan_result_status_none,\n+            RPCResult{\"When action=='start'\", RPCResult::Type::OBJ, \"\", \"\", {\n+                {RPCResult::Type::NUM, \"from_height\", \"The height we started the scan from\"},\n+                {RPCResult::Type::NUM, \"to_height\", \"The height we ended the scan at\"},\n+                {RPCResult::Type::ARR, \"relevant_blocks\", \"\", {{RPCResult::Type::STR_HEX, \"blockhash\", \"A relevant blockhash\"},}},\n+                },\n+            },\n+            RPCResult{\"when action=='status' and a scan is currently in progress\", RPCResult::Type::OBJ, \"\", \"\", {\n+                    {RPCResult::Type::NUM, \"progress\", \"Approximate percent complete\"},\n+                    {RPCResult::Type::NUM, \"current_height\", \"Height of the block currently being scanned\"},\n+                },\n+            },\n+            scan_result_abort,\n+        },\n+        RPCExamples{\n+            HelpExampleCli(\"scanblocks\", \"start '[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]' 300000\") +\n+            HelpExampleCli(\"scanblocks\", \"start '[\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"]' 100 150 basic\") +\n+            HelpExampleCli(\"scanblocks\", \"status\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"start\\\", [\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"], 300000\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"start\\\", [\\\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\\\"], 100, 150, \\\"basic\\\"\") +\n+            HelpExampleRpc(\"scanblocks\", \"\\\"status\\\"\")\n+        },\n+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue\n+{\n+    UniValue ret(UniValue::VOBJ);\n+    if (request.params[0].get_str() == \"status\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // no scan in progress\n+            return NullUniValue;\n+        }\n+        ret.pushKV(\"progress\", g_scanfilter_progress.load());\n+        ret.pushKV(\"current_height\", g_scanfilter_progress_height.load());\n+        return ret;\n+    } else if (request.params[0].get_str() == \"abort\") {\n+        BlockFiltersScanReserver reserver;\n+        if (reserver.reserve()) {\n+            // reserve was possible which means no scan was running\n+            return false;\n+        }\n+        // set the abort flag\n+        g_scanfilter_should_abort_scan = true;\n+        return true;\n+    }\n+    else if (request.params[0].get_str() == \"start\") {\n+        BlockFiltersScanReserver reserver;\n+        if (!reserver.reserve()) {\n+            throw JSONRPCError(RPC_INVALID_PARAMETER, \"Scan already in progress, use action \\\"abort\\\" or \\\"status\\\"\");\n+        }\n+        const std::string filtertype_name{request.params[4].isNull() ? \"basic\" : request.params[4].get_str()};\n+\n+        BlockFilterType filtertype;\n+        if (!BlockFilterTypeByName(filtertype_name, filtertype)) {\n+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, \"Unknown filtertype\");\n+        }\n+\n+        BlockFilterIndex* index = GetBlockFilterIndex(filtertype);\n+        if (!index) {\n+            throw JSONRPCError(RPC_MISC_ERROR, \"Index is not enabled for filtertype \" + filtertype_name);\n+        }\n+\n+        NodeContext& node = EnsureAnyNodeContext(request.context);\n+        ChainstateManager& chainman = EnsureChainman(node);\n+\n+        // set the start-height\n+        const CBlockIndex* block = nullptr;\n+        const CBlockIndex* stop_block = nullptr;\n+        {\n+            LOCK(cs_main);\n+            CChain& active_chain = chainman.ActiveChain();\n+            block = active_chain.Genesis();\n+            stop_block = active_chain.Tip();\n+            if (!request.params[2].isNull()) {\n+                block = active_chain[request.params[2].getInt<int>()];\n+                if (!block) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid start_height\");\n+                }\n+            }\n+            if (!request.params[3].isNull()) {\n+                stop_block = active_chain[request.params[3].getInt<int>()];\n+                if (!stop_block || stop_block->nHeight < block->nHeight) {\n+                    throw JSONRPCError(RPC_MISC_ERROR, \"Invalid stop_height\");\n+                }\n+            }\n+        }\n+        CHECK_NONFATAL(block);\n+\n+        // loop through the scan objects, add scripts to the needle_set\n+        GCSFilter::ElementSet needle_set;\n+        for (const UniValue& scanobject : request.params[1].get_array().getValues()) {\n+            FlatSigningProvider provider;\n+            std::vector<CScript> scripts = EvalDescriptorStringOrObject(scanobject, provider);\n+            for (const CScript& script : scripts) {\n+                needle_set.emplace(script.begin(), script.end());\n+            }\n+        }\n+        UniValue blocks(UniValue::VARR);\n+        const int amount_per_chunk = 10000;\n+        const CBlockIndex* start_index = block; // for remembering the start of a blockfilter range\n+        std::vector<BlockFilter> filters;\n+        const CBlockIndex* start_block = block; // for progress reporting\n+        const int total_blocks_to_process = stop_block->nHeight - start_block->nHeight;\n+\n+        g_scanfilter_should_abort_scan = false;\n+        g_scanfilter_progress = 0;\n+        g_scanfilter_progress_height = start_block->nHeight;\n+\n+        while (block) {\n+            node.rpc_interruption_point(); // allow a clean shutdown\n+            if (g_scanfilter_should_abort_scan) {\n+                LogPrintf(\"scanblocks RPC aborted at height %d.\\n\", block->nHeight);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/23549#discussion_r993571833",
+      "id" : 993571833,
+      "in_reply_to_id" : 987196230,
+      "line" : 2358,
+      "node_id" : "PRRC_kwDOABII5847OLP5",
+      "original_commit_id" : "626b7c8493ea1063f30ae4f62e1b36eb87adf685",
+      "original_line" : 2358,
+      "original_position" : 236,
+      "original_start_line" : null,
+      "path" : "src/rpc/blockchain.cpp",
+      "position" : 236,
+      "pull_request_review_id" : 1139249359,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/23549",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/993571833/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-10-12T14:53:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/993571833",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5377650?v=4",
+         "events_url" : "https://api.github.com/users/furszy/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/furszy/followers",
+         "following_url" : "https://api.github.com/users/furszy/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/furszy/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/furszy",
+         "id" : 5377650,
+         "login" : "furszy",
+         "node_id" : "MDQ6VXNlcjUzNzc2NTA=",
+         "organizations_url" : "https://api.github.com/users/furszy/orgs",
+         "received_events_url" : "https://api.github.com/users/furszy/received_events",
+         "repos_url" : "https://api.github.com/users/furszy/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/furszy/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/furszy/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/furszy"
+      }
    }
 ]
