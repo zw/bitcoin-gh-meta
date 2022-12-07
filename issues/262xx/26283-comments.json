@@ -4408,5 +4408,72 @@
          "type" : "User",
          "url" : "https://api.github.com/users/dergoegge"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26283#discussion_r1042464406"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26283"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1042464406"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This throws a `std::bad_variant_access` for peers that aren't fully registered yet (found by the fuzzer).\r\n\r\nMaybe create an internal helper method that only iterates through all fully registered peers/states to avoid this entirely?",
+      "commit_id" : "e480bed66158971493c2af51a72acaec582e8f01",
+      "created_at" : "2022-12-07T17:02:17Z",
+      "diff_hunk" : "@@ -121,26 +201,184 @@ class TxReconciliationTracker::Impl\n \n         const uint256 full_salt{ComputeSalt(local_salt, remote_salt)};\n         recon_state->second = TxReconciliationState(!is_peer_inbound, full_salt.GetUint64(0), full_salt.GetUint64(1));\n+        m_queue.push_back(peer_id);\n         return ReconciliationRegisterResult::SUCCESS;\n     }\n \n+    void AddToSet(NodeId peer_id, const std::vector<uint256>& txs_to_reconcile) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        Assume(txs_to_reconcile.size() > 0);\n+        LOCK(m_txreconciliation_mutex);\n+        assert(IsPeerRegistered(peer_id));\n+        auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        size_t added = 0;\n+        for (auto& wtxid : txs_to_reconcile) {\n+            added += recon_state.m_local_set.insert(wtxid).second;\n+        }\n+\n+        LogPrint(BCLog::TXRECONCILIATION, \"Added %i new transactions to the reconciliation set for peer=%d. \" /* Continued */\n+                                          \"Now the set contains %i transactions.\\n\",\n+                 added, peer_id, recon_state.m_local_set.size());\n+    }\n+\n+    void TryRemovingFromSet(NodeId peer_id, const uint256& wtxid_to_remove) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        assert(IsPeerRegistered(peer_id));\n+        auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        recon_state.m_local_set.erase(wtxid_to_remove);\n+    }\n+\n+    std::optional<std::pair<uint16_t, uint16_t>> MaybeRequestReconciliation(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        if (!IsPeerRegistered(peer_id)) return std::nullopt;\n+        auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        if (!recon_state.m_we_initiate) return std::nullopt;\n+\n+        if (!m_queue.empty()) {\n+            // Request transaction reconciliation periodically to efficiently exchange transactions.\n+            // To make reconciliation predictable and efficient, we reconcile with peers in order\n+            // based on the queue, taking a delay between requests.\n+            auto current_time = GetTime<std::chrono::seconds>();\n+            if (m_next_recon_request <= current_time && m_queue.front() == peer_id) {\n+                m_queue.pop_front();\n+                m_queue.push_back(peer_id);\n+                UpdateNextReconRequest(current_time);\n+                if (recon_state.m_phase_init_by_us != Phase::NONE) return std::nullopt;\n+                recon_state.m_phase_init_by_us = Phase::INIT_REQUESTED;\n+\n+                size_t local_set_size = recon_state.m_local_set.size();\n+\n+                LogPrint(BCLog::TXRECONCILIATION, \"Initiate reconciliation with peer=%d with the following params: \" /* Continued */\n+                                                  \"local_set_size=%i\\n\",\n+                         peer_id, local_set_size);\n+\n+                // In future, Q could be recomputed after every reconciliation based on the\n+                // set differences. For now, it provides good enough results without recompute\n+                // complexity, but we communicate it here to allow backward compatibility if\n+                // the value is changed or made dynamic.\n+                return std::make_pair(local_set_size, Q * Q_PRECISION);\n+            }\n+        }\n+        return std::nullopt;\n+    }\n+\n+    size_t GetPeerSetSize(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        assert(IsPeerRegistered(peer_id));\n+        const auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        return recon_state.m_local_set.size();\n+    }\n+\n     void ForgetPeer(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n     {\n         AssertLockNotHeld(m_txreconciliation_mutex);\n         LOCK(m_txreconciliation_mutex);\n         if (m_states.erase(peer_id)) {\n+            m_queue.erase(std::remove(m_queue.begin(), m_queue.end(), peer_id), m_queue.end());\n             LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, \"Forget txreconciliation state of peer=%d\\n\", peer_id);\n         }\n     }\n \n-    bool IsPeerRegistered(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    bool IsPeerRegistered(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n     {\n-        AssertLockNotHeld(m_txreconciliation_mutex);\n-        LOCK(m_txreconciliation_mutex);\n+        AssertLockHeld(m_txreconciliation_mutex);\n         auto recon_state = m_states.find(peer_id);\n         return (recon_state != m_states.end() &&\n                 std::holds_alternative<TxReconciliationState>(recon_state->second));\n     }\n+\n+    bool IsPeerRegisteredExternal(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        return IsPeerRegistered(peer_id);\n+    }\n+\n+    bool ShouldFloodTo(NodeId peer_id, const uint256& wtxid) const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        if (!IsPeerRegistered(peer_id)) return true;\n+        const auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        std::vector<NodeId> eligible_peers;\n+        const bool we_initiate = recon_state.m_we_initiate;\n+        // Find all peers of the same reconciliation direction.\n+        std::for_each(m_states.begin(), m_states.end(),\n+                      [&eligible_peers, we_initiate](auto indexed_state) {\n+                          const auto& cur_state = std::get<TxReconciliationState>(indexed_state.second);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26283#discussion_r1042464406",
+      "id" : 1042464406,
+      "line" : 320,
+      "node_id" : "PRRC_kwDOABII584-Ir6W",
+      "original_commit_id" : "e480bed66158971493c2af51a72acaec582e8f01",
+      "original_line" : 320,
+      "original_position" : 240,
+      "original_start_line" : null,
+      "path" : "src/node/txreconciliation.cpp",
+      "position" : 240,
+      "pull_request_review_id" : 1208800680,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26283",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1042464406/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-12-07T17:02:18Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1042464406",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8077169?v=4",
+         "events_url" : "https://api.github.com/users/dergoegge/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/dergoegge/followers",
+         "following_url" : "https://api.github.com/users/dergoegge/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/dergoegge/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/dergoegge",
+         "id" : 8077169,
+         "login" : "dergoegge",
+         "node_id" : "MDQ6VXNlcjgwNzcxNjk=",
+         "organizations_url" : "https://api.github.com/users/dergoegge/orgs",
+         "received_events_url" : "https://api.github.com/users/dergoegge/received_events",
+         "repos_url" : "https://api.github.com/users/dergoegge/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/dergoegge/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/dergoegge/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/dergoegge"
+      }
    }
 ]
