@@ -557,6 +557,74 @@
       }
    },
    {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25234#discussion_r914966747"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25234"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/914966747"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Yes, it should be the same benchmark times for all cases, so it doesn't make sense to run it separately for each `OutputType`.",
+      "commit_id" : "b2ec705072d85ce73c9aef1110a9afb78c5362cb",
+      "created_at" : "2022-07-06T15:16:38Z",
+      "diff_hunk" : "@@ -0,0 +1,128 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <bench/bench.h>\n+#include <chainparams.h>\n+#include <consensus/merkle.h>\n+#include <node/context.h>\n+#include <test/util/setup_common.h>\n+#include <test/util/wallet.h>\n+#include <validation.h>\n+#include <wallet/spend.h>\n+#include <wallet/wallet.h>\n+\n+using wallet::CWallet;\n+using wallet::CreateMockWalletDatabase;\n+using wallet::DBErrors;\n+using wallet::WALLET_FLAG_DESCRIPTORS;\n+\n+struct TipBlock\n+{\n+    uint256 prev_block_hash;\n+    int64_t prev_block_time;\n+    int tip_height;\n+};\n+\n+TipBlock getTip(const CChainParams& params, const node::NodeContext& context)\n+{\n+    auto tip = context.chainman->ActiveTip();\n+    return (tip) ? TipBlock{tip->GetBlockHash(), tip->GetBlockTime(), tip->nHeight} :\n+           TipBlock{params.GenesisBlock().GetHash(), params.GenesisBlock().GetBlockTime(), 0};\n+}\n+\n+void generateFakeBlock(const CChainParams& params,\n+                       const node::NodeContext& context,\n+                       CWallet& wallet,\n+                       const CScript& coinbase_out_script)\n+{\n+    TipBlock tip{getTip(params, context)};\n+\n+    // Create block\n+    CBlock block;\n+    CMutableTransaction coinbase_tx;\n+    coinbase_tx.vin.resize(1);\n+    coinbase_tx.vin[0].prevout.SetNull();\n+    coinbase_tx.vout.resize(2);\n+    coinbase_tx.vout[0].scriptPubKey = coinbase_out_script;\n+    coinbase_tx.vout[0].nValue = 49 * COIN;\n+    coinbase_tx.vin[0].scriptSig = CScript() << ++tip.tip_height << OP_0;\n+    coinbase_tx.vout[1].scriptPubKey = coinbase_out_script; // extra output\n+    coinbase_tx.vout[1].nValue = 1 * COIN;\n+    block.vtx = {MakeTransactionRef(std::move(coinbase_tx))};\n+\n+    block.nVersion = VERSIONBITS_LAST_OLD_BLOCK_VERSION;\n+    block.hashPrevBlock = tip.prev_block_hash;\n+    block.hashMerkleRoot = BlockMerkleRoot(block);\n+    block.nTime = ++tip.prev_block_time;\n+    block.nBits = params.GenesisBlock().nBits;\n+    block.nNonce = 0;\n+\n+    {\n+        LOCK(::cs_main);\n+        // Add it to the index\n+        CBlockIndex *pindex{context.chainman->m_blockman.AddToBlockIndex(block, context.chainman->m_best_header)};\n+        // add it to the chain\n+        context.chainman->ActiveChain().SetTip(pindex);\n+    }\n+\n+    // notify wallet\n+    wallet.blockConnected(block, tip.tip_height);\n+}\n+\n+static void WalletAvailableCoins(benchmark::Bench& bench, const std::vector<OutputType>& output_type)\n+{\n+    const auto test_setup = MakeNoLogFileContext<const TestingSetup>();\n+\n+    CWallet wallet{test_setup->m_node.chain.get(), \"\", gArgs, CreateMockWalletDatabase()};\n+    {\n+        LOCK(wallet.cs_wallet);\n+        if (std::any_of(output_type.begin(), output_type.end(), [](OutputType type){return type > OutputType::LEGACY;})) {\n+            wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);\n+            wallet.SetupDescriptorScriptPubKeyMans();\n+        }\n+        if (std::any_of(output_type.begin(), output_type.end(), [](OutputType type){return type == OutputType::LEGACY;})) {\n+            wallet.SetupLegacyScriptPubKeyMan();\n+        }\n+        if (wallet.LoadWallet() != DBErrors::LOAD_OK) assert(false);\n+    }\n+\n+    // Generate destinations\n+    std::vector<CScript> dest_wallet;\n+    for (auto type : output_type) {\n+        dest_wallet.emplace_back(GetScriptForDestination(getNewDestination(wallet, type)));\n+    }\n+\n+    // Generate chain; each coinbase will have two outputs to fill-up the wallet\n+    const auto& params = Params();\n+    unsigned int chain_size = 1000;\n+    for (unsigned int i = 0; i < chain_size / dest_wallet.size(); ++i) {\n+        for (auto dest : dest_wallet) {\n+            generateFakeBlock(params, test_setup->m_node, wallet, dest);\n+        }\n+    }\n+\n+    // Check available balance\n+    auto bal = wallet::GetAvailableBalance(wallet); // Cache\n+    assert(bal == 50 * COIN * (chain_size - COINBASE_MATURITY));\n+\n+    bench.epochIterations(2).run([&] {\n+        LOCK(wallet.cs_wallet);\n+        std::vector<wallet::COutput> vCoins;\n+        wallet::AvailableCoins(wallet, vCoins);\n+\n+        assert(vCoins.size() == (chain_size - COINBASE_MATURITY) * 2);\n+    });\n+}\n+\n+static void WalletAvailableCoinsOnlyBech32M(benchmark::Bench& bench) { WalletAvailableCoins(bench, {OutputType::BECH32M}); }\n+static void WalletAvailableCoinsOnlyBech32(benchmark::Bench& bench) { WalletAvailableCoins(bench, {OutputType::BECH32}); }\n+static void WalletAvailableCoinsOnlyP2SH_SEGWIT(benchmark::Bench& bench) { WalletAvailableCoins(bench, {OutputType::P2SH_SEGWIT}); }\n+static void WalletAvailableCoinsOnlyLegacy(benchmark::Bench& bench) { WalletAvailableCoins(bench, {OutputType::LEGACY}); }\n+static void WalletAvailableCoinsMulti(benchmark::Bench& bench) { WalletAvailableCoins(bench, {OutputType::LEGACY, OutputType::BECH32M, OutputType::BECH32, OutputType::P2SH_SEGWIT}); }\n+\n+BENCHMARK(WalletAvailableCoinsOnlyBech32M);\n+BENCHMARK(WalletAvailableCoinsOnlyBech32);\n+BENCHMARK(WalletAvailableCoinsOnlyP2SH_SEGWIT);\n+BENCHMARK(WalletAvailableCoinsOnlyLegacy);\n+BENCHMARK(WalletAvailableCoinsMulti);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25234#discussion_r914966747",
+      "id" : 914966747,
+      "in_reply_to_id" : 888279929,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII5842iUjb",
+      "original_commit_id" : "4029293e8c70c15eb7f64fe5a98e4d96e7de942a",
+      "original_line" : 127,
+      "original_position" : 128,
+      "original_start_line" : 118,
+      "path" : "src/bench/wallet_available_coins.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1030281113,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25234",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/914966747/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-07-06T15:16:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/914966747",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
       "author_association" : "CONTRIBUTOR",
       "body" : "<!--cf906140f33d8803c4a75a2196329ecb-->\nð This pull request conflicts with the target branch and [needs rebase](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#rebasing-changes).\n\n<sub>Want to unsubscribe from rebase notifications on this pull request? Just convert this pull request to a \"draft\".</sub>",
       "created_at" : "2022-07-12T13:15:55Z",
@@ -730,6 +798,73 @@
          "subscriptions_url" : "https://api.github.com/users/furszy/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/furszy"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25234#discussion_r1049888759"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25234"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1049888759"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I think this is a debugging leftover?",
+      "commit_id" : "b2ec705072d85ce73c9aef1110a9afb78c5362cb",
+      "created_at" : "2022-12-15T16:43:12Z",
+      "diff_hunk" : "@@ -132,11 +132,52 @@ static void WalletCreateTx(benchmark::Bench& bench, const OutputType output_type\n     });\n }\n \n+static void AvailableCoins(benchmark::Bench& bench, const std::vector<OutputType>& output_type)\n+{\n+    const auto test_setup = MakeNoLogFileContext<const TestingSetup>();\n+    CWallet wallet{test_setup->m_node.chain.get(), \"\", gArgs, CreateMockWalletDatabase()};\n+    {\n+        LOCK(wallet.cs_wallet);\n+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);\n+        wallet.SetupDescriptorScriptPubKeyMans();\n+        if (wallet.LoadWallet() != DBErrors::LOAD_OK) assert(false);\n+    }\n+\n+    // Generate destinations\n+    std::vector<CScript> dest_wallet;\n+    for (auto type : output_type) {\n+        dest_wallet.emplace_back(GetScriptForDestination(getNewDestination(wallet, type)));\n+    }\n+\n+    // Generate chain; each coinbase will have two outputs to fill-up the wallet\n+    const auto& params = Params();\n+    unsigned int chain_size = 1000;\n+    for (unsigned int i = 0; i < chain_size / dest_wallet.size(); ++i) {\n+        for (const auto& dest : dest_wallet) {\n+            generateFakeBlock(params, test_setup->m_node, wallet, dest);\n+        }\n+    }\n+\n+    // Check available balance\n+    auto bal = wallet::GetAvailableBalance(wallet); // Cache\n+    assert(bal == 50 * COIN * (chain_size - COINBASE_MATURITY));\n+\n+    bench.epochIterations(2).run([&] {\n+        LOCK(wallet.cs_wallet);\n+        const auto& res = wallet::AvailableCoins(wallet);\n+        std::cout << res.All().size() << std::endl;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25234#discussion_r1049888759",
+      "id" : 1049888759,
+      "line" : 168,
+      "node_id" : "PRRC_kwDOABII584-lAf3",
+      "original_commit_id" : "b2ec705072d85ce73c9aef1110a9afb78c5362cb",
+      "original_line" : 168,
+      "original_position" : 37,
+      "original_start_line" : null,
+      "path" : "src/bench/wallet_create_tx.cpp",
+      "position" : 37,
+      "pull_request_review_id" : 1219599081,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25234",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1049888759/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-12-15T16:43:12Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1049888759",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
       }
    }
 ]
