@@ -5760,5 +5760,542 @@
          "type" : "User",
          "url" : "https://api.github.com/users/LarryRuane"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050263740"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050263740"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "The benchmark (part of [my branch](https://github.com/LarryRuane/bitcoin/commits/2022-11-pr26152-refactor)) experienced a near-infinite loop without this change. The reason is that the benchmark test mempool has such a high degree of fan-out and fan-in that a single transaction could be added to the `to_process` set over and over. Of course, std::set doesn't allow duplicates, but I added some debug logging that shows the same tx being added, removed, processed, then added again, many times. This change fixed the problem completely.\r\n```suggestion\r\n                    if (!ancestors.count(parent_it)) {\r\n                        to_process.insert(parent_it);\r\n                        ancestors.insert(parent_it);\r\n                    }\r\n```",
+      "commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "created_at" : "2022-12-16T00:36:13Z",
+      "diff_hunk" : "@@ -0,0 +1,265 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/mini_miner.h>\n+\n+#include <consensus/amount.h>\n+#include <policy/feerate.h>\n+#include <primitives/transaction.h>\n+#include <timedata.h>\n+#include <util/check.h>\n+#include <util/moneystr.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <utility>\n+\n+namespace node {\n+\n+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)\n+{\n+    LOCK(mempool.cs);\n+    requested_outpoints = outpoints;\n+    // Find which outpoints to calculate bump fees for.\n+    // Anything that's spent by the mempool is to-be-replaced\n+    // Anything otherwise unavailable just has a bump fee of 0\n+    for (const auto& outpoint : outpoints) {\n+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {\n+            // The conflicting transaction is to-be-replaced\n+            to_be_replaced.insert(ptx->GetHash());\n+        }\n+\n+        if (!mempool.exists(GenTxid::Txid(outpoint.hash))) {\n+            // This UTXO is either confirmed or not yet submitted to mempool.\n+            // In the former case, no bump fee is required.\n+            // In the latter case, we have no information, so just return 0.\n+            this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+        } else {\n+            // This UTXO is unconfirmed, in the mempool, and available to spend.\n+            auto it = outpoints_needed_by_txid.find(outpoint.hash);\n+            if (it != outpoints_needed_by_txid.end()) {\n+                it->second.push_back(outpoint);\n+            } else {\n+                std::vector<COutPoint> outpoints_of_tx({outpoint});\n+                outpoints_needed_by_txid.emplace(std::make_pair(outpoint.hash, outpoints_of_tx));\n+                // Instead of operating on the entire mempool, just run the mining algorithm on the\n+                // cluster of relevant transactions, which we'll store in mapModifiedTx.\n+            }\n+        }\n+    }\n+    // Calculate the cluster and construct the entry map.\n+    std::vector<uint256> txids_needed;\n+    std::transform(outpoints_needed_by_txid.cbegin(),\n+                   outpoints_needed_by_txid.cend(),\n+                   std::back_inserter(txids_needed),\n+                   [](const auto& pair) { return pair.first; });\n+    const auto& cluster = mempool.CalculateCluster(txids_needed);\n+    for (const auto& txiter : cluster) {\n+        if (to_be_replaced.find(txiter->GetTx().GetHash()) == to_be_replaced.end()) {\n+            auto [mapiter, success] = entries_by_txid.emplace(std::make_pair(txiter->GetTx().GetHash(), MockMempoolEntry(txiter)));\n+            assert(success);\n+            entries.push_back(mapiter);\n+        } else {\n+            auto outpoints_it = outpoints_needed_by_txid.find(txiter->GetTx().GetHash());\n+            if (outpoints_it != outpoints_needed_by_txid.end()) {\n+                for (const auto& outpoint : outpoints_it->second) {\n+                    this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+                }\n+            }\n+        }\n+    }\n+\n+    // Remove the to-be-replaced transactions and build the descendant_set_by_txid cache.\n+    for (const auto& txiter : cluster) {\n+        const auto& txid = txiter->GetTx().GetHash();\n+        // Cache descendants for future use. Unlike the real mempool, a descendant MockMempoolEntry\n+        // will not exist without its ancestor MockMempoolEntry, so these sets won't be invalidated.\n+        std::vector<MockEntryMap::iterator> cached_descendants;\n+        cached_descendants.emplace_back(entries_by_txid.find(txid));\n+        // If a tx is to-be-replaced, remove any of its descendants so they can't fee-bump anything.\n+        // this case should be rare as the wallet won't normally attempt to replace transactions\n+        // with descendants.\n+        const bool remove = to_be_replaced.find(txid) != to_be_replaced.end();\n+        CTxMemPool::setEntries descendants;\n+        mempool.CalculateDescendants(txiter, descendants);\n+\n+        for (const auto& desc_txiter : descendants) {\n+            auto desc_it{entries_by_txid.find(desc_txiter->GetTx().GetHash())};\n+            if (desc_it != entries_by_txid.end()) {\n+                if (remove) {\n+                    entries_by_txid.erase(desc_it);\n+                } else {\n+                    cached_descendants.push_back(desc_it);\n+                }\n+            }\n+        }\n+        if (!remove) descendant_set_by_txid.emplace(std::make_pair(txid, cached_descendants));\n+    }\n+    // Release the mempool lock; we now have all the information we need for a subset of the entries\n+    // we care about. We will solely operate on the MockMempoolEntry map from now on.\n+    assert(entries.size() == entries_by_txid.size());\n+    assert(entries.size() == descendant_set_by_txid.size());\n+    assert(in_block.empty());\n+}\n+\n+// Compare by ancestor feerate, then iterator\n+struct AncestorFeerateComparator\n+{\n+    template<typename I>\n+    bool operator()(const I& a, const I& b) const {\n+        const CFeeRate a_feerate(a->second.GetModFeesWithAncestors(), a->second.GetSizeWithAncestors());\n+        const CFeeRate b_feerate(b->second.GetModFeesWithAncestors(), b->second.GetSizeWithAncestors());\n+        if (a_feerate != b_feerate) {\n+            return a_feerate > b_feerate;\n+        }\n+        return &(*a) > &(*b);\n+    }\n+};\n+\n+void MiniMiner::DeleteAncestorPackage(const std::set<MockEntryMap::iterator, IteratorComparator>& ancestors)\n+{\n+    for (const auto& anc : ancestors) {\n+        auto vec_it = std::find(entries.begin(), entries.end(), anc);\n+        assert(vec_it != entries.end());\n+        entries.erase(vec_it);\n+        entries_by_txid.erase(anc);\n+    }\n+}\n+\n+void MiniMiner::BuildMockTemplate(const CFeeRate& target_feerate)\n+{\n+    while (!entries_by_txid.empty()) {\n+        // Sort again, since transaction removal may change some entries' ancestor feerates.\n+        std::sort(entries.begin(), entries.end(), AncestorFeerateComparator());\n+\n+        // Pick highest ancestor feerate entry.\n+        auto best_iter = entries.begin();\n+        assert(best_iter != entries.end());\n+        const auto ancestor_package_size = (*best_iter)->second.GetSizeWithAncestors();\n+        const auto ancestor_package_fee = (*best_iter)->second.GetModFeesWithAncestors();\n+        // Stop here. Everything that didn't \"make it into the block\" has bumpfee.\n+        if (best_iter == entries.end() || ancestor_package_fee < target_feerate.GetFee(ancestor_package_size)) {\n+            break;\n+        }\n+\n+        // Calculate ancestors on the fly. This lookup should be fairly cheap, and ancestor sets\n+        // change at every iteration, so this is more efficient than maintaining a cache.\n+        std::set<MockEntryMap::iterator, IteratorComparator> ancestors;\n+        std::set<MockEntryMap::iterator, IteratorComparator> to_process;\n+        ancestors.insert(*best_iter);\n+        to_process.insert(*best_iter);\n+        while (!to_process.empty()) {\n+            auto iter = to_process.begin();\n+            assert(iter != to_process.end());\n+            const CTransaction& tx = (*iter)->second.GetTx();\n+            for (const auto& input : tx.vin) {\n+                if (auto parent_it{entries_by_txid.find(input.prevout.hash)}; parent_it != entries_by_txid.end()) {\n+                    to_process.insert(parent_it);\n+                    ancestors.insert(parent_it);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050263740",
+      "id" : 1050263740,
+      "line" : 159,
+      "node_id" : "PRRC_kwDOABII584-mcC8",
+      "original_commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "original_line" : 159,
+      "original_position" : 159,
+      "original_start_line" : 158,
+      "path" : "src/node/mini_miner.cpp",
+      "position" : 159,
+      "pull_request_review_id" : 1220130696,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050263740/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 158,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-12-16T06:31:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050263740",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8321330?v=4",
+         "events_url" : "https://api.github.com/users/LarryRuane/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/LarryRuane/followers",
+         "following_url" : "https://api.github.com/users/LarryRuane/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/LarryRuane/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/LarryRuane",
+         "id" : 8321330,
+         "login" : "LarryRuane",
+         "node_id" : "MDQ6VXNlcjgzMjEzMzA=",
+         "organizations_url" : "https://api.github.com/users/LarryRuane/orgs",
+         "received_events_url" : "https://api.github.com/users/LarryRuane/received_events",
+         "repos_url" : "https://api.github.com/users/LarryRuane/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/LarryRuane/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/LarryRuane/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/LarryRuane"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050281965"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050281965"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Same change as above -- this is _much_ more efficient with a large cluster, for example, running the benchmark.\r\n```suggestion\r\n                if (!ancestors.count(parent_it)) {\r\n                    to_process.insert(parent_it);\r\n                    ancestors.insert(parent_it);\r\n                }\r\n```",
+      "commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "created_at" : "2022-12-16T01:14:58Z",
+      "diff_hunk" : "@@ -0,0 +1,265 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/mini_miner.h>\n+\n+#include <consensus/amount.h>\n+#include <policy/feerate.h>\n+#include <primitives/transaction.h>\n+#include <timedata.h>\n+#include <util/check.h>\n+#include <util/moneystr.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <utility>\n+\n+namespace node {\n+\n+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)\n+{\n+    LOCK(mempool.cs);\n+    requested_outpoints = outpoints;\n+    // Find which outpoints to calculate bump fees for.\n+    // Anything that's spent by the mempool is to-be-replaced\n+    // Anything otherwise unavailable just has a bump fee of 0\n+    for (const auto& outpoint : outpoints) {\n+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {\n+            // The conflicting transaction is to-be-replaced\n+            to_be_replaced.insert(ptx->GetHash());\n+        }\n+\n+        if (!mempool.exists(GenTxid::Txid(outpoint.hash))) {\n+            // This UTXO is either confirmed or not yet submitted to mempool.\n+            // In the former case, no bump fee is required.\n+            // In the latter case, we have no information, so just return 0.\n+            this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+        } else {\n+            // This UTXO is unconfirmed, in the mempool, and available to spend.\n+            auto it = outpoints_needed_by_txid.find(outpoint.hash);\n+            if (it != outpoints_needed_by_txid.end()) {\n+                it->second.push_back(outpoint);\n+            } else {\n+                std::vector<COutPoint> outpoints_of_tx({outpoint});\n+                outpoints_needed_by_txid.emplace(std::make_pair(outpoint.hash, outpoints_of_tx));\n+                // Instead of operating on the entire mempool, just run the mining algorithm on the\n+                // cluster of relevant transactions, which we'll store in mapModifiedTx.\n+            }\n+        }\n+    }\n+    // Calculate the cluster and construct the entry map.\n+    std::vector<uint256> txids_needed;\n+    std::transform(outpoints_needed_by_txid.cbegin(),\n+                   outpoints_needed_by_txid.cend(),\n+                   std::back_inserter(txids_needed),\n+                   [](const auto& pair) { return pair.first; });\n+    const auto& cluster = mempool.CalculateCluster(txids_needed);\n+    for (const auto& txiter : cluster) {\n+        if (to_be_replaced.find(txiter->GetTx().GetHash()) == to_be_replaced.end()) {\n+            auto [mapiter, success] = entries_by_txid.emplace(std::make_pair(txiter->GetTx().GetHash(), MockMempoolEntry(txiter)));\n+            assert(success);\n+            entries.push_back(mapiter);\n+        } else {\n+            auto outpoints_it = outpoints_needed_by_txid.find(txiter->GetTx().GetHash());\n+            if (outpoints_it != outpoints_needed_by_txid.end()) {\n+                for (const auto& outpoint : outpoints_it->second) {\n+                    this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+                }\n+            }\n+        }\n+    }\n+\n+    // Remove the to-be-replaced transactions and build the descendant_set_by_txid cache.\n+    for (const auto& txiter : cluster) {\n+        const auto& txid = txiter->GetTx().GetHash();\n+        // Cache descendants for future use. Unlike the real mempool, a descendant MockMempoolEntry\n+        // will not exist without its ancestor MockMempoolEntry, so these sets won't be invalidated.\n+        std::vector<MockEntryMap::iterator> cached_descendants;\n+        cached_descendants.emplace_back(entries_by_txid.find(txid));\n+        // If a tx is to-be-replaced, remove any of its descendants so they can't fee-bump anything.\n+        // this case should be rare as the wallet won't normally attempt to replace transactions\n+        // with descendants.\n+        const bool remove = to_be_replaced.find(txid) != to_be_replaced.end();\n+        CTxMemPool::setEntries descendants;\n+        mempool.CalculateDescendants(txiter, descendants);\n+\n+        for (const auto& desc_txiter : descendants) {\n+            auto desc_it{entries_by_txid.find(desc_txiter->GetTx().GetHash())};\n+            if (desc_it != entries_by_txid.end()) {\n+                if (remove) {\n+                    entries_by_txid.erase(desc_it);\n+                } else {\n+                    cached_descendants.push_back(desc_it);\n+                }\n+            }\n+        }\n+        if (!remove) descendant_set_by_txid.emplace(std::make_pair(txid, cached_descendants));\n+    }\n+    // Release the mempool lock; we now have all the information we need for a subset of the entries\n+    // we care about. We will solely operate on the MockMempoolEntry map from now on.\n+    assert(entries.size() == entries_by_txid.size());\n+    assert(entries.size() == descendant_set_by_txid.size());\n+    assert(in_block.empty());\n+}\n+\n+// Compare by ancestor feerate, then iterator\n+struct AncestorFeerateComparator\n+{\n+    template<typename I>\n+    bool operator()(const I& a, const I& b) const {\n+        const CFeeRate a_feerate(a->second.GetModFeesWithAncestors(), a->second.GetSizeWithAncestors());\n+        const CFeeRate b_feerate(b->second.GetModFeesWithAncestors(), b->second.GetSizeWithAncestors());\n+        if (a_feerate != b_feerate) {\n+            return a_feerate > b_feerate;\n+        }\n+        return &(*a) > &(*b);\n+    }\n+};\n+\n+void MiniMiner::DeleteAncestorPackage(const std::set<MockEntryMap::iterator, IteratorComparator>& ancestors)\n+{\n+    for (const auto& anc : ancestors) {\n+        auto vec_it = std::find(entries.begin(), entries.end(), anc);\n+        assert(vec_it != entries.end());\n+        entries.erase(vec_it);\n+        entries_by_txid.erase(anc);\n+    }\n+}\n+\n+void MiniMiner::BuildMockTemplate(const CFeeRate& target_feerate)\n+{\n+    while (!entries_by_txid.empty()) {\n+        // Sort again, since transaction removal may change some entries' ancestor feerates.\n+        std::sort(entries.begin(), entries.end(), AncestorFeerateComparator());\n+\n+        // Pick highest ancestor feerate entry.\n+        auto best_iter = entries.begin();\n+        assert(best_iter != entries.end());\n+        const auto ancestor_package_size = (*best_iter)->second.GetSizeWithAncestors();\n+        const auto ancestor_package_fee = (*best_iter)->second.GetModFeesWithAncestors();\n+        // Stop here. Everything that didn't \"make it into the block\" has bumpfee.\n+        if (best_iter == entries.end() || ancestor_package_fee < target_feerate.GetFee(ancestor_package_size)) {\n+            break;\n+        }\n+\n+        // Calculate ancestors on the fly. This lookup should be fairly cheap, and ancestor sets\n+        // change at every iteration, so this is more efficient than maintaining a cache.\n+        std::set<MockEntryMap::iterator, IteratorComparator> ancestors;\n+        std::set<MockEntryMap::iterator, IteratorComparator> to_process;\n+        ancestors.insert(*best_iter);\n+        to_process.insert(*best_iter);\n+        while (!to_process.empty()) {\n+            auto iter = to_process.begin();\n+            assert(iter != to_process.end());\n+            const CTransaction& tx = (*iter)->second.GetTx();\n+            for (const auto& input : tx.vin) {\n+                if (auto parent_it{entries_by_txid.find(input.prevout.hash)}; parent_it != entries_by_txid.end()) {\n+                    to_process.insert(parent_it);\n+                    ancestors.insert(parent_it);\n+                }\n+            }\n+            to_process.erase(iter);\n+        }\n+        assert(ancestor_package_size == std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+            [](int64_t sum, const auto it) {return sum + it->second.GetTxSize();}));\n+        assert(ancestor_package_fee == std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+            [](CAmount sum, const auto it) {return sum + it->second.GetModifiedFee();}));\n+\n+        // \"Mine\" all transactions in this ancestor set.\n+        for (const auto& anc : ancestors) {\n+            in_block.insert(anc->second.GetTx().GetHash());\n+            total_fees += anc->second.GetModifiedFee();\n+            total_vsize += anc->second.GetTxSize();\n+            auto it = descendant_set_by_txid.find(anc->second.GetTx().GetHash());\n+            assert(it != descendant_set_by_txid.end());\n+            for (const auto& descendant : it->second) {\n+                descendant->second.vsize_with_ancestors -= anc->second.GetTxSize();\n+                descendant->second.fee_with_ancestors -= anc->second.GetModifiedFee();\n+            }\n+        }\n+        DeleteAncestorPackage(ancestors);\n+        assert(entries.size() == entries_by_txid.size());\n+    }\n+}\n+\n+std::map<COutPoint, CAmount> MiniMiner::CalculateBumpFees(const CFeeRate& target_feerate)\n+{\n+    // Build a block template until the target feerate is hit.\n+    BuildMockTemplate(target_feerate);\n+    assert(in_block.empty() || CFeeRate(total_fees, total_vsize) >= target_feerate);\n+\n+    // Each transaction that \"made it into the block\" has a bumpfee of 0, i.e. they are part of an\n+    // ancestor package that exceeds the target feerate and don't need to be bumped.\n+    for (const auto& txid : in_block) {\n+        // Not all of the block transactions were necessarily requested.\n+        auto it = outpoints_needed_by_txid.find(txid);\n+        if (it != outpoints_needed_by_txid.end()) {\n+            for (const auto& outpoint : it->second) {\n+                bump_fees.emplace(std::make_pair(outpoint, 0));\n+            }\n+            outpoints_needed_by_txid.erase(it);\n+        }\n+    }\n+    // For each transaction that remains, the bumpfee is the cost to raise it and its ancestors\n+    // to the target feerate, target_feerate * ancestor_size - ancestor_fees\n+    for (const auto& [txid, outpoints] : outpoints_needed_by_txid) {\n+        auto it = entries_by_txid.find(txid);\n+        assert(it != entries_by_txid.end());\n+        if (it != entries_by_txid.end()) {\n+            assert(target_feerate.GetFee(it->second.GetSizeWithAncestors()) > it->second.GetModFeesWithAncestors());\n+            const CAmount bump_fee{target_feerate.GetFee(it->second.GetSizeWithAncestors())\n+                                   - it->second.GetModFeesWithAncestors()};\n+            assert(bump_fee >= 0);\n+            for (const auto& outpoint : outpoints) {\n+                bump_fees.emplace(std::make_pair(outpoint, bump_fee));\n+            }\n+        }\n+    }\n+    return this->bump_fees;\n+}\n+\n+CAmount MiniMiner::CalculateTotalBumpFees(const CFeeRate& target_feerate)\n+{\n+    // Build a block template until the target feerate is hit.\n+    BuildMockTemplate(target_feerate);\n+    assert(in_block.empty() || CFeeRate(total_fees, total_vsize) >= target_feerate);\n+\n+    // All remaining ancestors that are not part of in_block must be bumped, but no other relatives (e.g. siblings, niblings, â¦)\n+    std::set<MockEntryMap::iterator, IteratorComparator> ancestors;\n+    std::set<MockEntryMap::iterator, IteratorComparator> to_process;\n+\n+    for (const auto& outpoint : requested_outpoints) {\n+        const auto& txid = outpoint.hash;\n+        // Skip any ancestors that have a higher minerscore already\n+        if (in_block.find(txid) != in_block.end()) continue;\n+        auto iter = entries_by_txid.find(outpoint.hash);\n+        assert(iter != entries_by_txid.end());\n+        to_process.insert(iter);\n+        ancestors.insert(iter);\n+    }\n+\n+    while (!to_process.empty()) {\n+        auto iter = to_process.begin();\n+        assert(iter != to_process.end());\n+        const CTransaction& tx = (*iter)->second.GetTx();\n+        for (const auto& input : tx.vin) {\n+            if (auto parent_it{entries_by_txid.find(input.prevout.hash)}; parent_it != entries_by_txid.end()) {\n+                to_process.insert(parent_it);\n+                ancestors.insert(parent_it);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050281965",
+      "id" : 1050281965,
+      "line" : 249,
+      "node_id" : "PRRC_kwDOABII584-mgft",
+      "original_commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "original_line" : 249,
+      "original_position" : 249,
+      "original_start_line" : 248,
+      "path" : "src/node/mini_miner.cpp",
+      "position" : 249,
+      "pull_request_review_id" : 1220130696,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050281965/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 248,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-12-16T06:31:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050281965",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8321330?v=4",
+         "events_url" : "https://api.github.com/users/LarryRuane/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/LarryRuane/followers",
+         "following_url" : "https://api.github.com/users/LarryRuane/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/LarryRuane/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/LarryRuane",
+         "id" : 8321330,
+         "login" : "LarryRuane",
+         "node_id" : "MDQ6VXNlcjgzMjEzMzA=",
+         "organizations_url" : "https://api.github.com/users/LarryRuane/orgs",
+         "received_events_url" : "https://api.github.com/users/LarryRuane/received_events",
+         "repos_url" : "https://api.github.com/users/LarryRuane/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/LarryRuane/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/LarryRuane/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/LarryRuane"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050360878"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050360878"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "```suggestion\r\n            // each entry's descendant set includes itself\r\n            assert(it != descendant_set_by_txid.end());\r\n```\r\n(it took me a little while to figure out why this assertion is valid)",
+      "commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "created_at" : "2022-12-16T04:28:49Z",
+      "diff_hunk" : "@@ -0,0 +1,265 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/mini_miner.h>\n+\n+#include <consensus/amount.h>\n+#include <policy/feerate.h>\n+#include <primitives/transaction.h>\n+#include <timedata.h>\n+#include <util/check.h>\n+#include <util/moneystr.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <utility>\n+\n+namespace node {\n+\n+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)\n+{\n+    LOCK(mempool.cs);\n+    requested_outpoints = outpoints;\n+    // Find which outpoints to calculate bump fees for.\n+    // Anything that's spent by the mempool is to-be-replaced\n+    // Anything otherwise unavailable just has a bump fee of 0\n+    for (const auto& outpoint : outpoints) {\n+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {\n+            // The conflicting transaction is to-be-replaced\n+            to_be_replaced.insert(ptx->GetHash());\n+        }\n+\n+        if (!mempool.exists(GenTxid::Txid(outpoint.hash))) {\n+            // This UTXO is either confirmed or not yet submitted to mempool.\n+            // In the former case, no bump fee is required.\n+            // In the latter case, we have no information, so just return 0.\n+            this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+        } else {\n+            // This UTXO is unconfirmed, in the mempool, and available to spend.\n+            auto it = outpoints_needed_by_txid.find(outpoint.hash);\n+            if (it != outpoints_needed_by_txid.end()) {\n+                it->second.push_back(outpoint);\n+            } else {\n+                std::vector<COutPoint> outpoints_of_tx({outpoint});\n+                outpoints_needed_by_txid.emplace(std::make_pair(outpoint.hash, outpoints_of_tx));\n+                // Instead of operating on the entire mempool, just run the mining algorithm on the\n+                // cluster of relevant transactions, which we'll store in mapModifiedTx.\n+            }\n+        }\n+    }\n+    // Calculate the cluster and construct the entry map.\n+    std::vector<uint256> txids_needed;\n+    std::transform(outpoints_needed_by_txid.cbegin(),\n+                   outpoints_needed_by_txid.cend(),\n+                   std::back_inserter(txids_needed),\n+                   [](const auto& pair) { return pair.first; });\n+    const auto& cluster = mempool.CalculateCluster(txids_needed);\n+    for (const auto& txiter : cluster) {\n+        if (to_be_replaced.find(txiter->GetTx().GetHash()) == to_be_replaced.end()) {\n+            auto [mapiter, success] = entries_by_txid.emplace(std::make_pair(txiter->GetTx().GetHash(), MockMempoolEntry(txiter)));\n+            assert(success);\n+            entries.push_back(mapiter);\n+        } else {\n+            auto outpoints_it = outpoints_needed_by_txid.find(txiter->GetTx().GetHash());\n+            if (outpoints_it != outpoints_needed_by_txid.end()) {\n+                for (const auto& outpoint : outpoints_it->second) {\n+                    this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+                }\n+            }\n+        }\n+    }\n+\n+    // Remove the to-be-replaced transactions and build the descendant_set_by_txid cache.\n+    for (const auto& txiter : cluster) {\n+        const auto& txid = txiter->GetTx().GetHash();\n+        // Cache descendants for future use. Unlike the real mempool, a descendant MockMempoolEntry\n+        // will not exist without its ancestor MockMempoolEntry, so these sets won't be invalidated.\n+        std::vector<MockEntryMap::iterator> cached_descendants;\n+        cached_descendants.emplace_back(entries_by_txid.find(txid));\n+        // If a tx is to-be-replaced, remove any of its descendants so they can't fee-bump anything.\n+        // this case should be rare as the wallet won't normally attempt to replace transactions\n+        // with descendants.\n+        const bool remove = to_be_replaced.find(txid) != to_be_replaced.end();\n+        CTxMemPool::setEntries descendants;\n+        mempool.CalculateDescendants(txiter, descendants);\n+\n+        for (const auto& desc_txiter : descendants) {\n+            auto desc_it{entries_by_txid.find(desc_txiter->GetTx().GetHash())};\n+            if (desc_it != entries_by_txid.end()) {\n+                if (remove) {\n+                    entries_by_txid.erase(desc_it);\n+                } else {\n+                    cached_descendants.push_back(desc_it);\n+                }\n+            }\n+        }\n+        if (!remove) descendant_set_by_txid.emplace(std::make_pair(txid, cached_descendants));\n+    }\n+    // Release the mempool lock; we now have all the information we need for a subset of the entries\n+    // we care about. We will solely operate on the MockMempoolEntry map from now on.\n+    assert(entries.size() == entries_by_txid.size());\n+    assert(entries.size() == descendant_set_by_txid.size());\n+    assert(in_block.empty());\n+}\n+\n+// Compare by ancestor feerate, then iterator\n+struct AncestorFeerateComparator\n+{\n+    template<typename I>\n+    bool operator()(const I& a, const I& b) const {\n+        const CFeeRate a_feerate(a->second.GetModFeesWithAncestors(), a->second.GetSizeWithAncestors());\n+        const CFeeRate b_feerate(b->second.GetModFeesWithAncestors(), b->second.GetSizeWithAncestors());\n+        if (a_feerate != b_feerate) {\n+            return a_feerate > b_feerate;\n+        }\n+        return &(*a) > &(*b);\n+    }\n+};\n+\n+void MiniMiner::DeleteAncestorPackage(const std::set<MockEntryMap::iterator, IteratorComparator>& ancestors)\n+{\n+    for (const auto& anc : ancestors) {\n+        auto vec_it = std::find(entries.begin(), entries.end(), anc);\n+        assert(vec_it != entries.end());\n+        entries.erase(vec_it);\n+        entries_by_txid.erase(anc);\n+    }\n+}\n+\n+void MiniMiner::BuildMockTemplate(const CFeeRate& target_feerate)\n+{\n+    while (!entries_by_txid.empty()) {\n+        // Sort again, since transaction removal may change some entries' ancestor feerates.\n+        std::sort(entries.begin(), entries.end(), AncestorFeerateComparator());\n+\n+        // Pick highest ancestor feerate entry.\n+        auto best_iter = entries.begin();\n+        assert(best_iter != entries.end());\n+        const auto ancestor_package_size = (*best_iter)->second.GetSizeWithAncestors();\n+        const auto ancestor_package_fee = (*best_iter)->second.GetModFeesWithAncestors();\n+        // Stop here. Everything that didn't \"make it into the block\" has bumpfee.\n+        if (best_iter == entries.end() || ancestor_package_fee < target_feerate.GetFee(ancestor_package_size)) {\n+            break;\n+        }\n+\n+        // Calculate ancestors on the fly. This lookup should be fairly cheap, and ancestor sets\n+        // change at every iteration, so this is more efficient than maintaining a cache.\n+        std::set<MockEntryMap::iterator, IteratorComparator> ancestors;\n+        std::set<MockEntryMap::iterator, IteratorComparator> to_process;\n+        ancestors.insert(*best_iter);\n+        to_process.insert(*best_iter);\n+        while (!to_process.empty()) {\n+            auto iter = to_process.begin();\n+            assert(iter != to_process.end());\n+            const CTransaction& tx = (*iter)->second.GetTx();\n+            for (const auto& input : tx.vin) {\n+                if (auto parent_it{entries_by_txid.find(input.prevout.hash)}; parent_it != entries_by_txid.end()) {\n+                    to_process.insert(parent_it);\n+                    ancestors.insert(parent_it);\n+                }\n+            }\n+            to_process.erase(iter);\n+        }\n+        assert(ancestor_package_size == std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+            [](int64_t sum, const auto it) {return sum + it->second.GetTxSize();}));\n+        assert(ancestor_package_fee == std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+            [](CAmount sum, const auto it) {return sum + it->second.GetModifiedFee();}));\n+\n+        // \"Mine\" all transactions in this ancestor set.\n+        for (const auto& anc : ancestors) {\n+            in_block.insert(anc->second.GetTx().GetHash());\n+            total_fees += anc->second.GetModifiedFee();\n+            total_vsize += anc->second.GetTxSize();\n+            auto it = descendant_set_by_txid.find(anc->second.GetTx().GetHash());\n+            assert(it != descendant_set_by_txid.end());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050360878",
+      "id" : 1050360878,
+      "line" : 175,
+      "node_id" : "PRRC_kwDOABII584-mzwu",
+      "original_commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "original_line" : 175,
+      "original_position" : 175,
+      "original_start_line" : null,
+      "path" : "src/node/mini_miner.cpp",
+      "position" : 175,
+      "pull_request_review_id" : 1220130696,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050360878/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-12-16T06:31:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050360878",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8321330?v=4",
+         "events_url" : "https://api.github.com/users/LarryRuane/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/LarryRuane/followers",
+         "following_url" : "https://api.github.com/users/LarryRuane/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/LarryRuane/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/LarryRuane",
+         "id" : 8321330,
+         "login" : "LarryRuane",
+         "node_id" : "MDQ6VXNlcjgzMjEzMzA=",
+         "organizations_url" : "https://api.github.com/users/LarryRuane/orgs",
+         "received_events_url" : "https://api.github.com/users/LarryRuane/received_events",
+         "repos_url" : "https://api.github.com/users/LarryRuane/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/LarryRuane/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/LarryRuane/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/LarryRuane"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050402228"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050402228"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "You may want to assert that these don't go negative, I would actually do it before the decrement, like this:\r\n```\r\nassert(descendant->second.vsize_with_ancestors >= anc->second.GetTxSize());\r\ndescendant->second.vsize_with_ancestors -= anc->second.GetTxSize();\r\n```",
+      "commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "created_at" : "2022-12-16T06:11:42Z",
+      "diff_hunk" : "@@ -0,0 +1,265 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/mini_miner.h>\n+\n+#include <consensus/amount.h>\n+#include <policy/feerate.h>\n+#include <primitives/transaction.h>\n+#include <timedata.h>\n+#include <util/check.h>\n+#include <util/moneystr.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <utility>\n+\n+namespace node {\n+\n+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)\n+{\n+    LOCK(mempool.cs);\n+    requested_outpoints = outpoints;\n+    // Find which outpoints to calculate bump fees for.\n+    // Anything that's spent by the mempool is to-be-replaced\n+    // Anything otherwise unavailable just has a bump fee of 0\n+    for (const auto& outpoint : outpoints) {\n+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {\n+            // The conflicting transaction is to-be-replaced\n+            to_be_replaced.insert(ptx->GetHash());\n+        }\n+\n+        if (!mempool.exists(GenTxid::Txid(outpoint.hash))) {\n+            // This UTXO is either confirmed or not yet submitted to mempool.\n+            // In the former case, no bump fee is required.\n+            // In the latter case, we have no information, so just return 0.\n+            this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+        } else {\n+            // This UTXO is unconfirmed, in the mempool, and available to spend.\n+            auto it = outpoints_needed_by_txid.find(outpoint.hash);\n+            if (it != outpoints_needed_by_txid.end()) {\n+                it->second.push_back(outpoint);\n+            } else {\n+                std::vector<COutPoint> outpoints_of_tx({outpoint});\n+                outpoints_needed_by_txid.emplace(std::make_pair(outpoint.hash, outpoints_of_tx));\n+                // Instead of operating on the entire mempool, just run the mining algorithm on the\n+                // cluster of relevant transactions, which we'll store in mapModifiedTx.\n+            }\n+        }\n+    }\n+    // Calculate the cluster and construct the entry map.\n+    std::vector<uint256> txids_needed;\n+    std::transform(outpoints_needed_by_txid.cbegin(),\n+                   outpoints_needed_by_txid.cend(),\n+                   std::back_inserter(txids_needed),\n+                   [](const auto& pair) { return pair.first; });\n+    const auto& cluster = mempool.CalculateCluster(txids_needed);\n+    for (const auto& txiter : cluster) {\n+        if (to_be_replaced.find(txiter->GetTx().GetHash()) == to_be_replaced.end()) {\n+            auto [mapiter, success] = entries_by_txid.emplace(std::make_pair(txiter->GetTx().GetHash(), MockMempoolEntry(txiter)));\n+            assert(success);\n+            entries.push_back(mapiter);\n+        } else {\n+            auto outpoints_it = outpoints_needed_by_txid.find(txiter->GetTx().GetHash());\n+            if (outpoints_it != outpoints_needed_by_txid.end()) {\n+                for (const auto& outpoint : outpoints_it->second) {\n+                    this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+                }\n+            }\n+        }\n+    }\n+\n+    // Remove the to-be-replaced transactions and build the descendant_set_by_txid cache.\n+    for (const auto& txiter : cluster) {\n+        const auto& txid = txiter->GetTx().GetHash();\n+        // Cache descendants for future use. Unlike the real mempool, a descendant MockMempoolEntry\n+        // will not exist without its ancestor MockMempoolEntry, so these sets won't be invalidated.\n+        std::vector<MockEntryMap::iterator> cached_descendants;\n+        cached_descendants.emplace_back(entries_by_txid.find(txid));\n+        // If a tx is to-be-replaced, remove any of its descendants so they can't fee-bump anything.\n+        // this case should be rare as the wallet won't normally attempt to replace transactions\n+        // with descendants.\n+        const bool remove = to_be_replaced.find(txid) != to_be_replaced.end();\n+        CTxMemPool::setEntries descendants;\n+        mempool.CalculateDescendants(txiter, descendants);\n+\n+        for (const auto& desc_txiter : descendants) {\n+            auto desc_it{entries_by_txid.find(desc_txiter->GetTx().GetHash())};\n+            if (desc_it != entries_by_txid.end()) {\n+                if (remove) {\n+                    entries_by_txid.erase(desc_it);\n+                } else {\n+                    cached_descendants.push_back(desc_it);\n+                }\n+            }\n+        }\n+        if (!remove) descendant_set_by_txid.emplace(std::make_pair(txid, cached_descendants));\n+    }\n+    // Release the mempool lock; we now have all the information we need for a subset of the entries\n+    // we care about. We will solely operate on the MockMempoolEntry map from now on.\n+    assert(entries.size() == entries_by_txid.size());\n+    assert(entries.size() == descendant_set_by_txid.size());\n+    assert(in_block.empty());\n+}\n+\n+// Compare by ancestor feerate, then iterator\n+struct AncestorFeerateComparator\n+{\n+    template<typename I>\n+    bool operator()(const I& a, const I& b) const {\n+        const CFeeRate a_feerate(a->second.GetModFeesWithAncestors(), a->second.GetSizeWithAncestors());\n+        const CFeeRate b_feerate(b->second.GetModFeesWithAncestors(), b->second.GetSizeWithAncestors());\n+        if (a_feerate != b_feerate) {\n+            return a_feerate > b_feerate;\n+        }\n+        return &(*a) > &(*b);\n+    }\n+};\n+\n+void MiniMiner::DeleteAncestorPackage(const std::set<MockEntryMap::iterator, IteratorComparator>& ancestors)\n+{\n+    for (const auto& anc : ancestors) {\n+        auto vec_it = std::find(entries.begin(), entries.end(), anc);\n+        assert(vec_it != entries.end());\n+        entries.erase(vec_it);\n+        entries_by_txid.erase(anc);\n+    }\n+}\n+\n+void MiniMiner::BuildMockTemplate(const CFeeRate& target_feerate)\n+{\n+    while (!entries_by_txid.empty()) {\n+        // Sort again, since transaction removal may change some entries' ancestor feerates.\n+        std::sort(entries.begin(), entries.end(), AncestorFeerateComparator());\n+\n+        // Pick highest ancestor feerate entry.\n+        auto best_iter = entries.begin();\n+        assert(best_iter != entries.end());\n+        const auto ancestor_package_size = (*best_iter)->second.GetSizeWithAncestors();\n+        const auto ancestor_package_fee = (*best_iter)->second.GetModFeesWithAncestors();\n+        // Stop here. Everything that didn't \"make it into the block\" has bumpfee.\n+        if (best_iter == entries.end() || ancestor_package_fee < target_feerate.GetFee(ancestor_package_size)) {\n+            break;\n+        }\n+\n+        // Calculate ancestors on the fly. This lookup should be fairly cheap, and ancestor sets\n+        // change at every iteration, so this is more efficient than maintaining a cache.\n+        std::set<MockEntryMap::iterator, IteratorComparator> ancestors;\n+        std::set<MockEntryMap::iterator, IteratorComparator> to_process;\n+        ancestors.insert(*best_iter);\n+        to_process.insert(*best_iter);\n+        while (!to_process.empty()) {\n+            auto iter = to_process.begin();\n+            assert(iter != to_process.end());\n+            const CTransaction& tx = (*iter)->second.GetTx();\n+            for (const auto& input : tx.vin) {\n+                if (auto parent_it{entries_by_txid.find(input.prevout.hash)}; parent_it != entries_by_txid.end()) {\n+                    to_process.insert(parent_it);\n+                    ancestors.insert(parent_it);\n+                }\n+            }\n+            to_process.erase(iter);\n+        }\n+        assert(ancestor_package_size == std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+            [](int64_t sum, const auto it) {return sum + it->second.GetTxSize();}));\n+        assert(ancestor_package_fee == std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+            [](CAmount sum, const auto it) {return sum + it->second.GetModifiedFee();}));\n+\n+        // \"Mine\" all transactions in this ancestor set.\n+        for (const auto& anc : ancestors) {\n+            in_block.insert(anc->second.GetTx().GetHash());\n+            total_fees += anc->second.GetModifiedFee();\n+            total_vsize += anc->second.GetTxSize();\n+            auto it = descendant_set_by_txid.find(anc->second.GetTx().GetHash());\n+            assert(it != descendant_set_by_txid.end());\n+            for (const auto& descendant : it->second) {\n+                descendant->second.vsize_with_ancestors -= anc->second.GetTxSize();\n+                descendant->second.fee_with_ancestors -= anc->second.GetModifiedFee();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050402228",
+      "id" : 1050402228,
+      "line" : 178,
+      "node_id" : "PRRC_kwDOABII584-m920",
+      "original_commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "original_line" : 178,
+      "original_position" : 178,
+      "original_start_line" : 177,
+      "path" : "src/node/mini_miner.cpp",
+      "position" : 178,
+      "pull_request_review_id" : 1220130696,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050402228/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 177,
+      "start_side" : "RIGHT",
+      "updated_at" : "2022-12-16T06:31:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050402228",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8321330?v=4",
+         "events_url" : "https://api.github.com/users/LarryRuane/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/LarryRuane/followers",
+         "following_url" : "https://api.github.com/users/LarryRuane/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/LarryRuane/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/LarryRuane",
+         "id" : 8321330,
+         "login" : "LarryRuane",
+         "node_id" : "MDQ6VXNlcjgzMjEzMzA=",
+         "organizations_url" : "https://api.github.com/users/LarryRuane/orgs",
+         "received_events_url" : "https://api.github.com/users/LarryRuane/received_events",
+         "repos_url" : "https://api.github.com/users/LarryRuane/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/LarryRuane/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/LarryRuane/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/LarryRuane"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050404621"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050404621"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Something more important: this `emplace_back()` shouldn't be here at all, because each mempool entry is a member of its own descendants' list. So this \"main\" transaction gets added to `cached_descendants` below. This was causing the `fee_with_ancestors` and `vsize_with_ancestors` to go negative near the end of `BuildMockTemplate()` below.",
+      "commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "created_at" : "2022-12-16T06:17:22Z",
+      "diff_hunk" : "@@ -0,0 +1,265 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/mini_miner.h>\n+\n+#include <consensus/amount.h>\n+#include <policy/feerate.h>\n+#include <primitives/transaction.h>\n+#include <timedata.h>\n+#include <util/check.h>\n+#include <util/moneystr.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <utility>\n+\n+namespace node {\n+\n+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)\n+{\n+    LOCK(mempool.cs);\n+    requested_outpoints = outpoints;\n+    // Find which outpoints to calculate bump fees for.\n+    // Anything that's spent by the mempool is to-be-replaced\n+    // Anything otherwise unavailable just has a bump fee of 0\n+    for (const auto& outpoint : outpoints) {\n+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {\n+            // The conflicting transaction is to-be-replaced\n+            to_be_replaced.insert(ptx->GetHash());\n+        }\n+\n+        if (!mempool.exists(GenTxid::Txid(outpoint.hash))) {\n+            // This UTXO is either confirmed or not yet submitted to mempool.\n+            // In the former case, no bump fee is required.\n+            // In the latter case, we have no information, so just return 0.\n+            this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+        } else {\n+            // This UTXO is unconfirmed, in the mempool, and available to spend.\n+            auto it = outpoints_needed_by_txid.find(outpoint.hash);\n+            if (it != outpoints_needed_by_txid.end()) {\n+                it->second.push_back(outpoint);\n+            } else {\n+                std::vector<COutPoint> outpoints_of_tx({outpoint});\n+                outpoints_needed_by_txid.emplace(std::make_pair(outpoint.hash, outpoints_of_tx));\n+                // Instead of operating on the entire mempool, just run the mining algorithm on the\n+                // cluster of relevant transactions, which we'll store in mapModifiedTx.\n+            }\n+        }\n+    }\n+    // Calculate the cluster and construct the entry map.\n+    std::vector<uint256> txids_needed;\n+    std::transform(outpoints_needed_by_txid.cbegin(),\n+                   outpoints_needed_by_txid.cend(),\n+                   std::back_inserter(txids_needed),\n+                   [](const auto& pair) { return pair.first; });\n+    const auto& cluster = mempool.CalculateCluster(txids_needed);\n+    for (const auto& txiter : cluster) {\n+        if (to_be_replaced.find(txiter->GetTx().GetHash()) == to_be_replaced.end()) {\n+            auto [mapiter, success] = entries_by_txid.emplace(std::make_pair(txiter->GetTx().GetHash(), MockMempoolEntry(txiter)));\n+            assert(success);\n+            entries.push_back(mapiter);\n+        } else {\n+            auto outpoints_it = outpoints_needed_by_txid.find(txiter->GetTx().GetHash());\n+            if (outpoints_it != outpoints_needed_by_txid.end()) {\n+                for (const auto& outpoint : outpoints_it->second) {\n+                    this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+                }\n+            }\n+        }\n+    }\n+\n+    // Remove the to-be-replaced transactions and build the descendant_set_by_txid cache.\n+    for (const auto& txiter : cluster) {\n+        const auto& txid = txiter->GetTx().GetHash();\n+        // Cache descendants for future use. Unlike the real mempool, a descendant MockMempoolEntry\n+        // will not exist without its ancestor MockMempoolEntry, so these sets won't be invalidated.\n+        std::vector<MockEntryMap::iterator> cached_descendants;\n+        cached_descendants.emplace_back(entries_by_txid.find(txid));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050404621",
+      "id" : 1050404621,
+      "line" : 79,
+      "node_id" : "PRRC_kwDOABII584-m-cN",
+      "original_commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "original_line" : 79,
+      "original_position" : 79,
+      "original_start_line" : null,
+      "path" : "src/node/mini_miner.cpp",
+      "position" : 79,
+      "pull_request_review_id" : 1220130696,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050404621/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-12-16T06:31:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050404621",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8321330?v=4",
+         "events_url" : "https://api.github.com/users/LarryRuane/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/LarryRuane/followers",
+         "following_url" : "https://api.github.com/users/LarryRuane/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/LarryRuane/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/LarryRuane",
+         "id" : 8321330,
+         "login" : "LarryRuane",
+         "node_id" : "MDQ6VXNlcjgzMjEzMzA=",
+         "organizations_url" : "https://api.github.com/users/LarryRuane/orgs",
+         "received_events_url" : "https://api.github.com/users/LarryRuane/received_events",
+         "repos_url" : "https://api.github.com/users/LarryRuane/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/LarryRuane/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/LarryRuane/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/LarryRuane"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050405337"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050405337"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "simpler:\r\n```suggestion\r\n            auto it = descendant_set_by_txid.find(anc->first);\r\n```",
+      "commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "created_at" : "2022-12-16T06:19:04Z",
+      "diff_hunk" : "@@ -0,0 +1,265 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/mini_miner.h>\n+\n+#include <consensus/amount.h>\n+#include <policy/feerate.h>\n+#include <primitives/transaction.h>\n+#include <timedata.h>\n+#include <util/check.h>\n+#include <util/moneystr.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <utility>\n+\n+namespace node {\n+\n+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)\n+{\n+    LOCK(mempool.cs);\n+    requested_outpoints = outpoints;\n+    // Find which outpoints to calculate bump fees for.\n+    // Anything that's spent by the mempool is to-be-replaced\n+    // Anything otherwise unavailable just has a bump fee of 0\n+    for (const auto& outpoint : outpoints) {\n+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {\n+            // The conflicting transaction is to-be-replaced\n+            to_be_replaced.insert(ptx->GetHash());\n+        }\n+\n+        if (!mempool.exists(GenTxid::Txid(outpoint.hash))) {\n+            // This UTXO is either confirmed or not yet submitted to mempool.\n+            // In the former case, no bump fee is required.\n+            // In the latter case, we have no information, so just return 0.\n+            this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+        } else {\n+            // This UTXO is unconfirmed, in the mempool, and available to spend.\n+            auto it = outpoints_needed_by_txid.find(outpoint.hash);\n+            if (it != outpoints_needed_by_txid.end()) {\n+                it->second.push_back(outpoint);\n+            } else {\n+                std::vector<COutPoint> outpoints_of_tx({outpoint});\n+                outpoints_needed_by_txid.emplace(std::make_pair(outpoint.hash, outpoints_of_tx));\n+                // Instead of operating on the entire mempool, just run the mining algorithm on the\n+                // cluster of relevant transactions, which we'll store in mapModifiedTx.\n+            }\n+        }\n+    }\n+    // Calculate the cluster and construct the entry map.\n+    std::vector<uint256> txids_needed;\n+    std::transform(outpoints_needed_by_txid.cbegin(),\n+                   outpoints_needed_by_txid.cend(),\n+                   std::back_inserter(txids_needed),\n+                   [](const auto& pair) { return pair.first; });\n+    const auto& cluster = mempool.CalculateCluster(txids_needed);\n+    for (const auto& txiter : cluster) {\n+        if (to_be_replaced.find(txiter->GetTx().GetHash()) == to_be_replaced.end()) {\n+            auto [mapiter, success] = entries_by_txid.emplace(std::make_pair(txiter->GetTx().GetHash(), MockMempoolEntry(txiter)));\n+            assert(success);\n+            entries.push_back(mapiter);\n+        } else {\n+            auto outpoints_it = outpoints_needed_by_txid.find(txiter->GetTx().GetHash());\n+            if (outpoints_it != outpoints_needed_by_txid.end()) {\n+                for (const auto& outpoint : outpoints_it->second) {\n+                    this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+                }\n+            }\n+        }\n+    }\n+\n+    // Remove the to-be-replaced transactions and build the descendant_set_by_txid cache.\n+    for (const auto& txiter : cluster) {\n+        const auto& txid = txiter->GetTx().GetHash();\n+        // Cache descendants for future use. Unlike the real mempool, a descendant MockMempoolEntry\n+        // will not exist without its ancestor MockMempoolEntry, so these sets won't be invalidated.\n+        std::vector<MockEntryMap::iterator> cached_descendants;\n+        cached_descendants.emplace_back(entries_by_txid.find(txid));\n+        // If a tx is to-be-replaced, remove any of its descendants so they can't fee-bump anything.\n+        // this case should be rare as the wallet won't normally attempt to replace transactions\n+        // with descendants.\n+        const bool remove = to_be_replaced.find(txid) != to_be_replaced.end();\n+        CTxMemPool::setEntries descendants;\n+        mempool.CalculateDescendants(txiter, descendants);\n+\n+        for (const auto& desc_txiter : descendants) {\n+            auto desc_it{entries_by_txid.find(desc_txiter->GetTx().GetHash())};\n+            if (desc_it != entries_by_txid.end()) {\n+                if (remove) {\n+                    entries_by_txid.erase(desc_it);\n+                } else {\n+                    cached_descendants.push_back(desc_it);\n+                }\n+            }\n+        }\n+        if (!remove) descendant_set_by_txid.emplace(std::make_pair(txid, cached_descendants));\n+    }\n+    // Release the mempool lock; we now have all the information we need for a subset of the entries\n+    // we care about. We will solely operate on the MockMempoolEntry map from now on.\n+    assert(entries.size() == entries_by_txid.size());\n+    assert(entries.size() == descendant_set_by_txid.size());\n+    assert(in_block.empty());\n+}\n+\n+// Compare by ancestor feerate, then iterator\n+struct AncestorFeerateComparator\n+{\n+    template<typename I>\n+    bool operator()(const I& a, const I& b) const {\n+        const CFeeRate a_feerate(a->second.GetModFeesWithAncestors(), a->second.GetSizeWithAncestors());\n+        const CFeeRate b_feerate(b->second.GetModFeesWithAncestors(), b->second.GetSizeWithAncestors());\n+        if (a_feerate != b_feerate) {\n+            return a_feerate > b_feerate;\n+        }\n+        return &(*a) > &(*b);\n+    }\n+};\n+\n+void MiniMiner::DeleteAncestorPackage(const std::set<MockEntryMap::iterator, IteratorComparator>& ancestors)\n+{\n+    for (const auto& anc : ancestors) {\n+        auto vec_it = std::find(entries.begin(), entries.end(), anc);\n+        assert(vec_it != entries.end());\n+        entries.erase(vec_it);\n+        entries_by_txid.erase(anc);\n+    }\n+}\n+\n+void MiniMiner::BuildMockTemplate(const CFeeRate& target_feerate)\n+{\n+    while (!entries_by_txid.empty()) {\n+        // Sort again, since transaction removal may change some entries' ancestor feerates.\n+        std::sort(entries.begin(), entries.end(), AncestorFeerateComparator());\n+\n+        // Pick highest ancestor feerate entry.\n+        auto best_iter = entries.begin();\n+        assert(best_iter != entries.end());\n+        const auto ancestor_package_size = (*best_iter)->second.GetSizeWithAncestors();\n+        const auto ancestor_package_fee = (*best_iter)->second.GetModFeesWithAncestors();\n+        // Stop here. Everything that didn't \"make it into the block\" has bumpfee.\n+        if (best_iter == entries.end() || ancestor_package_fee < target_feerate.GetFee(ancestor_package_size)) {\n+            break;\n+        }\n+\n+        // Calculate ancestors on the fly. This lookup should be fairly cheap, and ancestor sets\n+        // change at every iteration, so this is more efficient than maintaining a cache.\n+        std::set<MockEntryMap::iterator, IteratorComparator> ancestors;\n+        std::set<MockEntryMap::iterator, IteratorComparator> to_process;\n+        ancestors.insert(*best_iter);\n+        to_process.insert(*best_iter);\n+        while (!to_process.empty()) {\n+            auto iter = to_process.begin();\n+            assert(iter != to_process.end());\n+            const CTransaction& tx = (*iter)->second.GetTx();\n+            for (const auto& input : tx.vin) {\n+                if (auto parent_it{entries_by_txid.find(input.prevout.hash)}; parent_it != entries_by_txid.end()) {\n+                    to_process.insert(parent_it);\n+                    ancestors.insert(parent_it);\n+                }\n+            }\n+            to_process.erase(iter);\n+        }\n+        assert(ancestor_package_size == std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+            [](int64_t sum, const auto it) {return sum + it->second.GetTxSize();}));\n+        assert(ancestor_package_fee == std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+            [](CAmount sum, const auto it) {return sum + it->second.GetModifiedFee();}));\n+\n+        // \"Mine\" all transactions in this ancestor set.\n+        for (const auto& anc : ancestors) {\n+            in_block.insert(anc->second.GetTx().GetHash());\n+            total_fees += anc->second.GetModifiedFee();\n+            total_vsize += anc->second.GetTxSize();\n+            auto it = descendant_set_by_txid.find(anc->second.GetTx().GetHash());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050405337",
+      "id" : 1050405337,
+      "line" : 174,
+      "node_id" : "PRRC_kwDOABII584-m-nZ",
+      "original_commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "original_line" : 174,
+      "original_position" : 174,
+      "original_start_line" : null,
+      "path" : "src/node/mini_miner.cpp",
+      "position" : 174,
+      "pull_request_review_id" : 1220130696,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050405337/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-12-16T06:31:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050405337",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8321330?v=4",
+         "events_url" : "https://api.github.com/users/LarryRuane/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/LarryRuane/followers",
+         "following_url" : "https://api.github.com/users/LarryRuane/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/LarryRuane/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/LarryRuane",
+         "id" : 8321330,
+         "login" : "LarryRuane",
+         "node_id" : "MDQ6VXNlcjgzMjEzMzA=",
+         "organizations_url" : "https://api.github.com/users/LarryRuane/orgs",
+         "received_events_url" : "https://api.github.com/users/LarryRuane/received_events",
+         "repos_url" : "https://api.github.com/users/LarryRuane/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/LarryRuane/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/LarryRuane/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/LarryRuane"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050406026"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050406026"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "```suggestion\r\n            in_block.insert(anc->first);\r\n```\r\n(functionally the same, just simpler)",
+      "commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "created_at" : "2022-12-16T06:20:37Z",
+      "diff_hunk" : "@@ -0,0 +1,265 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/mini_miner.h>\n+\n+#include <consensus/amount.h>\n+#include <policy/feerate.h>\n+#include <primitives/transaction.h>\n+#include <timedata.h>\n+#include <util/check.h>\n+#include <util/moneystr.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <utility>\n+\n+namespace node {\n+\n+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)\n+{\n+    LOCK(mempool.cs);\n+    requested_outpoints = outpoints;\n+    // Find which outpoints to calculate bump fees for.\n+    // Anything that's spent by the mempool is to-be-replaced\n+    // Anything otherwise unavailable just has a bump fee of 0\n+    for (const auto& outpoint : outpoints) {\n+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {\n+            // The conflicting transaction is to-be-replaced\n+            to_be_replaced.insert(ptx->GetHash());\n+        }\n+\n+        if (!mempool.exists(GenTxid::Txid(outpoint.hash))) {\n+            // This UTXO is either confirmed or not yet submitted to mempool.\n+            // In the former case, no bump fee is required.\n+            // In the latter case, we have no information, so just return 0.\n+            this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+        } else {\n+            // This UTXO is unconfirmed, in the mempool, and available to spend.\n+            auto it = outpoints_needed_by_txid.find(outpoint.hash);\n+            if (it != outpoints_needed_by_txid.end()) {\n+                it->second.push_back(outpoint);\n+            } else {\n+                std::vector<COutPoint> outpoints_of_tx({outpoint});\n+                outpoints_needed_by_txid.emplace(std::make_pair(outpoint.hash, outpoints_of_tx));\n+                // Instead of operating on the entire mempool, just run the mining algorithm on the\n+                // cluster of relevant transactions, which we'll store in mapModifiedTx.\n+            }\n+        }\n+    }\n+    // Calculate the cluster and construct the entry map.\n+    std::vector<uint256> txids_needed;\n+    std::transform(outpoints_needed_by_txid.cbegin(),\n+                   outpoints_needed_by_txid.cend(),\n+                   std::back_inserter(txids_needed),\n+                   [](const auto& pair) { return pair.first; });\n+    const auto& cluster = mempool.CalculateCluster(txids_needed);\n+    for (const auto& txiter : cluster) {\n+        if (to_be_replaced.find(txiter->GetTx().GetHash()) == to_be_replaced.end()) {\n+            auto [mapiter, success] = entries_by_txid.emplace(std::make_pair(txiter->GetTx().GetHash(), MockMempoolEntry(txiter)));\n+            assert(success);\n+            entries.push_back(mapiter);\n+        } else {\n+            auto outpoints_it = outpoints_needed_by_txid.find(txiter->GetTx().GetHash());\n+            if (outpoints_it != outpoints_needed_by_txid.end()) {\n+                for (const auto& outpoint : outpoints_it->second) {\n+                    this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+                }\n+            }\n+        }\n+    }\n+\n+    // Remove the to-be-replaced transactions and build the descendant_set_by_txid cache.\n+    for (const auto& txiter : cluster) {\n+        const auto& txid = txiter->GetTx().GetHash();\n+        // Cache descendants for future use. Unlike the real mempool, a descendant MockMempoolEntry\n+        // will not exist without its ancestor MockMempoolEntry, so these sets won't be invalidated.\n+        std::vector<MockEntryMap::iterator> cached_descendants;\n+        cached_descendants.emplace_back(entries_by_txid.find(txid));\n+        // If a tx is to-be-replaced, remove any of its descendants so they can't fee-bump anything.\n+        // this case should be rare as the wallet won't normally attempt to replace transactions\n+        // with descendants.\n+        const bool remove = to_be_replaced.find(txid) != to_be_replaced.end();\n+        CTxMemPool::setEntries descendants;\n+        mempool.CalculateDescendants(txiter, descendants);\n+\n+        for (const auto& desc_txiter : descendants) {\n+            auto desc_it{entries_by_txid.find(desc_txiter->GetTx().GetHash())};\n+            if (desc_it != entries_by_txid.end()) {\n+                if (remove) {\n+                    entries_by_txid.erase(desc_it);\n+                } else {\n+                    cached_descendants.push_back(desc_it);\n+                }\n+            }\n+        }\n+        if (!remove) descendant_set_by_txid.emplace(std::make_pair(txid, cached_descendants));\n+    }\n+    // Release the mempool lock; we now have all the information we need for a subset of the entries\n+    // we care about. We will solely operate on the MockMempoolEntry map from now on.\n+    assert(entries.size() == entries_by_txid.size());\n+    assert(entries.size() == descendant_set_by_txid.size());\n+    assert(in_block.empty());\n+}\n+\n+// Compare by ancestor feerate, then iterator\n+struct AncestorFeerateComparator\n+{\n+    template<typename I>\n+    bool operator()(const I& a, const I& b) const {\n+        const CFeeRate a_feerate(a->second.GetModFeesWithAncestors(), a->second.GetSizeWithAncestors());\n+        const CFeeRate b_feerate(b->second.GetModFeesWithAncestors(), b->second.GetSizeWithAncestors());\n+        if (a_feerate != b_feerate) {\n+            return a_feerate > b_feerate;\n+        }\n+        return &(*a) > &(*b);\n+    }\n+};\n+\n+void MiniMiner::DeleteAncestorPackage(const std::set<MockEntryMap::iterator, IteratorComparator>& ancestors)\n+{\n+    for (const auto& anc : ancestors) {\n+        auto vec_it = std::find(entries.begin(), entries.end(), anc);\n+        assert(vec_it != entries.end());\n+        entries.erase(vec_it);\n+        entries_by_txid.erase(anc);\n+    }\n+}\n+\n+void MiniMiner::BuildMockTemplate(const CFeeRate& target_feerate)\n+{\n+    while (!entries_by_txid.empty()) {\n+        // Sort again, since transaction removal may change some entries' ancestor feerates.\n+        std::sort(entries.begin(), entries.end(), AncestorFeerateComparator());\n+\n+        // Pick highest ancestor feerate entry.\n+        auto best_iter = entries.begin();\n+        assert(best_iter != entries.end());\n+        const auto ancestor_package_size = (*best_iter)->second.GetSizeWithAncestors();\n+        const auto ancestor_package_fee = (*best_iter)->second.GetModFeesWithAncestors();\n+        // Stop here. Everything that didn't \"make it into the block\" has bumpfee.\n+        if (best_iter == entries.end() || ancestor_package_fee < target_feerate.GetFee(ancestor_package_size)) {\n+            break;\n+        }\n+\n+        // Calculate ancestors on the fly. This lookup should be fairly cheap, and ancestor sets\n+        // change at every iteration, so this is more efficient than maintaining a cache.\n+        std::set<MockEntryMap::iterator, IteratorComparator> ancestors;\n+        std::set<MockEntryMap::iterator, IteratorComparator> to_process;\n+        ancestors.insert(*best_iter);\n+        to_process.insert(*best_iter);\n+        while (!to_process.empty()) {\n+            auto iter = to_process.begin();\n+            assert(iter != to_process.end());\n+            const CTransaction& tx = (*iter)->second.GetTx();\n+            for (const auto& input : tx.vin) {\n+                if (auto parent_it{entries_by_txid.find(input.prevout.hash)}; parent_it != entries_by_txid.end()) {\n+                    to_process.insert(parent_it);\n+                    ancestors.insert(parent_it);\n+                }\n+            }\n+            to_process.erase(iter);\n+        }\n+        assert(ancestor_package_size == std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+            [](int64_t sum, const auto it) {return sum + it->second.GetTxSize();}));\n+        assert(ancestor_package_fee == std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+            [](CAmount sum, const auto it) {return sum + it->second.GetModifiedFee();}));\n+\n+        // \"Mine\" all transactions in this ancestor set.\n+        for (const auto& anc : ancestors) {\n+            in_block.insert(anc->second.GetTx().GetHash());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050406026",
+      "id" : 1050406026,
+      "line" : 171,
+      "node_id" : "PRRC_kwDOABII584-m-yK",
+      "original_commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "original_line" : 171,
+      "original_position" : 171,
+      "original_start_line" : null,
+      "path" : "src/node/mini_miner.cpp",
+      "position" : 171,
+      "pull_request_review_id" : 1220130696,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050406026/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-12-16T06:31:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050406026",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8321330?v=4",
+         "events_url" : "https://api.github.com/users/LarryRuane/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/LarryRuane/followers",
+         "following_url" : "https://api.github.com/users/LarryRuane/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/LarryRuane/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/LarryRuane",
+         "id" : 8321330,
+         "login" : "LarryRuane",
+         "node_id" : "MDQ6VXNlcjgzMjEzMzA=",
+         "organizations_url" : "https://api.github.com/users/LarryRuane/orgs",
+         "received_events_url" : "https://api.github.com/users/LarryRuane/received_events",
+         "repos_url" : "https://api.github.com/users/LarryRuane/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/LarryRuane/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/LarryRuane/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/LarryRuane"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050420893"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050420893"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "@josibake \r\n> ... which seems incorrect?\r\n\r\nNo, I think it's a convention in the strange Land of Mempool that a transaction's ancestor and descendant lists both include the transaction itself. This relates directly to my [comment](https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050404621) elsewhere that the `emplace_back()` should be removed; as it's currently written, the list would be: `txidA: [txidA, txidA, txidB, txidC...]`. This later causes a major accounting problem!",
+      "commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "created_at" : "2022-12-16T06:51:14Z",
+      "diff_hunk" : "@@ -0,0 +1,265 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/mini_miner.h>\n+\n+#include <consensus/amount.h>\n+#include <policy/feerate.h>\n+#include <primitives/transaction.h>\n+#include <timedata.h>\n+#include <util/check.h>\n+#include <util/moneystr.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <utility>\n+\n+namespace node {\n+\n+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)\n+{\n+    LOCK(mempool.cs);\n+    requested_outpoints = outpoints;\n+    // Find which outpoints to calculate bump fees for.\n+    // Anything that's spent by the mempool is to-be-replaced\n+    // Anything otherwise unavailable just has a bump fee of 0\n+    for (const auto& outpoint : outpoints) {\n+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {\n+            // The conflicting transaction is to-be-replaced\n+            to_be_replaced.insert(ptx->GetHash());\n+        }\n+\n+        if (!mempool.exists(GenTxid::Txid(outpoint.hash))) {\n+            // This UTXO is either confirmed or not yet submitted to mempool.\n+            // In the former case, no bump fee is required.\n+            // In the latter case, we have no information, so just return 0.\n+            this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+        } else {\n+            // This UTXO is unconfirmed, in the mempool, and available to spend.\n+            auto it = outpoints_needed_by_txid.find(outpoint.hash);\n+            if (it != outpoints_needed_by_txid.end()) {\n+                it->second.push_back(outpoint);\n+            } else {\n+                std::vector<COutPoint> outpoints_of_tx({outpoint});\n+                outpoints_needed_by_txid.emplace(std::make_pair(outpoint.hash, outpoints_of_tx));\n+                // Instead of operating on the entire mempool, just run the mining algorithm on the\n+                // cluster of relevant transactions, which we'll store in mapModifiedTx.\n+            }\n+        }\n+    }\n+    // Calculate the cluster and construct the entry map.\n+    std::vector<uint256> txids_needed;\n+    std::transform(outpoints_needed_by_txid.cbegin(),\n+                   outpoints_needed_by_txid.cend(),\n+                   std::back_inserter(txids_needed),\n+                   [](const auto& pair) { return pair.first; });\n+    const auto& cluster = mempool.CalculateCluster(txids_needed);\n+    for (const auto& txiter : cluster) {\n+        if (to_be_replaced.find(txiter->GetTx().GetHash()) == to_be_replaced.end()) {\n+            auto [mapiter, success] = entries_by_txid.emplace(std::make_pair(txiter->GetTx().GetHash(), MockMempoolEntry(txiter)));\n+            assert(success);\n+            entries.push_back(mapiter);\n+        } else {\n+            auto outpoints_it = outpoints_needed_by_txid.find(txiter->GetTx().GetHash());\n+            if (outpoints_it != outpoints_needed_by_txid.end()) {\n+                for (const auto& outpoint : outpoints_it->second) {\n+                    this->bump_fees.emplace(std::make_pair(outpoint, 0));\n+                }\n+            }\n+        }\n+    }\n+\n+    // Remove the to-be-replaced transactions and build the descendant_set_by_txid cache.\n+    for (const auto& txiter : cluster) {\n+        const auto& txid = txiter->GetTx().GetHash();\n+        // Cache descendants for future use. Unlike the real mempool, a descendant MockMempoolEntry\n+        // will not exist without its ancestor MockMempoolEntry, so these sets won't be invalidated.\n+        std::vector<MockEntryMap::iterator> cached_descendants;\n+        cached_descendants.emplace_back(entries_by_txid.find(txid));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26152#discussion_r1050420893",
+      "id" : 1050420893,
+      "in_reply_to_id" : 1040297609,
+      "line" : 79,
+      "node_id" : "PRRC_kwDOABII584-nCad",
+      "original_commit_id" : "898ad9d5904f1b689d18d94f20d92500cf443758",
+      "original_line" : 79,
+      "original_position" : 79,
+      "original_start_line" : null,
+      "path" : "src/node/mini_miner.cpp",
+      "position" : 79,
+      "pull_request_review_id" : 1220353810,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26152",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050420893/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2022-12-16T06:51:15Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1050420893",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8321330?v=4",
+         "events_url" : "https://api.github.com/users/LarryRuane/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/LarryRuane/followers",
+         "following_url" : "https://api.github.com/users/LarryRuane/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/LarryRuane/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/LarryRuane",
+         "id" : 8321330,
+         "login" : "LarryRuane",
+         "node_id" : "MDQ6VXNlcjgzMjEzMzA=",
+         "organizations_url" : "https://api.github.com/users/LarryRuane/orgs",
+         "received_events_url" : "https://api.github.com/users/LarryRuane/received_events",
+         "repos_url" : "https://api.github.com/users/LarryRuane/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/LarryRuane/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/LarryRuane/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/LarryRuane"
+      }
    }
 ]
