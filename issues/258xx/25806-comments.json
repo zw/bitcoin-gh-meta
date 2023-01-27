@@ -1878,5 +1878,139 @@
          "type" : "User",
          "url" : "https://api.github.com/users/furszy"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25806#discussion_r1089055672"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25806"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1089055672"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: could use the just-below-boundary value of 5 here\r\n```suggestion\r\n            /*is_from_me=*/false, CFeeRate(0), /*depth=*/5);\r\n```",
+      "commit_id" : "fc7b504d334da32fa559e04cc8a4d7205d66f2af",
+      "created_at" : "2023-01-27T14:56:23Z",
+      "diff_hunk" : "@@ -0,0 +1,224 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <test/util/setup_common.h>\n+\n+#include <wallet/coinselection.h>\n+#include <wallet/spend.h>\n+#include <wallet/wallet.h>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+namespace wallet {\n+BOOST_FIXTURE_TEST_SUITE(group_outputs_tests, TestingSetup)\n+\n+static int nextLockTime = 0;\n+\n+static std::shared_ptr<CWallet> NewWallet(const node::NodeContext& m_node, const ArgsManager& m_args)\n+{\n+    std::unique_ptr<CWallet> wallet = std::make_unique<CWallet>(m_node.chain.get(), \"\", m_args, CreateMockWalletDatabase());\n+    wallet->LoadWallet();\n+    LOCK(wallet->cs_wallet);\n+    wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);\n+    wallet->SetupDescriptorScriptPubKeyMans();\n+    return wallet;\n+}\n+\n+static void addCoin(CoinsResult& coins,\n+                     CWallet& wallet,\n+                     const CTxDestination& dest,\n+                     const CAmount& nValue,\n+                     bool is_from_me,\n+                     CFeeRate fee_rate = CFeeRate(0),\n+                     int depth = 6)\n+{\n+    CMutableTransaction tx;\n+    tx.nLockTime = nextLockTime++;        // so all transactions get different hashes\n+    tx.vout.resize(1);\n+    tx.vout[0].nValue = nValue;\n+    tx.vout[0].scriptPubKey = GetScriptForDestination(dest);\n+\n+    const uint256& txid = tx.GetHash();\n+    LOCK(wallet.cs_wallet);\n+    auto ret = wallet.mapWallet.emplace(std::piecewise_construct, std::forward_as_tuple(txid), std::forward_as_tuple(MakeTransactionRef(std::move(tx)), TxStateInactive{}));\n+    assert(ret.second);\n+    CWalletTx& wtx = (*ret.first).second;\n+    const auto& txout = wtx.tx->vout.at(0);\n+    coins.Add(*Assert(OutputTypeFromDestination(dest)),\n+              {COutPoint(wtx.GetHash(), 0),\n+                   txout,\n+                   depth,\n+                   CalculateMaximumSignedInputSize(txout, &wallet, /*coin_control=*/nullptr),\n+                   /*spendable=*/ true,\n+                   /*solvable=*/ true,\n+                   /*safe=*/ true,\n+                   wtx.GetTxTime(),\n+                   is_from_me,\n+                   fee_rate});\n+}\n+\n+ CoinSelectionParams makeSelectionParams(FastRandomContext& rand, bool avoid_partial_spends)\n+{\n+    return CoinSelectionParams{\n+            rand,\n+            /*change_output_size=*/ 0,\n+            /*change_spend_size=*/ 0,\n+            /*min_change_target=*/ CENT,\n+            /*effective_feerate=*/ CFeeRate(0),\n+            /*long_term_feerate=*/ CFeeRate(0),\n+            /*discard_feerate=*/ CFeeRate(0),\n+            /*tx_noinputs_size=*/ 0,\n+            /*avoid_partial=*/ avoid_partial_spends,\n+    };\n+}\n+\n+class GroupVerifier\n+{\n+public:\n+    std::shared_ptr<CWallet> wallet{nullptr};\n+    CoinsResult coins_pool;\n+    FastRandomContext rand;\n+\n+    void GroupVerify(const CoinEligibilityFilter& filter,\n+                     bool avoid_partial_spends,\n+                     bool positive_only,\n+                     int expected_size)\n+    {\n+        std::vector<OutputGroup> groups = GroupOutputs(*wallet,\n+                                                       coins_pool.All(),\n+                                                       makeSelectionParams(rand, avoid_partial_spends),\n+                                                       filter,\n+                                                       positive_only);\n+        BOOST_CHECK_EQUAL(groups.size(), expected_size);\n+    }\n+\n+    void GroupAndVerify(const CoinEligibilityFilter& filter,\n+                        int expected_with_partial_spends_size,\n+                        int expected_without_partial_spends_size,\n+                        bool positive_only)\n+    {\n+        // First avoid partial spends\n+        GroupVerify(filter, /*avoid_partial_spends=*/false, positive_only,  expected_with_partial_spends_size);\n+        // Second don't avoid partial spends\n+        GroupVerify(filter, /*avoid_partial_spends=*/true, positive_only, expected_without_partial_spends_size);\n+    }\n+};\n+\n+BOOST_AUTO_TEST_CASE(outputs_grouping_tests)\n+{\n+    const auto& wallet = NewWallet(m_node, m_args);\n+    GroupVerifier group_verifier;\n+    group_verifier.wallet = wallet;\n+\n+    const CoinEligibilityFilter& BASIC_FILTER{1, 6, 0};\n+\n+    // #################################################################################\n+    // 10 outputs from different txs going to the same script\n+    // 1) if partial spends is enabled --> must not be grouped\n+    // 2) if partial spends is not enabled --> must be grouped into a single OutputGroup\n+    // #################################################################################\n+\n+    unsigned long GROUP_SIZE = 10;\n+    const CTxDestination dest = *Assert(wallet->GetNewDestination(OutputType::BECH32, \"\"));\n+    for (unsigned long i = 0; i < GROUP_SIZE; i++) {\n+        addCoin(group_verifier.coins_pool, *wallet, dest, 10 * COIN, /*is_from_me=*/true);\n+    }\n+\n+    group_verifier.GroupAndVerify(BASIC_FILTER,\n+                                  /*expected_with_partial_spends_size=*/ GROUP_SIZE,\n+                                  /*expected_without_partial_spends_size=*/ 1,\n+                                  /*positive_only=*/ true);\n+\n+    // ####################################################################################\n+    // 3) 10 more UTXO are added with a different script --> must be grouped into a single\n+    //    group for avoid partial spends and 10 different output groups for partial spends\n+    // ####################################################################################\n+\n+    const CTxDestination dest2 = *Assert(wallet->GetNewDestination(OutputType::BECH32, \"\"));\n+    for (unsigned long i = 0; i < GROUP_SIZE; i++) {\n+        addCoin(group_verifier.coins_pool, *wallet, dest2, 5 * COIN, /*is_from_me=*/true);\n+    }\n+\n+    group_verifier.GroupAndVerify(BASIC_FILTER,\n+            /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2,\n+            /*expected_without_partial_spends_size=*/ 2,\n+            /*positive_only=*/ true);\n+\n+    // ################################################################################\n+    // 4) Now add a negative output --> which will be skipped if \"positive_only\" is set\n+    // ################################################################################\n+\n+    const CTxDestination dest3 = *Assert(wallet->GetNewDestination(OutputType::BECH32, \"\"));\n+    addCoin(group_verifier.coins_pool, *wallet, dest3, 1, true, CFeeRate(100));\n+    BOOST_CHECK(group_verifier.coins_pool.coins[OutputType::BECH32].back().GetEffectiveValue() <= 0);\n+\n+    // First expect no changes with \"positive_only\" enabled\n+    group_verifier.GroupAndVerify(BASIC_FILTER,\n+            /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2,\n+            /*expected_without_partial_spends_size=*/ 2,\n+            /*positive_only=*/ true);\n+\n+    // Then expect changes with \"positive_only\" disabled\n+    group_verifier.GroupAndVerify(BASIC_FILTER,\n+            /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2 + 1,\n+            /*expected_without_partial_spends_size=*/ 3,\n+            /*positive_only=*/ false);\n+\n+\n+    // ##############################################################################\n+    // 5) Try to add a non-eligible UTXO (due not fulfilling the min depth target for\n+    //    \"not mine\" UTXOs) --> it must not be added to any group\n+    // ##############################################################################\n+\n+    const CTxDestination dest4 = *Assert(wallet->GetNewDestination(OutputType::BECH32, \"\"));\n+    addCoin(group_verifier.coins_pool, *wallet, dest4, 6 * COIN,\n+            /*is_from_me=*/false, CFeeRate(0), /*depth=*/2);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25806#discussion_r1089055672",
+      "id" : 1089055672,
+      "line" : 180,
+      "node_id" : "PRRC_kwDOABII585A6au4",
+      "original_commit_id" : "17bd243dfa050516900098dc8c2ff3171df740f7",
+      "original_line" : 176,
+      "original_position" : 176,
+      "original_start_line" : null,
+      "path" : "src/wallet/test/group_outputs_tests.cpp",
+      "position" : 176,
+      "pull_request_review_id" : 1272840693,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25806",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1089055672/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2023-01-27T14:57:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1089055672",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/91535?v=4",
+         "events_url" : "https://api.github.com/users/theStack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theStack/followers",
+         "following_url" : "https://api.github.com/users/theStack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theStack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theStack",
+         "id" : 91535,
+         "login" : "theStack",
+         "node_id" : "MDQ6VXNlcjkxNTM1",
+         "organizations_url" : "https://api.github.com/users/theStack/orgs",
+         "received_events_url" : "https://api.github.com/users/theStack/received_events",
+         "repos_url" : "https://api.github.com/users/theStack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theStack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theStack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theStack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25806#discussion_r1089056734"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25806"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1089056734"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: could just-above-boundary value of 101 here\r\n```suggestion\r\n    for (unsigned long i = 0; i < 101; i++) { // OUTPUT_GROUP_MAX_ENTRIES{100}\r\n```",
+      "commit_id" : "fc7b504d334da32fa559e04cc8a4d7205d66f2af",
+      "created_at" : "2023-01-27T14:57:20Z",
+      "diff_hunk" : "@@ -0,0 +1,224 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <test/util/setup_common.h>\n+\n+#include <wallet/coinselection.h>\n+#include <wallet/spend.h>\n+#include <wallet/wallet.h>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+namespace wallet {\n+BOOST_FIXTURE_TEST_SUITE(group_outputs_tests, TestingSetup)\n+\n+static int nextLockTime = 0;\n+\n+static std::shared_ptr<CWallet> NewWallet(const node::NodeContext& m_node, const ArgsManager& m_args)\n+{\n+    std::unique_ptr<CWallet> wallet = std::make_unique<CWallet>(m_node.chain.get(), \"\", m_args, CreateMockWalletDatabase());\n+    wallet->LoadWallet();\n+    LOCK(wallet->cs_wallet);\n+    wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);\n+    wallet->SetupDescriptorScriptPubKeyMans();\n+    return wallet;\n+}\n+\n+static void addCoin(CoinsResult& coins,\n+                     CWallet& wallet,\n+                     const CTxDestination& dest,\n+                     const CAmount& nValue,\n+                     bool is_from_me,\n+                     CFeeRate fee_rate = CFeeRate(0),\n+                     int depth = 6)\n+{\n+    CMutableTransaction tx;\n+    tx.nLockTime = nextLockTime++;        // so all transactions get different hashes\n+    tx.vout.resize(1);\n+    tx.vout[0].nValue = nValue;\n+    tx.vout[0].scriptPubKey = GetScriptForDestination(dest);\n+\n+    const uint256& txid = tx.GetHash();\n+    LOCK(wallet.cs_wallet);\n+    auto ret = wallet.mapWallet.emplace(std::piecewise_construct, std::forward_as_tuple(txid), std::forward_as_tuple(MakeTransactionRef(std::move(tx)), TxStateInactive{}));\n+    assert(ret.second);\n+    CWalletTx& wtx = (*ret.first).second;\n+    const auto& txout = wtx.tx->vout.at(0);\n+    coins.Add(*Assert(OutputTypeFromDestination(dest)),\n+              {COutPoint(wtx.GetHash(), 0),\n+                   txout,\n+                   depth,\n+                   CalculateMaximumSignedInputSize(txout, &wallet, /*coin_control=*/nullptr),\n+                   /*spendable=*/ true,\n+                   /*solvable=*/ true,\n+                   /*safe=*/ true,\n+                   wtx.GetTxTime(),\n+                   is_from_me,\n+                   fee_rate});\n+}\n+\n+ CoinSelectionParams makeSelectionParams(FastRandomContext& rand, bool avoid_partial_spends)\n+{\n+    return CoinSelectionParams{\n+            rand,\n+            /*change_output_size=*/ 0,\n+            /*change_spend_size=*/ 0,\n+            /*min_change_target=*/ CENT,\n+            /*effective_feerate=*/ CFeeRate(0),\n+            /*long_term_feerate=*/ CFeeRate(0),\n+            /*discard_feerate=*/ CFeeRate(0),\n+            /*tx_noinputs_size=*/ 0,\n+            /*avoid_partial=*/ avoid_partial_spends,\n+    };\n+}\n+\n+class GroupVerifier\n+{\n+public:\n+    std::shared_ptr<CWallet> wallet{nullptr};\n+    CoinsResult coins_pool;\n+    FastRandomContext rand;\n+\n+    void GroupVerify(const CoinEligibilityFilter& filter,\n+                     bool avoid_partial_spends,\n+                     bool positive_only,\n+                     int expected_size)\n+    {\n+        std::vector<OutputGroup> groups = GroupOutputs(*wallet,\n+                                                       coins_pool.All(),\n+                                                       makeSelectionParams(rand, avoid_partial_spends),\n+                                                       filter,\n+                                                       positive_only);\n+        BOOST_CHECK_EQUAL(groups.size(), expected_size);\n+    }\n+\n+    void GroupAndVerify(const CoinEligibilityFilter& filter,\n+                        int expected_with_partial_spends_size,\n+                        int expected_without_partial_spends_size,\n+                        bool positive_only)\n+    {\n+        // First avoid partial spends\n+        GroupVerify(filter, /*avoid_partial_spends=*/false, positive_only,  expected_with_partial_spends_size);\n+        // Second don't avoid partial spends\n+        GroupVerify(filter, /*avoid_partial_spends=*/true, positive_only, expected_without_partial_spends_size);\n+    }\n+};\n+\n+BOOST_AUTO_TEST_CASE(outputs_grouping_tests)\n+{\n+    const auto& wallet = NewWallet(m_node, m_args);\n+    GroupVerifier group_verifier;\n+    group_verifier.wallet = wallet;\n+\n+    const CoinEligibilityFilter& BASIC_FILTER{1, 6, 0};\n+\n+    // #################################################################################\n+    // 10 outputs from different txs going to the same script\n+    // 1) if partial spends is enabled --> must not be grouped\n+    // 2) if partial spends is not enabled --> must be grouped into a single OutputGroup\n+    // #################################################################################\n+\n+    unsigned long GROUP_SIZE = 10;\n+    const CTxDestination dest = *Assert(wallet->GetNewDestination(OutputType::BECH32, \"\"));\n+    for (unsigned long i = 0; i < GROUP_SIZE; i++) {\n+        addCoin(group_verifier.coins_pool, *wallet, dest, 10 * COIN, /*is_from_me=*/true);\n+    }\n+\n+    group_verifier.GroupAndVerify(BASIC_FILTER,\n+                                  /*expected_with_partial_spends_size=*/ GROUP_SIZE,\n+                                  /*expected_without_partial_spends_size=*/ 1,\n+                                  /*positive_only=*/ true);\n+\n+    // ####################################################################################\n+    // 3) 10 more UTXO are added with a different script --> must be grouped into a single\n+    //    group for avoid partial spends and 10 different output groups for partial spends\n+    // ####################################################################################\n+\n+    const CTxDestination dest2 = *Assert(wallet->GetNewDestination(OutputType::BECH32, \"\"));\n+    for (unsigned long i = 0; i < GROUP_SIZE; i++) {\n+        addCoin(group_verifier.coins_pool, *wallet, dest2, 5 * COIN, /*is_from_me=*/true);\n+    }\n+\n+    group_verifier.GroupAndVerify(BASIC_FILTER,\n+            /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2,\n+            /*expected_without_partial_spends_size=*/ 2,\n+            /*positive_only=*/ true);\n+\n+    // ################################################################################\n+    // 4) Now add a negative output --> which will be skipped if \"positive_only\" is set\n+    // ################################################################################\n+\n+    const CTxDestination dest3 = *Assert(wallet->GetNewDestination(OutputType::BECH32, \"\"));\n+    addCoin(group_verifier.coins_pool, *wallet, dest3, 1, true, CFeeRate(100));\n+    BOOST_CHECK(group_verifier.coins_pool.coins[OutputType::BECH32].back().GetEffectiveValue() <= 0);\n+\n+    // First expect no changes with \"positive_only\" enabled\n+    group_verifier.GroupAndVerify(BASIC_FILTER,\n+            /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2,\n+            /*expected_without_partial_spends_size=*/ 2,\n+            /*positive_only=*/ true);\n+\n+    // Then expect changes with \"positive_only\" disabled\n+    group_verifier.GroupAndVerify(BASIC_FILTER,\n+            /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2 + 1,\n+            /*expected_without_partial_spends_size=*/ 3,\n+            /*positive_only=*/ false);\n+\n+\n+    // ##############################################################################\n+    // 5) Try to add a non-eligible UTXO (due not fulfilling the min depth target for\n+    //    \"not mine\" UTXOs) --> it must not be added to any group\n+    // ##############################################################################\n+\n+    const CTxDestination dest4 = *Assert(wallet->GetNewDestination(OutputType::BECH32, \"\"));\n+    addCoin(group_verifier.coins_pool, *wallet, dest4, 6 * COIN,\n+            /*is_from_me=*/false, CFeeRate(0), /*depth=*/2);\n+\n+    // Expect no changes from this round and the previous one (point 4)\n+    group_verifier.GroupAndVerify(BASIC_FILTER,\n+            /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2 + 1,\n+            /*expected_without_partial_spends_size=*/ 3,\n+            /*positive_only=*/ false);\n+\n+\n+    // ##############################################################################\n+    // 6) Try to add a non-eligible UTXO (due not fulfilling the min depth target for\n+    //    \"mine\" UTXOs) --> it must not be added to any group\n+    // ##############################################################################\n+\n+    const CTxDestination dest5 = *Assert(wallet->GetNewDestination(OutputType::BECH32, \"\"));\n+    addCoin(group_verifier.coins_pool, *wallet, dest5, 6 * COIN,\n+            /*is_from_me=*/true, CFeeRate(0), /*depth=*/0);\n+\n+    // Expect no changes from this round and the previous one (point 5)\n+    group_verifier.GroupAndVerify(BASIC_FILTER,\n+            /*expected_with_partial_spends_size=*/ GROUP_SIZE * 2 + 1,\n+            /*expected_without_partial_spends_size=*/ 3,\n+            /*positive_only=*/ false);\n+\n+    // ###########################################################################################\n+    // 7) Surpass the OUTPUT_GROUP_MAX_ENTRIES and verify that a second partial group gets created\n+    // ###########################################################################################\n+\n+    const CTxDestination dest7 = *Assert(wallet->GetNewDestination(OutputType::BECH32, \"\"));\n+    for (unsigned long i = 0; i < 130; i++) { // OUTPUT_GROUP_MAX_ENTRIES{100}",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25806#discussion_r1089056734",
+      "id" : 1089056734,
+      "line" : 211,
+      "node_id" : "PRRC_kwDOABII585A6a_e",
+      "original_commit_id" : "17bd243dfa050516900098dc8c2ff3171df740f7",
+      "original_line" : 205,
+      "original_position" : 205,
+      "original_start_line" : null,
+      "path" : "src/wallet/test/group_outputs_tests.cpp",
+      "position" : 205,
+      "pull_request_review_id" : 1272840693,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25806",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1089056734/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2023-01-27T14:57:59Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1089056734",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/91535?v=4",
+         "events_url" : "https://api.github.com/users/theStack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theStack/followers",
+         "following_url" : "https://api.github.com/users/theStack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theStack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theStack",
+         "id" : 91535,
+         "login" : "theStack",
+         "node_id" : "MDQ6VXNlcjkxNTM1",
+         "organizations_url" : "https://api.github.com/users/theStack/orgs",
+         "received_events_url" : "https://api.github.com/users/theStack/received_events",
+         "repos_url" : "https://api.github.com/users/theStack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theStack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theStack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theStack"
+      }
    }
 ]
