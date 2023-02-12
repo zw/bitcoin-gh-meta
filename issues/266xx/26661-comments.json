@@ -1249,5 +1249,72 @@
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26661#discussion_r1103836760"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26661"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1103836760"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "The local variable `res` in here shadows another one: https://github.com/bitcoin/bitcoin/blob/76dc547ee7b05864e7b1b6c55fc0301d47aa3a15/src/wallet/spend.cpp#L658\r\n\r\nFixed in #27087.",
+      "commit_id" : "76dc547ee7b05864e7b1b6c55fc0301d47aa3a15",
+      "created_at" : "2023-02-12T16:57:16Z",
+      "diff_hunk" : "@@ -643,54 +655,56 @@ std::optional<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coi\n     // Coin Selection attempts to select inputs from a pool of eligible UTXOs to fund the\n     // transaction at a target feerate. If an attempt fails, more attempts may be made using a more\n     // permissive CoinEligibilityFilter.\n-    std::optional<SelectionResult> res = [&] {\n-        // If possible, fund the transaction with confirmed UTXOs only. Prefer at least six\n-        // confirmations on outputs received from other wallets and only spend confirmed change.\n-        if (auto r1{AttemptSelection(wallet, value_to_select, CoinEligibilityFilter(1, 6, 0), available_coins, coin_selection_params, /*allow_mixed_output_types=*/false)}) return r1;\n-        // Allow mixing only if no solution from any single output type can be found\n-        if (auto r2{AttemptSelection(wallet, value_to_select, CoinEligibilityFilter(1, 1, 0), available_coins, coin_selection_params, /*allow_mixed_output_types=*/true)}) return r2;\n-\n+    util::Result<SelectionResult> res = [&] {\n+        // Place coins eligibility filters on a scope increasing order.\n+        std::vector<SelectionFilter> ordered_filters{\n+                // If possible, fund the transaction with confirmed UTXOs only. Prefer at least six\n+                // confirmations on outputs received from other wallets and only spend confirmed change.\n+                {CoinEligibilityFilter(1, 6, 0), /*allow_mixed_output_types=*/false},\n+                {CoinEligibilityFilter(1, 1, 0)},\n+        };\n         // Fall back to using zero confirmation change (but with as few ancestors in the mempool as\n         // possible) if we cannot fund the transaction otherwise.\n         if (wallet.m_spend_zero_conf_change) {\n-            if (auto r3{AttemptSelection(wallet, value_to_select, CoinEligibilityFilter(0, 1, 2), available_coins, coin_selection_params, /*allow_mixed_output_types=*/true)}) return r3;\n-            if (auto r4{AttemptSelection(wallet, value_to_select, CoinEligibilityFilter(0, 1, std::min((size_t)4, max_ancestors/3), std::min((size_t)4, max_descendants/3)),\n-                                   available_coins, coin_selection_params, /*allow_mixed_output_types=*/true)}) {\n-                return r4;\n-            }\n-            if (auto r5{AttemptSelection(wallet, value_to_select, CoinEligibilityFilter(0, 1, max_ancestors/2, max_descendants/2),\n-                                   available_coins, coin_selection_params, /*allow_mixed_output_types=*/true)}) {\n-                return r5;\n-            }\n+            ordered_filters.push_back({CoinEligibilityFilter(0, 1, 2)});\n+            ordered_filters.push_back({CoinEligibilityFilter(0, 1, std::min((size_t)4, max_ancestors/3), std::min((size_t)4, max_descendants/3))});\n+            ordered_filters.push_back({CoinEligibilityFilter(0, 1, max_ancestors/2, max_descendants/2)});\n             // If partial groups are allowed, relax the requirement of spending OutputGroups (groups\n             // of UTXOs sent to the same address, which are obviously controlled by a single wallet)\n             // in their entirety.\n-            if (auto r6{AttemptSelection(wallet, value_to_select, CoinEligibilityFilter(0, 1, max_ancestors-1, max_descendants-1, /*include_partial=*/true),\n-                                   available_coins, coin_selection_params, /*allow_mixed_output_types=*/true)}) {\n-                return r6;\n-            }\n+            ordered_filters.push_back({CoinEligibilityFilter(0, 1, max_ancestors-1, max_descendants-1, /*include_partial=*/true)});\n             // Try with unsafe inputs if they are allowed. This may spend unconfirmed outputs\n             // received from other wallets.\n             if (coin_control.m_include_unsafe_inputs) {\n-                if (auto r7{AttemptSelection(wallet, value_to_select,\n-                    CoinEligibilityFilter(/*conf_mine=*/0, /*conf_theirs=*/0, max_ancestors-1, max_descendants-1, /*include_partial=*/true),\n-                    available_coins, coin_selection_params, /*allow_mixed_output_types=*/true)}) {\n-                    return r7;\n-                }\n+                ordered_filters.push_back({CoinEligibilityFilter(/*conf_mine=*/0, /*conf_theirs*/0, max_ancestors-1, max_descendants-1, /*include_partial=*/true)});\n             }\n             // Try with unlimited ancestors/descendants. The transaction will still need to meet\n             // mempool ancestor/descendant policy to be accepted to mempool and broadcasted, but\n             // OutputGroups use heuristics that may overestimate ancestor/descendant counts.\n             if (!fRejectLongChains) {\n-                if (auto r8{AttemptSelection(wallet, value_to_select,\n-                                      CoinEligibilityFilter(0, 1, std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max(), /*include_partial=*/true),\n-                                      available_coins, coin_selection_params, /*allow_mixed_output_types=*/true)}) {\n-                    return r8;\n-                }\n+                ordered_filters.push_back({CoinEligibilityFilter(0, 1, std::numeric_limits<uint64_t>::max(),\n+                                                                   std::numeric_limits<uint64_t>::max(),\n+                                                                   /*include_partial=*/true)});\n+            }\n+        }\n+\n+        // Walk-through the filters until the solution gets found.\n+        // If no solution is found, return the first detailed error (if any).\n+        // future: add \"error level\" so the worst one can be picked instead.\n+        std::vector<util::Result<SelectionResult>> res_detailed_errors;\n+        for (const auto& select_filter : ordered_filters) {\n+            if (auto res{AttemptSelection(wallet, value_to_select, select_filter.filter, available_coins,",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26661#discussion_r1103836760",
+      "id" : 1103836760,
+      "line" : 696,
+      "node_id" : "PRRC_kwDOABII585ByzZY",
+      "original_commit_id" : "76dc547ee7b05864e7b1b6c55fc0301d47aa3a15",
+      "original_line" : 696,
+      "original_position" : 182,
+      "original_start_line" : null,
+      "path" : "src/wallet/spend.cpp",
+      "position" : 182,
+      "pull_request_review_id" : 1294744886,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26661",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1103836760/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2023-02-12T16:57:16Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1103836760",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/32963518?v=4",
+         "events_url" : "https://api.github.com/users/hebasto/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/hebasto/followers",
+         "following_url" : "https://api.github.com/users/hebasto/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/hebasto/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/hebasto",
+         "id" : 32963518,
+         "login" : "hebasto",
+         "node_id" : "MDQ6VXNlcjMyOTYzNTE4",
+         "organizations_url" : "https://api.github.com/users/hebasto/orgs",
+         "received_events_url" : "https://api.github.com/users/hebasto/received_events",
+         "repos_url" : "https://api.github.com/users/hebasto/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/hebasto/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/hebasto/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/hebasto"
+      }
    }
 ]
