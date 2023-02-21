@@ -1337,5 +1337,209 @@
          "type" : "User",
          "url" : "https://api.github.com/users/jamesob"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26857#discussion_r1113120278"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1113120278"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Good point. This has been done; see the `limit_recursion` parameter. Thanks to @john-moffett for outlining a particular test case to ensure that recursion is limited to a single call.",
+      "commit_id" : "b7620a98946265e63bc1db1680c7e28225b5e47b",
+      "created_at" : "2023-02-21T14:11:24Z",
+      "diff_hunk" : "@@ -1213,6 +1342,185 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript&\n                 }\n                 break;\n \n+                case OP_VAULT:\n+                {\n+                    // only available post-segwit\n+                    if (sigversion == SigVersion::BASE) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);\n+\n+                    // <recovery-spk-hash> <spend-delay> <trigger-spk-hash>\n+                    if (stack.size() < 3) return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);\n+\n+                    valtype& hash_from_stack = stacktop(-3);\n+                    if (hash_from_stack.size() != 32) {\n+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);\n+                    }\n+                    const uint256 recovery_spk_hash{hash_from_stack};\n+\n+                    // `spend-delay` is a CScriptNum, up to 4 bytes, that is interpreted\n+                    // in the same way as the first 23 bits of nSequence are per\n+                    // BIP 68 (relative time-locks). This enables users of vaults to\n+                    // express spend delays in either wall time or block count, and reuse\n+                    // the same machinery as OP_CHECKSEQUENCEVERIFY.\n+                    const CScriptNum spend_delay(stacktop(-2), fRequireMinimal);\n+\n+                    hash_from_stack = stacktop(-1);\n+                    if (hash_from_stack.size() != 32) {\n+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);\n+                    }\n+                    const uint256 expected_trigger_spk_hash{hash_from_stack};\n+\n+                    popstack(stack);\n+                    popstack(stack);\n+                    popstack(stack);\n+\n+                    // Case 1: sweep to recovery\n+                    if (checker.CheckVaultSpendToRecoveryOutputs(recovery_spk_hash)) {\n+                        stack.push_back(vchTrue);\n+                        break;\n+                    }\n+\n+                    // Case 2: spend to compatible OP_UNVAULT\n+\n+                    // [trigger witness stack ...] <trigger-spk> [prev stack items]\n+                    if (stack.size() < 2) {\n+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);\n+                    }\n+\n+                    CScript unvault_output_spk;\n+\n+                    if (!checker.CheckUnvaultTriggerOutputsCommon(\n+                            recovery_spk_hash,\n+                            spend_delay,\n+                            fRequireMinimal,\n+                            unvault_output_spk)) {\n+                        return set_error(serror, SCRIPT_ERR_UNVAULT_MISMATCH);\n+                    }\n+                    assert(unvault_output_spk.size() > 0);\n+\n+                    // Determine the type of the proposed OP_UNVAULT script.\n+                    // If it lives behind a scripthash, we will have to construct\n+                    // a specific expected scriptPubKey and compare to that. Otherwise\n+                    // we'll analyze its prefix as a bare script.\n+                    int opuv_witversion;\n+                    valtype opuv_witprogram;\n+                    const bool is_unvault_output_wit =\n+                        unvault_output_spk.IsWitnessProgram(opuv_witversion, opuv_witprogram);\n+\n+                    if (!is_unvault_output_wit) {\n+                        // Validate the OP_UNVAULT output as a bare script.\n+                        if (!CheckUnvaultTriggerOutputsBare(\n+                                unvault_output_spk,\n+                                recovery_spk_hash, spend_delay, fRequireMinimal)) {\n+                            return set_error(serror, SCRIPT_ERR_UNVAULT_MISMATCH);\n+                        }\n+                    } else {\n+                        // We now expect an additional item on the stack, <target-hash>,\n+                        // which is used to validate the proposed OP_UNVAULT witness\n+                        // output sPK - which hides the actual OP_UNVAULT script behind a\n+                        // scripthash.\n+                        if (stack.size() < 3) {\n+                            return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);\n+                        }\n+                        valtype& hash_from_stack = stacktop(-1);\n+                        if (hash_from_stack.size() != 32) {\n+                            return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);\n+                        }\n+                        const uint256 target_hash{hash_from_stack};\n+                        popstack(stack);\n+\n+                        if (!CheckUnvaultTriggerOutputsWitness(\n+                                opuv_witversion, opuv_witprogram,\n+                                recovery_spk_hash, spend_delay, target_hash,\n+                                fRequireMinimal, flags, serror)) {\n+                            return set_error(serror, SCRIPT_ERR_UNVAULT_MISMATCH);\n+                        }\n+                    }\n+\n+                    // Now that we have verified the structure of the outputs, verify\n+                    // the signature authorizing the beginning of the unvault.\n+                    //\n+                    // Check that a valid trigger signature has been put on the witness\n+                    // stack.\n+                    const valtype& trigger_witness_program = stacktop(-1);\n+                    auto trigger_witness_spk = CScript(\n+                        trigger_witness_program.begin(), trigger_witness_program.end());\n+\n+                    const uint256 trigger_spk_hash = VaultScriptHash(\n+                            HASHER_VAULT_UNVAULT_SPK, trigger_witness_spk);\n+\n+                    if (trigger_spk_hash != expected_trigger_spk_hash) {\n+                        return set_error(serror, SCRIPT_ERR_VAULT_WRONG_TRIGGER_WITNESS_PROGRAM);\n+                    }\n+                    popstack(stack);\n+                    // Everything remaining on the stack is the witness stack\n+                    // to be fed into the witness program above.\n+\n+                    CScriptWitness witness;\n+                    witness.stack = stack;\n+                    int witnessversion;\n+                    std::vector<unsigned char> witnessprogram;\n+\n+                    if (!trigger_witness_spk.IsWitnessProgram(witnessversion, witnessprogram)) {\n+                        return set_error(serror, SCRIPT_ERR_VAULT_INVALID_TRIGGER_WITNESS_PROGRAM);\n+                    }\n+                    // Note that this will recursively call EvalScript. We could get\n+                    // into a further recursion if OP_VAULT spends are included in the\n+                    // trigger witness program; the recursion depth is limited\n+                    // solely by script size constraints.\n+                    //\n+                    // TODO: think more about whether to limit recursive OP_VAULT\n+                    // evaluations in trigger witness programs.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26857#discussion_r1113120278",
+      "id" : 1113120278,
+      "in_reply_to_id" : 1071577974,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585CWN4W",
+      "original_commit_id" : "a8323b9cea602f4af8206f86c0193d189b721904",
+      "original_line" : 1428,
+      "original_position" : 287,
+      "original_start_line" : 1471,
+      "path" : "src/script/interpreter.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1307509728,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26857",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1113120278/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "updated_at" : "2023-02-21T14:11:24Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1113120278",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26857#discussion_r1113121652"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1113121652"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Removed. Vault opcodes now only exist as OP_SUCCESSx overrides in tapscript. ",
+      "commit_id" : "b7620a98946265e63bc1db1680c7e28225b5e47b",
+      "created_at" : "2023-02-21T14:12:33Z",
+      "diff_hunk" : "@@ -1267,12 +1385,62 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript&\n                     if (stack.size() < 2) {\n                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);\n                     }\n-                    if (!checker.CheckUnvaultTriggerOutputs(\n-                            recovery_spk_hash, spend_delay, fRequireMinimal)) {\n+\n+                    CScript unvault_output_spk;\n+\n+                    if (!checker.CheckUnvaultTriggerOutputsCommon(\n+                            recovery_spk_hash,\n+                            spend_delay,\n+                            fRequireMinimal,\n+                            unvault_output_spk)) {\n                         return set_error(serror, SCRIPT_ERR_UNVAULT_MISMATCH);\n                     }\n+                    assert(unvault_output_spk.size() > 0);\n+\n+                    // Determine the type of the proposed OP_UNVAULT script.\n+                    // If it lives behind a scripthash, we will have to construct\n+                    // a specific expected scriptPubKey and compare to that. Otherwise\n+                    // we'll analyze its prefix as a bare script.\n+                    int opuv_witversion;\n+                    valtype opuv_witprogram;\n+                    const bool is_unvault_output_wit =\n+                        unvault_output_spk.IsWitnessProgram(opuv_witversion, opuv_witprogram);\n+\n+                    if (!is_unvault_output_wit) {\n+                        // Validate the OP_UNVAULT output as a bare script.\n+                        if (!CheckUnvaultTriggerOutputsBare(\n+                                unvault_output_spk,\n+                                recovery_spk_hash, spend_delay, fRequireMinimal)) {\n+                            return set_error(serror, SCRIPT_ERR_UNVAULT_MISMATCH);\n+                        }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26857#discussion_r1113121652",
+      "id" : 1113121652,
+      "in_reply_to_id" : 1071585163,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585CWON0",
+      "original_commit_id" : "a9db7392bf9d4d69d5a7a91db32dda7bd50479d8",
+      "original_line" : 1434,
+      "original_position" : 165,
+      "original_start_line" : 1409,
+      "path" : "src/script/interpreter.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1307511788,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26857",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1113121652/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "updated_at" : "2023-02-21T14:12:34Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1113121652",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26857#discussion_r1113122540"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26857"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1113122540"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed. OP_UNVAULT outputs (and recovery outputs) are now specified explicitly by an index on the witness stack. Thanks for this feedback.",
+      "commit_id" : "b7620a98946265e63bc1db1680c7e28225b5e47b",
+      "created_at" : "2023-02-21T14:13:20Z",
+      "diff_hunk" : "@@ -2137,11 +2166,49 @@ bool GenericTransactionSignatureChecker<T>::CheckUnvaultTriggerOutputsCommon(\n     if (!this->txdata) return HandleMissingData(m_mdb);\n     const auto& txd{*this->txdata};\n \n-    if (!CommonVaultSpendChecks(txd, this->txTo->vout)) {\n+    const auto num_outs = this->txTo->vout.size();\n+    if (num_outs < 1 || num_outs > 3) {\n         return false;\n     }\n \n-    unvault_output_spk = this->txTo->vout[0].scriptPubKey;\n+    CAmount total_val_out_to_vaults{0};\n+\n+    assert(txd.m_spent_outputs_ready);\n+    const CScript& vault_spk = txd.m_spent_outputs[this->nIn].scriptPubKey;\n+\n+    bool has_ea{false};\n+    bool has_revault{false};\n+\n+    // Verify that all optional outputs are either an ephemeral anchor or a revault.\n+    // Permit the optional outputs to appear in any order.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26857#discussion_r1113122540",
+      "id" : 1113122540,
+      "in_reply_to_id" : 1071588874,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585CWObs",
+      "original_commit_id" : "c00dad503d7dfa990afd24c9fde2555482cc247b",
+      "original_line" : 2160,
+      "original_position" : 85,
+      "original_start_line" : 2182,
+      "path" : "src/script/interpreter.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1307513132,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26857",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1113122540/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "updated_at" : "2023-02-21T14:13:20Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1113122540",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/73197?v=4",
+         "events_url" : "https://api.github.com/users/jamesob/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/jamesob/followers",
+         "following_url" : "https://api.github.com/users/jamesob/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/jamesob/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/jamesob",
+         "id" : 73197,
+         "login" : "jamesob",
+         "node_id" : "MDQ6VXNlcjczMTk3",
+         "organizations_url" : "https://api.github.com/users/jamesob/orgs",
+         "received_events_url" : "https://api.github.com/users/jamesob/received_events",
+         "repos_url" : "https://api.github.com/users/jamesob/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/jamesob/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/jamesob/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/jamesob"
+      }
    }
 ]
