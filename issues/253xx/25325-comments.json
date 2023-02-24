@@ -5801,5 +5801,139 @@
          "type" : "User",
          "url" : "https://api.github.com/users/martinus"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25325#discussion_r1117323095"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25325"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1117323095"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`m_untouched_memory_end` now called `m_available_memory_end`",
+      "commit_id" : "d87cb99bb37637e26a9e00b9f7de4bc6f44cb79d",
+      "created_at" : "2023-02-24T17:01:36Z",
+      "diff_hunk" : "@@ -0,0 +1,349 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_SUPPORT_ALLOCATORS_POOL_H\n+#define BITCOIN_SUPPORT_ALLOCATORS_POOL_H\n+\n+#include <array>\n+#include <cassert>\n+#include <cstddef>\n+#include <list>\n+#include <memory>\n+#include <new>\n+#include <type_traits>\n+#include <utility>\n+\n+/**\n+ * A memory resource similar to std::pmr::unsynchronized_pool_resource, but\n+ * optimized for node-based containers. It has the following properties:\n+ *\n+ * * Owns the allocated memory and frees it on destruction, even when deallocate\n+ *   has not been called on the allocated blocks.\n+ *\n+ * * Consists of a number of pools, each one for a different block size.\n+ *   Each pool holds blocks of uniform size in a freelist.\n+ *\n+ * * Exhausting memory in a freelist causes a new allocation of a fixed size chunk.\n+ *   This chunk is used to carve out blocks.\n+ *\n+ * * Block sizes or alignments that can not be served by the pools are allocated\n+ *   and deallocated by operator new().\n+ *\n+ * PoolResource is not thread-safe. It is intended to be used by PoolAllocator.\n+ *\n+ * @tparam MAX_BLOCK_SIZE_BYTES Maximum size to allocate with the pool. If larger\n+ *         sizes are requested, allocation falls back to new().\n+ *\n+ * @tparam ALIGN_BYTES Required alignment for the allocations.\n+ *\n+ * An example: If you create a PoolResource<128, 8>(262144) and perform a bunch of\n+ * allocations and deallocate 2 blocks with size 8 bytes, and 3 blocks with size 16,\n+ * the members will look like this:\n+ *\n+ *     m_free_lists                         m_allocated_chunks\n+ *        âââââ                                âââââ  âââââââââââââ-------âââââââ\n+ *        â   â  blocks                        â   âââºâ    262144 B             â\n+ *        â   â  âââââââ  âââââââ              âââ¬ââ  âââââââââââââ-------âââââââ\n+ *        â 1 âââºâ 8 B âââºâ 8 B â                â\n+ *        â   â  âââââââ  âââââââ                :\n+ *        â   â                                  â\n+ *        â   â  âââââââ  âââââââ  âââââââ       â¼\n+ *        â 2 âââºâ16 B âââºâ16 B âââºâ16 B â     âââââ  âââââââââââââââââââââââââââ\n+ *        â   â  âââââââ  âââââââ  âââââââ     â   âââºâ          â²              â â²\n+ *        â   â                                âââââ  ââââââââââââ¬âââââââââââââââ â\n+ *        â . â                                                  â    m_available_memory_end\n+ *        â . â                                         m_available_memory_it\n+ *        â . â\n+ *        â   â\n+ *        â   â\n+ *        â16 â\n+ *        âââââ\n+ *\n+ * Here m_free_lists[1] holds the 2 blocks of size 8 bytes, and m_free_lists[2]\n+ * holds the 3 blocks of size 16. The blocks came from the data stored in the\n+ * m_allocated_chunks list. Each chunk has bytes 262144. The last chunk has still\n+ * some memory available for the blocks, and when m_available_memory_it is at the\n+ * end, a new chunk will be allocated and added to the list.\n+ */\n+template <std::size_t MAX_BLOCK_SIZE_BYTES, std::size_t ALIGN_BYTES>\n+class PoolResource final\n+{\n+    static_assert(ALIGN_BYTES > 0, \"ALIGN_BYTES must be nonzero\");\n+    static_assert((ALIGN_BYTES & (ALIGN_BYTES - 1)) == 0, \"ALIGN_BYTES must be a power of two\");\n+\n+    /**\n+     * In-place linked list of the allocations, used for the freelist.\n+     */\n+    struct ListNode {\n+        ListNode* m_next;\n+\n+        explicit ListNode(ListNode* next) : m_next(next) {}\n+    };\n+    static_assert(std::is_trivially_destructible_v<ListNode>, \"Make sure we don't need to manually call a destructor\");\n+\n+    /**\n+     * Internal alignment value. The larger of the requested ALIGN_BYTES and alignof(FreeList).\n+     */\n+    static constexpr std::size_t ELEM_ALIGN_BYTES = std::max(alignof(ListNode), ALIGN_BYTES);\n+    static_assert((ELEM_ALIGN_BYTES & (ELEM_ALIGN_BYTES - 1)) == 0, \"ELEM_ALIGN_BYTES must be a power of two\");\n+    static_assert(sizeof(ListNode) <= ELEM_ALIGN_BYTES, \"Units of size ELEM_SIZE_ALIGN need to be able to store a ListNode\");\n+    static_assert((MAX_BLOCK_SIZE_BYTES & (ELEM_ALIGN_BYTES - 1)) == 0, \"MAX_BLOCK_SIZE_BYTES needs to be a multiple of the alignment.\");\n+\n+    /**\n+     * Size in bytes to allocate per chunk\n+     */\n+    const size_t m_chunk_size_bytes;\n+\n+    /**\n+     * Contains all allocated pools of memory, used to free the data in the destructor.\n+     */\n+    std::list<std::byte*> m_allocated_chunks{};\n+\n+    /**\n+     * Single linked lists of all data that came from deallocating.\n+     * m_free_lists[n] will serve blocks of size n*ELEM_ALIGN_BYTES.\n+     */\n+    std::array<ListNode*, MAX_BLOCK_SIZE_BYTES / ELEM_ALIGN_BYTES + 1> m_free_lists{};\n+\n+    /**\n+     * Points to the beginning of available memory for carving out allocations.\n+     */\n+    std::byte* m_available_memory_it = nullptr;\n+\n+    /**\n+     * Points to the end of available memory for carving out allocations.\n+     *\n+     * That member variable is redundant, and is always equal to `m_allocated_chunks.back() + m_chunk_size_bytes`\n+     * whenever it is accessed, but `m_untouched_memory_end` caches this for clarity and efficiency.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25325#discussion_r1117323095",
+      "id" : 1117323095,
+      "line" : 118,
+      "node_id" : "PRRC_kwDOABII585CmP9X",
+      "original_commit_id" : "d87cb99bb37637e26a9e00b9f7de4bc6f44cb79d",
+      "original_line" : 118,
+      "original_position" : 118,
+      "original_start_line" : null,
+      "path" : "src/support/allocators/pool.h",
+      "position" : 118,
+      "pull_request_review_id" : 1313921906,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25325",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1117323095/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2023-02-24T17:12:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1117323095",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/116917595?v=4",
+         "events_url" : "https://api.github.com/users/john-moffett/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/john-moffett/followers",
+         "following_url" : "https://api.github.com/users/john-moffett/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/john-moffett/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/john-moffett",
+         "id" : 116917595,
+         "login" : "john-moffett",
+         "node_id" : "U_kgDOBvgFWw",
+         "organizations_url" : "https://api.github.com/users/john-moffett/orgs",
+         "received_events_url" : "https://api.github.com/users/john-moffett/received_events",
+         "repos_url" : "https://api.github.com/users/john-moffett/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/john-moffett/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/john-moffett/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/john-moffett"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/25325#discussion_r1117328292"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25325"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1117328292"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Extra \"is\" after \"memory\".",
+      "commit_id" : "d87cb99bb37637e26a9e00b9f7de4bc6f44cb79d",
+      "created_at" : "2023-02-24T17:04:53Z",
+      "diff_hunk" : "@@ -0,0 +1,349 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_SUPPORT_ALLOCATORS_POOL_H\n+#define BITCOIN_SUPPORT_ALLOCATORS_POOL_H\n+\n+#include <array>\n+#include <cassert>\n+#include <cstddef>\n+#include <list>\n+#include <memory>\n+#include <new>\n+#include <type_traits>\n+#include <utility>\n+\n+/**\n+ * A memory resource similar to std::pmr::unsynchronized_pool_resource, but\n+ * optimized for node-based containers. It has the following properties:\n+ *\n+ * * Owns the allocated memory and frees it on destruction, even when deallocate\n+ *   has not been called on the allocated blocks.\n+ *\n+ * * Consists of a number of pools, each one for a different block size.\n+ *   Each pool holds blocks of uniform size in a freelist.\n+ *\n+ * * Exhausting memory in a freelist causes a new allocation of a fixed size chunk.\n+ *   This chunk is used to carve out blocks.\n+ *\n+ * * Block sizes or alignments that can not be served by the pools are allocated\n+ *   and deallocated by operator new().\n+ *\n+ * PoolResource is not thread-safe. It is intended to be used by PoolAllocator.\n+ *\n+ * @tparam MAX_BLOCK_SIZE_BYTES Maximum size to allocate with the pool. If larger\n+ *         sizes are requested, allocation falls back to new().\n+ *\n+ * @tparam ALIGN_BYTES Required alignment for the allocations.\n+ *\n+ * An example: If you create a PoolResource<128, 8>(262144) and perform a bunch of\n+ * allocations and deallocate 2 blocks with size 8 bytes, and 3 blocks with size 16,\n+ * the members will look like this:\n+ *\n+ *     m_free_lists                         m_allocated_chunks\n+ *        âââââ                                âââââ  âââââââââââââ-------âââââââ\n+ *        â   â  blocks                        â   âââºâ    262144 B             â\n+ *        â   â  âââââââ  âââââââ              âââ¬ââ  âââââââââââââ-------âââââââ\n+ *        â 1 âââºâ 8 B âââºâ 8 B â                â\n+ *        â   â  âââââââ  âââââââ                :\n+ *        â   â                                  â\n+ *        â   â  âââââââ  âââââââ  âââââââ       â¼\n+ *        â 2 âââºâ16 B âââºâ16 B âââºâ16 B â     âââââ  âââââââââââââââââââââââââââ\n+ *        â   â  âââââââ  âââââââ  âââââââ     â   âââºâ          â²              â â²\n+ *        â   â                                âââââ  ââââââââââââ¬âââââââââââââââ â\n+ *        â . â                                                  â    m_available_memory_end\n+ *        â . â                                         m_available_memory_it\n+ *        â . â\n+ *        â   â\n+ *        â   â\n+ *        â16 â\n+ *        âââââ\n+ *\n+ * Here m_free_lists[1] holds the 2 blocks of size 8 bytes, and m_free_lists[2]\n+ * holds the 3 blocks of size 16. The blocks came from the data stored in the\n+ * m_allocated_chunks list. Each chunk has bytes 262144. The last chunk has still\n+ * some memory available for the blocks, and when m_available_memory_it is at the\n+ * end, a new chunk will be allocated and added to the list.\n+ */\n+template <std::size_t MAX_BLOCK_SIZE_BYTES, std::size_t ALIGN_BYTES>\n+class PoolResource final\n+{\n+    static_assert(ALIGN_BYTES > 0, \"ALIGN_BYTES must be nonzero\");\n+    static_assert((ALIGN_BYTES & (ALIGN_BYTES - 1)) == 0, \"ALIGN_BYTES must be a power of two\");\n+\n+    /**\n+     * In-place linked list of the allocations, used for the freelist.\n+     */\n+    struct ListNode {\n+        ListNode* m_next;\n+\n+        explicit ListNode(ListNode* next) : m_next(next) {}\n+    };\n+    static_assert(std::is_trivially_destructible_v<ListNode>, \"Make sure we don't need to manually call a destructor\");\n+\n+    /**\n+     * Internal alignment value. The larger of the requested ALIGN_BYTES and alignof(FreeList).\n+     */\n+    static constexpr std::size_t ELEM_ALIGN_BYTES = std::max(alignof(ListNode), ALIGN_BYTES);\n+    static_assert((ELEM_ALIGN_BYTES & (ELEM_ALIGN_BYTES - 1)) == 0, \"ELEM_ALIGN_BYTES must be a power of two\");\n+    static_assert(sizeof(ListNode) <= ELEM_ALIGN_BYTES, \"Units of size ELEM_SIZE_ALIGN need to be able to store a ListNode\");\n+    static_assert((MAX_BLOCK_SIZE_BYTES & (ELEM_ALIGN_BYTES - 1)) == 0, \"MAX_BLOCK_SIZE_BYTES needs to be a multiple of the alignment.\");\n+\n+    /**\n+     * Size in bytes to allocate per chunk\n+     */\n+    const size_t m_chunk_size_bytes;\n+\n+    /**\n+     * Contains all allocated pools of memory, used to free the data in the destructor.\n+     */\n+    std::list<std::byte*> m_allocated_chunks{};\n+\n+    /**\n+     * Single linked lists of all data that came from deallocating.\n+     * m_free_lists[n] will serve blocks of size n*ELEM_ALIGN_BYTES.\n+     */\n+    std::array<ListNode*, MAX_BLOCK_SIZE_BYTES / ELEM_ALIGN_BYTES + 1> m_free_lists{};\n+\n+    /**\n+     * Points to the beginning of available memory for carving out allocations.\n+     */\n+    std::byte* m_available_memory_it = nullptr;\n+\n+    /**\n+     * Points to the end of available memory for carving out allocations.\n+     *\n+     * That member variable is redundant, and is always equal to `m_allocated_chunks.back() + m_chunk_size_bytes`\n+     * whenever it is accessed, but `m_untouched_memory_end` caches this for clarity and efficiency.\n+     */\n+    std::byte* m_available_memory_end = nullptr;\n+\n+    /**\n+     * How many multiple of ELEM_ALIGN_BYTES are necessary to fit bytes. We use that result directly as an index\n+     * into m_free_lists.\n+     */\n+    [[nodiscard]] static constexpr std::size_t NumElemAlignBytes(std::size_t bytes)\n+    {\n+        return (bytes + ELEM_ALIGN_BYTES - 1) / ELEM_ALIGN_BYTES;\n+    }\n+\n+    /**\n+     * True when it is possible to make use of the freelist\n+     */\n+    [[nodiscard]] static constexpr bool IsFreeListUsable(std::size_t bytes, std::size_t alignment)\n+    {\n+        return alignment <= ELEM_ALIGN_BYTES && bytes <= MAX_BLOCK_SIZE_BYTES;\n+    }\n+\n+    /**\n+     * Replaces node with placement constructed ListNode that points to the previous node\n+     */\n+    void PlacementAddToList(void* p, ListNode*& node)\n+    {\n+        node = new (p) ListNode{node};\n+    }\n+\n+    /**\n+     * Allocate one full memory chunk which will be used to carve out allocations.\n+     * Also puts any leftover bytes into the freelist.\n+     *\n+     * Precondition: leftover bytes are either 0 or few enough to fit into a place in the freelist\n+     */\n+    void AllocateChunk()\n+    {\n+        // if there is still any available memory is left, put it into the freelist.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/25325#discussion_r1117328292",
+      "id" : 1117328292,
+      "line" : 155,
+      "node_id" : "PRRC_kwDOABII585CmROk",
+      "original_commit_id" : "d87cb99bb37637e26a9e00b9f7de4bc6f44cb79d",
+      "original_line" : 155,
+      "original_position" : 155,
+      "original_start_line" : null,
+      "path" : "src/support/allocators/pool.h",
+      "position" : 155,
+      "pull_request_review_id" : 1313921906,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/25325",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1117328292/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2023-02-24T17:12:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1117328292",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/116917595?v=4",
+         "events_url" : "https://api.github.com/users/john-moffett/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/john-moffett/followers",
+         "following_url" : "https://api.github.com/users/john-moffett/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/john-moffett/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/john-moffett",
+         "id" : 116917595,
+         "login" : "john-moffett",
+         "node_id" : "U_kgDOBvgFWw",
+         "organizations_url" : "https://api.github.com/users/john-moffett/orgs",
+         "received_events_url" : "https://api.github.com/users/john-moffett/received_events",
+         "repos_url" : "https://api.github.com/users/john-moffett/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/john-moffett/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/john-moffett/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/john-moffett"
+      }
    }
 ]
