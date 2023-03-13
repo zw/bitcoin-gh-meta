@@ -10881,5 +10881,140 @@
          "type" : "User",
          "url" : "https://api.github.com/users/Sjors"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r1134633292"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1134633292"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "In commit \"Implement MigrateLegacyToDescriptor\" (0bf7b38bff422e7413bcd3dc0abe2568dd918ddc)\r\n\r\nIt seems like this should say `IsMine` not `!IsMine`. Also I'm not sure why `addr_pair.second.purpose == \"receive\"` check is necessary. It seems like just checking IsMine should be enough, and it would be less robust to rely on purpose field being present.",
+      "commit_id" : "53e7ed075c49f853cc845afc7b2f058cabad0cb0",
+      "created_at" : "2023-03-13T21:25:00Z",
+      "diff_hunk" : "@@ -3726,4 +3726,400 @@ bool CWallet::MigrateToSQLite(bilingual_str& error)\n     assert(committed); // This is a critical error, the new db could not be written to. The original db exists as a backup, but we should not continue execution.\n     return true;\n }\n+\n+std::optional<MigrationData> CWallet::GetDescriptorsForLegacy(bilingual_str& error) const\n+{\n+    AssertLockHeld(cs_wallet);\n+\n+    LegacyScriptPubKeyMan* legacy_spkm = GetLegacyScriptPubKeyMan();\n+    if (!legacy_spkm) {\n+        error = _(\"Error: This wallet is already a descriptor wallet\");\n+        return std::nullopt;\n+    }\n+\n+    std::optional<MigrationData> res = legacy_spkm->MigrateToDescriptor();\n+    if (res == std::nullopt) {\n+        error = _(\"Error: Unable to produce descriptors for this legacy wallet. Make sure the wallet is unlocked first\");\n+        return std::nullopt;\n+    }\n+    return res;\n+}\n+\n+bool CWallet::ApplyMigrationData(MigrationData& data, bilingual_str& error)\n+{\n+    AssertLockHeld(cs_wallet);\n+\n+    LegacyScriptPubKeyMan* legacy_spkm = GetLegacyScriptPubKeyMan();\n+    if (!legacy_spkm) {\n+        error = _(\"Error: This wallet is already a descriptor wallet\");\n+        return false;\n+    }\n+\n+    for (auto& desc_spkm : data.desc_spkms) {\n+        if (m_spk_managers.count(desc_spkm->GetID()) > 0) {\n+            error = _(\"Error: Duplicate descriptors created during migration. Your wallet may be corrupted.\");\n+            return false;\n+        }\n+        m_spk_managers[desc_spkm->GetID()] = std::move(desc_spkm);\n+    }\n+\n+    // Remove the LegacyScriptPubKeyMan from disk\n+    if (!legacy_spkm->DeleteRecords()) {\n+        return false;\n+    }\n+\n+    // Remove the LegacyScriptPubKeyMan from memory\n+    m_spk_managers.erase(legacy_spkm->GetID());\n+    m_external_spk_managers.clear();\n+    m_internal_spk_managers.clear();\n+\n+    // Setup new descriptors\n+    SetWalletFlag(WALLET_FLAG_DESCRIPTORS);\n+    if (!IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {\n+        // Use the existing master key if we have it\n+        if (data.master_key.key.IsValid()) {\n+            SetupDescriptorScriptPubKeyMans(data.master_key);\n+        } else {\n+            // Setup with a new seed if we don't.\n+            SetupDescriptorScriptPubKeyMans();\n+        }\n+    }\n+\n+    // Check if the transactions in the wallet are still ours. Either they belong here, or they belong in the watchonly wallet.\n+    // We need to go through these in the tx insertion order so that lookups to spends works.\n+    std::vector<uint256> txids_to_delete;\n+    for (const auto& [_pos, wtx] : wtxOrdered) {\n+        if (!IsMine(*wtx->tx) && !IsFromMe(*wtx->tx)) {\n+            // Check it is the watchonly wallet's\n+            // solvable_wallet doesn't need to be checked because transactions for those scripts weren't being watched for\n+            if (data.watchonly_wallet) {\n+                LOCK(data.watchonly_wallet->cs_wallet);\n+                if (data.watchonly_wallet->IsMine(*wtx->tx) || data.watchonly_wallet->IsFromMe(*wtx->tx)) {\n+                    // Add to watchonly wallet\n+                    if (!data.watchonly_wallet->AddToWallet(wtx->tx, wtx->m_state)) {\n+                        error = _(\"Error: Could not add watchonly tx to watchonly wallet\");\n+                        return false;\n+                    }\n+                    // Mark as to remove from this wallet\n+                    txids_to_delete.push_back(wtx->GetHash());\n+                    continue;\n+                }\n+            }\n+            // Both not ours and not in the watchonly wallet\n+            error = strprintf(_(\"Error: Transaction %s in wallet cannot be identified to belong to migrated wallets\"), wtx->GetHash().GetHex());\n+            return false;\n+        }\n+    }\n+    // Do the removes\n+    if (txids_to_delete.size() > 0) {\n+        std::vector<uint256> deleted_txids;\n+        if (ZapSelectTx(txids_to_delete, deleted_txids) != DBErrors::LOAD_OK) {\n+            error = _(\"Error: Could not delete watchonly transactions\");\n+            return false;\n+        }\n+        if (deleted_txids != txids_to_delete) {\n+            error = _(\"Error: Not all watchonly txs could be deleted\");\n+            return false;\n+        }\n+        // Tell the GUI of each tx\n+        for (const uint256& txid : deleted_txids) {\n+            NotifyTransactionChanged(txid, CT_UPDATED);\n+        }\n+    }\n+\n+    // Check the address book data in the same way we did for transactions\n+    std::vector<CTxDestination> dests_to_delete;\n+    for (const auto& addr_pair : m_address_book) {\n+        // Labels applied to receiving addresses should go based on IsMine\n+        if (addr_pair.second.purpose == \"receive\") {\n+            if (!IsMine(addr_pair.first)) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r1134633292",
+      "id" : 1134633292,
+      "line" : 3835,
+      "node_id" : "PRRC_kwDOABII585DoSFM",
+      "original_commit_id" : "0bf7b38bff422e7413bcd3dc0abe2568dd918ddc",
+      "original_line" : 3835,
+      "original_position" : 110,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : 254,
+      "pull_request_review_id" : 1337977991,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1134633292/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2023-03-13T21:26:20Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1134633292",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r1134644466"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1134644466"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "It's because the migration process divides data between different wallets.\r\nIt first deletes and unloads the legacy spkm from the main wallet (check the beginning of the function), and setup new descriptors. Then moves the data to two possible wallets; a solvable and a watch-only wallet.\r\n\r\nSo the `!IsMine` means that the record in the addressbook is from the legacy spkm (not loaded anymore), so it needs migration to the new wallets.\r\n\r\nIt also took me a while to get it while was rewriting it for #26836.\r\n(sorry for the double PR mention, saw late your response in the other PR)",
+      "commit_id" : "53e7ed075c49f853cc845afc7b2f058cabad0cb0",
+      "created_at" : "2023-03-13T21:40:13Z",
+      "diff_hunk" : "@@ -3726,4 +3726,400 @@ bool CWallet::MigrateToSQLite(bilingual_str& error)\n     assert(committed); // This is a critical error, the new db could not be written to. The original db exists as a backup, but we should not continue execution.\n     return true;\n }\n+\n+std::optional<MigrationData> CWallet::GetDescriptorsForLegacy(bilingual_str& error) const\n+{\n+    AssertLockHeld(cs_wallet);\n+\n+    LegacyScriptPubKeyMan* legacy_spkm = GetLegacyScriptPubKeyMan();\n+    if (!legacy_spkm) {\n+        error = _(\"Error: This wallet is already a descriptor wallet\");\n+        return std::nullopt;\n+    }\n+\n+    std::optional<MigrationData> res = legacy_spkm->MigrateToDescriptor();\n+    if (res == std::nullopt) {\n+        error = _(\"Error: Unable to produce descriptors for this legacy wallet. Make sure the wallet is unlocked first\");\n+        return std::nullopt;\n+    }\n+    return res;\n+}\n+\n+bool CWallet::ApplyMigrationData(MigrationData& data, bilingual_str& error)\n+{\n+    AssertLockHeld(cs_wallet);\n+\n+    LegacyScriptPubKeyMan* legacy_spkm = GetLegacyScriptPubKeyMan();\n+    if (!legacy_spkm) {\n+        error = _(\"Error: This wallet is already a descriptor wallet\");\n+        return false;\n+    }\n+\n+    for (auto& desc_spkm : data.desc_spkms) {\n+        if (m_spk_managers.count(desc_spkm->GetID()) > 0) {\n+            error = _(\"Error: Duplicate descriptors created during migration. Your wallet may be corrupted.\");\n+            return false;\n+        }\n+        m_spk_managers[desc_spkm->GetID()] = std::move(desc_spkm);\n+    }\n+\n+    // Remove the LegacyScriptPubKeyMan from disk\n+    if (!legacy_spkm->DeleteRecords()) {\n+        return false;\n+    }\n+\n+    // Remove the LegacyScriptPubKeyMan from memory\n+    m_spk_managers.erase(legacy_spkm->GetID());\n+    m_external_spk_managers.clear();\n+    m_internal_spk_managers.clear();\n+\n+    // Setup new descriptors\n+    SetWalletFlag(WALLET_FLAG_DESCRIPTORS);\n+    if (!IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {\n+        // Use the existing master key if we have it\n+        if (data.master_key.key.IsValid()) {\n+            SetupDescriptorScriptPubKeyMans(data.master_key);\n+        } else {\n+            // Setup with a new seed if we don't.\n+            SetupDescriptorScriptPubKeyMans();\n+        }\n+    }\n+\n+    // Check if the transactions in the wallet are still ours. Either they belong here, or they belong in the watchonly wallet.\n+    // We need to go through these in the tx insertion order so that lookups to spends works.\n+    std::vector<uint256> txids_to_delete;\n+    for (const auto& [_pos, wtx] : wtxOrdered) {\n+        if (!IsMine(*wtx->tx) && !IsFromMe(*wtx->tx)) {\n+            // Check it is the watchonly wallet's\n+            // solvable_wallet doesn't need to be checked because transactions for those scripts weren't being watched for\n+            if (data.watchonly_wallet) {\n+                LOCK(data.watchonly_wallet->cs_wallet);\n+                if (data.watchonly_wallet->IsMine(*wtx->tx) || data.watchonly_wallet->IsFromMe(*wtx->tx)) {\n+                    // Add to watchonly wallet\n+                    if (!data.watchonly_wallet->AddToWallet(wtx->tx, wtx->m_state)) {\n+                        error = _(\"Error: Could not add watchonly tx to watchonly wallet\");\n+                        return false;\n+                    }\n+                    // Mark as to remove from this wallet\n+                    txids_to_delete.push_back(wtx->GetHash());\n+                    continue;\n+                }\n+            }\n+            // Both not ours and not in the watchonly wallet\n+            error = strprintf(_(\"Error: Transaction %s in wallet cannot be identified to belong to migrated wallets\"), wtx->GetHash().GetHex());\n+            return false;\n+        }\n+    }\n+    // Do the removes\n+    if (txids_to_delete.size() > 0) {\n+        std::vector<uint256> deleted_txids;\n+        if (ZapSelectTx(txids_to_delete, deleted_txids) != DBErrors::LOAD_OK) {\n+            error = _(\"Error: Could not delete watchonly transactions\");\n+            return false;\n+        }\n+        if (deleted_txids != txids_to_delete) {\n+            error = _(\"Error: Not all watchonly txs could be deleted\");\n+            return false;\n+        }\n+        // Tell the GUI of each tx\n+        for (const uint256& txid : deleted_txids) {\n+            NotifyTransactionChanged(txid, CT_UPDATED);\n+        }\n+    }\n+\n+    // Check the address book data in the same way we did for transactions\n+    std::vector<CTxDestination> dests_to_delete;\n+    for (const auto& addr_pair : m_address_book) {\n+        // Labels applied to receiving addresses should go based on IsMine\n+        if (addr_pair.second.purpose == \"receive\") {\n+            if (!IsMine(addr_pair.first)) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/19602#discussion_r1134644466",
+      "id" : 1134644466,
+      "in_reply_to_id" : 1134633292,
+      "line" : 3835,
+      "node_id" : "PRRC_kwDOABII585DoUzy",
+      "original_commit_id" : "0bf7b38bff422e7413bcd3dc0abe2568dd918ddc",
+      "original_line" : 3835,
+      "original_position" : 110,
+      "original_start_line" : null,
+      "path" : "src/wallet/wallet.cpp",
+      "position" : 254,
+      "pull_request_review_id" : 1337994773,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/19602",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1134644466/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2023-03-13T22:00:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1134644466",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5377650?v=4",
+         "events_url" : "https://api.github.com/users/furszy/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/furszy/followers",
+         "following_url" : "https://api.github.com/users/furszy/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/furszy/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/furszy",
+         "id" : 5377650,
+         "login" : "furszy",
+         "node_id" : "MDQ6VXNlcjUzNzc2NTA=",
+         "organizations_url" : "https://api.github.com/users/furszy/orgs",
+         "received_events_url" : "https://api.github.com/users/furszy/received_events",
+         "repos_url" : "https://api.github.com/users/furszy/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/furszy/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/furszy/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/furszy"
+      }
    }
 ]
