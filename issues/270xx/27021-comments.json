@@ -5372,8 +5372,8 @@
          }
       },
       "author_association" : "MEMBER",
-      "body" : "This has been puzzling me for a while.\r\n\r\nIt is not clear to me why need to calculate the descendants once more if the information is available in the cluster (it is just not accesible because data is unordered).\r\nCouldn't return from `GatherCluster` a map of tx id and its descendants instead? Like first going up into the DAG, starting with the higher parents, and then build the map<tx_id, children> with a recursive children call.\r\nIt looks like a heavy waste to recalculate the same twice.\r\n\r\nor well.. it is not that heavy because you set the 500 entries limit. hmm.. it still is duplicated work but it has a limit.\r\n\r\nAnother point is why continue traversing the children when the parent was marked to be removed? To double assert that the previous loop worked as expected? (if that is the case, what about decoupling the previous loop into a separate function and adding unit test coverage instead of all the runtime `Assume` calls?).",
-      "commit_id" : "d227d394cdfc377169888dcf1d9f574f02903065",
+      "body" : "This has been puzzling me for a while.\r\n\r\nIt is not clear to me why need to calculate the descendants once more if the information is available in the cluster (it is just not accesible because data is unordered).\r\nCouldn't return from `GatherCluster` a map of tx id and its descendants instead? Like first going up into the DAG, starting with the highest parents, and then build the map<tx_id, vector<children>> with a recursive children call.\r\nIt looks like a heavy waste to recalculate the same twice.\r\n\r\nor well.. it is not that heavy because you set the 500 entries limit. hmm.. it still is duplicated work but it has a limit.\r\n\r\nAnother point is why continue traversing the children when the parent was marked to be removed? To double assert that the previous loop worked as expected? (if that is the case, what about decoupling the previous loop into a separate function and adding unit test coverage instead of all the runtime `Assume` calls?).",
+      "commit_id" : "cf1636078f7e97110cab15646110fcc1ce935136",
       "created_at" : "2023-03-09T21:19:43Z",
       "diff_hunk" : "@@ -0,0 +1,318 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/mini_miner.h>\n+\n+#include <consensus/amount.h>\n+#include <policy/feerate.h>\n+#include <primitives/transaction.h>\n+#include <timedata.h>\n+#include <util/check.h>\n+#include <util/moneystr.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <utility>\n+\n+namespace node {\n+\n+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)\n+{\n+    LOCK(mempool.cs);\n+    // Find which outpoints to calculate bump fees for.\n+    // Anything that's spent by the mempool is to-be-replaced\n+    // Anything otherwise unavailable just has a bump fee of 0\n+    for (const auto& outpoint : outpoints) {\n+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {\n+            // This outpoint is already being spent by another transaction in the mempool.\n+            // We assume that the caller wants to replace this transaction (and its descendants).\n+            // If the outpoint is from a mempool transaction, we still need to calculate its\n+            // ancestors bump fees (added to m_requested_outpoints_by_txid below), but after\n+            // removing the to-be-replaced entries. Note that this is only calculating bump fees.\n+            // RBF fee rules should be handled separately.\n+            m_to_be_replaced.insert(ptx->GetHash());\n+            // Remove descendants because they will be replaced as well. This case should be rare\n+            // as the wallet won't normally attempt to replace transactions with descendants.\n+            CTxMemPool::setEntries descendants;\n+            mempool.CalculateDescendants(mempool.GetIter(ptx->GetHash()).value(), descendants);\n+            for (const auto& desc_txiter : descendants) {\n+                m_to_be_replaced.insert(desc_txiter->GetTx().GetHash());\n+            }\n+        }\n+\n+        if (mempool.exists(GenTxid::Txid(outpoint.hash))) {\n+            // UXTO is created by transaction in mempool, add to map.\n+            // Note: This will either create a missing entry or add the outpoint to an existing entry\n+            m_requested_outpoints_by_txid[outpoint.hash].push_back(outpoint);\n+        } else {\n+            // This UTXO is either confirmed or not yet submitted to mempool.\n+            // If it's confirmed, no bump fee is required.\n+            // If it's not yet submitted, we have no information, so return 0.\n+            m_bump_fees.emplace(outpoint, 0);\n+        }\n+    }\n+\n+    // No unconfirmed UTXOs, so nothing mempool-related needs to be calculated.\n+    if (m_requested_outpoints_by_txid.empty()) return;\n+\n+    // Calculate the cluster and construct the entry map.\n+    std::vector<uint256> txids_needed;\n+    for (const auto& [txid, _]: m_requested_outpoints_by_txid) {\n+        txids_needed.push_back(txid);\n+    }\n+    const auto cluster = mempool.GatherClusters(txids_needed);\n+    if (cluster.empty()) {\n+        // An empty cluster means that at least one of the transactions is missing from the mempool\n+        // (should not be possible given processing above) or DoS limit was hit.\n+        m_ready_to_calculate = false;\n+        return;\n+    }\n+\n+    // Add every entry to m_entries_by_txid and m_entries, except the ones that will be replaced.\n+    for (const auto& txiter : cluster) {\n+        if (!m_to_be_replaced.count(txiter->GetTx().GetHash())) {\n+            auto [mapiter, success] = m_entries_by_txid.emplace(txiter->GetTx().GetHash(), MiniMinerMempoolEntry(txiter));\n+            m_entries.push_back(mapiter);\n+        } else {\n+            auto outpoints_it = m_requested_outpoints_by_txid.find(txiter->GetTx().GetHash());\n+            if (outpoints_it != m_requested_outpoints_by_txid.end()) {\n+                // This UTXO is the output of a to-be-replaced transaction. Bump fee is 0; spending\n+                // this UTXO is impossible as it will no longer exist after the replacement.\n+                for (const auto& outpoint : outpoints_it->second) {\n+                    m_bump_fees.emplace(outpoint, 0);\n+                }\n+                m_requested_outpoints_by_txid.erase(outpoints_it);\n+            }\n+        }\n+    }\n+\n+    // Build the m_descendant_set_by_txid cache.\n+    for (const auto& txiter : cluster) {\n+        const auto& txid = txiter->GetTx().GetHash();\n+        // Cache descendants for future use. Unlike the real mempool, a descendant MiniMinerMempoolEntry\n+        // will not exist without its ancestor MiniMinerMempoolEntry, so these sets won't be invalidated.\n+        std::vector<MockEntryMap::iterator> cached_descendants;\n+        const bool remove{m_to_be_replaced.count(txid) > 0};\n+        CTxMemPool::setEntries descendants;\n+        mempool.CalculateDescendants(txiter, descendants);\n+        Assume(descendants.count(txiter) > 0);\n+        for (const auto& desc_txiter : descendants) {",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/27021#discussion_r1131618449",
@@ -5403,7 +5403,8 @@
       "side" : "RIGHT",
       "start_line" : 90,
       "start_side" : "RIGHT",
-      "updated_at" : "2023-03-09T23:26:54Z",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-12T13:39:53Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1131618449",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/5377650?v=4",
@@ -5550,7 +5551,7 @@
          }
       },
       "author_association" : "CONTRIBUTOR",
-      "body" : "I was curious about a possible relation between `sum(CalculateBumpFees)` over all outpoints, and `CalculateTotalBumpFees` for the same outpoints / target feerate.\r\nMy naive thought was that taking the sum over `CalculateBumpFees` might overestimate the total bump fee by counting the bumping of some mempool txs twice if there is a shared ancestry, and that the quantities should be equal if there is no shared ancestry. As a result, `CalculateTotalBumpFees` should never be larger than the sum of `CalculateBumpFees`.\r\nBut when I tried to test this hypothesis by changing the fuzz test here to not calculate just one but both quantities in each run (using two mini miners) and then asserting that the above relation holds, it quickly fails - so where did I go wrong? ",
+      "body" : "I was curious about a possible relation between `sum(CalculateBumpFees)` over all outpoints, and `CalculateTotalBumpFees` for the same outpoints / target feerate.\r\nMy naive thought was that taking the sum over `CalculateBumpFees` might overestimate the total bump fee by counting the bumping of some mempool txs twice if there is a shared ancestry, and that the quantities should be equal if there is no shared ancestry. As a result, `CalculateTotalBumpFees` should never be larger than the sum of `CalculateBumpFees`.\r\nBut when I tried to test this hypothesis by changing the fuzz test here to not calculate just one but both quantities in each run (using two mini miners, see https://github.com/mzumsande/bitcoin/commit/e690c11a4c8e1d2d23037cc5439366ce722a9ef2) and then asserting that the above relation holds, it quickly fails - so where did I go wrong? ",
       "commit_id" : "cf1636078f7e97110cab15646110fcc1ce935136",
       "created_at" : "2023-03-12T04:40:38Z",
       "diff_hunk" : "@@ -0,0 +1,183 @@\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+#include <test/fuzz/util/mempool.h>\n+#include <test/util/script.h>\n+#include <test/util/setup_common.h>\n+#include <test/util/txmempool.h>\n+#include <test/util/mining.h>\n+\n+#include <node/mini_miner.h>\n+#include <node/miner.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <txmempool.h>\n+\n+#include <deque>\n+#include <vector>\n+\n+namespace {\n+\n+const TestingSetup* g_setup;\n+std::deque<COutPoint> g_available_coins;\n+void initialize_miner()\n+{\n+    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();\n+    g_setup = testing_setup.get();\n+    for (uint32_t i = 0; i < uint32_t{100}; ++i) {\n+        g_available_coins.push_back(COutPoint{uint256::ZERO, i});\n+    }\n+}\n+\n+// Test that the MiniMiner can run with various outpoints and feerates.\n+FUZZ_TARGET_INIT(mini_miner, initialize_miner)\n+{\n+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};\n+    CTxMemPool pool{CTxMemPool::Options{}};\n+    std::vector<COutPoint> outpoints;\n+    std::deque<COutPoint> available_coins = g_available_coins;\n+    LOCK2(::cs_main, pool.cs);\n+    // Cluster size cannot exceed 500\n+    LIMITED_WHILE(!available_coins.empty(), 500)\n+    {\n+        CMutableTransaction mtx = CMutableTransaction();\n+        const size_t num_inputs = fuzzed_data_provider.ConsumeIntegralInRange<size_t>(1, available_coins.size());\n+        const size_t num_outputs = fuzzed_data_provider.ConsumeIntegralInRange<size_t>(1, 50);\n+        for (size_t n{0}; n < num_inputs; ++n) {\n+            auto prevout = available_coins.front();\n+            mtx.vin.push_back(CTxIn(prevout, CScript()));\n+            available_coins.pop_front();\n+        }\n+        for (uint32_t n{0}; n < num_outputs; ++n) {\n+            mtx.vout.push_back(CTxOut(100, P2WSH_OP_TRUE));\n+        }\n+        CTransactionRef tx = MakeTransactionRef(mtx);\n+        TestMemPoolEntryHelper entry;\n+        const CAmount fee{ConsumeMoney(fuzzed_data_provider, /*max=*/MAX_MONEY/100000)};\n+        assert(MoneyRange(fee));\n+        pool.addUnchecked(entry.Fee(fee).FromTx(tx));\n+\n+        // All outputs are available to spend\n+        for (uint32_t n{0}; n < num_outputs; ++n) {\n+            if (fuzzed_data_provider.ConsumeBool()) {\n+                available_coins.push_back(COutPoint{tx->GetHash(), n});\n+            }\n+        }\n+\n+        if (fuzzed_data_provider.ConsumeBool() && !tx->vout.empty()) {\n+            // Add outpoint from this tx (may or not be spent by a later tx)\n+            outpoints.push_back(COutPoint{tx->GetHash(),\n+                                          (uint32_t)fuzzed_data_provider.ConsumeIntegralInRange<size_t>(0, tx->vout.size())});\n+        } else {\n+            // Add some random outpoint (will be interpreted as confirmed or not yet submitted\n+            // to mempool).\n+            auto outpoint = ConsumeDeserializable<COutPoint>(fuzzed_data_provider);\n+            if (outpoint.has_value() && std::find(outpoints.begin(), outpoints.end(), *outpoint) == outpoints.end()) {\n+                outpoints.push_back(*outpoint);\n+            }\n+        }\n+\n+    }\n+\n+    node::MiniMiner mini_miner{pool, outpoints};\n+    assert(mini_miner.IsReadyToCalculate());\n+    const CFeeRate target_feerate{CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/MAX_MONEY/1000)}};\n+    if (fuzzed_data_provider.ConsumeBool()) {",
@@ -5581,7 +5582,8 @@
       "side" : "RIGHT",
       "start_line" : null,
       "start_side" : null,
-      "updated_at" : "2023-03-12T04:43:13Z",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-13T20:53:56Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133185828",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/48763452?v=4",
@@ -5602,6 +5604,281 @@
          "subscriptions_url" : "https://api.github.com/users/mzumsande/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/mzumsande"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27021#discussion_r1134606456"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27021"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1134606456"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Thanks, thatâs unexpected. I would also expect that `CalculateTotalBumpFees(â¦)` always is equal or smaller to the sum of individual bump fees. Iâll check it out.",
+      "commit_id" : "cf1636078f7e97110cab15646110fcc1ce935136",
+      "created_at" : "2023-03-13T20:55:02Z",
+      "diff_hunk" : "@@ -0,0 +1,183 @@\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+#include <test/fuzz/util/mempool.h>\n+#include <test/util/script.h>\n+#include <test/util/setup_common.h>\n+#include <test/util/txmempool.h>\n+#include <test/util/mining.h>\n+\n+#include <node/mini_miner.h>\n+#include <node/miner.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <txmempool.h>\n+\n+#include <deque>\n+#include <vector>\n+\n+namespace {\n+\n+const TestingSetup* g_setup;\n+std::deque<COutPoint> g_available_coins;\n+void initialize_miner()\n+{\n+    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();\n+    g_setup = testing_setup.get();\n+    for (uint32_t i = 0; i < uint32_t{100}; ++i) {\n+        g_available_coins.push_back(COutPoint{uint256::ZERO, i});\n+    }\n+}\n+\n+// Test that the MiniMiner can run with various outpoints and feerates.\n+FUZZ_TARGET_INIT(mini_miner, initialize_miner)\n+{\n+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};\n+    CTxMemPool pool{CTxMemPool::Options{}};\n+    std::vector<COutPoint> outpoints;\n+    std::deque<COutPoint> available_coins = g_available_coins;\n+    LOCK2(::cs_main, pool.cs);\n+    // Cluster size cannot exceed 500\n+    LIMITED_WHILE(!available_coins.empty(), 500)\n+    {\n+        CMutableTransaction mtx = CMutableTransaction();\n+        const size_t num_inputs = fuzzed_data_provider.ConsumeIntegralInRange<size_t>(1, available_coins.size());\n+        const size_t num_outputs = fuzzed_data_provider.ConsumeIntegralInRange<size_t>(1, 50);\n+        for (size_t n{0}; n < num_inputs; ++n) {\n+            auto prevout = available_coins.front();\n+            mtx.vin.push_back(CTxIn(prevout, CScript()));\n+            available_coins.pop_front();\n+        }\n+        for (uint32_t n{0}; n < num_outputs; ++n) {\n+            mtx.vout.push_back(CTxOut(100, P2WSH_OP_TRUE));\n+        }\n+        CTransactionRef tx = MakeTransactionRef(mtx);\n+        TestMemPoolEntryHelper entry;\n+        const CAmount fee{ConsumeMoney(fuzzed_data_provider, /*max=*/MAX_MONEY/100000)};\n+        assert(MoneyRange(fee));\n+        pool.addUnchecked(entry.Fee(fee).FromTx(tx));\n+\n+        // All outputs are available to spend\n+        for (uint32_t n{0}; n < num_outputs; ++n) {\n+            if (fuzzed_data_provider.ConsumeBool()) {\n+                available_coins.push_back(COutPoint{tx->GetHash(), n});\n+            }\n+        }\n+\n+        if (fuzzed_data_provider.ConsumeBool() && !tx->vout.empty()) {\n+            // Add outpoint from this tx (may or not be spent by a later tx)\n+            outpoints.push_back(COutPoint{tx->GetHash(),\n+                                          (uint32_t)fuzzed_data_provider.ConsumeIntegralInRange<size_t>(0, tx->vout.size())});\n+        } else {\n+            // Add some random outpoint (will be interpreted as confirmed or not yet submitted\n+            // to mempool).\n+            auto outpoint = ConsumeDeserializable<COutPoint>(fuzzed_data_provider);\n+            if (outpoint.has_value() && std::find(outpoints.begin(), outpoints.end(), *outpoint) == outpoints.end()) {\n+                outpoints.push_back(*outpoint);\n+            }\n+        }\n+\n+    }\n+\n+    node::MiniMiner mini_miner{pool, outpoints};\n+    assert(mini_miner.IsReadyToCalculate());\n+    const CFeeRate target_feerate{CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/MAX_MONEY/1000)}};\n+    if (fuzzed_data_provider.ConsumeBool()) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27021#discussion_r1134606456",
+      "id" : 1134606456,
+      "in_reply_to_id" : 1133185828,
+      "line" : 85,
+      "node_id" : "PRRC_kwDOABII585DoLh4",
+      "original_commit_id" : "cf1636078f7e97110cab15646110fcc1ce935136",
+      "original_line" : 85,
+      "original_position" : 85,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/mini_miner.cpp",
+      "position" : 85,
+      "pull_request_review_id" : 1337937335,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27021",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1134606456/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-13T20:55:02Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1134606456",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/4060799?v=4",
+         "events_url" : "https://api.github.com/users/Xekyo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Xekyo/followers",
+         "following_url" : "https://api.github.com/users/Xekyo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Xekyo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Xekyo",
+         "id" : 4060799,
+         "login" : "Xekyo",
+         "node_id" : "MDQ6VXNlcjQwNjA3OTk=",
+         "organizations_url" : "https://api.github.com/users/Xekyo/orgs",
+         "received_events_url" : "https://api.github.com/users/Xekyo/received_events",
+         "repos_url" : "https://api.github.com/users/Xekyo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Xekyo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Xekyo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Xekyo"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27021#discussion_r1136136446"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27021"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136136446"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "The init value should be `CAmount{0}`, not `0` which would convert the summed items to `int`, see [std::accumulate](https://en.cppreference.com/w/cpp/algorithm/accumulate) under \"Common mistakes\". This caused the unexpected fuzzer behavior I saw, because the `int` could overflow.\r\nAlso, for `ancestor_package_size`, the init value should be `int64_t{0}`;",
+      "commit_id" : "cf1636078f7e97110cab15646110fcc1ce935136",
+      "created_at" : "2023-03-14T20:09:38Z",
+      "diff_hunk" : "@@ -0,0 +1,358 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/mini_miner.h>\n+\n+#include <consensus/amount.h>\n+#include <policy/feerate.h>\n+#include <primitives/transaction.h>\n+#include <timedata.h>\n+#include <util/check.h>\n+#include <util/moneystr.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <utility>\n+\n+namespace node {\n+\n+MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)\n+{\n+    LOCK(mempool.cs);\n+    // Find which outpoints to calculate bump fees for.\n+    // Anything that's spent by the mempool is to-be-replaced\n+    // Anything otherwise unavailable just has a bump fee of 0\n+    for (const auto& outpoint : outpoints) {\n+        if (const auto ptx{mempool.GetConflictTx(outpoint)}) {\n+            // This outpoint is already being spent by another transaction in the mempool.\n+            // We assume that the caller wants to replace this transaction (and its descendants).\n+            // If the outpoint is from a mempool transaction, we still need to calculate its\n+            // ancestors bump fees (added to m_requested_outpoints_by_txid below), but after\n+            // removing the to-be-replaced entries. Note that this is only calculating bump fees.\n+            // RBF fee rules should be handled separately.\n+            m_to_be_replaced.insert(ptx->GetHash());\n+            // Remove descendants because they will be replaced as well. This case should be rare\n+            // as the wallet won't normally attempt to replace transactions with descendants.\n+            CTxMemPool::setEntries descendants;\n+            mempool.CalculateDescendants(mempool.GetIter(ptx->GetHash()).value(), descendants);\n+            for (const auto& desc_txiter : descendants) {\n+                m_to_be_replaced.insert(desc_txiter->GetTx().GetHash());\n+            }\n+        }\n+\n+        if (mempool.exists(GenTxid::Txid(outpoint.hash))) {\n+            // UXTO is created by transaction in mempool, add to map.\n+            // Note: This will either create a missing entry or add the outpoint to an existing entry\n+            m_requested_outpoints_by_txid[outpoint.hash].push_back(outpoint);\n+        } else {\n+            // This UTXO is either confirmed or not yet submitted to mempool.\n+            // If it's confirmed, no bump fee is required.\n+            // If it's not yet submitted, we have no information, so return 0.\n+            m_bump_fees.emplace(outpoint, 0);\n+        }\n+    }\n+\n+    // No unconfirmed UTXOs, so nothing mempool-related needs to be calculated.\n+    if (m_requested_outpoints_by_txid.empty()) return;\n+\n+    // Calculate the cluster and construct the entry map.\n+    std::vector<uint256> txids_needed;\n+    for (const auto& [txid, _]: m_requested_outpoints_by_txid) {\n+        txids_needed.push_back(txid);\n+    }\n+    const auto cluster = mempool.GatherClusters(txids_needed);\n+    if (cluster.empty()) {\n+        // An empty cluster means that at least one of the transactions is missing from the mempool\n+        // (should not be possible given processing above) or DoS limit was hit.\n+        m_ready_to_calculate = false;\n+        return;\n+    }\n+\n+    // Add every entry to m_entries_by_txid and m_entries, except the ones that will be replaced.\n+    for (const auto& txiter : cluster) {\n+        if (!m_to_be_replaced.count(txiter->GetTx().GetHash())) {\n+            auto [mapiter, success] = m_entries_by_txid.emplace(txiter->GetTx().GetHash(), MiniMinerMempoolEntry(txiter));\n+            m_entries.push_back(mapiter);\n+        } else {\n+            auto outpoints_it = m_requested_outpoints_by_txid.find(txiter->GetTx().GetHash());\n+            if (outpoints_it != m_requested_outpoints_by_txid.end()) {\n+                // This UTXO is the output of a to-be-replaced transaction. Bump fee is 0; spending\n+                // this UTXO is impossible as it will no longer exist after the replacement.\n+                for (const auto& outpoint : outpoints_it->second) {\n+                    m_bump_fees.emplace(outpoint, 0);\n+                }\n+                m_requested_outpoints_by_txid.erase(outpoints_it);\n+            }\n+        }\n+    }\n+\n+    // Build the m_descendant_set_by_txid cache.\n+    for (const auto& txiter : cluster) {\n+        const auto& txid = txiter->GetTx().GetHash();\n+        // Cache descendants for future use. Unlike the real mempool, a descendant MiniMinerMempoolEntry\n+        // will not exist without its ancestor MiniMinerMempoolEntry, so these sets won't be invalidated.\n+        std::vector<MockEntryMap::iterator> cached_descendants;\n+        const bool remove{m_to_be_replaced.count(txid) > 0};\n+        CTxMemPool::setEntries descendants;\n+        mempool.CalculateDescendants(txiter, descendants);\n+        Assume(descendants.count(txiter) > 0);\n+        for (const auto& desc_txiter : descendants) {\n+            const auto txid_desc = desc_txiter->GetTx().GetHash();\n+            const bool remove_desc{m_to_be_replaced.count(txid_desc) > 0};\n+            auto desc_it{m_entries_by_txid.find(txid_desc)};\n+            Assume((desc_it == m_entries_by_txid.end()) == remove_desc);\n+            if (remove) Assume(remove_desc);\n+            // It's possible that remove=false but remove_desc=true.\n+            if (!remove && !remove_desc) {\n+                cached_descendants.push_back(desc_it);\n+            }\n+        }\n+        if (remove) {\n+            Assume(cached_descendants.empty());\n+        } else {\n+            m_descendant_set_by_txid.emplace(txid, cached_descendants);\n+        }\n+    }\n+\n+    // Release the mempool lock; we now have all the information we need for a subset of the entries\n+    // we care about. We will solely operate on the MiniMinerMempoolEntry map from now on.\n+    Assume(m_in_block.empty());\n+    Assume(m_requested_outpoints_by_txid.size() <= outpoints.size());\n+    SanityCheck();\n+}\n+\n+// Compare by min(ancestor feerate, individual feerate), then iterator\n+struct AncestorFeerateComparator\n+{\n+    template<typename I>\n+    bool operator()(const I& a, const I& b) const {\n+        const auto& ea = a->second;\n+        const CFeeRate a_feerate =\n+            ea.GetModFeesWithAncestors() * ea.GetTxSize() <= ea.GetModifiedFee() * ea.GetSizeWithAncestors() ?\n+            CFeeRate(ea.GetModFeesWithAncestors(), ea.GetSizeWithAncestors()) :\n+            CFeeRate(ea.GetModifiedFee(), ea.GetTxSize());\n+        const auto& eb = b->second;\n+        const CFeeRate b_feerate =\n+            eb.GetModFeesWithAncestors() * eb.GetTxSize() <= eb.GetModifiedFee() * eb.GetSizeWithAncestors() ?\n+            CFeeRate(eb.GetModFeesWithAncestors(), eb.GetSizeWithAncestors()) :\n+            CFeeRate(eb.GetModifiedFee(), eb.GetTxSize());\n+        if (a_feerate != b_feerate) {\n+            return a_feerate > b_feerate;\n+        }\n+        // Compare by txid\n+        return a->first < b->first;\n+    }\n+};\n+\n+void MiniMiner::DeleteAncestorPackage(const std::set<MockEntryMap::iterator, IteratorComparator>& ancestors)\n+{\n+    Assume(ancestors.size() >= 1);\n+    // \"Mine\" all transactions in this ancestor set.\n+    for (auto& anc : ancestors) {\n+        Assume(m_in_block.count(anc->first) == 0);\n+        m_in_block.insert(anc->first);\n+        m_total_fees += anc->second.GetModifiedFee();\n+        m_total_vsize += anc->second.GetTxSize();\n+        auto it = m_descendant_set_by_txid.find(anc->first);\n+        // Each entryâs descendant set includes itself\n+        Assume(it != m_descendant_set_by_txid.end());\n+        for (auto& descendant : it->second) {\n+            // If these fail, we must be double-deducting.\n+            Assume(descendant->second.GetModFeesWithAncestors() >= anc->second.GetModifiedFee());\n+            Assume(descendant->second.vsize_with_ancestors >= anc->second.GetTxSize());\n+            descendant->second.fee_with_ancestors -= anc->second.GetModifiedFee();\n+            descendant->second.vsize_with_ancestors -= anc->second.GetTxSize();\n+        }\n+    }\n+    // Delete these entries.\n+    for (const auto& anc : ancestors) {\n+        m_descendant_set_by_txid.erase(anc->first);\n+        // The above loop should have deducted each ancestor's size and fees from each of their\n+        // respective descendants exactly once.\n+        Assume(anc->second.GetModFeesWithAncestors() == 0);\n+        Assume(anc->second.GetSizeWithAncestors() == 0);\n+        auto vec_it = std::find(m_entries.begin(), m_entries.end(), anc);\n+        Assume(vec_it != m_entries.end());\n+        m_entries.erase(vec_it);\n+        m_entries_by_txid.erase(anc);\n+    }\n+}\n+\n+void MiniMiner::SanityCheck() const\n+{\n+    // m_entries, m_entries_by_txid, and m_descendant_set_by_txid all same size\n+    Assume(m_entries.size() == m_entries_by_txid.size());\n+    Assume(m_entries.size() == m_descendant_set_by_txid.size());\n+    // Cached ancestor values should be at least as large as the transaction's own fee and size\n+    Assume(std::all_of(m_entries.begin(), m_entries.end(), [](const auto& entry) {\n+        return entry->second.GetSizeWithAncestors() >= entry->second.GetTxSize() &&\n+               entry->second.GetModFeesWithAncestors() >= entry->second.GetModifiedFee();}));\n+    // None of the entries should be to-be-replaced transactions\n+    Assume(std::all_of(m_to_be_replaced.begin(), m_to_be_replaced.end(),\n+        [&](const auto& txid){return m_entries_by_txid.find(txid) == m_entries_by_txid.end();}));\n+}\n+\n+void MiniMiner::BuildMockTemplate(const CFeeRate& target_feerate)\n+{\n+    while (!m_entries_by_txid.empty()) {\n+        // Sort again, since transaction removal may change some m_entries' ancestor feerates.\n+        std::sort(m_entries.begin(), m_entries.end(), AncestorFeerateComparator());\n+\n+        // Pick highest ancestor feerate entry.\n+        auto best_iter = m_entries.begin();\n+        Assume(best_iter != m_entries.end());\n+        const auto ancestor_package_size = (*best_iter)->second.GetSizeWithAncestors();\n+        const auto ancestor_package_fee = (*best_iter)->second.GetModFeesWithAncestors();\n+        // Stop here. Everything that didn't \"make it into the block\" has bumpfee.\n+        if (ancestor_package_fee < target_feerate.GetFee(ancestor_package_size)) {\n+            break;\n+        }\n+\n+        // Calculate ancestors on the fly. This lookup should be fairly cheap, and ancestor sets\n+        // change at every iteration, so this is more efficient than maintaining a cache.\n+        std::set<MockEntryMap::iterator, IteratorComparator> ancestors;\n+        {\n+            std::set<MockEntryMap::iterator, IteratorComparator> to_process;\n+            to_process.insert(*best_iter);\n+            while (!to_process.empty()) {\n+                auto iter = to_process.begin();\n+                Assume(iter != to_process.end());\n+                ancestors.insert(*iter);\n+                for (const auto& input : (*iter)->second.GetTx().vin) {\n+                    if (auto parent_it{m_entries_by_txid.find(input.prevout.hash)}; parent_it != m_entries_by_txid.end()) {\n+                        if (ancestors.count(parent_it) == 0) {\n+                            to_process.insert(parent_it);\n+                        }\n+                    }\n+                }\n+                to_process.erase(iter);\n+            }\n+        }\n+        DeleteAncestorPackage(ancestors);\n+        SanityCheck();\n+    }\n+    Assume(m_in_block.empty() || m_total_fees >= target_feerate.GetFee(m_total_vsize));\n+    // Do not try to continue building the block template with a different feerate.\n+    m_ready_to_calculate = false;\n+}\n+\n+std::map<COutPoint, CAmount> MiniMiner::CalculateBumpFees(const CFeeRate& target_feerate)\n+{\n+    if (!m_ready_to_calculate) return {};\n+    // Build a block template until the target feerate is hit.\n+    BuildMockTemplate(target_feerate);\n+\n+    // Each transaction that \"made it into the block\" has a bumpfee of 0, i.e. they are part of an\n+    // ancestor package with at least the target feerate and don't need to be bumped.\n+    for (const auto& txid : m_in_block) {\n+        // Not all of the block transactions were necessarily requested.\n+        auto it = m_requested_outpoints_by_txid.find(txid);\n+        if (it != m_requested_outpoints_by_txid.end()) {\n+            for (const auto& outpoint : it->second) {\n+                m_bump_fees.emplace(outpoint, 0);\n+            }\n+            m_requested_outpoints_by_txid.erase(it);\n+        }\n+    }\n+\n+    // A transactions and its ancestors will only be picked into a block when\n+    // both the ancestor set feerate and the individual feerate meet the target\n+    // feerate.\n+    //\n+    // We had to convince ourselves that after running the mini miner and\n+    // picking all eligible transactions into our MockBlockTemplate, there\n+    // could still be transactions remaining that have a lower individual\n+    // feerate than their ancestor feerate. So here is an example:\n+    //\n+    //               âââââââââââââââââââ\n+    //               â                 â\n+    //               â   Grandparent   â\n+    //               â    1700 vB      â\n+    //               â    1700 sats    â                    Target feerate: 10    s/vB\n+    //               â       1 s/vB    â    GP Ancestor Set Feerate (ASFR):  1    s/vB\n+    //               â                 â                           P1_ASFR:  9.84â¯s/vB\n+    //               ââââââââ²ââââ²âââââââ                           P2_ASFR:  2.47 s/vB\n+    //                      â   â                                   C_ASFR: 10.27 s/vB\n+    // âââââââââââââââââ    â   â    ââââââââââââââââ\n+    // â               ââââââ   ââââââ¤              â             â C_FR < TFR < C_ASFR\n+    // â   Parent 1    â             â   Parent 2   â\n+    // â    200 vB     â             â    200 vB    â\n+    // â  17000 sats   â             â   3000 sats  â\n+    // â     85 s/vB   â             â     15 s/vB  â\n+    // â               â             â              â\n+    // âââââââââââââ²ââââ             âââââ²âââââââââââ\n+    //             â                     â\n+    //             â    âââââââââââââ    â\n+    //             ââââââ¤           ââââââ\n+    //                  â   Child   â\n+    //                  â  100 vB   â\n+    //                  â  900 sats â\n+    //                  â    9 s/vB â\n+    //                  â           â\n+    //                  âââââââââââââ\n+    //\n+    // We therefore calculate both the bump fee that is necessary to elevate\n+    // the individual transaction to the target feerate:\n+    //         target_feerate Ã tx_size - tx_fees\n+    // and the bump fee that is necessary to bump the entire ancestor set to\n+    // the target feerate:\n+    //         target_feerate Ã ancestor_set_size - ancestor_set_fees\n+    // By picking the maximum from the two, we ensure that a transaction meets\n+    // both criteria.\n+    for (const auto& [txid, outpoints] : m_requested_outpoints_by_txid) {\n+        auto it = m_entries_by_txid.find(txid);\n+        Assume(it != m_entries_by_txid.end());\n+        if (it != m_entries_by_txid.end()) {\n+            Assume(target_feerate.GetFee(it->second.GetSizeWithAncestors()) > std::min(it->second.GetModifiedFee(), it->second.GetModFeesWithAncestors()));\n+            CAmount bump_fee_with_ancestors = target_feerate.GetFee(it->second.GetSizeWithAncestors()) - it->second.GetModFeesWithAncestors();\n+            CAmount bump_fee_individual = target_feerate.GetFee(it->second.GetTxSize()) - it->second.GetModifiedFee();\n+            const CAmount bump_fee{std::max(bump_fee_with_ancestors, bump_fee_individual)};\n+            Assume(bump_fee >= 0);\n+            for (const auto& outpoint : outpoints) {\n+                m_bump_fees.emplace(outpoint, bump_fee);\n+            }\n+        }\n+    }\n+    return m_bump_fees;\n+}\n+\n+std::optional<CAmount> MiniMiner::CalculateTotalBumpFees(const CFeeRate& target_feerate)\n+{\n+    if (!m_ready_to_calculate) return std::nullopt;\n+    // Build a block template until the target feerate is hit.\n+    BuildMockTemplate(target_feerate);\n+\n+    // All remaining ancestors that are not part of m_in_block must be bumped, but no other relatives\n+    std::set<MockEntryMap::iterator, IteratorComparator> ancestors;\n+    {\n+        std::set<MockEntryMap::iterator, IteratorComparator> to_process;\n+        for (const auto& [txid, outpoints] : m_requested_outpoints_by_txid) {\n+            // Skip any ancestors that already have a miner score higher than the target feerate\n+            // (already \"made it\" into the block)\n+            if (m_in_block.count(txid)) continue;\n+            auto iter = m_entries_by_txid.find(txid);\n+            if (iter == m_entries_by_txid.end()) continue;\n+            to_process.insert(iter);\n+            ancestors.insert(iter);\n+        }\n+        while (!to_process.empty()) {\n+            auto iter = to_process.begin();\n+            assert(iter != to_process.end());\n+            const CTransaction& tx = (*iter)->second.GetTx();\n+            for (const auto& input : tx.vin) {\n+                if (auto parent_it{m_entries_by_txid.find(input.prevout.hash)}; parent_it != m_entries_by_txid.end()) {\n+                    to_process.insert(parent_it);\n+                    ancestors.insert(parent_it);\n+                }\n+            }\n+            to_process.erase(iter);\n+        }\n+    }\n+    const auto ancestor_package_size = std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,\n+        [](int64_t sum, const auto it) {return sum + it->second.GetTxSize();});\n+    const auto ancestor_package_fee = std::accumulate(ancestors.cbegin(), ancestors.cend(), 0,",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27021#discussion_r1136136446",
+      "id" : 1136136446,
+      "line" : 354,
+      "node_id" : "PRRC_kwDOABII585DuBD-",
+      "original_commit_id" : "82d068ea0e247e7deb3f4dd2c222db3d3eb6d0e4",
+      "original_line" : 354,
+      "original_position" : 354,
+      "original_start_line" : null,
+      "path" : "src/node/mini_miner.cpp",
+      "position" : 354,
+      "pull_request_review_id" : 1340199248,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27021",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136136446/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-14T20:25:31Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136136446",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48763452?v=4",
+         "events_url" : "https://api.github.com/users/mzumsande/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/mzumsande/followers",
+         "following_url" : "https://api.github.com/users/mzumsande/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/mzumsande/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/mzumsande",
+         "id" : 48763452,
+         "login" : "mzumsande",
+         "node_id" : "MDQ6VXNlcjQ4NzYzNDUy",
+         "organizations_url" : "https://api.github.com/users/mzumsande/orgs",
+         "received_events_url" : "https://api.github.com/users/mzumsande/received_events",
+         "repos_url" : "https://api.github.com/users/mzumsande/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/mzumsande/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/mzumsande/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/mzumsande"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27021#discussion_r1136146262"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27021"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136146262"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I commented below for this. After fixing this, the fuzzer doesn't crash anymore (at least not immediately, haven't run it for long). \r\nI wonder if it might make sense to adjust the fuzz test permanently similar to my branch above and assert `sum(CalculateBumpFees) >= CalculateTotalBumpFees()`, if that is really the expectation - in general, I like it if fuzz tests contain asserts test actual non-trivial high-level expectations we have for the code, and don't just run over the code \"blindly\".",
+      "commit_id" : "cf1636078f7e97110cab15646110fcc1ce935136",
+      "created_at" : "2023-03-14T20:18:26Z",
+      "diff_hunk" : "@@ -0,0 +1,183 @@\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+#include <test/fuzz/util/mempool.h>\n+#include <test/util/script.h>\n+#include <test/util/setup_common.h>\n+#include <test/util/txmempool.h>\n+#include <test/util/mining.h>\n+\n+#include <node/mini_miner.h>\n+#include <node/miner.h>\n+#include <primitives/transaction.h>\n+#include <random.h>\n+#include <txmempool.h>\n+\n+#include <deque>\n+#include <vector>\n+\n+namespace {\n+\n+const TestingSetup* g_setup;\n+std::deque<COutPoint> g_available_coins;\n+void initialize_miner()\n+{\n+    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();\n+    g_setup = testing_setup.get();\n+    for (uint32_t i = 0; i < uint32_t{100}; ++i) {\n+        g_available_coins.push_back(COutPoint{uint256::ZERO, i});\n+    }\n+}\n+\n+// Test that the MiniMiner can run with various outpoints and feerates.\n+FUZZ_TARGET_INIT(mini_miner, initialize_miner)\n+{\n+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};\n+    CTxMemPool pool{CTxMemPool::Options{}};\n+    std::vector<COutPoint> outpoints;\n+    std::deque<COutPoint> available_coins = g_available_coins;\n+    LOCK2(::cs_main, pool.cs);\n+    // Cluster size cannot exceed 500\n+    LIMITED_WHILE(!available_coins.empty(), 500)\n+    {\n+        CMutableTransaction mtx = CMutableTransaction();\n+        const size_t num_inputs = fuzzed_data_provider.ConsumeIntegralInRange<size_t>(1, available_coins.size());\n+        const size_t num_outputs = fuzzed_data_provider.ConsumeIntegralInRange<size_t>(1, 50);\n+        for (size_t n{0}; n < num_inputs; ++n) {\n+            auto prevout = available_coins.front();\n+            mtx.vin.push_back(CTxIn(prevout, CScript()));\n+            available_coins.pop_front();\n+        }\n+        for (uint32_t n{0}; n < num_outputs; ++n) {\n+            mtx.vout.push_back(CTxOut(100, P2WSH_OP_TRUE));\n+        }\n+        CTransactionRef tx = MakeTransactionRef(mtx);\n+        TestMemPoolEntryHelper entry;\n+        const CAmount fee{ConsumeMoney(fuzzed_data_provider, /*max=*/MAX_MONEY/100000)};\n+        assert(MoneyRange(fee));\n+        pool.addUnchecked(entry.Fee(fee).FromTx(tx));\n+\n+        // All outputs are available to spend\n+        for (uint32_t n{0}; n < num_outputs; ++n) {\n+            if (fuzzed_data_provider.ConsumeBool()) {\n+                available_coins.push_back(COutPoint{tx->GetHash(), n});\n+            }\n+        }\n+\n+        if (fuzzed_data_provider.ConsumeBool() && !tx->vout.empty()) {\n+            // Add outpoint from this tx (may or not be spent by a later tx)\n+            outpoints.push_back(COutPoint{tx->GetHash(),\n+                                          (uint32_t)fuzzed_data_provider.ConsumeIntegralInRange<size_t>(0, tx->vout.size())});\n+        } else {\n+            // Add some random outpoint (will be interpreted as confirmed or not yet submitted\n+            // to mempool).\n+            auto outpoint = ConsumeDeserializable<COutPoint>(fuzzed_data_provider);\n+            if (outpoint.has_value() && std::find(outpoints.begin(), outpoints.end(), *outpoint) == outpoints.end()) {\n+                outpoints.push_back(*outpoint);\n+            }\n+        }\n+\n+    }\n+\n+    node::MiniMiner mini_miner{pool, outpoints};\n+    assert(mini_miner.IsReadyToCalculate());\n+    const CFeeRate target_feerate{CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/MAX_MONEY/1000)}};\n+    if (fuzzed_data_provider.ConsumeBool()) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27021#discussion_r1136146262",
+      "id" : 1136146262,
+      "in_reply_to_id" : 1133185828,
+      "line" : 85,
+      "node_id" : "PRRC_kwDOABII585DuDdW",
+      "original_commit_id" : "cf1636078f7e97110cab15646110fcc1ce935136",
+      "original_line" : 85,
+      "original_position" : 85,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/mini_miner.cpp",
+      "position" : 85,
+      "pull_request_review_id" : 1340211226,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27021",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136146262/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-14T20:18:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136146262",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48763452?v=4",
+         "events_url" : "https://api.github.com/users/mzumsande/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/mzumsande/followers",
+         "following_url" : "https://api.github.com/users/mzumsande/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/mzumsande/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/mzumsande",
+         "id" : 48763452,
+         "login" : "mzumsande",
+         "node_id" : "MDQ6VXNlcjQ4NzYzNDUy",
+         "organizations_url" : "https://api.github.com/users/mzumsande/orgs",
+         "received_events_url" : "https://api.github.com/users/mzumsande/received_events",
+         "repos_url" : "https://api.github.com/users/mzumsande/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/mzumsande/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/mzumsande/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/mzumsande"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27021#discussion_r1136182559"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27021"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136182559"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I think I need to touch five or six different places for this. Is that worth it?",
+      "commit_id" : "cf1636078f7e97110cab15646110fcc1ce935136",
+      "created_at" : "2023-03-14T20:48:44Z",
+      "diff_hunk" : "@@ -0,0 +1,123 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_NODE_MINI_MINER_H\n+#define BITCOIN_NODE_MINI_MINER_H\n+\n+#include <txmempool.h>\n+\n+#include <memory>\n+#include <optional>\n+#include <stdint.h>\n+\n+namespace node {\n+\n+// Container for tracking updates to ancestor feerate as we include ancestors in the \"block\"\n+class MiniMinerMempoolEntry\n+{\n+    const CAmount fee_individual;\n+    const CTransaction tx;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27021#discussion_r1136182559",
+      "id" : 1136182559,
+      "in_reply_to_id" : 1131024834,
+      "line" : 20,
+      "node_id" : "PRRC_kwDOABII585DuMUf",
+      "original_commit_id" : "a0d54e6b8f8afab070de48911f3b11d4cdf289ff",
+      "original_line" : 20,
+      "original_position" : 20,
+      "original_start_line" : null,
+      "path" : "src/node/mini_miner.h",
+      "position" : 20,
+      "pull_request_review_id" : 1340256487,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27021",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136182559/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-14T20:48:45Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136182559",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/4060799?v=4",
+         "events_url" : "https://api.github.com/users/Xekyo/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Xekyo/followers",
+         "following_url" : "https://api.github.com/users/Xekyo/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Xekyo/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Xekyo",
+         "id" : 4060799,
+         "login" : "Xekyo",
+         "node_id" : "MDQ6VXNlcjQwNjA3OTk=",
+         "organizations_url" : "https://api.github.com/users/Xekyo/orgs",
+         "received_events_url" : "https://api.github.com/users/Xekyo/received_events",
+         "repos_url" : "https://api.github.com/users/Xekyo/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Xekyo/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Xekyo/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Xekyo"
       }
    }
 ]
