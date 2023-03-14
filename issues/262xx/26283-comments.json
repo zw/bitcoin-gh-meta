@@ -6345,5 +6345,140 @@
          "type" : "User",
          "url" : "https://api.github.com/users/naumenkogs"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26283#discussion_r1135725988"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26283"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1135725988"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Same as https://github.com/bitcoin/bitcoin/pull/26283#discussion_r1042464406",
+      "commit_id" : "00df0aefff938e849bdab5278d6658d5c9d5d064",
+      "created_at" : "2023-03-14T15:20:01Z",
+      "diff_hunk" : "@@ -121,26 +194,204 @@ class TxReconciliationTracker::Impl\n \n         const uint256 full_salt{ComputeSalt(local_salt, remote_salt)};\n         recon_state->second = TxReconciliationState(!is_peer_inbound, full_salt.GetUint64(0), full_salt.GetUint64(1));\n+        if (!is_peer_inbound) m_queue.push_back(peer_id);\n         return ReconciliationRegisterResult::SUCCESS;\n     }\n \n+    bool AddToSet(NodeId peer_id, const uint256& wtxid) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        if (!IsPeerRegistered(peer_id)) return false;\n+        auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        // Check if reconciliation set is not at capacity for two reasons:\n+        // - limit sizes of reconciliation sets and short id mappings;\n+        // - limit CPU use for sketch computations.\n+        //\n+        // Since we reconcile frequently, reaching capacity either means:\n+        // (1) a peer for some reason does not request reconciliations from us for a long while, or\n+        // (2) really a lot of valid fee-paying transactions were dumped on us at once.\n+        // We don't care about a laggy peer (1) because we probably can't help them even if we fanout transactions.\n+        // However, exploiting (2) should not prevent us from relaying certain transactions.\n+        //\n+        // Transactions which don't make it to the set due to the limit are announced via fan-out.\n+        if (recon_state.m_local_set.size() >= MAX_SET_SIZE) return false;\n+\n+        Assume(recon_state.m_local_set.insert(wtxid).second);\n+        LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, \"Added a transaction to the reconciliation set for peer=%d. \" /* Continued */\n+                                                                    \"Now the set contains %i transactions.\\n\",\n+                      peer_id, recon_state.m_local_set.size());\n+        return true;\n+    }\n+\n+    bool TryRemovingFromSet(NodeId peer_id, const uint256& wtxid_to_remove) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        if (!IsPeerRegistered(peer_id)) return false;\n+        auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        return recon_state.m_local_set.erase(wtxid_to_remove) > 0;\n+    }\n+\n+    bool IsPeerNextToReconcileWith(NodeId peer_id, std::chrono::microseconds now) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+\n+        if (!IsPeerRegistered(peer_id)) return false;\n+        if (m_queue.empty()) return false;\n+\n+        const auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        if (m_next_recon_request <= now && m_queue.front() == peer_id) {\n+            Assume(recon_state.m_we_initiate);\n+            m_queue.pop_front();\n+            m_queue.push_back(peer_id);\n+\n+            // If the phase is not NONE, the peer hasn't responded to the previous reconciliation.\n+            // A laggy peer should not affect other peers.\n+            //\n+            // This doesn't prevent from a malicious peer gaming this by staying in this state\n+            // all the time somehow.\n+            if (recon_state.m_phase_init_by_us == Phase::NONE) UpdateNextReconRequest(now);\n+            return true;\n+        }\n+\n+        return false;\n+    }\n+\n+    std::optional<std::pair<uint16_t, uint16_t>> InitiateReconciliationRequest(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        if (!IsPeerRegistered(peer_id)) return std::nullopt;\n+\n+        auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+        if (!recon_state.m_we_initiate) return std::nullopt;\n+\n+        if (recon_state.m_phase_init_by_us != Phase::NONE) return std::nullopt;\n+        recon_state.m_phase_init_by_us = Phase::INIT_REQUESTED;\n+\n+        size_t local_set_size = recon_state.m_local_set.size();\n+\n+        LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, \"Initiate reconciliation with peer=%d with the following params: \" /* Continued */\n+                                                                    \"local_set_size=%i\\n\",\n+                      peer_id, local_set_size);\n+\n+        // In future, Q could be recomputed after every reconciliation based on the\n+        // set differences. For now, it provides good enough results without recompute\n+        // complexity, but we communicate it here to allow backward compatibility if\n+        // the value is changed or made dynamic.\n+        return std::make_pair(local_set_size, Q * Q_PRECISION);\n+    }\n+\n     void ForgetPeer(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n     {\n         AssertLockNotHeld(m_txreconciliation_mutex);\n         LOCK(m_txreconciliation_mutex);\n         if (m_states.erase(peer_id)) {\n+            m_queue.erase(std::remove(m_queue.begin(), m_queue.end(), peer_id), m_queue.end());\n             LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, \"Forget txreconciliation state of peer=%d\\n\", peer_id);\n         }\n     }\n \n-    bool IsPeerRegistered(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    bool IsPeerRegistered(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n     {\n-        AssertLockNotHeld(m_txreconciliation_mutex);\n-        LOCK(m_txreconciliation_mutex);\n+        AssertLockHeld(m_txreconciliation_mutex);\n         auto recon_state = m_states.find(peer_id);\n         return (recon_state != m_states.end() &&\n                 std::holds_alternative<TxReconciliationState>(recon_state->second));\n     }\n+\n+    bool IsPeerRegisteredExternal(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        return IsPeerRegistered(peer_id);\n+    }\n+\n+    std::vector<NodeId> GetFanoutTargets(const uint256& wtxid, CSipHasher& deterministic_randomizer,\n+                                         bool we_initiate, float limit) const EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n+    {\n+        // To handle fractional values, we add one peer optimistically and then probabilistically\n+        // drop it later.\n+        // Initiate the randomness here so that it's not influenced by the following code.\n+        double fractional_peer;\n+        const size_t targets = size_t(std::modf(limit, &fractional_peer)) + 1;\n+        const bool drop_peer_if_extra = deterministic_randomizer.Finalize() > fractional_peer * float(UINT64_MAX);\n+\n+        std::vector<std::pair<uint64_t, NodeId>> best_peers(targets, std::make_pair(0, 0));\n+\n+        auto try_fanout_candidate = [&best_peers, &deterministic_randomizer, targets](\n+                                        const std::pair<NodeId, std::variant<uint64_t, TxReconciliationState>> candidate) {\n+            const auto& cur_state = std::get<TxReconciliationState>(candidate.second);\n+            uint64_t hash_key = std::max<uint64_t>(deterministic_randomizer.Write(cur_state.m_k0).Finalize(), 1);\n+\n+            for (size_t i = 0; i < targets; ++i) {\n+                if (hash_key > best_peers[i].first) {\n+                    std::copy(best_peers.begin() + i, best_peers.begin() + targets - 1, best_peers.begin() + i + 1);\n+                    best_peers[i] = std::make_pair(hash_key, candidate.first);\n+                    break;\n+                }\n+            }\n+        };\n+\n+        for (auto indexed_state : m_states) {\n+            const auto& cur_state = std::get<TxReconciliationState>(indexed_state.second);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26283#discussion_r1135725988",
+      "id" : 1135725988,
+      "line" : 342,
+      "node_id" : "PRRC_kwDOABII585Dsc2k",
+      "original_commit_id" : "00df0aefff938e849bdab5278d6658d5c9d5d064",
+      "original_line" : 342,
+      "original_position" : 262,
+      "original_start_line" : null,
+      "path" : "src/node/txreconciliation.cpp",
+      "position" : 262,
+      "pull_request_review_id" : 1339558296,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26283",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1135725988/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2023-03-14T15:31:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1135725988",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8077169?v=4",
+         "events_url" : "https://api.github.com/users/dergoegge/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/dergoegge/followers",
+         "following_url" : "https://api.github.com/users/dergoegge/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/dergoegge/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/dergoegge",
+         "id" : 8077169,
+         "login" : "dergoegge",
+         "node_id" : "MDQ6VXNlcjgwNzcxNjk=",
+         "organizations_url" : "https://api.github.com/users/dergoegge/orgs",
+         "received_events_url" : "https://api.github.com/users/dergoegge/received_events",
+         "repos_url" : "https://api.github.com/users/dergoegge/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/dergoegge/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/dergoegge/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/dergoegge"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26283#discussion_r1135765960"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26283"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1135765960"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Could use [`std::visit`](https://en.cppreference.com/w/cpp/utility/variant/visit).",
+      "commit_id" : "00df0aefff938e849bdab5278d6658d5c9d5d064",
+      "created_at" : "2023-03-14T15:44:09Z",
+      "diff_hunk" : "@@ -121,26 +194,204 @@ class TxReconciliationTracker::Impl\n \n         const uint256 full_salt{ComputeSalt(local_salt, remote_salt)};\n         recon_state->second = TxReconciliationState(!is_peer_inbound, full_salt.GetUint64(0), full_salt.GetUint64(1));\n+        if (!is_peer_inbound) m_queue.push_back(peer_id);\n         return ReconciliationRegisterResult::SUCCESS;\n     }\n \n+    bool AddToSet(NodeId peer_id, const uint256& wtxid) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        if (!IsPeerRegistered(peer_id)) return false;\n+        auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        // Check if reconciliation set is not at capacity for two reasons:\n+        // - limit sizes of reconciliation sets and short id mappings;\n+        // - limit CPU use for sketch computations.\n+        //\n+        // Since we reconcile frequently, reaching capacity either means:\n+        // (1) a peer for some reason does not request reconciliations from us for a long while, or\n+        // (2) really a lot of valid fee-paying transactions were dumped on us at once.\n+        // We don't care about a laggy peer (1) because we probably can't help them even if we fanout transactions.\n+        // However, exploiting (2) should not prevent us from relaying certain transactions.\n+        //\n+        // Transactions which don't make it to the set due to the limit are announced via fan-out.\n+        if (recon_state.m_local_set.size() >= MAX_SET_SIZE) return false;\n+\n+        Assume(recon_state.m_local_set.insert(wtxid).second);\n+        LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, \"Added a transaction to the reconciliation set for peer=%d. \" /* Continued */\n+                                                                    \"Now the set contains %i transactions.\\n\",\n+                      peer_id, recon_state.m_local_set.size());\n+        return true;\n+    }\n+\n+    bool TryRemovingFromSet(NodeId peer_id, const uint256& wtxid_to_remove) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        if (!IsPeerRegistered(peer_id)) return false;\n+        auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        return recon_state.m_local_set.erase(wtxid_to_remove) > 0;\n+    }\n+\n+    bool IsPeerNextToReconcileWith(NodeId peer_id, std::chrono::microseconds now) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+\n+        if (!IsPeerRegistered(peer_id)) return false;\n+        if (m_queue.empty()) return false;\n+\n+        const auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+\n+        if (m_next_recon_request <= now && m_queue.front() == peer_id) {\n+            Assume(recon_state.m_we_initiate);\n+            m_queue.pop_front();\n+            m_queue.push_back(peer_id);\n+\n+            // If the phase is not NONE, the peer hasn't responded to the previous reconciliation.\n+            // A laggy peer should not affect other peers.\n+            //\n+            // This doesn't prevent from a malicious peer gaming this by staying in this state\n+            // all the time somehow.\n+            if (recon_state.m_phase_init_by_us == Phase::NONE) UpdateNextReconRequest(now);\n+            return true;\n+        }\n+\n+        return false;\n+    }\n+\n+    std::optional<std::pair<uint16_t, uint16_t>> InitiateReconciliationRequest(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        if (!IsPeerRegistered(peer_id)) return std::nullopt;\n+\n+        auto& recon_state = std::get<TxReconciliationState>(m_states.find(peer_id)->second);\n+        if (!recon_state.m_we_initiate) return std::nullopt;\n+\n+        if (recon_state.m_phase_init_by_us != Phase::NONE) return std::nullopt;\n+        recon_state.m_phase_init_by_us = Phase::INIT_REQUESTED;\n+\n+        size_t local_set_size = recon_state.m_local_set.size();\n+\n+        LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, \"Initiate reconciliation with peer=%d with the following params: \" /* Continued */\n+                                                                    \"local_set_size=%i\\n\",\n+                      peer_id, local_set_size);\n+\n+        // In future, Q could be recomputed after every reconciliation based on the\n+        // set differences. For now, it provides good enough results without recompute\n+        // complexity, but we communicate it here to allow backward compatibility if\n+        // the value is changed or made dynamic.\n+        return std::make_pair(local_set_size, Q * Q_PRECISION);\n+    }\n+\n     void ForgetPeer(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n     {\n         AssertLockNotHeld(m_txreconciliation_mutex);\n         LOCK(m_txreconciliation_mutex);\n         if (m_states.erase(peer_id)) {\n+            m_queue.erase(std::remove(m_queue.begin(), m_queue.end(), peer_id), m_queue.end());\n             LogPrintLevel(BCLog::TXRECONCILIATION, BCLog::Level::Debug, \"Forget txreconciliation state of peer=%d\\n\", peer_id);\n         }\n     }\n \n-    bool IsPeerRegistered(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    bool IsPeerRegistered(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n     {\n-        AssertLockNotHeld(m_txreconciliation_mutex);\n-        LOCK(m_txreconciliation_mutex);\n+        AssertLockHeld(m_txreconciliation_mutex);\n         auto recon_state = m_states.find(peer_id);\n         return (recon_state != m_states.end() &&\n                 std::holds_alternative<TxReconciliationState>(recon_state->second));\n     }\n+\n+    bool IsPeerRegisteredExternal(NodeId peer_id) const EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        return IsPeerRegistered(peer_id);\n+    }\n+\n+    std::vector<NodeId> GetFanoutTargets(const uint256& wtxid, CSipHasher& deterministic_randomizer,\n+                                         bool we_initiate, float limit) const EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n+    {\n+        // To handle fractional values, we add one peer optimistically and then probabilistically\n+        // drop it later.\n+        // Initiate the randomness here so that it's not influenced by the following code.\n+        double fractional_peer;\n+        const size_t targets = size_t(std::modf(limit, &fractional_peer)) + 1;\n+        const bool drop_peer_if_extra = deterministic_randomizer.Finalize() > fractional_peer * float(UINT64_MAX);\n+\n+        std::vector<std::pair<uint64_t, NodeId>> best_peers(targets, std::make_pair(0, 0));\n+\n+        auto try_fanout_candidate = [&best_peers, &deterministic_randomizer, targets](\n+                                        const std::pair<NodeId, std::variant<uint64_t, TxReconciliationState>> candidate) {\n+            const auto& cur_state = std::get<TxReconciliationState>(candidate.second);\n+            uint64_t hash_key = std::max<uint64_t>(deterministic_randomizer.Write(cur_state.m_k0).Finalize(), 1);\n+\n+            for (size_t i = 0; i < targets; ++i) {\n+                if (hash_key > best_peers[i].first) {\n+                    std::copy(best_peers.begin() + i, best_peers.begin() + targets - 1, best_peers.begin() + i + 1);\n+                    best_peers[i] = std::make_pair(hash_key, candidate.first);\n+                    break;\n+                }\n+            }\n+        };\n+\n+        for (auto indexed_state : m_states) {\n+            const auto& cur_state = std::get<TxReconciliationState>(indexed_state.second);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26283#discussion_r1135765960",
+      "id" : 1135765960,
+      "in_reply_to_id" : 1135725988,
+      "line" : 342,
+      "node_id" : "PRRC_kwDOABII585DsmnI",
+      "original_commit_id" : "00df0aefff938e849bdab5278d6658d5c9d5d064",
+      "original_line" : 342,
+      "original_position" : 262,
+      "original_start_line" : null,
+      "path" : "src/node/txreconciliation.cpp",
+      "position" : 262,
+      "pull_request_review_id" : 1339614248,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26283",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1135765960/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "updated_at" : "2023-03-14T15:44:09Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1135765960",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8077169?v=4",
+         "events_url" : "https://api.github.com/users/dergoegge/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/dergoegge/followers",
+         "following_url" : "https://api.github.com/users/dergoegge/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/dergoegge/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/dergoegge",
+         "id" : 8077169,
+         "login" : "dergoegge",
+         "node_id" : "MDQ6VXNlcjgwNzcxNjk=",
+         "organizations_url" : "https://api.github.com/users/dergoegge/orgs",
+         "received_events_url" : "https://api.github.com/users/dergoegge/received_events",
+         "repos_url" : "https://api.github.com/users/dergoegge/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/dergoegge/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/dergoegge/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/dergoegge"
+      }
    }
 ]
