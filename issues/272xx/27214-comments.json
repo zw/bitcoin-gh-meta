@@ -2463,5 +2463,1730 @@
          "type" : "User",
          "url" : "https://api.github.com/users/mzumsande"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1132837417"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1132837417"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "good point about checking bounds. one way to do that is with simple checks like `assert(bucket <= ADDRMAN_TRIED_BUCKET_COUNT)` etc. \r\n\r\n> Maybe change the arrays to std::array and use .at() here.\r\n\r\nbut I'd like to understand this option better. right now `vvTried` and `vvNew` are declared as C-style arrays. is your recommendation to change those `AddrManImpl` declarations so that we can utilize the bounds checking of the `.at()` function? ",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-10T20:20:42Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {\n+        auto it = m_network_counts.find(*network);\n+        if (it == m_network_counts.end()) return {};\n+\n+        auto counts = it->second;\n+        new_count = counts.n_new;\n+        tried_count = counts.n_tried;\n+    }\n+\n+    if (new_only && new_count == 0) return {};\n+    if ((new_count + tried_count) == 0) return {};\n+\n+    // Decide if we are going to search the new or tried table\n+    // If either option is viable, use a 50% chance to choose\n+    bool search_tried;\n+    if (new_only || tried_count == 0) {\n+        search_tried = false;\n+    } else if (new_count == 0) {\n+        search_tried = true;\n     } else {\n-        // use a new node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a new bucket, and an initial position in that bucket.\n-            int nUBucket = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);\n-            int nUBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from new\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n+        search_tried = insecure_rand.randbool();\n+    }\n+\n+    const int bucket_count{search_tried ? ADDRMAN_TRIED_BUCKET_COUNT : ADDRMAN_NEW_BUCKET_COUNT};\n+\n+    //  Loop through the addrman table until we find an appropriate entry\n+    double chance_factor = 1.0;\n+    while (1) {\n+        // Pick a bucket, and an initial position in that bucket.\n+        int bucket = insecure_rand.randrange(bucket_count);\n+        int initial_position = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n+\n+        // Iterate over the positions of that bucket, starting at the initial one,\n+        // and looping around.\n+        int i;\n+        for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n+            int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+            int node_id = LookupAddrmanEntry(search_tried, bucket, position);\n+            if (node_id != -1) {\n+                if (network) {\n+                    const auto it{mapInfo.find(node_id)};\n+                    const auto info{it->second};\n+                    if (info.GetNetwork() == *network) break;\n+                } else {\n+                    break;\n+                }\n             }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n         }\n+\n+        // If the bucket is entirely empty, start over with a (likely) different one.\n+        if (i == ADDRMAN_BUCKET_SIZE) continue;\n+\n+        // Find the entry to return.\n+        int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+        int nId = LookupAddrmanEntry(search_tried, bucket, position);\n+        const auto it_found{mapInfo.find(nId)};\n+        assert(it_found != mapInfo.end());\n+        const AddrInfo& info{it_found->second};\n+\n+        // With probability GetChance() * chance_factor, return the entry.\n+        if (insecure_rand.randbits(30) < chance_factor * info.GetChance() * (1 << 30)) {\n+            std::string table_name;\n+            search_tried ? table_name = \"tried\" : table_name = \"new\";\n+            LogPrint(BCLog::ADDRMAN, \"Selected %s from %s\\n\", info.ToStringAddrPort(), table_name);\n+            return {info, info.m_last_try};\n+        }\n+\n+        // Otherwise start over with a (likely) different bucket, and increased chance factor.\n+        chance_factor *= 1.2;\n+    }\n+}\n+\n+int AddrManImpl::LookupAddrmanEntry(bool use_tried, int bucket, int position) const\n+{\n+    AssertLockHeld(cs);\n+\n+    if (use_tried) {\n+        return vvTried[bucket][position];\n+    } else {\n+        return vvNew[bucket][position];\n     }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1132837417",
+      "id" : 1132837417,
+      "in_reply_to_id" : 1129439158,
+      "line" : 805,
+      "node_id" : "PRRC_kwDOABII585Dhbop",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 805,
+      "original_position" : 163,
+      "original_start_line" : 802,
+      "path" : "src/addrman.cpp",
+      "position" : 162,
+      "pull_request_review_id" : 1335559840,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1132837417/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 801,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-10T20:20:42Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1132837417",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1132968822"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1132968822"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "oh interesting, I thought that the compiler optimizes away these sort of named-variables-used-shortly-after patterns, but maybe it's different for `std::string`? I took it to compiler explorer to see if I could observe the allocation- https://godbolt.org/z/GG78zv3KT. are the calls to `std::allocator<char>` what you are referring to? ",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-10T23:29:52Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {\n+        auto it = m_network_counts.find(*network);\n+        if (it == m_network_counts.end()) return {};\n+\n+        auto counts = it->second;\n+        new_count = counts.n_new;\n+        tried_count = counts.n_tried;\n+    }\n+\n+    if (new_only && new_count == 0) return {};\n+    if ((new_count + tried_count) == 0) return {};\n+\n+    // Decide if we are going to search the new or tried table\n+    // If either option is viable, use a 50% chance to choose\n+    bool search_tried;\n+    if (new_only || tried_count == 0) {\n+        search_tried = false;\n+    } else if (new_count == 0) {\n+        search_tried = true;\n     } else {\n-        // use a new node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a new bucket, and an initial position in that bucket.\n-            int nUBucket = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);\n-            int nUBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from new\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n+        search_tried = insecure_rand.randbool();\n+    }\n+\n+    const int bucket_count{search_tried ? ADDRMAN_TRIED_BUCKET_COUNT : ADDRMAN_NEW_BUCKET_COUNT};\n+\n+    //  Loop through the addrman table until we find an appropriate entry\n+    double chance_factor = 1.0;\n+    while (1) {\n+        // Pick a bucket, and an initial position in that bucket.\n+        int bucket = insecure_rand.randrange(bucket_count);\n+        int initial_position = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n+\n+        // Iterate over the positions of that bucket, starting at the initial one,\n+        // and looping around.\n+        int i;\n+        for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n+            int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+            int node_id = LookupAddrmanEntry(search_tried, bucket, position);\n+            if (node_id != -1) {\n+                if (network) {\n+                    const auto it{mapInfo.find(node_id)};\n+                    const auto info{it->second};\n+                    if (info.GetNetwork() == *network) break;\n+                } else {\n+                    break;\n+                }\n             }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n         }\n+\n+        // If the bucket is entirely empty, start over with a (likely) different one.\n+        if (i == ADDRMAN_BUCKET_SIZE) continue;\n+\n+        // Find the entry to return.\n+        int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+        int nId = LookupAddrmanEntry(search_tried, bucket, position);\n+        const auto it_found{mapInfo.find(nId)};\n+        assert(it_found != mapInfo.end());\n+        const AddrInfo& info{it_found->second};\n+\n+        // With probability GetChance() * chance_factor, return the entry.\n+        if (insecure_rand.randbits(30) < chance_factor * info.GetChance() * (1 << 30)) {\n+            std::string table_name;\n+            search_tried ? table_name = \"tried\" : table_name = \"new\";\n+            LogPrint(BCLog::ADDRMAN, \"Selected %s from %s\\n\", info.ToStringAddrPort(), table_name);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1132968822",
+      "id" : 1132968822,
+      "in_reply_to_id" : 1129522848,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Dh7t2",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 789,
+      "original_position" : 146,
+      "original_start_line" : 787,
+      "path" : "src/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335744428,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1132968822/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-10T23:29:52Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1132968822",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133106788"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133106788"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "this test is actually covering the `tried_count == 0` logic. if it were to hit line 746, it would sometimes select the tried table and sometimes the new table, which means it should fail 50% of the time. this coverage is ensuring that the `tried_count` has the proper interactions with `network`, which gets assigned earlier in the function-\r\n\r\n```\r\n    if (network.has_value()) {\r\n        auto it = m_network_counts.find(*network);\r\n        if (it == m_network_counts.end()) return {};\r\n\r\n        auto counts = it->second;\r\n        new_count = counts.n_new;\r\n        tried_count = counts.n_tried;\r\n    }\r\n``` \r\n\r\nlmk if that makes sense ",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T15:29:08Z",
+      "diff_hunk" : "@@ -181,17 +183,85 @@ BOOST_AUTO_TEST_CASE(addrman_select)\n     BOOST_CHECK(addrman->Add({CAddress(addr7, NODE_NONE)}, ResolveService(\"250.1.1.3\", 8333)));\n     BOOST_CHECK(addrman->Good(CAddress(addr7, NODE_NONE)));\n \n-    // Test: 6 addrs + 1 addr from last test = 7.\n+    // 6 addrs + 1 addr from last test = 7.\n     BOOST_CHECK_EQUAL(addrman->Size(), 7U);\n \n-    // Test: Select pulls from new and tried regardless of port number.\n+    // Select pulls from new and tried regardless of port number.\n     std::set<uint16_t> ports;\n     for (int i = 0; i < 20; ++i) {\n         ports.insert(addrman->Select().first.GetPort());\n     }\n     BOOST_CHECK_EQUAL(ports.size(), 3U);\n }\n \n+BOOST_AUTO_TEST_CASE(addrman_select_by_network)\n+{\n+    auto addrman = std::make_unique<AddrMan>(EMPTY_NETGROUPMAN, DETERMINISTIC, GetCheckRatio(m_node));\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+\n+    // add ipv4 address to the new table\n+    CNetAddr source = ResolveIP(\"252.2.2.2\");\n+    CService addr1 = ResolveService(\"250.1.1.1\", 8333);\n+    BOOST_CHECK(addrman->Add({CAddress(addr1, NODE_NONE)}, source));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV6).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_ONION).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_CJDNS).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+\n+    // add I2P address to the new table\n+    CService i2p_addr;\n+    i2p_addr.SetSpecial(\"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p\");\n+    BOOST_CHECK(addrman->Add({CAddress(i2p_addr, NODE_NONE)}, source));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_I2P).first.ToStringAddrPort(), \"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort(), \"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV6).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_ONION).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_CJDNS).first.ToStringAddrPort(), \"[::]:0\");\n+\n+    // bump I2P address to tried table\n+    BOOST_CHECK(addrman->Good(CAddress(i2p_addr, NODE_NONE)));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_I2P).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort(), \"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:0\");\n+\n+    // add another I2P address to the new table\n+    CService i2p_addr2;\n+    i2p_addr2.SetSpecial(\"c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p\");\n+    BOOST_CHECK(addrman->Add({CAddress(i2p_addr2, NODE_NONE)}, source));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_I2P).first.ToStringAddrPort(), \"c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p:0\");\n+\n+    // ensure that both new and tried table are selected from\n+    std::set<std::string> i2p_addrs;\n+    for (int i = 0; i < 10; ++i) {\n+        i2p_addrs.insert(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort());\n+    }\n+    BOOST_CHECK_EQUAL(i2p_addrs.size(), 2U);\n+}\n+\n+BOOST_AUTO_TEST_CASE(addrman_select_special)\n+{\n+    // use a non-deterministic addrman to ensure a passing test isn't due to setup\n+    auto addrman = std::make_unique<AddrMan>(EMPTY_NETGROUPMAN, /*deterministic*/false, GetCheckRatio(m_node));\n+\n+    // add ipv4 address to the new table\n+    CNetAddr source = ResolveIP(\"252.2.2.2\");\n+    CService addr1 = ResolveService(\"250.1.1.3\", 8333);\n+    BOOST_CHECK(addrman->Add({CAddress(addr1, NODE_NONE)}, source));\n+\n+    // since the only address is on the new table, ensure that the new table\n+    // gets selected even if new_only is false. if the table was being selected\n+    // at random, this test will sporadically fail\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.3:8333\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133106788",
+      "id" : 1133106788,
+      "in_reply_to_id" : 1130754068,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DidZk",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 262,
+      "original_position" : 142,
+      "original_start_line" : 259,
+      "path" : "src/test/addrman_tests.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335898315,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133106788/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T15:29:24Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133106788",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133112932"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133112932"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "if I am understanding this thread properly, it seems like there are two concepts being discussed:\r\n1. changes to the bench tests\r\n2. optimization to `AddrManImpl::Select_`\r\n\r\nRE 1, I'm slightly confused as to the desired coverage. Without the network parameter, I would expect the worst case of the current `Select_` function to happen when addrman is practically empty, which is why we introduced `AddrManSelectFromAlmostEmpty`. On mainnet, this case would be unlikely, which is represented by `AddrManSelect`. With the network parameter, I would expect worst case to be represented by `AddrManSelectByNetwork` where theres just 1 I2P address on an addrman filled with other addresses. @vasild can you clarify what feels absent or misrepresentative?\r\n\r\nalso happy to discuss 2 further, but a question there - does it feel relevant to these patches to improve performance, or is it an orthogonal improvement (since we see similar worst cases right now)?  ",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T15:58:51Z",
+      "diff_hunk" : "@@ -95,6 +110,43 @@ static void AddrManSelect(benchmark::Bench& bench)\n     });\n }\n \n+// The worst case performance of the Select() function is when there is only\n+// one address on the table, because it linearly searches every position of\n+// several buckets before identifying the correct bucket\n+static void AddrManSelectFromAlmostEmpty(benchmark::Bench& bench)\n+{\n+    AddrMan addrman{EMPTY_NETGROUPMAN, /*deterministic=*/false, ADDRMAN_CONSISTENCY_CHECK_RATIO};\n+\n+    // Add one address to the new table\n+    CService addr = ResolveService(\"250.3.1.1\", 8333);\n+    addrman.Add({CAddress(addr, NODE_NONE)}, ResolveService(\"250.3.1.1\", 8333));\n+\n+    bench.run([&] {\n+        const auto& address = addrman.Select();\n+        assert(address.first.GetPort() > 0);\n+    });\n+}\n+\n+static void AddrManSelectByNetwork(benchmark::Bench& bench)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133112932",
+      "id" : 1133112932,
+      "in_reply_to_id" : 1130844842,
+      "line" : 129,
+      "node_id" : "PRRC_kwDOABII585Die5k",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 129,
+      "original_position" : 50,
+      "original_start_line" : null,
+      "path" : "src/bench/addrman.cpp",
+      "position" : 49,
+      "pull_request_review_id" : 1335901245,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133112932/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T15:58:51Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133112932",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131333"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131333"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "good point, updated to `GetEntry` to match the naming style of `GetAddr`",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:31:04Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {\n+        auto it = m_network_counts.find(*network);\n+        if (it == m_network_counts.end()) return {};\n+\n+        auto counts = it->second;\n+        new_count = counts.n_new;\n+        tried_count = counts.n_tried;\n+    }\n+\n+    if (new_only && new_count == 0) return {};\n+    if ((new_count + tried_count) == 0) return {};\n+\n+    // Decide if we are going to search the new or tried table\n+    // If either option is viable, use a 50% chance to choose\n+    bool search_tried;\n+    if (new_only || tried_count == 0) {\n+        search_tried = false;\n+    } else if (new_count == 0) {\n+        search_tried = true;\n     } else {\n-        // use a new node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a new bucket, and an initial position in that bucket.\n-            int nUBucket = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);\n-            int nUBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from new\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n+        search_tried = insecure_rand.randbool();\n+    }\n+\n+    const int bucket_count{search_tried ? ADDRMAN_TRIED_BUCKET_COUNT : ADDRMAN_NEW_BUCKET_COUNT};\n+\n+    //  Loop through the addrman table until we find an appropriate entry\n+    double chance_factor = 1.0;\n+    while (1) {\n+        // Pick a bucket, and an initial position in that bucket.\n+        int bucket = insecure_rand.randrange(bucket_count);\n+        int initial_position = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n+\n+        // Iterate over the positions of that bucket, starting at the initial one,\n+        // and looping around.\n+        int i;\n+        for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n+            int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+            int node_id = LookupAddrmanEntry(search_tried, bucket, position);\n+            if (node_id != -1) {\n+                if (network) {\n+                    const auto it{mapInfo.find(node_id)};\n+                    const auto info{it->second};\n+                    if (info.GetNetwork() == *network) break;\n+                } else {\n+                    break;\n+                }\n             }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n         }\n+\n+        // If the bucket is entirely empty, start over with a (likely) different one.\n+        if (i == ADDRMAN_BUCKET_SIZE) continue;\n+\n+        // Find the entry to return.\n+        int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+        int nId = LookupAddrmanEntry(search_tried, bucket, position);\n+        const auto it_found{mapInfo.find(nId)};\n+        assert(it_found != mapInfo.end());\n+        const AddrInfo& info{it_found->second};\n+\n+        // With probability GetChance() * chance_factor, return the entry.\n+        if (insecure_rand.randbits(30) < chance_factor * info.GetChance() * (1 << 30)) {\n+            std::string table_name;\n+            search_tried ? table_name = \"tried\" : table_name = \"new\";\n+            LogPrint(BCLog::ADDRMAN, \"Selected %s from %s\\n\", info.ToStringAddrPort(), table_name);\n+            return {info, info.m_last_try};\n+        }\n+\n+        // Otherwise start over with a (likely) different bucket, and increased chance factor.\n+        chance_factor *= 1.2;\n+    }\n+}\n+\n+int AddrManImpl::LookupAddrmanEntry(bool use_tried, int bucket, int position) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131333",
+      "id" : 1133131333,
+      "in_reply_to_id" : 1129434505,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijZF",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 798,
+      "original_position" : 155,
+      "original_start_line" : null,
+      "path" : "src/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920167,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131333/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:31:04Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131333",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131478"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131478"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "updated, my understanding is that `size_t` is unsigned and better optimizes for different platforms. does that track?",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:32:14Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {\n+        auto it = m_network_counts.find(*network);\n+        if (it == m_network_counts.end()) return {};\n+\n+        auto counts = it->second;\n+        new_count = counts.n_new;\n+        tried_count = counts.n_tried;\n+    }\n+\n+    if (new_only && new_count == 0) return {};\n+    if ((new_count + tried_count) == 0) return {};\n+\n+    // Decide if we are going to search the new or tried table\n+    // If either option is viable, use a 50% chance to choose\n+    bool search_tried;\n+    if (new_only || tried_count == 0) {\n+        search_tried = false;\n+    } else if (new_count == 0) {\n+        search_tried = true;\n     } else {\n-        // use a new node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a new bucket, and an initial position in that bucket.\n-            int nUBucket = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);\n-            int nUBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from new\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n+        search_tried = insecure_rand.randbool();\n+    }\n+\n+    const int bucket_count{search_tried ? ADDRMAN_TRIED_BUCKET_COUNT : ADDRMAN_NEW_BUCKET_COUNT};\n+\n+    //  Loop through the addrman table until we find an appropriate entry\n+    double chance_factor = 1.0;\n+    while (1) {\n+        // Pick a bucket, and an initial position in that bucket.\n+        int bucket = insecure_rand.randrange(bucket_count);\n+        int initial_position = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n+\n+        // Iterate over the positions of that bucket, starting at the initial one,\n+        // and looping around.\n+        int i;\n+        for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n+            int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+            int node_id = LookupAddrmanEntry(search_tried, bucket, position);\n+            if (node_id != -1) {\n+                if (network) {\n+                    const auto it{mapInfo.find(node_id)};\n+                    const auto info{it->second};\n+                    if (info.GetNetwork() == *network) break;\n+                } else {\n+                    break;\n+                }\n             }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n         }\n+\n+        // If the bucket is entirely empty, start over with a (likely) different one.\n+        if (i == ADDRMAN_BUCKET_SIZE) continue;\n+\n+        // Find the entry to return.\n+        int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+        int nId = LookupAddrmanEntry(search_tried, bucket, position);\n+        const auto it_found{mapInfo.find(nId)};\n+        assert(it_found != mapInfo.end());\n+        const AddrInfo& info{it_found->second};\n+\n+        // With probability GetChance() * chance_factor, return the entry.\n+        if (insecure_rand.randbits(30) < chance_factor * info.GetChance() * (1 << 30)) {\n+            std::string table_name;\n+            search_tried ? table_name = \"tried\" : table_name = \"new\";\n+            LogPrint(BCLog::ADDRMAN, \"Selected %s from %s\\n\", info.ToStringAddrPort(), table_name);\n+            return {info, info.m_last_try};\n+        }\n+\n+        // Otherwise start over with a (likely) different bucket, and increased chance factor.\n+        chance_factor *= 1.2;\n+    }\n+}\n+\n+int AddrManImpl::LookupAddrmanEntry(bool use_tried, int bucket, int position) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131478",
+      "id" : 1133131478,
+      "in_reply_to_id" : 1129442167,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijbW",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 798,
+      "original_position" : 155,
+      "original_start_line" : null,
+      "path" : "src/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920290,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131478/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:32:15Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131478",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131507"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131507"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "updated",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:32:45Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {\n+        auto it = m_network_counts.find(*network);\n+        if (it == m_network_counts.end()) return {};\n+\n+        auto counts = it->second;\n+        new_count = counts.n_new;\n+        tried_count = counts.n_tried;\n+    }\n+\n+    if (new_only && new_count == 0) return {};\n+    if ((new_count + tried_count) == 0) return {};\n+\n+    // Decide if we are going to search the new or tried table\n+    // If either option is viable, use a 50% chance to choose\n+    bool search_tried;\n+    if (new_only || tried_count == 0) {\n+        search_tried = false;\n+    } else if (new_count == 0) {\n+        search_tried = true;\n     } else {\n-        // use a new node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a new bucket, and an initial position in that bucket.\n-            int nUBucket = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);\n-            int nUBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from new\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n+        search_tried = insecure_rand.randbool();\n+    }\n+\n+    const int bucket_count{search_tried ? ADDRMAN_TRIED_BUCKET_COUNT : ADDRMAN_NEW_BUCKET_COUNT};\n+\n+    //  Loop through the addrman table until we find an appropriate entry\n+    double chance_factor = 1.0;\n+    while (1) {\n+        // Pick a bucket, and an initial position in that bucket.\n+        int bucket = insecure_rand.randrange(bucket_count);\n+        int initial_position = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n+\n+        // Iterate over the positions of that bucket, starting at the initial one,\n+        // and looping around.\n+        int i;\n+        for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n+            int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+            int node_id = LookupAddrmanEntry(search_tried, bucket, position);\n+            if (node_id != -1) {\n+                if (network) {\n+                    const auto it{mapInfo.find(node_id)};\n+                    const auto info{it->second};\n+                    if (info.GetNetwork() == *network) break;\n+                } else {\n+                    break;\n+                }\n             }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n         }\n+\n+        // If the bucket is entirely empty, start over with a (likely) different one.\n+        if (i == ADDRMAN_BUCKET_SIZE) continue;\n+\n+        // Find the entry to return.\n+        int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+        int nId = LookupAddrmanEntry(search_tried, bucket, position);\n+        const auto it_found{mapInfo.find(nId)};\n+        assert(it_found != mapInfo.end());\n+        const AddrInfo& info{it_found->second};\n+\n+        // With probability GetChance() * chance_factor, return the entry.\n+        if (insecure_rand.randbits(30) < chance_factor * info.GetChance() * (1 << 30)) {\n+            std::string table_name;\n+            search_tried ? table_name = \"tried\" : table_name = \"new\";\n+            LogPrint(BCLog::ADDRMAN, \"Selected %s from %s\\n\", info.ToStringAddrPort(), table_name);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131507",
+      "id" : 1133131507,
+      "in_reply_to_id" : 1129522848,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Dijbz",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 789,
+      "original_position" : 146,
+      "original_start_line" : 787,
+      "path" : "src/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920334,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131507/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:32:45Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131507",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131556"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131556"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "done",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:33:05Z",
+      "diff_hunk" : "@@ -146,11 +146,12 @@ class AddrMan\n     /**\n      * Choose an address to connect to.\n      *\n-     * @param[in] newOnly  Whether to only select addresses from the new table.\n+     * @param[in] new_only Whether to only select addresses from the new table.\n+     * @param[in] network  Select only addresses of this network (nullopt = all)\n      * @return    CAddress The record for the selected peer.\n      *            seconds  The last time we attempted to connect to that peer.\n      */\n-    std::pair<CAddress, NodeSeconds> Select(bool newOnly = false) const;\n+    std::pair<CAddress, NodeSeconds> Select(bool new_only = false, std::optional<Network> network = {}) const;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131556",
+      "id" : 1133131556,
+      "in_reply_to_id" : 1129539099,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Dijck",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 154,
+      "original_position" : 11,
+      "original_start_line" : 150,
+      "path" : "src/addrman.h",
+      "position" : null,
+      "pull_request_review_id" : 1335920364,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131556/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:33:05Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131556",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131581"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131581"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "done",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:33:20Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131581",
+      "id" : 1133131581,
+      "in_reply_to_id" : 1129547711,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Dijc9",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 726,
+      "original_position" : 58,
+      "original_start_line" : null,
+      "path" : "src/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920380,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131581/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:33:20Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131581",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131605"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131605"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "done ",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:33:30Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {\n+        auto it = m_network_counts.find(*network);\n+        if (it == m_network_counts.end()) return {};\n+\n+        auto counts = it->second;\n+        new_count = counts.n_new;\n+        tried_count = counts.n_tried;\n+    }\n+\n+    if (new_only && new_count == 0) return {};\n+    if ((new_count + tried_count) == 0) return {};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131605",
+      "id" : 1133131605,
+      "in_reply_to_id" : 1129552332,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijdV",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 736,
+      "original_position" : 68,
+      "original_start_line" : null,
+      "path" : "src/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920400,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131605/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:33:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131605",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131667"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131667"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "updated but worded it a bit differently - the 50% is only true if there are matches in both tables (with network interactions). lmk if the new language seems reasonable to you",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:34:16Z",
+      "diff_hunk" : "@@ -146,11 +146,12 @@ class AddrMan\n     /**\n      * Choose an address to connect to.\n      *\n-     * @param[in] newOnly  Whether to only select addresses from the new table.\n+     * @param[in] new_only Whether to only select addresses from the new table.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131667",
+      "id" : 1133131667,
+      "in_reply_to_id" : 1129566625,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijeT",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 149,
+      "original_position" : 5,
+      "original_start_line" : null,
+      "path" : "src/addrman.h",
+      "position" : null,
+      "pull_request_review_id" : 1335920465,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131667/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:34:16Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131667",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131673"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131673"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "done",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:34:25Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {\n+        auto it = m_network_counts.find(*network);\n+        if (it == m_network_counts.end()) return {};\n+\n+        auto counts = it->second;\n+        new_count = counts.n_new;\n+        tried_count = counts.n_tried;\n+    }\n+\n+    if (new_only && new_count == 0) return {};\n+    if ((new_count + tried_count) == 0) return {};\n+\n+    // Decide if we are going to search the new or tried table\n+    // If either option is viable, use a 50% chance to choose\n+    bool search_tried;\n+    if (new_only || tried_count == 0) {\n+        search_tried = false;\n+    } else if (new_count == 0) {\n+        search_tried = true;\n     } else {\n-        // use a new node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a new bucket, and an initial position in that bucket.\n-            int nUBucket = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);\n-            int nUBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from new\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n+        search_tried = insecure_rand.randbool();\n+    }\n+\n+    const int bucket_count{search_tried ? ADDRMAN_TRIED_BUCKET_COUNT : ADDRMAN_NEW_BUCKET_COUNT};\n+\n+    //  Loop through the addrman table until we find an appropriate entry",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131673",
+      "id" : 1133131673,
+      "in_reply_to_id" : 1129568636,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijeZ",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 751,
+      "original_position" : 106,
+      "original_start_line" : null,
+      "path" : "src/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920475,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131673/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:34:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131673",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131714"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131714"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "done",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:34:48Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {\n+        auto it = m_network_counts.find(*network);\n+        if (it == m_network_counts.end()) return {};\n+\n+        auto counts = it->second;\n+        new_count = counts.n_new;\n+        tried_count = counts.n_tried;\n+    }\n+\n+    if (new_only && new_count == 0) return {};\n+    if ((new_count + tried_count) == 0) return {};\n+\n+    // Decide if we are going to search the new or tried table\n+    // If either option is viable, use a 50% chance to choose\n+    bool search_tried;\n+    if (new_only || tried_count == 0) {\n+        search_tried = false;\n+    } else if (new_count == 0) {\n+        search_tried = true;\n     } else {\n-        // use a new node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a new bucket, and an initial position in that bucket.\n-            int nUBucket = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);\n-            int nUBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from new\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n+        search_tried = insecure_rand.randbool();\n+    }\n+\n+    const int bucket_count{search_tried ? ADDRMAN_TRIED_BUCKET_COUNT : ADDRMAN_NEW_BUCKET_COUNT};\n+\n+    //  Loop through the addrman table until we find an appropriate entry\n+    double chance_factor = 1.0;\n+    while (1) {\n+        // Pick a bucket, and an initial position in that bucket.\n+        int bucket = insecure_rand.randrange(bucket_count);\n+        int initial_position = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n+\n+        // Iterate over the positions of that bucket, starting at the initial one,\n+        // and looping around.\n+        int i;\n+        for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n+            int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+            int node_id = LookupAddrmanEntry(search_tried, bucket, position);\n+            if (node_id != -1) {\n+                if (network) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131714",
+      "id" : 1133131714,
+      "in_reply_to_id" : 1129569710,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijfC",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 765,
+      "original_position" : 120,
+      "original_start_line" : null,
+      "path" : "src/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920510,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131714/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:34:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131714",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131741"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131741"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "done",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:35:02Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {\n+        auto it = m_network_counts.find(*network);\n+        if (it == m_network_counts.end()) return {};\n+\n+        auto counts = it->second;\n+        new_count = counts.n_new;\n+        tried_count = counts.n_tried;\n+    }\n+\n+    if (new_only && new_count == 0) return {};\n+    if ((new_count + tried_count) == 0) return {};\n+\n+    // Decide if we are going to search the new or tried table\n+    // If either option is viable, use a 50% chance to choose\n+    bool search_tried;\n+    if (new_only || tried_count == 0) {\n+        search_tried = false;\n+    } else if (new_count == 0) {\n+        search_tried = true;\n     } else {\n-        // use a new node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a new bucket, and an initial position in that bucket.\n-            int nUBucket = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);\n-            int nUBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from new\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n+        search_tried = insecure_rand.randbool();\n+    }\n+\n+    const int bucket_count{search_tried ? ADDRMAN_TRIED_BUCKET_COUNT : ADDRMAN_NEW_BUCKET_COUNT};\n+\n+    //  Loop through the addrman table until we find an appropriate entry\n+    double chance_factor = 1.0;\n+    while (1) {\n+        // Pick a bucket, and an initial position in that bucket.\n+        int bucket = insecure_rand.randrange(bucket_count);\n+        int initial_position = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n+\n+        // Iterate over the positions of that bucket, starting at the initial one,\n+        // and looping around.\n+        int i;\n+        for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n+            int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+            int node_id = LookupAddrmanEntry(search_tried, bucket, position);\n+            if (node_id != -1) {\n+                if (network) {\n+                    const auto it{mapInfo.find(node_id)};\n+                    const auto info{it->second};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131741",
+      "id" : 1133131741,
+      "in_reply_to_id" : 1129577204,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Dijfd",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 768,
+      "original_position" : 122,
+      "original_start_line" : 766,
+      "path" : "src/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920533,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131741/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:35:02Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131741",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131754"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131754"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "done",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:35:09Z",
+      "diff_hunk" : "@@ -127,45 +127,47 @@ BOOST_AUTO_TEST_CASE(addrman_ports)\n     // the specified port to tried, but not the other.\n     addrman->Good(CAddress(addr1_port, NODE_NONE));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131754",
+      "id" : 1133131754,
+      "in_reply_to_id" : 1130661248,
+      "line" : 128,
+      "node_id" : "PRRC_kwDOABII585Dijfq",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 128,
+      "original_position" : 2,
+      "original_start_line" : null,
+      "path" : "src/test/addrman_tests.cpp",
+      "position" : 2,
+      "pull_request_review_id" : 1335920546,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131754/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:35:10Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131754",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131791"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131791"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "ah, thanks. updated lots of comments, I think I caught them all?",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:35:33Z",
+      "diff_hunk" : "@@ -181,17 +183,85 @@ BOOST_AUTO_TEST_CASE(addrman_select)\n     BOOST_CHECK(addrman->Add({CAddress(addr7, NODE_NONE)}, ResolveService(\"250.1.1.3\", 8333)));\n     BOOST_CHECK(addrman->Good(CAddress(addr7, NODE_NONE)));\n \n-    // Test: 6 addrs + 1 addr from last test = 7.\n+    // 6 addrs + 1 addr from last test = 7.\n     BOOST_CHECK_EQUAL(addrman->Size(), 7U);\n \n-    // Test: Select pulls from new and tried regardless of port number.\n+    // Select pulls from new and tried regardless of port number.\n     std::set<uint16_t> ports;\n     for (int i = 0; i < 20; ++i) {\n         ports.insert(addrman->Select().first.GetPort());\n     }\n     BOOST_CHECK_EQUAL(ports.size(), 3U);\n }\n \n+BOOST_AUTO_TEST_CASE(addrman_select_by_network)\n+{\n+    auto addrman = std::make_unique<AddrMan>(EMPTY_NETGROUPMAN, DETERMINISTIC, GetCheckRatio(m_node));\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131791",
+      "id" : 1133131791,
+      "in_reply_to_id" : 1130664213,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijgP",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 200,
+      "original_position" : 80,
+      "original_start_line" : null,
+      "path" : "src/test/addrman_tests.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920580,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131791/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:35:34Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131791",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131815"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131815"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "thanks, updated this in lots of places",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:35:48Z",
+      "diff_hunk" : "@@ -181,17 +183,85 @@ BOOST_AUTO_TEST_CASE(addrman_select)\n     BOOST_CHECK(addrman->Add({CAddress(addr7, NODE_NONE)}, ResolveService(\"250.1.1.3\", 8333)));\n     BOOST_CHECK(addrman->Good(CAddress(addr7, NODE_NONE)));\n \n-    // Test: 6 addrs + 1 addr from last test = 7.\n+    // 6 addrs + 1 addr from last test = 7.\n     BOOST_CHECK_EQUAL(addrman->Size(), 7U);\n \n-    // Test: Select pulls from new and tried regardless of port number.\n+    // Select pulls from new and tried regardless of port number.\n     std::set<uint16_t> ports;\n     for (int i = 0; i < 20; ++i) {\n         ports.insert(addrman->Select().first.GetPort());\n     }\n     BOOST_CHECK_EQUAL(ports.size(), 3U);\n }\n \n+BOOST_AUTO_TEST_CASE(addrman_select_by_network)\n+{\n+    auto addrman = std::make_unique<AddrMan>(EMPTY_NETGROUPMAN, DETERMINISTIC, GetCheckRatio(m_node));\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131815",
+      "id" : 1133131815,
+      "in_reply_to_id" : 1130668333,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Dijgn",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 201,
+      "original_position" : 81,
+      "original_start_line" : null,
+      "path" : "src/test/addrman_tests.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920605,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131815/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:35:49Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131815",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131847"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131847"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "incorporated this in many places in the tests I touched. definitely reads better",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:36:11Z",
+      "diff_hunk" : "@@ -181,17 +183,85 @@ BOOST_AUTO_TEST_CASE(addrman_select)\n     BOOST_CHECK(addrman->Add({CAddress(addr7, NODE_NONE)}, ResolveService(\"250.1.1.3\", 8333)));\n     BOOST_CHECK(addrman->Good(CAddress(addr7, NODE_NONE)));\n \n-    // Test: 6 addrs + 1 addr from last test = 7.\n+    // 6 addrs + 1 addr from last test = 7.\n     BOOST_CHECK_EQUAL(addrman->Size(), 7U);\n \n-    // Test: Select pulls from new and tried regardless of port number.\n+    // Select pulls from new and tried regardless of port number.\n     std::set<uint16_t> ports;\n     for (int i = 0; i < 20; ++i) {\n         ports.insert(addrman->Select().first.GetPort());\n     }\n     BOOST_CHECK_EQUAL(ports.size(), 3U);\n }\n \n+BOOST_AUTO_TEST_CASE(addrman_select_by_network)\n+{\n+    auto addrman = std::make_unique<AddrMan>(EMPTY_NETGROUPMAN, DETERMINISTIC, GetCheckRatio(m_node));\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+\n+    // add ipv4 address to the new table\n+    CNetAddr source = ResolveIP(\"252.2.2.2\");\n+    CService addr1 = ResolveService(\"250.1.1.1\", 8333);\n+    BOOST_CHECK(addrman->Add({CAddress(addr1, NODE_NONE)}, source));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131847",
+      "id" : 1133131847,
+      "in_reply_to_id" : 1130699029,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijhH",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 208,
+      "original_position" : 88,
+      "original_start_line" : null,
+      "path" : "src/test/addrman_tests.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920639,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131847/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:36:12Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131847",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131864"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131864"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "added",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:36:17Z",
+      "diff_hunk" : "@@ -181,17 +183,85 @@ BOOST_AUTO_TEST_CASE(addrman_select)\n     BOOST_CHECK(addrman->Add({CAddress(addr7, NODE_NONE)}, ResolveService(\"250.1.1.3\", 8333)));\n     BOOST_CHECK(addrman->Good(CAddress(addr7, NODE_NONE)));\n \n-    // Test: 6 addrs + 1 addr from last test = 7.\n+    // 6 addrs + 1 addr from last test = 7.\n     BOOST_CHECK_EQUAL(addrman->Size(), 7U);\n \n-    // Test: Select pulls from new and tried regardless of port number.\n+    // Select pulls from new and tried regardless of port number.\n     std::set<uint16_t> ports;\n     for (int i = 0; i < 20; ++i) {\n         ports.insert(addrman->Select().first.GetPort());\n     }\n     BOOST_CHECK_EQUAL(ports.size(), 3U);\n }\n \n+BOOST_AUTO_TEST_CASE(addrman_select_by_network)\n+{\n+    auto addrman = std::make_unique<AddrMan>(EMPTY_NETGROUPMAN, DETERMINISTIC, GetCheckRatio(m_node));\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+\n+    // add ipv4 address to the new table\n+    CNetAddr source = ResolveIP(\"252.2.2.2\");\n+    CService addr1 = ResolveService(\"250.1.1.1\", 8333);\n+    BOOST_CHECK(addrman->Add({CAddress(addr1, NODE_NONE)}, source));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV6).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_ONION).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_CJDNS).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+\n+    // add I2P address to the new table\n+    CService i2p_addr;\n+    i2p_addr.SetSpecial(\"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p\");\n+    BOOST_CHECK(addrman->Add({CAddress(i2p_addr, NODE_NONE)}, source));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_I2P).first.ToStringAddrPort(), \"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort(), \"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV6).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_ONION).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_CJDNS).first.ToStringAddrPort(), \"[::]:0\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131864",
+      "id" : 1133131864,
+      "in_reply_to_id" : 1130705627,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijhY",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 226,
+      "original_position" : 106,
+      "original_start_line" : null,
+      "path" : "src/test/addrman_tests.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920643,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131864/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:36:18Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131864",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131874"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131874"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "done",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:36:26Z",
+      "diff_hunk" : "@@ -181,17 +183,85 @@ BOOST_AUTO_TEST_CASE(addrman_select)\n     BOOST_CHECK(addrman->Add({CAddress(addr7, NODE_NONE)}, ResolveService(\"250.1.1.3\", 8333)));\n     BOOST_CHECK(addrman->Good(CAddress(addr7, NODE_NONE)));\n \n-    // Test: 6 addrs + 1 addr from last test = 7.\n+    // 6 addrs + 1 addr from last test = 7.\n     BOOST_CHECK_EQUAL(addrman->Size(), 7U);\n \n-    // Test: Select pulls from new and tried regardless of port number.\n+    // Select pulls from new and tried regardless of port number.\n     std::set<uint16_t> ports;\n     for (int i = 0; i < 20; ++i) {\n         ports.insert(addrman->Select().first.GetPort());\n     }\n     BOOST_CHECK_EQUAL(ports.size(), 3U);\n }\n \n+BOOST_AUTO_TEST_CASE(addrman_select_by_network)\n+{\n+    auto addrman = std::make_unique<AddrMan>(EMPTY_NETGROUPMAN, DETERMINISTIC, GetCheckRatio(m_node));\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+\n+    // add ipv4 address to the new table\n+    CNetAddr source = ResolveIP(\"252.2.2.2\");\n+    CService addr1 = ResolveService(\"250.1.1.1\", 8333);\n+    BOOST_CHECK(addrman->Add({CAddress(addr1, NODE_NONE)}, source));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV6).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_ONION).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_CJDNS).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+\n+    // add I2P address to the new table\n+    CService i2p_addr;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131874",
+      "id" : 1133131874,
+      "in_reply_to_id" : 1130712887,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Dijhi",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 217,
+      "original_position" : 97,
+      "original_start_line" : null,
+      "path" : "src/test/addrman_tests.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920656,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131874/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:36:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131874",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131929"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131929"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "great idea ! updated to use this while loop. also added you as co-author for this commit btw, thanks for the in depth review :)",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:36:58Z",
+      "diff_hunk" : "@@ -181,17 +183,85 @@ BOOST_AUTO_TEST_CASE(addrman_select)\n     BOOST_CHECK(addrman->Add({CAddress(addr7, NODE_NONE)}, ResolveService(\"250.1.1.3\", 8333)));\n     BOOST_CHECK(addrman->Good(CAddress(addr7, NODE_NONE)));\n \n-    // Test: 6 addrs + 1 addr from last test = 7.\n+    // 6 addrs + 1 addr from last test = 7.\n     BOOST_CHECK_EQUAL(addrman->Size(), 7U);\n \n-    // Test: Select pulls from new and tried regardless of port number.\n+    // Select pulls from new and tried regardless of port number.\n     std::set<uint16_t> ports;\n     for (int i = 0; i < 20; ++i) {\n         ports.insert(addrman->Select().first.GetPort());\n     }\n     BOOST_CHECK_EQUAL(ports.size(), 3U);\n }\n \n+BOOST_AUTO_TEST_CASE(addrman_select_by_network)\n+{\n+    auto addrman = std::make_unique<AddrMan>(EMPTY_NETGROUPMAN, DETERMINISTIC, GetCheckRatio(m_node));\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"[::]:0\");\n+\n+    // add ipv4 address to the new table\n+    CNetAddr source = ResolveIP(\"252.2.2.2\");\n+    CService addr1 = ResolveService(\"250.1.1.1\", 8333);\n+    BOOST_CHECK(addrman->Add({CAddress(addr1, NODE_NONE)}, source));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV6).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_ONION).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_CJDNS).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+\n+    // add I2P address to the new table\n+    CService i2p_addr;\n+    i2p_addr.SetSpecial(\"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p\");\n+    BOOST_CHECK(addrman->Add({CAddress(i2p_addr, NODE_NONE)}, source));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_I2P).first.ToStringAddrPort(), \"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort(), \"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV4).first.ToStringAddrPort(), \"250.1.1.1:8333\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_IPV6).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_ONION).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_CJDNS).first.ToStringAddrPort(), \"[::]:0\");\n+\n+    // bump I2P address to tried table\n+    BOOST_CHECK(addrman->Good(CAddress(i2p_addr, NODE_NONE)));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_I2P).first.ToStringAddrPort(), \"[::]:0\");\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort(), \"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:0\");\n+\n+    // add another I2P address to the new table\n+    CService i2p_addr2;\n+    i2p_addr2.SetSpecial(\"c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p\");\n+    BOOST_CHECK(addrman->Add({CAddress(i2p_addr2, NODE_NONE)}, source));\n+\n+    BOOST_CHECK_EQUAL(addrman->Select(/*new_only*/true, NET_I2P).first.ToStringAddrPort(), \"c4gfnttsuwqomiygupdqqqyy5y5emnk5c73hrfvatri67prd7vyq.b32.i2p:0\");\n+\n+    // ensure that both new and tried table are selected from\n+    std::set<std::string> i2p_addrs;\n+    for (int i = 0; i < 10; ++i) {\n+        i2p_addrs.insert(addrman->Select(/*new_only*/false, NET_I2P).first.ToStringAddrPort());\n+    }\n+    BOOST_CHECK_EQUAL(i2p_addrs.size(), 2U);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131929",
+      "id" : 1133131929,
+      "in_reply_to_id" : 1130731456,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijiZ",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 246,
+      "original_position" : 126,
+      "original_start_line" : 241,
+      "path" : "src/test/addrman_tests.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920706,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131929/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:36:58Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131929",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131961"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131961"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "that makes sense, updated to remove correctness tests",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:37:28Z",
+      "diff_hunk" : "@@ -95,6 +110,43 @@ static void AddrManSelect(benchmark::Bench& bench)\n     });\n }\n \n+// The worst case performance of the Select() function is when there is only\n+// one address on the table, because it linearly searches every position of\n+// several buckets before identifying the correct bucket\n+static void AddrManSelectFromAlmostEmpty(benchmark::Bench& bench)\n+{\n+    AddrMan addrman{EMPTY_NETGROUPMAN, /*deterministic=*/false, ADDRMAN_CONSISTENCY_CHECK_RATIO};\n+\n+    // Add one address to the new table\n+    CService addr = ResolveService(\"250.3.1.1\", 8333);\n+    addrman.Add({CAddress(addr, NODE_NONE)}, ResolveService(\"250.3.1.1\", 8333));\n+\n+    bench.run([&] {\n+        const auto& address = addrman.Select();\n+        assert(address.first.GetPort() > 0);\n+    });\n+}\n+\n+static void AddrManSelectByNetwork(benchmark::Bench& bench)\n+{\n+    AddrMan addrman{EMPTY_NETGROUPMAN, /*deterministic=*/false, ADDRMAN_CONSISTENCY_CHECK_RATIO};\n+\n+    // add single I2P address to new table\n+    CService i2p_service;\n+    i2p_service.SetSpecial(\"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p\");\n+    CAddress i2p_address(i2p_service, NODE_NONE);\n+    i2p_address.nTime = Now<NodeSeconds>();\n+    CNetAddr source = ResolveIP(\"252.2.2.2\");\n+    addrman.Add({i2p_address}, source);\n+\n+    FillAddrMan(addrman);\n+\n+    bench.run([&] {\n+        const auto& address = addrman.Select(/*new_only*/false, NET_I2P);\n+        assert(address.first.ToStringAddrPort() == \"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:0\");",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131961",
+      "id" : 1133131961,
+      "in_reply_to_id" : 1130835999,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Diji5",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 146,
+      "original_position" : 66,
+      "original_start_line" : 145,
+      "path" : "src/bench/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920753,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131961/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:37:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131961",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131985"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131985"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "yeah it was, but updated to remove that assertion. ",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-11T18:37:41Z",
+      "diff_hunk" : "@@ -95,6 +110,43 @@ static void AddrManSelect(benchmark::Bench& bench)\n     });\n }\n \n+// The worst case performance of the Select() function is when there is only\n+// one address on the table, because it linearly searches every position of\n+// several buckets before identifying the correct bucket\n+static void AddrManSelectFromAlmostEmpty(benchmark::Bench& bench)\n+{\n+    AddrMan addrman{EMPTY_NETGROUPMAN, /*deterministic=*/false, ADDRMAN_CONSISTENCY_CHECK_RATIO};\n+\n+    // Add one address to the new table\n+    CService addr = ResolveService(\"250.3.1.1\", 8333);\n+    addrman.Add({CAddress(addr, NODE_NONE)}, ResolveService(\"250.3.1.1\", 8333));\n+\n+    bench.run([&] {\n+        const auto& address = addrman.Select();\n+        assert(address.first.GetPort() > 0);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1133131985",
+      "id" : 1133131985,
+      "in_reply_to_id" : 1130840488,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585DijjR",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 126,
+      "original_position" : 46,
+      "original_start_line" : 125,
+      "path" : "src/bench/addrman.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1335920779,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131985/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-11T18:37:41Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1133131985",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1500952?v=4",
+         "events_url" : "https://api.github.com/users/amitiuttarwar/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/amitiuttarwar/followers",
+         "following_url" : "https://api.github.com/users/amitiuttarwar/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/amitiuttarwar/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/amitiuttarwar",
+         "id" : 1500952,
+         "login" : "amitiuttarwar",
+         "node_id" : "MDQ6VXNlcjE1MDA5NTI=",
+         "organizations_url" : "https://api.github.com/users/amitiuttarwar/orgs",
+         "received_events_url" : "https://api.github.com/users/amitiuttarwar/received_events",
+         "repos_url" : "https://api.github.com/users/amitiuttarwar/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/amitiuttarwar/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/amitiuttarwar/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/amitiuttarwar"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1136853031"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136853031"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "@mzumsande,\r\n\r\n> I'd expect performance to go down a bit for the case where we have many addresses to choose from. Do you see this in your benchmark?\r\n\r\nYes, that slows down a bit the fast `Select()` (any network is ok). I observed that and think it is ok because it is still super fast with or without the shuffling.\r\n\r\n> Why does this need `ALREADY_VISITED_AND_BORING`?\r\n\r\nThe `for` loop could still repeat the whole array from the start if some address was found but was skipped. `ALREADY_VISITED_AND_BORING` is a further optimization to completely skip that bucket on the second and further passes through the array.\r\n\r\n@amitiuttarwar, you are right that I modified the newly added `AddrManSelectByNetwork()` so that, in general, it tests the same thing as `AddrManSelect()` which already exists in `master`. I did that in order to be sure that everything else is _identical_: the way addrman is filled, `minEpochIterations(300)` and the `GetPort()` call. Way too many times I have been bitten by chasing noise in benchmarks, so I wanted to be sure that this is the only difference in the two things I am comparing:\r\n\r\n```cpp\r\n#if 0 // flip to 1 to test the other case\r\n        addrman.Select(/*new_only=*/false);\r\n#else\r\n        addrman.Select(/*new_only=*/false, NET_I2P);\r\n#endif\r\n```\r\n\r\n> also happy to discuss 2 further, but a question there - does it feel relevant to these patches to improve performance, or is it an orthogonal improvement\r\n\r\nI think the performance improvement would be a nice addition to the work done by this PR (or maybe even a \"must have\"?)\r\n\r\n> (since we see similar worst cases right now)?\r\n\r\nHmm? Now on `master` on mainnet it takes 0.18 microseconds and with this PR on mainnet it will take 6000 microseconds. That is the average case (averaged by the benchmark executing `Select` about 3500 times). The difference in the worst case is even more pronounced.",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-15T10:40:18Z",
+      "diff_hunk" : "@@ -95,6 +110,43 @@ static void AddrManSelect(benchmark::Bench& bench)\n     });\n }\n \n+// The worst case performance of the Select() function is when there is only\n+// one address on the table, because it linearly searches every position of\n+// several buckets before identifying the correct bucket\n+static void AddrManSelectFromAlmostEmpty(benchmark::Bench& bench)\n+{\n+    AddrMan addrman{EMPTY_NETGROUPMAN, /*deterministic=*/false, ADDRMAN_CONSISTENCY_CHECK_RATIO};\n+\n+    // Add one address to the new table\n+    CService addr = ResolveService(\"250.3.1.1\", 8333);\n+    addrman.Add({CAddress(addr, NODE_NONE)}, ResolveService(\"250.3.1.1\", 8333));\n+\n+    bench.run([&] {\n+        const auto& address = addrman.Select();\n+        assert(address.first.GetPort() > 0);\n+    });\n+}\n+\n+static void AddrManSelectByNetwork(benchmark::Bench& bench)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1136853031",
+      "id" : 1136853031,
+      "in_reply_to_id" : 1130844842,
+      "line" : 129,
+      "node_id" : "PRRC_kwDOABII585DwwAn",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 129,
+      "original_position" : 50,
+      "original_start_line" : null,
+      "path" : "src/bench/addrman.cpp",
+      "position" : 49,
+      "pull_request_review_id" : 1341141202,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136853031/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-15T10:40:19Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136853031",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1136869429"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136869429"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Yes, but I am not saying to do it (use `std::array` and `.at()`). It is just an option, in case you have not considered it. Up to you.\r\n\r\nBtw, a difference between an `assert()` and `.at()` is that the former will call `abort()` and will inevitably cause the program to exit. OTOH `.at()` will throw `std::out_of_range` which the caller can catch and continue the execution. I don't have a strong opinion which one is more preferable to use here. Maybe either one is ok. Usually on such \"programmer error\" we want to really stop the whole program, OTOH `.at()` is much more elegant to write :) and if the exception is unhandled then it will also cause the program to exit.",
+      "commit_id" : "09d514583f15860f3bc7ae0c89e640c94fae3c71",
+      "created_at" : "2023-03-15T10:54:20Z",
+      "diff_hunk" : "@@ -714,72 +714,95 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool newOnly) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n {\n     AssertLockHeld(cs);\n \n     if (vRandom.empty()) return {};\n \n-    if (newOnly && nNew == 0) return {};\n-\n-    // Use a 50% chance for choosing between tried and new table entries.\n-    if (!newOnly &&\n-       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {\n-        // use a tried node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a tried bucket, and an initial position in that bucket.\n-            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);\n-            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvTried[nKBucket][(nKBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from tried\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n-            }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n-        }\n+    size_t new_count = nNew;\n+    size_t tried_count = nTried;\n+\n+    if (network) {\n+        auto it = m_network_counts.find(*network);\n+        if (it == m_network_counts.end()) return {};\n+\n+        auto counts = it->second;\n+        new_count = counts.n_new;\n+        tried_count = counts.n_tried;\n+    }\n+\n+    if (new_only && new_count == 0) return {};\n+    if ((new_count + tried_count) == 0) return {};\n+\n+    // Decide if we are going to search the new or tried table\n+    // If either option is viable, use a 50% chance to choose\n+    bool search_tried;\n+    if (new_only || tried_count == 0) {\n+        search_tried = false;\n+    } else if (new_count == 0) {\n+        search_tried = true;\n     } else {\n-        // use a new node\n-        double fChanceFactor = 1.0;\n-        while (1) {\n-            // Pick a new bucket, and an initial position in that bucket.\n-            int nUBucket = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);\n-            int nUBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n-            // Iterate over the positions of that bucket, starting at the initial one,\n-            // and looping around.\n-            int i;\n-            for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n-                if (vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE] != -1) break;\n-            }\n-            // If the bucket is entirely empty, start over with a (likely) different one.\n-            if (i == ADDRMAN_BUCKET_SIZE) continue;\n-            // Find the entry to return.\n-            int nId = vvNew[nUBucket][(nUBucketPos + i) % ADDRMAN_BUCKET_SIZE];\n-            const auto it_found{mapInfo.find(nId)};\n-            assert(it_found != mapInfo.end());\n-            const AddrInfo& info{it_found->second};\n-            // With probability GetChance() * fChanceFactor, return the entry.\n-            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30)) {\n-                LogPrint(BCLog::ADDRMAN, \"Selected %s from new\\n\", info.ToStringAddrPort());\n-                return {info, info.m_last_try};\n+        search_tried = insecure_rand.randbool();\n+    }\n+\n+    const int bucket_count{search_tried ? ADDRMAN_TRIED_BUCKET_COUNT : ADDRMAN_NEW_BUCKET_COUNT};\n+\n+    //  Loop through the addrman table until we find an appropriate entry\n+    double chance_factor = 1.0;\n+    while (1) {\n+        // Pick a bucket, and an initial position in that bucket.\n+        int bucket = insecure_rand.randrange(bucket_count);\n+        int initial_position = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);\n+\n+        // Iterate over the positions of that bucket, starting at the initial one,\n+        // and looping around.\n+        int i;\n+        for (i = 0; i < ADDRMAN_BUCKET_SIZE; ++i) {\n+            int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+            int node_id = LookupAddrmanEntry(search_tried, bucket, position);\n+            if (node_id != -1) {\n+                if (network) {\n+                    const auto it{mapInfo.find(node_id)};\n+                    const auto info{it->second};\n+                    if (info.GetNetwork() == *network) break;\n+                } else {\n+                    break;\n+                }\n             }\n-            // Otherwise start over with a (likely) different bucket, and increased chance factor.\n-            fChanceFactor *= 1.2;\n         }\n+\n+        // If the bucket is entirely empty, start over with a (likely) different one.\n+        if (i == ADDRMAN_BUCKET_SIZE) continue;\n+\n+        // Find the entry to return.\n+        int position = (initial_position + i) % ADDRMAN_BUCKET_SIZE;\n+        int nId = LookupAddrmanEntry(search_tried, bucket, position);\n+        const auto it_found{mapInfo.find(nId)};\n+        assert(it_found != mapInfo.end());\n+        const AddrInfo& info{it_found->second};\n+\n+        // With probability GetChance() * chance_factor, return the entry.\n+        if (insecure_rand.randbits(30) < chance_factor * info.GetChance() * (1 << 30)) {\n+            std::string table_name;\n+            search_tried ? table_name = \"tried\" : table_name = \"new\";\n+            LogPrint(BCLog::ADDRMAN, \"Selected %s from %s\\n\", info.ToStringAddrPort(), table_name);\n+            return {info, info.m_last_try};\n+        }\n+\n+        // Otherwise start over with a (likely) different bucket, and increased chance factor.\n+        chance_factor *= 1.2;\n+    }\n+}\n+\n+int AddrManImpl::LookupAddrmanEntry(bool use_tried, int bucket, int position) const\n+{\n+    AssertLockHeld(cs);\n+\n+    if (use_tried) {\n+        return vvTried[bucket][position];\n+    } else {\n+        return vvNew[bucket][position];\n     }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27214#discussion_r1136869429",
+      "id" : 1136869429,
+      "in_reply_to_id" : 1129439158,
+      "line" : 805,
+      "node_id" : "PRRC_kwDOABII585Dw0A1",
+      "original_commit_id" : "25a64a20749f10ce84060f3570ad76d1a4776948",
+      "original_line" : 805,
+      "original_position" : 163,
+      "original_start_line" : 802,
+      "path" : "src/addrman.cpp",
+      "position" : 162,
+      "pull_request_review_id" : 1341177551,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27214",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136869429/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 801,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-03-15T10:54:21Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1136869429",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
    }
 ]
