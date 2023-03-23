@@ -1158,5 +1158,279 @@
          "type" : "User",
          "url" : "https://api.github.com/users/TheCharlatan"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27254#discussion_r1145230536"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27254"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1145230536"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "In commit \"refactor: Extract util/fs_helpers from util/system\" (59c02e68f75f7b727162d2ea36bf3ed99fabf035)\r\n\r\nAnybody have advice on easiest way to review changes like this when blocks of code are moving but also changing slightly at the same time?\r\n\r\nI find it pretty easy to review blocks of moved code in git with the `--color-moved` option, but once code is moved and reformatted at the same time (the `{` at the end of this line was previously on its own line) it becomes very tedious to find the matching blocks of old and new code, and then compare them to make sure the differences are not significant.\r\n\r\nIf there isn't some more convenient way to review changes like this, I would definitely appreciate it if the code could just be moved and not reformatted.",
+      "commit_id" : "3ceb8dde48fc12f4f16372f661a4cccf7104e194",
+      "created_at" : "2023-03-22T18:12:50Z",
+      "diff_hunk" : "@@ -0,0 +1,284 @@\n+// Copyright (c) 2009-2010 Satoshi Nakamoto\n+// Copyright (c) 2009-2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <util/fs_helpers.h>\n+\n+#if defined(HAVE_CONFIG_H)\n+#include <config/bitcoin-config.h>\n+#endif\n+\n+#include <fs.h>\n+#include <logging.h>\n+#include <sync.h>\n+#include <tinyformat.h>\n+#include <util/getuniquepath.h>\n+\n+#include <cerrno>\n+#include <filesystem>\n+#include <fstream>\n+#include <map>\n+#include <memory>\n+#include <string>\n+#include <system_error>\n+#include <utility>\n+\n+#ifdef WIN32\n+#include <io.h>\n+#include <shlobj.h>\n+#else\n+#include <fcntl.h>\n+#include <sys/resource.h>\n+#include <unistd.h>\n+#endif // WIN32\n+\n+/** Mutex to protect dir_locks. */\n+static GlobalMutex cs_dir_locks;\n+/** A map that contains all the currently held directory locks. After\n+ * successful locking, these will be held here until the global destructor\n+ * cleans them up and thus automatically unlocks them, or ReleaseDirectoryLocks\n+ * is called.\n+ */\n+static std::map<std::string, std::unique_ptr<fsbridge::FileLock>> dir_locks GUARDED_BY(cs_dir_locks);\n+\n+bool LockDirectory(const fs::path& directory, const fs::path& lockfile_name, bool probe_only)\n+{\n+    LOCK(cs_dir_locks);\n+    fs::path pathLockFile = directory / lockfile_name;\n+\n+    // If a lock for this directory already exists in the map, don't try to re-lock it\n+    if (dir_locks.count(fs::PathToString(pathLockFile))) {\n+        return true;\n+    }\n+\n+    // Create empty lock file if it doesn't exist.\n+    FILE* file = fsbridge::fopen(pathLockFile, \"a\");\n+    if (file) fclose(file);\n+    auto lock = std::make_unique<fsbridge::FileLock>(pathLockFile);\n+    if (!lock->TryLock()) {\n+        return error(\"Error while attempting to lock directory %s: %s\", fs::PathToString(directory), lock->GetReason());\n+    }\n+    if (!probe_only) {\n+        // Lock successful and we're not just probing, put it into the map\n+        dir_locks.emplace(fs::PathToString(pathLockFile), std::move(lock));\n+    }\n+    return true;\n+}\n+\n+void UnlockDirectory(const fs::path& directory, const fs::path& lockfile_name)\n+{\n+    LOCK(cs_dir_locks);\n+    dir_locks.erase(fs::PathToString(directory / lockfile_name));\n+}\n+\n+void ReleaseDirectoryLocks()\n+{\n+    LOCK(cs_dir_locks);\n+    dir_locks.clear();\n+}\n+\n+bool DirIsWritable(const fs::path& directory)\n+{\n+    fs::path tmpFile = GetUniquePath(directory);\n+\n+    FILE* file = fsbridge::fopen(tmpFile, \"a\");\n+    if (!file) return false;\n+\n+    fclose(file);\n+    remove(tmpFile);\n+\n+    return true;\n+}\n+\n+bool CheckDiskSpace(const fs::path& dir, uint64_t additional_bytes)\n+{\n+    constexpr uint64_t min_disk_space = 52428800; // 50 MiB\n+\n+    uint64_t free_bytes_available = fs::space(dir).available;\n+    return free_bytes_available >= min_disk_space + additional_bytes;\n+}\n+\n+std::streampos GetFileSize(const char* path, std::streamsize max)\n+{\n+    std::ifstream file{path, std::ios::binary};\n+    file.ignore(max);\n+    return file.gcount();\n+}\n+\n+bool FileCommit(FILE* file)\n+{\n+    if (fflush(file) != 0) { // harmless if redundantly called\n+        LogPrintf(\"%s: fflush failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#ifdef WIN32\n+    HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(file));\n+    if (FlushFileBuffers(hFile) == 0) {\n+        LogPrintf(\"%s: FlushFileBuffers failed: %d\\n\", __func__, GetLastError());\n+        return false;\n+    }\n+#elif defined(MAC_OSX) && defined(F_FULLFSYNC)\n+    if (fcntl(fileno(file), F_FULLFSYNC, 0) == -1) { // Manpage says \"value other than -1\" is returned on success\n+        LogPrintf(\"%s: fcntl F_FULLFSYNC failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#elif HAVE_FDATASYNC\n+    if (fdatasync(fileno(file)) != 0 && errno != EINVAL) { // Ignore EINVAL for filesystems that don't support sync\n+        LogPrintf(\"%s: fdatasync failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#else\n+    if (fsync(fileno(file)) != 0 && errno != EINVAL) {\n+        LogPrintf(\"%s: fsync failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#endif\n+    return true;\n+}\n+\n+void DirectoryCommit(const fs::path& dirname)\n+{\n+#ifndef WIN32\n+    FILE* file = fsbridge::fopen(dirname, \"r\");\n+    if (file) {\n+        fsync(fileno(file));\n+        fclose(file);\n+    }\n+#endif\n+}\n+\n+bool TruncateFile(FILE* file, unsigned int length)\n+{\n+#if defined(WIN32)\n+    return _chsize(_fileno(file), length) == 0;\n+#else\n+    return ftruncate(fileno(file), length) == 0;\n+#endif\n+}\n+\n+/**\n+ * this function tries to raise the file descriptor limit to the requested number.\n+ * It returns the actual file descriptor limit (which may be more or less than nMinFD)\n+ */\n+int RaiseFileDescriptorLimit(int nMinFD)\n+{\n+#if defined(WIN32)\n+    return 2048;\n+#else\n+    struct rlimit limitFD;\n+    if (getrlimit(RLIMIT_NOFILE, &limitFD) != -1) {\n+        if (limitFD.rlim_cur < (rlim_t)nMinFD) {\n+            limitFD.rlim_cur = nMinFD;\n+            if (limitFD.rlim_cur > limitFD.rlim_max)\n+                limitFD.rlim_cur = limitFD.rlim_max;\n+            setrlimit(RLIMIT_NOFILE, &limitFD);\n+            getrlimit(RLIMIT_NOFILE, &limitFD);\n+        }\n+        return limitFD.rlim_cur;\n+    }\n+    return nMinFD; // getrlimit failed, assume it's fine\n+#endif\n+}\n+\n+/**\n+ * this function tries to make a particular range of a file allocated (corresponding to disk space)\n+ * it is advisory, and the range specified in the arguments will never contain live data\n+ */\n+void AllocateFileRange(FILE* file, unsigned int offset, unsigned int length)\n+{\n+#if defined(WIN32)\n+    // Windows-specific version\n+    HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(file));\n+    LARGE_INTEGER nFileSize;\n+    int64_t nEndPos = (int64_t)offset + length;\n+    nFileSize.u.LowPart = nEndPos & 0xFFFFFFFF;\n+    nFileSize.u.HighPart = nEndPos >> 32;\n+    SetFilePointerEx(hFile, nFileSize, 0, FILE_BEGIN);\n+    SetEndOfFile(hFile);\n+#elif defined(MAC_OSX)\n+    // OSX specific version\n+    // NOTE: Contrary to other OS versions, the OSX version assumes that\n+    // NOTE: offset is the size of the file.\n+    fstore_t fst;\n+    fst.fst_flags = F_ALLOCATECONTIG;\n+    fst.fst_posmode = F_PEOFPOSMODE;\n+    fst.fst_offset = 0;\n+    fst.fst_length = length; // mac os fst_length takes the # of free bytes to allocate, not desired file size\n+    fst.fst_bytesalloc = 0;\n+    if (fcntl(fileno(file), F_PREALLOCATE, &fst) == -1) {\n+        fst.fst_flags = F_ALLOCATEALL;\n+        fcntl(fileno(file), F_PREALLOCATE, &fst);\n+    }\n+    ftruncate(fileno(file), static_cast<off_t>(offset) + length);\n+#else\n+#if defined(HAVE_POSIX_FALLOCATE)\n+    // Version using posix_fallocate\n+    off_t nEndPos = (off_t)offset + length;\n+    if (0 == posix_fallocate(fileno(file), 0, nEndPos)) return;\n+#endif\n+    // Fallback version\n+    // TODO: just write one byte per block\n+    static const char buf[65536] = {};\n+    if (fseek(file, offset, SEEK_SET)) {\n+        return;\n+    }\n+    while (length > 0) {\n+        unsigned int now = 65536;\n+        if (length < now)\n+            now = length;\n+        fwrite(buf, 1, now, file); // allowed to fail; this function is advisory anyway\n+        length -= now;\n+    }\n+#endif\n+}\n+\n+#ifdef WIN32\n+fs::path GetSpecialFolderPath(int nFolder, bool fCreate)\n+{\n+    WCHAR pszPath[MAX_PATH] = L\"\";\n+\n+    if (SHGetSpecialFolderPathW(nullptr, pszPath, nFolder, fCreate)) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27254#discussion_r1145230536",
+      "id" : 1145230536,
+      "line" : 241,
+      "node_id" : "PRRC_kwDOABII585EQtTI",
+      "original_commit_id" : "59c02e68f75f7b727162d2ea36bf3ed99fabf035",
+      "original_line" : 241,
+      "original_position" : 241,
+      "original_start_line" : null,
+      "path" : "src/util/fs_helpers.cpp",
+      "position" : 241,
+      "pull_request_review_id" : 1353213975,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27254",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1145230536/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-22T18:12:51Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1145230536",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27254#discussion_r1145331263"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27254"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1145331263"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "> If there isn't some more convenient way to review changes like this, I would definitely appreciate it if the code could just be moved and not reformatted.\r\n\r\nACK, I will stop using `clang-format-diff` on all moved code. Thank you for the review!",
+      "commit_id" : "3ceb8dde48fc12f4f16372f661a4cccf7104e194",
+      "created_at" : "2023-03-22T19:48:39Z",
+      "diff_hunk" : "@@ -0,0 +1,284 @@\n+// Copyright (c) 2009-2010 Satoshi Nakamoto\n+// Copyright (c) 2009-2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <util/fs_helpers.h>\n+\n+#if defined(HAVE_CONFIG_H)\n+#include <config/bitcoin-config.h>\n+#endif\n+\n+#include <fs.h>\n+#include <logging.h>\n+#include <sync.h>\n+#include <tinyformat.h>\n+#include <util/getuniquepath.h>\n+\n+#include <cerrno>\n+#include <filesystem>\n+#include <fstream>\n+#include <map>\n+#include <memory>\n+#include <string>\n+#include <system_error>\n+#include <utility>\n+\n+#ifdef WIN32\n+#include <io.h>\n+#include <shlobj.h>\n+#else\n+#include <fcntl.h>\n+#include <sys/resource.h>\n+#include <unistd.h>\n+#endif // WIN32\n+\n+/** Mutex to protect dir_locks. */\n+static GlobalMutex cs_dir_locks;\n+/** A map that contains all the currently held directory locks. After\n+ * successful locking, these will be held here until the global destructor\n+ * cleans them up and thus automatically unlocks them, or ReleaseDirectoryLocks\n+ * is called.\n+ */\n+static std::map<std::string, std::unique_ptr<fsbridge::FileLock>> dir_locks GUARDED_BY(cs_dir_locks);\n+\n+bool LockDirectory(const fs::path& directory, const fs::path& lockfile_name, bool probe_only)\n+{\n+    LOCK(cs_dir_locks);\n+    fs::path pathLockFile = directory / lockfile_name;\n+\n+    // If a lock for this directory already exists in the map, don't try to re-lock it\n+    if (dir_locks.count(fs::PathToString(pathLockFile))) {\n+        return true;\n+    }\n+\n+    // Create empty lock file if it doesn't exist.\n+    FILE* file = fsbridge::fopen(pathLockFile, \"a\");\n+    if (file) fclose(file);\n+    auto lock = std::make_unique<fsbridge::FileLock>(pathLockFile);\n+    if (!lock->TryLock()) {\n+        return error(\"Error while attempting to lock directory %s: %s\", fs::PathToString(directory), lock->GetReason());\n+    }\n+    if (!probe_only) {\n+        // Lock successful and we're not just probing, put it into the map\n+        dir_locks.emplace(fs::PathToString(pathLockFile), std::move(lock));\n+    }\n+    return true;\n+}\n+\n+void UnlockDirectory(const fs::path& directory, const fs::path& lockfile_name)\n+{\n+    LOCK(cs_dir_locks);\n+    dir_locks.erase(fs::PathToString(directory / lockfile_name));\n+}\n+\n+void ReleaseDirectoryLocks()\n+{\n+    LOCK(cs_dir_locks);\n+    dir_locks.clear();\n+}\n+\n+bool DirIsWritable(const fs::path& directory)\n+{\n+    fs::path tmpFile = GetUniquePath(directory);\n+\n+    FILE* file = fsbridge::fopen(tmpFile, \"a\");\n+    if (!file) return false;\n+\n+    fclose(file);\n+    remove(tmpFile);\n+\n+    return true;\n+}\n+\n+bool CheckDiskSpace(const fs::path& dir, uint64_t additional_bytes)\n+{\n+    constexpr uint64_t min_disk_space = 52428800; // 50 MiB\n+\n+    uint64_t free_bytes_available = fs::space(dir).available;\n+    return free_bytes_available >= min_disk_space + additional_bytes;\n+}\n+\n+std::streampos GetFileSize(const char* path, std::streamsize max)\n+{\n+    std::ifstream file{path, std::ios::binary};\n+    file.ignore(max);\n+    return file.gcount();\n+}\n+\n+bool FileCommit(FILE* file)\n+{\n+    if (fflush(file) != 0) { // harmless if redundantly called\n+        LogPrintf(\"%s: fflush failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#ifdef WIN32\n+    HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(file));\n+    if (FlushFileBuffers(hFile) == 0) {\n+        LogPrintf(\"%s: FlushFileBuffers failed: %d\\n\", __func__, GetLastError());\n+        return false;\n+    }\n+#elif defined(MAC_OSX) && defined(F_FULLFSYNC)\n+    if (fcntl(fileno(file), F_FULLFSYNC, 0) == -1) { // Manpage says \"value other than -1\" is returned on success\n+        LogPrintf(\"%s: fcntl F_FULLFSYNC failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#elif HAVE_FDATASYNC\n+    if (fdatasync(fileno(file)) != 0 && errno != EINVAL) { // Ignore EINVAL for filesystems that don't support sync\n+        LogPrintf(\"%s: fdatasync failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#else\n+    if (fsync(fileno(file)) != 0 && errno != EINVAL) {\n+        LogPrintf(\"%s: fsync failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#endif\n+    return true;\n+}\n+\n+void DirectoryCommit(const fs::path& dirname)\n+{\n+#ifndef WIN32\n+    FILE* file = fsbridge::fopen(dirname, \"r\");\n+    if (file) {\n+        fsync(fileno(file));\n+        fclose(file);\n+    }\n+#endif\n+}\n+\n+bool TruncateFile(FILE* file, unsigned int length)\n+{\n+#if defined(WIN32)\n+    return _chsize(_fileno(file), length) == 0;\n+#else\n+    return ftruncate(fileno(file), length) == 0;\n+#endif\n+}\n+\n+/**\n+ * this function tries to raise the file descriptor limit to the requested number.\n+ * It returns the actual file descriptor limit (which may be more or less than nMinFD)\n+ */\n+int RaiseFileDescriptorLimit(int nMinFD)\n+{\n+#if defined(WIN32)\n+    return 2048;\n+#else\n+    struct rlimit limitFD;\n+    if (getrlimit(RLIMIT_NOFILE, &limitFD) != -1) {\n+        if (limitFD.rlim_cur < (rlim_t)nMinFD) {\n+            limitFD.rlim_cur = nMinFD;\n+            if (limitFD.rlim_cur > limitFD.rlim_max)\n+                limitFD.rlim_cur = limitFD.rlim_max;\n+            setrlimit(RLIMIT_NOFILE, &limitFD);\n+            getrlimit(RLIMIT_NOFILE, &limitFD);\n+        }\n+        return limitFD.rlim_cur;\n+    }\n+    return nMinFD; // getrlimit failed, assume it's fine\n+#endif\n+}\n+\n+/**\n+ * this function tries to make a particular range of a file allocated (corresponding to disk space)\n+ * it is advisory, and the range specified in the arguments will never contain live data\n+ */\n+void AllocateFileRange(FILE* file, unsigned int offset, unsigned int length)\n+{\n+#if defined(WIN32)\n+    // Windows-specific version\n+    HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(file));\n+    LARGE_INTEGER nFileSize;\n+    int64_t nEndPos = (int64_t)offset + length;\n+    nFileSize.u.LowPart = nEndPos & 0xFFFFFFFF;\n+    nFileSize.u.HighPart = nEndPos >> 32;\n+    SetFilePointerEx(hFile, nFileSize, 0, FILE_BEGIN);\n+    SetEndOfFile(hFile);\n+#elif defined(MAC_OSX)\n+    // OSX specific version\n+    // NOTE: Contrary to other OS versions, the OSX version assumes that\n+    // NOTE: offset is the size of the file.\n+    fstore_t fst;\n+    fst.fst_flags = F_ALLOCATECONTIG;\n+    fst.fst_posmode = F_PEOFPOSMODE;\n+    fst.fst_offset = 0;\n+    fst.fst_length = length; // mac os fst_length takes the # of free bytes to allocate, not desired file size\n+    fst.fst_bytesalloc = 0;\n+    if (fcntl(fileno(file), F_PREALLOCATE, &fst) == -1) {\n+        fst.fst_flags = F_ALLOCATEALL;\n+        fcntl(fileno(file), F_PREALLOCATE, &fst);\n+    }\n+    ftruncate(fileno(file), static_cast<off_t>(offset) + length);\n+#else\n+#if defined(HAVE_POSIX_FALLOCATE)\n+    // Version using posix_fallocate\n+    off_t nEndPos = (off_t)offset + length;\n+    if (0 == posix_fallocate(fileno(file), 0, nEndPos)) return;\n+#endif\n+    // Fallback version\n+    // TODO: just write one byte per block\n+    static const char buf[65536] = {};\n+    if (fseek(file, offset, SEEK_SET)) {\n+        return;\n+    }\n+    while (length > 0) {\n+        unsigned int now = 65536;\n+        if (length < now)\n+            now = length;\n+        fwrite(buf, 1, now, file); // allowed to fail; this function is advisory anyway\n+        length -= now;\n+    }\n+#endif\n+}\n+\n+#ifdef WIN32\n+fs::path GetSpecialFolderPath(int nFolder, bool fCreate)\n+{\n+    WCHAR pszPath[MAX_PATH] = L\"\";\n+\n+    if (SHGetSpecialFolderPathW(nullptr, pszPath, nFolder, fCreate)) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27254#discussion_r1145331263",
+      "id" : 1145331263,
+      "in_reply_to_id" : 1145230536,
+      "line" : 241,
+      "node_id" : "PRRC_kwDOABII585ERF4_",
+      "original_commit_id" : "59c02e68f75f7b727162d2ea36bf3ed99fabf035",
+      "original_line" : 241,
+      "original_position" : 241,
+      "original_start_line" : null,
+      "path" : "src/util/fs_helpers.cpp",
+      "position" : 241,
+      "pull_request_review_id" : 1353373356,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27254",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1145331263/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-22T19:48:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1145331263",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8421793?v=4",
+         "events_url" : "https://api.github.com/users/TheCharlatan/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/TheCharlatan/followers",
+         "following_url" : "https://api.github.com/users/TheCharlatan/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/TheCharlatan/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/TheCharlatan",
+         "id" : 8421793,
+         "login" : "TheCharlatan",
+         "node_id" : "MDQ6VXNlcjg0MjE3OTM=",
+         "organizations_url" : "https://api.github.com/users/TheCharlatan/orgs",
+         "received_events_url" : "https://api.github.com/users/TheCharlatan/received_events",
+         "repos_url" : "https://api.github.com/users/TheCharlatan/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/TheCharlatan/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/TheCharlatan/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/TheCharlatan"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27254#discussion_r1145848255"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27254"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1145848255"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "You could do it in a separate commit, after the move",
+      "commit_id" : "3ceb8dde48fc12f4f16372f661a4cccf7104e194",
+      "created_at" : "2023-03-23T08:41:22Z",
+      "diff_hunk" : "@@ -0,0 +1,284 @@\n+// Copyright (c) 2009-2010 Satoshi Nakamoto\n+// Copyright (c) 2009-2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <util/fs_helpers.h>\n+\n+#if defined(HAVE_CONFIG_H)\n+#include <config/bitcoin-config.h>\n+#endif\n+\n+#include <fs.h>\n+#include <logging.h>\n+#include <sync.h>\n+#include <tinyformat.h>\n+#include <util/getuniquepath.h>\n+\n+#include <cerrno>\n+#include <filesystem>\n+#include <fstream>\n+#include <map>\n+#include <memory>\n+#include <string>\n+#include <system_error>\n+#include <utility>\n+\n+#ifdef WIN32\n+#include <io.h>\n+#include <shlobj.h>\n+#else\n+#include <fcntl.h>\n+#include <sys/resource.h>\n+#include <unistd.h>\n+#endif // WIN32\n+\n+/** Mutex to protect dir_locks. */\n+static GlobalMutex cs_dir_locks;\n+/** A map that contains all the currently held directory locks. After\n+ * successful locking, these will be held here until the global destructor\n+ * cleans them up and thus automatically unlocks them, or ReleaseDirectoryLocks\n+ * is called.\n+ */\n+static std::map<std::string, std::unique_ptr<fsbridge::FileLock>> dir_locks GUARDED_BY(cs_dir_locks);\n+\n+bool LockDirectory(const fs::path& directory, const fs::path& lockfile_name, bool probe_only)\n+{\n+    LOCK(cs_dir_locks);\n+    fs::path pathLockFile = directory / lockfile_name;\n+\n+    // If a lock for this directory already exists in the map, don't try to re-lock it\n+    if (dir_locks.count(fs::PathToString(pathLockFile))) {\n+        return true;\n+    }\n+\n+    // Create empty lock file if it doesn't exist.\n+    FILE* file = fsbridge::fopen(pathLockFile, \"a\");\n+    if (file) fclose(file);\n+    auto lock = std::make_unique<fsbridge::FileLock>(pathLockFile);\n+    if (!lock->TryLock()) {\n+        return error(\"Error while attempting to lock directory %s: %s\", fs::PathToString(directory), lock->GetReason());\n+    }\n+    if (!probe_only) {\n+        // Lock successful and we're not just probing, put it into the map\n+        dir_locks.emplace(fs::PathToString(pathLockFile), std::move(lock));\n+    }\n+    return true;\n+}\n+\n+void UnlockDirectory(const fs::path& directory, const fs::path& lockfile_name)\n+{\n+    LOCK(cs_dir_locks);\n+    dir_locks.erase(fs::PathToString(directory / lockfile_name));\n+}\n+\n+void ReleaseDirectoryLocks()\n+{\n+    LOCK(cs_dir_locks);\n+    dir_locks.clear();\n+}\n+\n+bool DirIsWritable(const fs::path& directory)\n+{\n+    fs::path tmpFile = GetUniquePath(directory);\n+\n+    FILE* file = fsbridge::fopen(tmpFile, \"a\");\n+    if (!file) return false;\n+\n+    fclose(file);\n+    remove(tmpFile);\n+\n+    return true;\n+}\n+\n+bool CheckDiskSpace(const fs::path& dir, uint64_t additional_bytes)\n+{\n+    constexpr uint64_t min_disk_space = 52428800; // 50 MiB\n+\n+    uint64_t free_bytes_available = fs::space(dir).available;\n+    return free_bytes_available >= min_disk_space + additional_bytes;\n+}\n+\n+std::streampos GetFileSize(const char* path, std::streamsize max)\n+{\n+    std::ifstream file{path, std::ios::binary};\n+    file.ignore(max);\n+    return file.gcount();\n+}\n+\n+bool FileCommit(FILE* file)\n+{\n+    if (fflush(file) != 0) { // harmless if redundantly called\n+        LogPrintf(\"%s: fflush failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#ifdef WIN32\n+    HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(file));\n+    if (FlushFileBuffers(hFile) == 0) {\n+        LogPrintf(\"%s: FlushFileBuffers failed: %d\\n\", __func__, GetLastError());\n+        return false;\n+    }\n+#elif defined(MAC_OSX) && defined(F_FULLFSYNC)\n+    if (fcntl(fileno(file), F_FULLFSYNC, 0) == -1) { // Manpage says \"value other than -1\" is returned on success\n+        LogPrintf(\"%s: fcntl F_FULLFSYNC failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#elif HAVE_FDATASYNC\n+    if (fdatasync(fileno(file)) != 0 && errno != EINVAL) { // Ignore EINVAL for filesystems that don't support sync\n+        LogPrintf(\"%s: fdatasync failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#else\n+    if (fsync(fileno(file)) != 0 && errno != EINVAL) {\n+        LogPrintf(\"%s: fsync failed: %d\\n\", __func__, errno);\n+        return false;\n+    }\n+#endif\n+    return true;\n+}\n+\n+void DirectoryCommit(const fs::path& dirname)\n+{\n+#ifndef WIN32\n+    FILE* file = fsbridge::fopen(dirname, \"r\");\n+    if (file) {\n+        fsync(fileno(file));\n+        fclose(file);\n+    }\n+#endif\n+}\n+\n+bool TruncateFile(FILE* file, unsigned int length)\n+{\n+#if defined(WIN32)\n+    return _chsize(_fileno(file), length) == 0;\n+#else\n+    return ftruncate(fileno(file), length) == 0;\n+#endif\n+}\n+\n+/**\n+ * this function tries to raise the file descriptor limit to the requested number.\n+ * It returns the actual file descriptor limit (which may be more or less than nMinFD)\n+ */\n+int RaiseFileDescriptorLimit(int nMinFD)\n+{\n+#if defined(WIN32)\n+    return 2048;\n+#else\n+    struct rlimit limitFD;\n+    if (getrlimit(RLIMIT_NOFILE, &limitFD) != -1) {\n+        if (limitFD.rlim_cur < (rlim_t)nMinFD) {\n+            limitFD.rlim_cur = nMinFD;\n+            if (limitFD.rlim_cur > limitFD.rlim_max)\n+                limitFD.rlim_cur = limitFD.rlim_max;\n+            setrlimit(RLIMIT_NOFILE, &limitFD);\n+            getrlimit(RLIMIT_NOFILE, &limitFD);\n+        }\n+        return limitFD.rlim_cur;\n+    }\n+    return nMinFD; // getrlimit failed, assume it's fine\n+#endif\n+}\n+\n+/**\n+ * this function tries to make a particular range of a file allocated (corresponding to disk space)\n+ * it is advisory, and the range specified in the arguments will never contain live data\n+ */\n+void AllocateFileRange(FILE* file, unsigned int offset, unsigned int length)\n+{\n+#if defined(WIN32)\n+    // Windows-specific version\n+    HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(file));\n+    LARGE_INTEGER nFileSize;\n+    int64_t nEndPos = (int64_t)offset + length;\n+    nFileSize.u.LowPart = nEndPos & 0xFFFFFFFF;\n+    nFileSize.u.HighPart = nEndPos >> 32;\n+    SetFilePointerEx(hFile, nFileSize, 0, FILE_BEGIN);\n+    SetEndOfFile(hFile);\n+#elif defined(MAC_OSX)\n+    // OSX specific version\n+    // NOTE: Contrary to other OS versions, the OSX version assumes that\n+    // NOTE: offset is the size of the file.\n+    fstore_t fst;\n+    fst.fst_flags = F_ALLOCATECONTIG;\n+    fst.fst_posmode = F_PEOFPOSMODE;\n+    fst.fst_offset = 0;\n+    fst.fst_length = length; // mac os fst_length takes the # of free bytes to allocate, not desired file size\n+    fst.fst_bytesalloc = 0;\n+    if (fcntl(fileno(file), F_PREALLOCATE, &fst) == -1) {\n+        fst.fst_flags = F_ALLOCATEALL;\n+        fcntl(fileno(file), F_PREALLOCATE, &fst);\n+    }\n+    ftruncate(fileno(file), static_cast<off_t>(offset) + length);\n+#else\n+#if defined(HAVE_POSIX_FALLOCATE)\n+    // Version using posix_fallocate\n+    off_t nEndPos = (off_t)offset + length;\n+    if (0 == posix_fallocate(fileno(file), 0, nEndPos)) return;\n+#endif\n+    // Fallback version\n+    // TODO: just write one byte per block\n+    static const char buf[65536] = {};\n+    if (fseek(file, offset, SEEK_SET)) {\n+        return;\n+    }\n+    while (length > 0) {\n+        unsigned int now = 65536;\n+        if (length < now)\n+            now = length;\n+        fwrite(buf, 1, now, file); // allowed to fail; this function is advisory anyway\n+        length -= now;\n+    }\n+#endif\n+}\n+\n+#ifdef WIN32\n+fs::path GetSpecialFolderPath(int nFolder, bool fCreate)\n+{\n+    WCHAR pszPath[MAX_PATH] = L\"\";\n+\n+    if (SHGetSpecialFolderPathW(nullptr, pszPath, nFolder, fCreate)) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27254#discussion_r1145848255",
+      "id" : 1145848255,
+      "in_reply_to_id" : 1145230536,
+      "line" : 241,
+      "node_id" : "PRRC_kwDOABII585ETEG_",
+      "original_commit_id" : "59c02e68f75f7b727162d2ea36bf3ed99fabf035",
+      "original_line" : 241,
+      "original_position" : 241,
+      "original_start_line" : null,
+      "path" : "src/util/fs_helpers.cpp",
+      "position" : 241,
+      "pull_request_review_id" : 1354094188,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27254",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1145848255/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-23T08:41:23Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1145848255",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27254#discussion_r1146057675"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27254"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1146057675"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "The `_POSIX_C_SOURCE` should be moved here too.",
+      "commit_id" : "3ceb8dde48fc12f4f16372f661a4cccf7104e194",
+      "created_at" : "2023-03-23T11:41:54Z",
+      "diff_hunk" : "@@ -0,0 +1,284 @@\n+// Copyright (c) 2009-2010 Satoshi Nakamoto\n+// Copyright (c) 2009-2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <util/fs_helpers.h>\n+\n+#if defined(HAVE_CONFIG_H)\n+#include <config/bitcoin-config.h>\n+#endif\n+\n+#include <logging.h>\n+#include <sync.h>\n+#include <tinyformat.h>\n+#include <util/fs.h>\n+#include <util/getuniquepath.h>\n+\n+#include <cerrno>\n+#include <filesystem>\n+#include <fstream>\n+#include <map>\n+#include <memory>\n+#include <string>\n+#include <system_error>\n+#include <utility>\n+\n+#ifdef WIN32",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27254#discussion_r1146057675",
+      "id" : 1146057675,
+      "line" : 27,
+      "node_id" : "PRRC_kwDOABII585ET3PL",
+      "original_commit_id" : "3ceb8dde48fc12f4f16372f661a4cccf7104e194",
+      "original_line" : 27,
+      "original_position" : 27,
+      "original_start_line" : null,
+      "path" : "src/util/fs_helpers.cpp",
+      "position" : 27,
+      "pull_request_review_id" : 1354406362,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27254",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1146057675/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-03-23T11:41:55Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1146057675",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8421793?v=4",
+         "events_url" : "https://api.github.com/users/TheCharlatan/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/TheCharlatan/followers",
+         "following_url" : "https://api.github.com/users/TheCharlatan/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/TheCharlatan/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/TheCharlatan",
+         "id" : 8421793,
+         "login" : "TheCharlatan",
+         "node_id" : "MDQ6VXNlcjg0MjE3OTM=",
+         "organizations_url" : "https://api.github.com/users/TheCharlatan/orgs",
+         "received_events_url" : "https://api.github.com/users/TheCharlatan/received_events",
+         "repos_url" : "https://api.github.com/users/TheCharlatan/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/TheCharlatan/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/TheCharlatan/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/TheCharlatan"
+      }
    }
 ]
