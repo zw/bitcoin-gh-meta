@@ -21276,5 +21276,280 @@
          "type" : "User",
          "url" : "https://api.github.com/users/ryanofsky"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24914#discussion_r1242864916"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24914"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242864916"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done",
+      "commit_id" : "7cb774048c5f04b3e20d95e794c5a350ea4eff97",
+      "created_at" : "2023-06-26T22:06:04Z",
+      "diff_hunk" : "@@ -855,6 +751,269 @@ static DBErrors LoadWalletFlags(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIV\n     return DBErrors::LOAD_OK;\n }\n \n+struct LoadResult\n+{\n+    DBErrors m_result{DBErrors::LOAD_OK};\n+    std::string m_error{};\n+    int m_records{0};\n+};\n+\n+using LoadFunc = std::function<DBErrors(CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err)>;\n+static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std::string& key, LoadFunc load_func)\n+{\n+    LoadResult result;\n+    DataStream ssKey;\n+    CDataStream ssValue(SER_DISK, CLIENT_VERSION);\n+\n+    DataStream prefix;\n+    prefix << key;\n+    std::unique_ptr<DatabaseCursor> cursor = batch.GetNewPrefixCursor(prefix);\n+    if (!cursor) {\n+        pwallet->WalletLogPrintf(\"Error getting database cursor for '%s' records\\n\", key);\n+        result.m_result = DBErrors::CORRUPT;\n+        return result;\n+    }\n+\n+    while (true) {\n+        DatabaseCursor::Status status = cursor->Next(ssKey, ssValue);\n+        if (status == DatabaseCursor::Status::DONE) {\n+            break;\n+        } else if (status == DatabaseCursor::Status::FAIL) {\n+            pwallet->WalletLogPrintf(\"Error reading next '%s' record for wallet database\\n\", key);\n+            result.m_result = DBErrors::CORRUPT;\n+            return result;\n+        }\n+        std::string type;\n+        ssKey >> type;\n+        assert(type == key);\n+        DBErrors record_res = load_func(pwallet, ssKey, ssValue, result.m_error);\n+        if (record_res != DBErrors::LOAD_OK) {\n+            pwallet->WalletLogPrintf(\"%s\\n\", result.m_error);\n+        }\n+        result.m_result = std::max(result.m_result, record_res);\n+        ++result.m_records;\n+    }\n+    return result;\n+}\n+\n+static DBErrors LoadLegacyWalletRecords(CWallet* pwallet, DatabaseBatch& batch, int last_client) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)\n+{\n+    AssertLockHeld(pwallet->cs_wallet);\n+    DBErrors result = DBErrors::LOAD_OK;\n+\n+    // Make sure descriptor wallets don't have any legacy records\n+    if (pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {\n+        for (const auto& type : DBKeys::LEGACY_TYPES) {\n+            DataStream key;\n+            CDataStream value(SER_DISK, CLIENT_VERSION);\n+\n+            DataStream prefix;\n+            prefix << type;\n+            std::unique_ptr<DatabaseCursor> cursor = batch.GetNewPrefixCursor(prefix);\n+            if (!cursor) {\n+                pwallet->WalletLogPrintf(\"Error getting database cursor for '%s' records\\n\", type);\n+                return DBErrors::CORRUPT;\n+            }\n+\n+            DatabaseCursor::Status status = cursor->Next(key, value);\n+            if (status != DatabaseCursor::Status::DONE) {\n+                pwallet->WalletLogPrintf(\"Error: Unexpected legacy entry found in descriptor wallet %s. The wallet might have been tampered with or created with malicious intent.\\n\", pwallet->GetName());\n+                return DBErrors::UNEXPECTED_LEGACY_ENTRY;\n+            }\n+        }\n+\n+        return DBErrors::LOAD_OK;\n+    }\n+\n+    // Load HD Chain\n+    // Note: There should only be one HDCHAIN record with no data following the type\n+    LoadResult hd_chain_res = LoadRecords(pwallet, batch, DBKeys::HDCHAIN,\n+        [] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) {\n+        return LoadHDChain(pwallet, value, err) ? DBErrors:: LOAD_OK : DBErrors::CORRUPT;\n+    });\n+    result = std::max(result, hd_chain_res.m_result);\n+\n+    // Load unencrypted keys\n+    LoadResult key_res = LoadRecords(pwallet, batch, DBKeys::KEY,\n+        [] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) {\n+        return LoadKey(pwallet, key, value, err) ? DBErrors::LOAD_OK : DBErrors::CORRUPT;\n+    });\n+    result = std::max(result, key_res.m_result);\n+\n+    // Load encrypted keys\n+    LoadResult ckey_res = LoadRecords(pwallet, batch, DBKeys::CRYPTED_KEY,\n+        [] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) {\n+        return LoadCryptedKey(pwallet, key, value, err) ? DBErrors::LOAD_OK : DBErrors::CORRUPT;\n+    });\n+    result = std::max(result, ckey_res.m_result);\n+\n+    // Load scripts\n+    LoadResult script_res = LoadRecords(pwallet, batch, DBKeys::CSCRIPT,\n+        [] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& strErr) {\n+        uint160 hash;\n+        key >> hash;\n+        CScript script;\n+        value >> script;\n+        if (!pwallet->GetOrCreateLegacyScriptPubKeyMan()->LoadCScript(script))\n+        {\n+            strErr = \"Error reading wallet database: LegacyScriptPubKeyMan::LoadCScript failed\";\n+            return DBErrors::NONCRITICAL_ERROR;\n+        }\n+        return DBErrors::LOAD_OK;\n+    });\n+    result = std::max(result, script_res.m_result);\n+\n+    // Check whether rewrite is needed\n+    if (ckey_res.m_records > 0) {\n+        // Rewrite encrypted wallets of versions 0.4.0 and 0.5.0rc:\n+        if (last_client == 40000 || last_client == 50000) result = std::max(result, DBErrors::NEED_REWRITE);\n+    }\n+\n+    // Load keymeta\n+    std::map<uint160, CHDChain> hd_chains;\n+    LoadResult keymeta_res = LoadRecords(pwallet, batch, DBKeys::KEYMETA,\n+        [&hd_chains] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& strErr) {\n+        CPubKey vchPubKey;\n+        key >> vchPubKey;\n+        CKeyMetadata keyMeta;\n+        value >> keyMeta;\n+        pwallet->GetOrCreateLegacyScriptPubKeyMan()->LoadKeyMetadata(vchPubKey.GetID(), keyMeta);\n+\n+        // Extract some CHDChain info from this metadata if it has any\n+        if (keyMeta.nVersion >= CKeyMetadata::VERSION_WITH_HDDATA && !keyMeta.hd_seed_id.IsNull() && keyMeta.hdKeypath.size() > 0) {\n+            // Get the path from the key origin or from the path string\n+            // Not applicable when path is \"s\" or \"m\" as those indicate a seed\n+            // See https://github.com/bitcoin/bitcoin/pull/12924\n+            bool internal = false;\n+            uint32_t index = 0;\n+            if (keyMeta.hdKeypath != \"s\" && keyMeta.hdKeypath != \"m\") {\n+                std::vector<uint32_t> path;\n+                if (keyMeta.has_key_origin) {\n+                    // We have a key origin, so pull it from its path vector\n+                    path = keyMeta.key_origin.path;\n+                } else {\n+                    // No key origin, have to parse the string\n+                    if (!ParseHDKeypath(keyMeta.hdKeypath, path)) {\n+                        strErr = \"Error reading wallet database: keymeta with invalid HD keypath\";\n+                        return DBErrors::NONCRITICAL_ERROR;\n+                    }\n+                }\n+\n+                // Extract the index and internal from the path\n+                // Path string is m/0'/k'/i'\n+                // Path vector is [0', k', i'] (but as ints OR'd with the hardened bit\n+                // k == 0 for external, 1 for internal. i is the index\n+                if (path.size() != 3) {\n+                    strErr = \"Error reading wallet database: keymeta found with unexpected path\";\n+                    return DBErrors::NONCRITICAL_ERROR;\n+                }\n+                if (path[0] != 0x80000000) {\n+                    strErr = strprintf(\"Unexpected path index of 0x%08x (expected 0x80000000) for the element at index 0\", path[0]);\n+                    return DBErrors::NONCRITICAL_ERROR;\n+                }\n+                if (path[1] != 0x80000000 && path[1] != (1 | 0x80000000)) {\n+                    strErr = strprintf(\"Unexpected path index of 0x%08x (expected 0x80000000 or 0x80000001) for the element at index 1\", path[1]);\n+                    return DBErrors::NONCRITICAL_ERROR;\n+                }\n+                if ((path[2] & 0x80000000) == 0) {\n+                    strErr = strprintf(\"Unexpected path index of 0x%08x (expected to be greater than or equal to 0x80000000)\", path[2]);\n+                    return DBErrors::NONCRITICAL_ERROR;\n+                }\n+                internal = path[1] == (1 | 0x80000000);\n+                index = path[2] & ~0x80000000;\n+            }\n+\n+            // Insert a new CHDChain, or get the one that already exists\n+            auto [ins, inserted] = hd_chains.emplace(keyMeta.hd_seed_id, CHDChain());\n+            CHDChain& chain = ins->second;\n+            if (inserted) {\n+                // For new chains, we want to default to VERSION_HD_BASE until we see an internal\n+                chain.nVersion = CHDChain::VERSION_HD_BASE;\n+                chain.seed_id = keyMeta.hd_seed_id;\n+            }\n+            if (internal) {\n+                chain.nVersion = CHDChain::VERSION_HD_CHAIN_SPLIT;\n+                chain.nInternalChainCounter = std::max(chain.nInternalChainCounter, index + 1);\n+            } else {\n+                chain.nExternalChainCounter = std::max(chain.nExternalChainCounter, index + 1);\n+            }\n+        }\n+        return DBErrors::LOAD_OK;\n+    });\n+    result = std::max(result, keymeta_res.m_result);\n+\n+    // Set inactive chains\n+    if (!hd_chains.empty()) {\n+        LegacyScriptPubKeyMan* legacy_spkm = pwallet->GetLegacyScriptPubKeyMan();\n+        if (legacy_spkm) {\n+            for (const auto& [hd_seed_id, chain] : hd_chains) {\n+                if (hd_seed_id != legacy_spkm->GetHDChain().seed_id) {\n+                    legacy_spkm->AddInactiveHDChain(chain);\n+                }\n+            }\n+        }\n+        else {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24914#discussion_r1242864916",
+      "id" : 1242864916,
+      "in_reply_to_id" : 1242372035,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585KFJ0U",
+      "original_commit_id" : "7c13da13790617d5fe219efe5f52810a69eeb4ad",
+      "original_line" : 955,
+      "original_position" : 376,
+      "original_start_line" : 954,
+      "path" : "src/wallet/walletdb.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1499565747,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24914",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242864916/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-06-26T22:06:04Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242864916",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24914#discussion_r1242864971"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24914"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242864971"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done",
+      "commit_id" : "7cb774048c5f04b3e20d95e794c5a350ea4eff97",
+      "created_at" : "2023-06-26T22:06:09Z",
+      "diff_hunk" : "@@ -795,6 +785,37 @@ static DBErrors LoadLegacyWalletRecords(CWallet* pwallet, DatabaseBatch& batch,\n     });\n     result = std::max(result, pool_res.m_result);\n \n+    // Deal with old \"wkey\" and \"defaultkey\" records.\n+    // These are not actually loaded, but we need to check for them\n+\n+    // We don't want or need the default key, but if there is one set,\n+    // we want to make sure that it is valid so that we can detect corruption\n+    // Note: There should only be one DEFAULTKEY with nothing trailing the type\n+    LoadResult default_key_res = LoadRecords(pwallet, batch, DBKeys::DEFAULTKEY,\n+        [] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) {\n+        CPubKey default_pubkey;\n+        try {\n+            value >> default_pubkey;\n+        } catch (const std::exception& e) {\n+            if (err.empty()) err = e.what();\n+            return DBErrors::CORRUPT;\n+        }\n+        if (!default_pubkey.IsValid()) {\n+            pwallet->WalletLogPrintf(\"Error reading wallet database: Default Key corrupt\\n\");\n+            return DBErrors::CORRUPT;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24914#discussion_r1242864971",
+      "id" : 1242864971,
+      "in_reply_to_id" : 1242385895,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585KFJ1L",
+      "original_commit_id" : "aea1a43b372b2cecdafb83eaf3852ae27d4b6385",
+      "original_line" : 741,
+      "original_position" : 44,
+      "original_start_line" : 804,
+      "path" : "src/wallet/walletdb.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1499565829,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24914",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242864971/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-06-26T22:06:10Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242864971",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24914#discussion_r1242865250"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24914"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242865250"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Removed `corrupted_tx` as suggested.",
+      "commit_id" : "7cb774048c5f04b3e20d95e794c5a350ea4eff97",
+      "created_at" : "2023-06-26T22:06:38Z",
+      "diff_hunk" : "@@ -1113,12 +1059,107 @@ static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) E\n     return result;\n }\n \n+static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vector<uint256>& upgraded_txs, bool& any_unordered) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)\n+{\n+    AssertLockHeld(pwallet->cs_wallet);\n+    DBErrors result = DBErrors::LOAD_OK;\n+\n+    // Load tx record\n+    bool corrupted_tx = false;\n+    any_unordered = false;\n+    LoadResult tx_res = LoadRecords(pwallet, batch, DBKeys::TX,\n+        [&corrupted_tx, &any_unordered, &upgraded_txs] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {\n+        DBErrors result = DBErrors::LOAD_OK;\n+        uint256 hash;\n+        key >> hash;\n+        // LoadToWallet call below creates a new CWalletTx that fill_wtx\n+        // callback fills with transaction metadata.\n+        auto fill_wtx = [&](CWalletTx& wtx, bool new_tx) {\n+            if(!new_tx) {\n+                // There's some corruption here since the tx we just tried to load was already in the wallet.\n+                // it can be fixed by removing tx data and rescanning.\n+                err = \"Error: Corrupt transaction found. This can be fixed by removing transactions from wallet and rescanning.\";\n+                result = DBErrors::CORRUPT;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24914#discussion_r1242865250",
+      "id" : 1242865250,
+      "in_reply_to_id" : 1242640941,
+      "line" : 1023,
+      "node_id" : "PRRC_kwDOABII585KFJ5i",
+      "original_commit_id" : "dc1ef26e430abbf92ef39d2ce595adac651b949a",
+      "original_line" : 1023,
+      "original_position" : 108,
+      "original_start_line" : null,
+      "path" : "src/wallet/walletdb.cpp",
+      "position" : 1119,
+      "pull_request_review_id" : 1499566210,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24914",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242865250/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-06-26T22:06:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242865250",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/24914#discussion_r1242886714"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24914"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242886714"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "```suggestion\r\n            // Use std::max as fill_wtx may have already set result to CORRUPT;\r\n```",
+      "commit_id" : "7cb774048c5f04b3e20d95e794c5a350ea4eff97",
+      "created_at" : "2023-06-26T22:40:08Z",
+      "diff_hunk" : "@@ -1112,12 +1058,101 @@ static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) E\n     return result;\n }\n \n+static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vector<uint256>& upgraded_txs, bool& any_unordered) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)\n+{\n+    AssertLockHeld(pwallet->cs_wallet);\n+    DBErrors result = DBErrors::LOAD_OK;\n+\n+    // Load tx record\n+    any_unordered = false;\n+    LoadResult tx_res = LoadRecords(pwallet, batch, DBKeys::TX,\n+        [&any_unordered, &upgraded_txs] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {\n+        DBErrors result = DBErrors::LOAD_OK;\n+        uint256 hash;\n+        key >> hash;\n+        // LoadToWallet call below creates a new CWalletTx that fill_wtx\n+        // callback fills with transaction metadata.\n+        auto fill_wtx = [&](CWalletTx& wtx, bool new_tx) {\n+            if(!new_tx) {\n+                // There's some corruption here since the tx we just tried to load was already in the wallet.\n+                err = \"Error: Corrupt transaction found. This can be fixed by removing transactions from wallet and rescanning.\";\n+                result = DBErrors::CORRUPT;\n+                return false;\n+            }\n+            value >> wtx;\n+            if (wtx.GetHash() != hash)\n+                return false;\n+\n+            // Undo serialize changes in 31600\n+            if (31404 <= wtx.fTimeReceivedIsTxTime && wtx.fTimeReceivedIsTxTime <= 31703)\n+            {\n+                if (!value.empty())\n+                {\n+                    uint8_t fTmp;\n+                    uint8_t fUnused;\n+                    std::string unused_string;\n+                    value >> fTmp >> fUnused >> unused_string;\n+                    pwallet->WalletLogPrintf(\"LoadWallet() upgrading tx ver=%d %d %s\\n\",\n+                                       wtx.fTimeReceivedIsTxTime, fTmp, hash.ToString());\n+                    wtx.fTimeReceivedIsTxTime = fTmp;\n+                }\n+                else\n+                {\n+                    pwallet->WalletLogPrintf(\"LoadWallet() repairing tx ver=%d %s\\n\", wtx.fTimeReceivedIsTxTime, hash.ToString());\n+                    wtx.fTimeReceivedIsTxTime = 0;\n+                }\n+                upgraded_txs.push_back(hash);\n+            }\n+\n+            if (wtx.nOrderPos == -1)\n+                any_unordered = true;\n+\n+            return true;\n+        };\n+        if (!pwallet->LoadToWallet(hash, fill_wtx)) {\n+            // Use std::max as fill_wtx may have already set result to CORRUP;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/24914#discussion_r1242886714",
+      "id" : 1242886714,
+      "line" : 1057,
+      "node_id" : "PRRC_kwDOABII585KFPI6",
+      "original_commit_id" : "f6b07b20e16f96a28509a509e44f8c5444a8215e",
+      "original_line" : 1113,
+      "original_position" : 140,
+      "original_start_line" : null,
+      "path" : "src/wallet/walletdb.cpp",
+      "position" : 1153,
+      "pull_request_review_id" : 1499603948,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/24914",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242886714/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-06-26T22:40:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1242886714",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5377650?v=4",
+         "events_url" : "https://api.github.com/users/furszy/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/furszy/followers",
+         "following_url" : "https://api.github.com/users/furszy/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/furszy/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/furszy",
+         "id" : 5377650,
+         "login" : "furszy",
+         "node_id" : "MDQ6VXNlcjUzNzc2NTA=",
+         "organizations_url" : "https://api.github.com/users/furszy/orgs",
+         "received_events_url" : "https://api.github.com/users/furszy/received_events",
+         "repos_url" : "https://api.github.com/users/furszy/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/furszy/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/furszy/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/furszy"
+      }
    }
 ]
