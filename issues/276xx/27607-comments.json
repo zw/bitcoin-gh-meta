@@ -4418,5 +4418,73 @@
          "type" : "User",
          "url" : "https://api.github.com/users/furszy"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27607#discussion_r1245477180"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27607"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1245477180"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "In commit \"refactor: simplify pruning violation check\" (2412ffdce69ce2b164e5303ae4b610ab0d00fd5c)\r\n\r\nLooking at this code, it's not really clear that `block_to_test` is going to be non-null, and that the `CheckBlockDataAvailability` check is going to pass. If it were null, the pruning check would fail even if there were no pruned data.\r\n\r\nSo I think it would be good add an assert with an explanation of why `block_to_test` can't be null here, and I implemented this below.\r\n\r\nWhile implementing this I also noticed that current `CheckBlockDataAvailability` interface seems less safe to use because it accepts a second null parameter when there's no reason to pass it one, and it's also awkward because it returns a pointer instead of just a boolean that reflects whether data is available. Would suggest the following changes to address all of this:\r\n\r\n```diff\r\n--- a/src/index/base.cpp\r\n+++ b/src/index/base.cpp\r\n@@ -111,6 +111,14 @@ bool BaseIndex::Init()\r\n     if (!synced && g_indexes_ready_to_sync) {\r\n         const CBlockIndex* block_to_test = start_block;\r\n         if (!block_to_test) block_to_test = active_chain.Genesis();\r\n+\r\n+        // Assert block_to_test is not null here. It can't be null because the\r\n+        // genesis block can't be null here. The genesis block will be null\r\n+        // during this BaseIndex::Init() call if the node is being started for\r\n+        // the first time, or if -reindex is used. But in both of these cases\r\n+        // m_best_block_index is also null so this branch is not reached.\r\n+        assert(block_to_test);\r\n+\r\n         if (!active_chain.Contains(block_to_test)) {\r\n             // if the bestblock is not part of the mainchain, find the fork\r\n             // so we can make sure we have all data down to the fork\r\n@@ -118,7 +126,7 @@ bool BaseIndex::Init()\r\n         }\r\n \r\n         // make sure we have all block data back to the start block\r\n-        if (m_chainstate->m_blockman.CheckBlockDataAvailability(*active_chain.Tip(), block_to_test) != block_to_test) {\r\n+        if (!m_chainstate->m_blockman.CheckBlockDataAvailability(*active_chain.Tip(), *Assert(block_to_test))) {\r\n             return InitError(strprintf(Untranslated(\"%s best block of the index goes beyond pruned data. Please disable the index or reindex (which will download the whole blockchain again)\"), GetName()));\r\n         }\r\n     }\r\n--- a/src/node/blockstorage.cpp\r\n+++ b/src/node/blockstorage.cpp\r\n@@ -402,7 +402,7 @@ bool BlockManager::IsBlockPruned(const CBlockIndex* pblockindex)\r\n     return (m_have_pruned && !(pblockindex->nStatus & BLOCK_HAVE_DATA) && pblockindex->nTx > 0);\r\n }\r\n \r\n-const CBlockIndex* BlockManager::CheckBlockDataAvailability(const CBlockIndex& upper_block, const CBlockIndex* lower_block)\r\n+const CBlockIndex& FindFirstStored(const CBlockIndex& upper_block, const CBlockIndex* lower_block) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)\r\n {\r\n     AssertLockHeld(::cs_main);\r\n     const CBlockIndex* last_block = &upper_block;\r\n@@ -410,7 +410,7 @@ const CBlockIndex* BlockManager::CheckBlockDataAvailability(const CBlockIndex& u\r\n     while (last_block->pprev && (last_block->pprev->nStatus & BLOCK_HAVE_DATA)) {\r\n         if (lower_block) {\r\n             // Return if we reached the lower_block\r\n-            if (last_block == lower_block) return lower_block;\r\n+            if (last_block == lower_block) return *lower_block;\r\n             // if range was surpassed, means that 'lower_block' is not part of the 'upper_block' chain\r\n             // and so far this is not allowed.\r\n             assert(last_block->nHeight >= lower_block->nHeight);\r\n@@ -418,12 +418,17 @@ const CBlockIndex* BlockManager::CheckBlockDataAvailability(const CBlockIndex& u\r\n         last_block = last_block->pprev;\r\n     }\r\n     assert(last_block != nullptr);\r\n-    return last_block;\r\n+    return *last_block;\r\n+}\r\n+\r\n+bool BlockManager::CheckBlockDataAvailability(const CBlockIndex& upper_block, const CBlockIndex& lower_block)\r\n+{\r\n+    return &FindFirstStored(upper_block, &lower_block) == &lower_block;\r\n }\r\n \r\n const CBlockIndex* BlockManager::GetFirstStoredBlock(const CBlockIndex& start_block)\r\n {\r\n-    return CheckBlockDataAvailability(start_block);\r\n+    return &FindFirstStored(start_block, nullptr);\r\n }\r\n \r\n // If we're using -prune with -reindex, then delete block files that will be ignored by the\r\n--- a/src/node/blockstorage.h\r\n+++ b/src/node/blockstorage.h\r\n@@ -217,15 +217,15 @@ public:\r\n     //! Returns last CBlockIndex* that is a checkpoint\r\n     const CBlockIndex* GetLastCheckpoint(const CCheckpointData& data) EXCLUSIVE_LOCKS_REQUIRED(cs_main);\r\n \r\n-    //! Find the oldest block that is not pruned in the [upper_block, lower_block] range.\r\n-    //! If all blocks down to lower_block are available, returns lower_block.\r\n-    //! If 'lower_block=nullptr': the function verifies all blocks down to the genesis block.\r\n+    //! Check if all blocks in the [upper_block, lower_block] range have data available.\r\n     //! Preconditions:\r\n     //!  1) The caller must ensure that upper_block has block data available.\r\n     //!  2) The caller must ensure that lower_block is an ancestor of upper_block (part of the same chain).\r\n-    const CBlockIndex* CheckBlockDataAvailability(const CBlockIndex& upper_block LIFETIMEBOUND, const CBlockIndex* lower_block=nullptr) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);\r\n+    bool CheckBlockDataAvailability(const CBlockIndex& upper_block LIFETIMEBOUND, const CBlockIndex& lower_block LIFETIMEBOUND) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);\r\n \r\n-    //! Find the first block that is not pruned\r\n+    //! Find the first stored ancestor of start_block immediately after the last\r\n+    //! pruned ancestor. Return value will never be null. Caller is responsible\r\n+    //! for ensuring that start_block has data is not pruned.\r\n     const CBlockIndex* GetFirstStoredBlock(const CBlockIndex& start_block LIFETIMEBOUND) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);\r\n \r\n     /** True if any block files have ever been pruned. */\r\ndiff --git a/src/test/blockmanager_tests.cpp b/src/test/blockmanager_tests.cpp\r\nindex fadf1c2026c0..a7248935f394 100644\r\n--- a/src/test/blockmanager_tests.cpp\r\n+++ b/src/test/blockmanager_tests.cpp\r\n@@ -107,11 +107,11 @@ BOOST_FIXTURE_TEST_CASE(blockmanager_block_data_availability, TestChain100Setup)\r\n \r\n     // 1) Return genesis block when all blocks are available\r\n     BOOST_CHECK_EQUAL(blockman.GetFirstStoredBlock(tip), chainman->ActiveChain()[0]);\r\n-    BOOST_CHECK_EQUAL(blockman.CheckBlockDataAvailability(tip), chainman->ActiveChain()[0]);\r\n+    BOOST_CHECK(blockman.CheckBlockDataAvailability(tip, *chainman->ActiveChain()[0]));\r\n \r\n-    // 2) Return lower_block when all blocks are available\r\n+    // 2) Check lower_block when all blocks are available\r\n     CBlockIndex* lower_block = chainman->ActiveChain()[tip.nHeight / 2];\r\n-    BOOST_CHECK_EQUAL(blockman.CheckBlockDataAvailability(tip, lower_block), lower_block);\r\n+    BOOST_CHECK(blockman.CheckBlockDataAvailability(tip, *lower_block));\r\n \r\n     // Prune half of the blocks\r\n     int height_to_prune = tip.nHeight / 2;\r\n@@ -121,10 +121,8 @@ BOOST_FIXTURE_TEST_CASE(blockmanager_block_data_availability, TestChain100Setup)\r\n \r\n     // 3) The last block not pruned is in-between upper-block and the genesis block\r\n     BOOST_CHECK_EQUAL(blockman.GetFirstStoredBlock(tip), first_available_block);\r\n-    BOOST_CHECK_EQUAL(blockman.CheckBlockDataAvailability(tip), first_available_block);\r\n-\r\n-    // 4) The last block not pruned in the [tip, last_pruned_block] range is the lower_block + 1\r\n-    BOOST_CHECK_EQUAL(blockman.CheckBlockDataAvailability(tip, last_pruned_block), first_available_block);\r\n+    BOOST_CHECK(blockman.CheckBlockDataAvailability(tip, *first_available_block));\r\n+    BOOST_CHECK(!blockman.CheckBlockDataAvailability(tip, *last_pruned_block));\r\n }\r\n \r\n BOOST_AUTO_TEST_SUITE_END()\r\n```",
+      "commit_id" : "2f830d1de8f0b57f46f1d7da3cb7b9ab4aa1e2ff",
+      "created_at" : "2023-06-28T16:27:23Z",
+      "diff_hunk" : "@@ -109,36 +109,16 @@ bool BaseIndex::Init()\n     const CBlockIndex* start_block = m_best_block_index.load();\n     bool synced = start_block == active_chain.Tip();\n     if (!synced && g_indexes_ready_to_sync) {\n-        bool prune_violation = false;\n-        if (!start_block) {\n-            // index is not built yet\n-            // make sure we have all block data back to the genesis\n-            prune_violation = m_chainstate->m_blockman.GetFirstStoredBlock(*active_chain.Tip()) != active_chain.Genesis();\n+        const CBlockIndex* block_to_test = start_block;\n+        if (!block_to_test) block_to_test = active_chain.Genesis();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27607#discussion_r1245477180",
+      "id" : 1245477180,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585KPHk8",
+      "original_commit_id" : "2412ffdce69ce2b164e5303ae4b610ab0d00fd5c",
+      "original_line" : 113,
+      "original_position" : 10,
+      "original_start_line" : null,
+      "path" : "src/index/base.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1503519460,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27607",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1245477180/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-06-28T16:42:44Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1245477180",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7133040?v=4",
+         "events_url" : "https://api.github.com/users/ryanofsky/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ryanofsky/followers",
+         "following_url" : "https://api.github.com/users/ryanofsky/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ryanofsky/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ryanofsky",
+         "id" : 7133040,
+         "login" : "ryanofsky",
+         "node_id" : "MDQ6VXNlcjcxMzMwNDA=",
+         "organizations_url" : "https://api.github.com/users/ryanofsky/orgs",
+         "received_events_url" : "https://api.github.com/users/ryanofsky/received_events",
+         "repos_url" : "https://api.github.com/users/ryanofsky/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ryanofsky/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ryanofsky/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ryanofsky"
+      }
    }
 ]
