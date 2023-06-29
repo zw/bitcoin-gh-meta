@@ -8133,7 +8133,7 @@
    },
    {
       "author_association" : "MEMBER",
-      "body" : "> As I understand it, there are (at least) these two issues to be addressed:\r\n\r\nYes, essentially \"the package contains valid transactions, but we should only accept a subset of it due to fees.\" The first one can happen normally if we just came out of IBD or our peer has a lower minfeerate than we do - this PR was initially to address that. It was also to address \"the package contains some invalid transactions, and we should take the subset that is valid\" but I now think of that as a distinct concern.\r\n\r\nFor the second, I believe the worst concerns are due to problems with eviction (i.e. fixed with cluster mempool). But it's also such a waste to validate, accept, and potentially relay them, so I think we should try to reject it as soon as possible.\r\n\r\nMost problems with this PR boil down to how it groups transactions together (each time, just take the not-yet-submitted ancestor set of each tx). It's not smart enough to, for example, find a parent+2children group since every grouping is ancestor set-shaped. It also seems that its retry attempts (specifically the O(n^2) `PreChecks`) are a dealbreaker, so being able to decide on groups earlier is important.\r\n\r\n> My belief is that the second problem, deciding whether a low-feerate subset exists in a package, is actually equivalent to the cluster linearization/chunking problem\r\n\r\nYes! I think using ancestor feerate linearization + chunking method would be a much better way to divide the package into subgroups before validation. I also spent some time whiteboarding whether package RBF could be feasible for non-v3 this way. I haven't found anything I'm happy with yet, but I think incorporating \"cost to RBF conflicts\" into the chunking algorithm could be a start.\r\n\r\nOne thing I want to preserve from the current approach is minimizing groups when we can. For example, when the \"top\" of the package is above minimum feerate, we'll try it by itself before grouping. One goal of that is to prevent any potential regression from legacy orphan handling. Another problem is around granularity of checking ancestor/descendant limits: imagine a diamond shape (grandparent, 2 parents, 1 child) where grandparent has 23 in-mempool ancestors. The child won't make it regardless of fee, since it would have 26 ancestors. So if it's not necessary to chunk all 4 together (i.e. no need to CPFP), we shouldn't. [1]\r\n\r\nSo I think we'd want to use the linearization/chunking algo, but favor smaller chunks whenever possible. And preserve the behavior where, when every transaction's feerate is above our minimums, we just call `AcceptSingleTransaction` on each one. This also allows RBF.\r\n\r\n> This approach does not deal well with (transient) failures for non-feerate reasons, because if some transactions fails checks, if you've already linearized, everything after it may possibly depend on the failing one. It's possible in that case to go back and relinearize, but perhaps it's okay to just give up then?\r\n\r\nI still believe the answer to this is to give up and ensure we do not block an honest peer from relaying it to us later. If a peer is stuffing invalid transactions into a package, we don't waste any time and imo it's reasonable to wait for an honest peer to send the real package to us.\r\n\r\nI've been wondering if we should still try the transactions that are not descendants of the transaction(s) that failed. It seems a shame to just skip validation for a transaction we downloaded and has no dependencies on things we deemed invalid. But this does leave room for weird behavior... for example, we can only take 1 of 2 transactions before hitting descendant limits, so stuffing the package with high-feerate invalid txns can make us accept the lower-feerate one first if we don't re-linearize after we see the invalid tx. One idea is, when something is invalid for non-fee reasons, we skip its descendants but do a re-linearization that's topo-only and randomly tie-broken for everything else? But maybe this is unrealistic and not worth thinking about.\r\n\r\nAnyway, to summarize, the approach I'm going with now is:\r\n1. Basic sanitization. Topological sort.\r\n2. Grab UTXOs and calculate fees. Deduplicate txns already in mempool or seemingly just-confirmed. Drop things with missing inputs.\r\n3. Refine our linearization using the fee information.\r\n4. If each transaction passes `CheckFeeRate` by themselves, just call `AcceptSingleTransaction(tx)` for each tx -> return\r\n5. Chunkify, favoring smaller chunks over larger ones.\r\n6. For each chunk, `AcceptPackageWrappingSingle(chunk)` -> return\r\n\r\nWill see what can be borrowed from the cluster mempool code - thanks!!\r\n\r\n[1] Similarly, since `PackageMempoolChecks` would overestimate each parent's ancestor count the way it's currently implemented (it was written with the assumption that inputs would be tx + ancestors), we should be willing to take one parent and not the other.",
+      "body" : "> As I understand it, there are (at least) these two issues to be addressed:\r\n\r\nYes, essentially \"the package contains valid transactions, but we should only accept a subset of it due to fees.\" The first one can happen normally if we just came out of IBD or our peer has a lower minfeerate than we do - this PR was initially to address that. It was also to address \"the package contains some invalid transactions, and we should take the subset that is valid\" but I now think of that as a distinct concern.\r\n\r\nFor the second, I believe the worst concerns are due to problems with eviction (i.e. fixed with cluster mempool). But it's also such a waste to validate, accept, and potentially relay them, so I think we should try to reject it as soon as possible.\r\n\r\nMost problems with this PR boil down to how it groups transactions together (each time, just take the not-yet-submitted ancestor set of each tx). It's not smart enough to, for example, find a parent+2children group since every grouping is ancestor set-shaped. It also seems that its retry attempts (specifically the O(n^2) `PreChecks`) are a dealbreaker, so being able to decide on groups earlier is important.\r\n\r\n> My belief is that the second problem, deciding whether a low-feerate subset exists in a package, is actually equivalent to the cluster linearization/chunking problem\r\n\r\nYes! I think using ancestor feerate linearization + chunking method would be a much better way to divide the package into subgroups before validation. I also spent some time whiteboarding whether package RBF could be feasible for non-v3 this way. I haven't found anything I'm happy with yet, but I think incorporating \"cost to RBF conflicts\" into the chunking algorithm could be a start.\r\n\r\nOne thing I want to preserve from the current approach is minimizing groups when we can. For example, when the \"top\" of the package is above minimum feerate, we'll try it by itself before grouping. One goal of that is to prevent any potential regression from legacy orphan handling. Another problem is around granularity of checking ancestor/descendant limits: imagine a diamond shape (grandparent, 2 parents, 1 child) where grandparent has 23 in-mempool ancestors. The child won't make it regardless of fee, since it would have 26 ancestors. So if it's not necessary to chunk all 4 together (i.e. no need to CPFP), we shouldn't. [1]\r\n\r\nSo I think we'd want to use the linearization/chunking algo, but favor smaller chunks whenever possible. And preserve the behavior where, when every transaction's feerate is above our minimums, we just call `AcceptSingleTransaction` on each one. This also allows RBF.\r\n\r\n> This approach does not deal well with (transient) failures for non-feerate reasons, because if some transactions fails checks, if you've already linearized, everything after it may possibly depend on the failing one. It's possible in that case to go back and relinearize, but perhaps it's okay to just give up then?\r\n\r\nI still believe the answer to this is to give up and ensure we do not block an honest peer from relaying it to us later. If a peer is stuffing invalid transactions into a package, we don't waste any time and imo it's reasonable to wait for an honest peer to send the real package to us.\r\n\r\nI've been wondering if we should still try the transactions that are not descendants of the transaction(s) that failed. It seems a shame to just skip validation for a transaction we downloaded and has no dependencies on things we deemed invalid. But this does leave room for weird behavior... for example, we can only take 1 of 2 transactions before hitting descendant limits, so stuffing the package with high-feerate invalid txns can make us accept the lower-feerate one first if we don't re-linearize after we see the invalid tx. One idea is, when something is invalid for non-fee reasons, we skip its descendants but do a re-linearization that's topo-only and randomly tie-broken for everything else? But maybe this is unrealistic and not worth thinking about.\r\n\r\nAnyway, to summarize, the approach I'm going with now is:\r\n1. Basic sanitization. Topological sort.\r\n2. Grab UTXOs and calculate fees. Deduplicate txns already in mempool or seemingly just-confirmed. Drop things with missing inputs.\r\n3. Refine our linearization using the fee information.\r\n4. If each transaction passes `CheckFeeRate` by themselves, just call `AcceptSingleTransaction(tx)` for each tx -> return\r\n5. Chunkify, favoring smaller chunks (i.e. don't chunk together if possible)\r\n6. For each chunk, `AcceptPackageWrappingSingle(chunk)` -> return\r\n\r\nWill see what can be borrowed from the cluster mempool code - thanks!!\r\n\r\n[1] Similarly, since `PackageMempoolChecks` would overestimate each parent's ancestor count the way it's currently implemented (it was written with the assumption that inputs would be tx + ancestors), we should be willing to take one parent and not the other.",
       "created_at" : "2023-06-29T11:08:26Z",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#issuecomment-1612912372",
       "id" : 1612912372,
@@ -8152,7 +8152,7 @@
          "total_count" : 0,
          "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1612912372/reactions"
       },
-      "updated_at" : "2023-06-29T11:08:26Z",
+      "updated_at" : "2023-06-29T14:22:43Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1612912372",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
@@ -8311,6 +8311,50 @@
          "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "> One goal of that is to prevent any potential regression from legacy orphan handling\r\n\r\nSorry can you motivate the issue here explicitly? How would this issue not arise in cluster mempool world?\r\n\r\n> favoring smaller chunks over larger ones.\r\n\r\nI think it'd be good to be explicit what \"favoring\" means here. Is this just individual submissions, then the full chunk on the rest of the chunk on an individual failure?\r\n\r\n> Refine our linearization using the fee information.\r\n\r\nAny thoughts on what algo here? IIUC Pieter should have ancestor-set rate code ready to go so maybe that could be used as good enough for mvp.",
+      "created_at" : "2023-06-29T14:25:58Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#issuecomment-1613277774",
+      "id" : 1613277774,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/26711",
+      "node_id" : "IC_kwDOABII585gKKpO",
+      "performed_via_github_app" : null,
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1613277774/reactions"
+      },
+      "updated_at" : "2023-06-29T14:25:58Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1613277774",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
       }
    }
 ]
