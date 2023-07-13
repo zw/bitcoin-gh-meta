@@ -2034,5 +2034,278 @@
          "type" : "User",
          "url" : "https://api.github.com/users/dergoegge"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1261605505"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261605505"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "There should be a `setmocktime` call with the initial time somewhere before the first `fastforward`, otherwise this can fail intermittently.",
+      "commit_id" : "116378efc1c9c1fe0d26cb42e2bdbb5770815c35",
+      "created_at" : "2023-07-12T18:56:05Z",
+      "diff_hunk" : "@@ -0,0 +1,270 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2022 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"\n+\"\"\"\n+\n+import random\n+import time\n+\n+from test_framework.messages import (\n+    CInv,\n+    COutPoint,\n+    CTransaction,\n+    CTxIn,\n+    CTxInWitness,\n+    CTxOut,\n+    MSG_TX,\n+    MSG_WITNESS_FLAG,\n+    MSG_WITNESS_TX,\n+    MSG_WTX,\n+    msg_getdata,\n+    msg_inv,\n+    msg_tx,\n+)\n+from test_framework.p2p import (\n+    NONPREF_PEER_TX_DELAY,\n+    ORPHAN_ANCESTOR_GETDATA_INTERVAL,\n+    OVERLOADED_PEER_TX_DELAY,\n+    p2p_lock,\n+    P2PTxInvStore,\n+    TXID_RELAY_DELAY,\n+)\n+from test_framework.script import (\n+    CScript,\n+    OP_NOP,\n+    OP_RETURN,\n+)\n+from test_framework.util import (\n+    assert_equal,\n+)\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.wallet import (\n+    MiniWallet,\n+)\n+\n+# Time to fastforward (using setmocktime) before waiting for the node to send getdata(tx) in response\n+# to an inv(tx), in seconds. This delay includes all possible delays + 1, so it should only be used\n+# when the value of the delay is not interesting. If we want to test that the node waits x seconds\n+# for one peer and y seconds for another, use specific values instead.\n+TXREQUEST_TIME_SKIP = NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY + OVERLOADED_PEER_TX_DELAY + 1\n+\n+# Time to fastfoward (using setmocktime) in between subtests to ensure they do not interfere with\n+# one another, in seconds. Equal to 12 hours, which is enough to expire anything that may exist\n+# (though nothing should since state should be cleared) in p2p data structures.\n+LONG_TIME_SKIP = 12 * 60 * 60\n+\n+def cleanup(func):\n+    def wrapper(self):\n+        try:\n+            func(self)\n+        finally:\n+            # Clear mempool\n+            self.generate(self.nodes[0], 1)\n+            self.nodes[0].disconnect_p2ps()\n+            self.mocktime += LONG_TIME_SKIP\n+            self.nodes[0].setmocktime(self.mocktime)\n+    return wrapper\n+\n+class PeerTxRelayer(P2PTxInvStore):\n+    def __init__(self):\n+        super().__init__()\n+        self._tx_received = []\n+        self._getdata_received = []\n+\n+    @property\n+    def tx_received(self):\n+        with p2p_lock:\n+            return self._tx_received\n+\n+    @property\n+    def getdata_received(self):\n+        with p2p_lock:\n+            return self._getdata_received\n+\n+    def on_tx(self, message):\n+        self._tx_received.append(message)\n+\n+    def on_getdata(self, message):\n+        self._getdata_received.append(message)\n+\n+    def wait_for_getdata_txids(self, txids):\n+        def test_function():\n+            last_getdata = self.last_message.get('getdata')\n+            if not last_getdata:\n+                return False\n+            return all([item.type == MSG_WITNESS_TX and item.hash in txids for item in last_getdata.inv])\n+        self.wait_until(test_function, timeout=10)\n+\n+    def assert_message_ignored(self, message):\n+        \"\"\"Check that the node does not respond to this message with any of\n+        getdata, inv, tx.\n+        \"\"\"\n+        prev_lastmessage = self.last_message\n+        self.send_and_ping(message)\n+        after_lastmessage = self.last_message\n+        for msgtype in [\"getdata\", \"inv\", \"tx\"]:\n+            if msgtype not in prev_lastmessage:\n+                assert msgtype not in after_lastmessage\n+            else:\n+                assert_equal(prev_lastmessage[msgtype], after_lastmessage[msgtype])\n+\n+    def assert_never_requested(self, txhash):\n+        \"\"\"Check that the node has never sent us a getdata for this hash (int type)\"\"\"\n+        for getdata in self.getdata_received:\n+            for request in getdata.inv:\n+                assert request.hash != txhash\n+\n+class OrphanHandlingTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.extra_args = [[]]\n+        self.mocktime = int(time.time())\n+\n+    def create_package(self):\n+        \"\"\"Create package with 1 parent and 1 child, normal fees (no cpfp).\n+        \"\"\"\n+        parent = self.wallet.create_self_transfer()\n+        child = self.wallet.create_self_transfer(utxo_to_spend=parent['new_utxo'])\n+        orphan_wtxid = child[\"tx\"].getwtxid()\n+        orphan_tx = child[\"tx\"]\n+        parent_tx = parent[\"tx\"]\n+        return orphan_wtxid, orphan_tx, parent_tx\n+\n+    def create_large_orphan(self):\n+        \"\"\"Create huge orphan transaction\"\"\"\n+        tx = CTransaction()\n+        # Nonexistent UTXO\n+        tx.vin = [CTxIn(COutPoint(random.randrange(1 << 256), random.randrange(1, 100)))]\n+        tx.wit.vtxinwit = [CTxInWitness()]\n+        tx.wit.vtxinwit[0].scriptWitness.stack = [CScript([OP_NOP] * 390000)]\n+        tx.vout = [CTxOut(100, CScript([OP_RETURN, b'a' * 20]))]\n+        return tx\n+\n+    def fastforward(self, seconds):\n+        \"\"\"Convenience helper function to fast-forward, so we don't need to keep track of the\n+        starting time when we call setmocktime.\"\"\"\n+        self.mocktime += seconds\n+        self.nodes[0].setmocktime(self.mocktime)\n+\n+    @cleanup\n+    def test_orphan_handling_prefer_outbound(self):\n+        self.log.info(\"Test that the node prefers requesting from outbound peers\")\n+        node = self.nodes[0]\n+        orphan_wtxid, orphan_tx, parent_tx = self.create_package()\n+        orphan_inv = CInv(t=MSG_WTX, h=int(orphan_wtxid, 16))\n+\n+        peer_inbound = node.add_p2p_connection(PeerTxRelayer())\n+        peer_inbound.send_and_ping(msg_inv([orphan_inv]))\n+        self.fastforward(TXREQUEST_TIME_SKIP)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1261605505",
+      "id" : 1261605505,
+      "line" : 160,
+      "node_id" : "PRRC_kwDOABII585LMpKB",
+      "original_commit_id" : "116378efc1c9c1fe0d26cb42e2bdbb5770815c35",
+      "original_line" : 160,
+      "original_position" : 160,
+      "original_start_line" : null,
+      "path" : "test/functional/p2p_orphan_handling.py",
+      "position" : 160,
+      "pull_request_review_id" : 1527052773,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261605505/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-07-12T22:26:04Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261605505",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48763452?v=4",
+         "events_url" : "https://api.github.com/users/mzumsande/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/mzumsande/followers",
+         "following_url" : "https://api.github.com/users/mzumsande/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/mzumsande/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/mzumsande",
+         "id" : 48763452,
+         "login" : "mzumsande",
+         "node_id" : "MDQ6VXNlcjQ4NzYzNDUy",
+         "organizations_url" : "https://api.github.com/users/mzumsande/orgs",
+         "received_events_url" : "https://api.github.com/users/mzumsande/received_events",
+         "repos_url" : "https://api.github.com/users/mzumsande/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/mzumsande/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/mzumsande/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/mzumsande"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1261645151"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261645151"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "commit 543273d96e896adf5531ed961856aa0eb70cbe57:\r\nnit:  `uint256&` like in the line above?",
+      "commit_id" : "116378efc1c9c1fe0d26cb42e2bdbb5770815c35",
+      "created_at" : "2023-07-12T19:35:16Z",
+      "diff_hunk" : "@@ -2960,9 +2960,10 @@ bool PeerManagerImpl::ProcessOrphanTx(Peer& peer)\n         const MempoolAcceptResult result = m_chainman.ProcessTransaction(porphanTx);\n         const TxValidationState& state = result.m_state;\n         const uint256& orphanHash = porphanTx->GetHash();\n+        const uint256 orphan_wtxid = porphanTx->GetWitnessHash();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1261645151",
+      "id" : 1261645151,
+      "line" : 3017,
+      "node_id" : "PRRC_kwDOABII585LMy1f",
+      "original_commit_id" : "543273d96e896adf5531ed961856aa0eb70cbe57",
+      "original_line" : 2963,
+      "original_position" : 4,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : 173,
+      "pull_request_review_id" : 1527052773,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261645151/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-07-12T22:26:04Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261645151",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48763452?v=4",
+         "events_url" : "https://api.github.com/users/mzumsande/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/mzumsande/followers",
+         "following_url" : "https://api.github.com/users/mzumsande/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/mzumsande/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/mzumsande",
+         "id" : 48763452,
+         "login" : "mzumsande",
+         "node_id" : "MDQ6VXNlcjQ4NzYzNDUy",
+         "organizations_url" : "https://api.github.com/users/mzumsande/orgs",
+         "received_events_url" : "https://api.github.com/users/mzumsande/received_events",
+         "repos_url" : "https://api.github.com/users/mzumsande/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/mzumsande/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/mzumsande/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/mzumsande"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1261779747"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261779747"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I don't think there should ever be a `\\n` prefix, why would we want to separate the meta information (timestamp, threadname etc.) from the actual log entry?",
+      "commit_id" : "116378efc1c9c1fe0d26cb42e2bdbb5770815c35",
+      "created_at" : "2023-07-12T22:20:41Z",
+      "diff_hunk" : "@@ -0,0 +1,181 @@\n+// Copyright (c) 2022\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/txpackagetracker.h>\n+\n+#include <common/bloom.h>\n+#include <logging.h>\n+#include <txorphanage.h>\n+#include <txrequest.h>\n+#include <util/hasher.h>\n+\n+namespace node {\n+    /** How long to wait before requesting orphan ancpkginfo/parents from an additional peer. */\n+    static constexpr auto ORPHAN_ANCESTOR_GETDATA_INTERVAL{60s};\n+\n+class TxPackageTracker::Impl {\n+    /** Manages unvalidated tx data (orphan transactions for which we are downloading ancestors). */\n+    TxOrphanage m_orphanage;\n+\n+    /** Maximum number of transactions in the orphanage, used when calling LimitOrphans(). */\n+    const size_t m_max_orphanage_count;\n+\n+    mutable Mutex m_mutex;\n+\n+    /** Tracks orphans for which we need to request ancestor information. All hashes stored are\n+     * wtxids, i.e., the wtxid of the orphan. However, the Announcement::m_is_wtxid field is used to\n+     * indicate whether we would request the ancestor information by wtxid (via package relay) or by\n+     * txid (via prevouts of the missing inputs). */\n+    TxRequestTracker orphan_request_tracker GUARDED_BY(m_mutex);\n+\n+public:\n+    Impl(const Options& options) :\n+        m_max_orphanage_count{options.m_max_orphanage_count}\n+    {}\n+\n+    // Orphanage Wrapper Functions\n+    bool OrphanageHaveTx(const GenTxid& gtxid) { return m_orphanage.HaveTx(gtxid); }\n+    CTransactionRef GetTxToReconsider(NodeId peer) { return m_orphanage.GetTxToReconsider(peer); }\n+    void DisconnectedPeer(NodeId nodeid) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        AssertLockNotHeld(m_mutex);\n+        LOCK(m_mutex);\n+        orphan_request_tracker.DisconnectedPeer(nodeid);\n+        m_orphanage.EraseForPeer(nodeid);\n+    }\n+    void BlockConnected(const CBlock& block) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        AssertLockNotHeld(m_mutex);\n+        LOCK(m_mutex);\n+        const auto wtxids_erased{m_orphanage.EraseForBlock(block)};\n+        std::set<uint256> block_wtxids;\n+        std::set<uint256> conflicted_wtxids;\n+        for (const CTransactionRef& ptx : block.vtx) {\n+            block_wtxids.insert(ptx->GetWitnessHash());\n+        }\n+        for (const auto& wtxid : wtxids_erased) {\n+            if (block_wtxids.count(wtxid) == 0) {\n+                conflicted_wtxids.insert(wtxid);\n+            }\n+        }\n+        for (const auto& wtxid : block_wtxids) {\n+            orphan_request_tracker.ForgetTxHash(wtxid);\n+        }\n+        for (const auto& wtxid : conflicted_wtxids) {\n+            orphan_request_tracker.ForgetTxHash(wtxid);\n+        }\n+    }\n+    bool HaveTxToReconsider(NodeId peer) { return m_orphanage.HaveTxToReconsider(peer); }\n+    size_t OrphanageSize() { return m_orphanage.Size(); }\n+    void MempoolAcceptedTx(const CTransactionRef& ptx) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        LOCK(m_mutex);\n+        m_orphanage.AddChildrenToWorkSet(*ptx);\n+        m_orphanage.EraseTx(ptx->GetWitnessHash());\n+    }\n+    void MempoolRejectedTx(const uint256& wtxid) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        LOCK(m_mutex);\n+        m_orphanage.EraseTx(wtxid);\n+    }\n+    void AddOrphanTx(NodeId nodeid, const uint256& wtxid, const CTransactionRef& tx, bool is_preferred, std::chrono::microseconds reqtime)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        AssertLockNotHeld(m_mutex);\n+        LOCK(m_mutex);\n+        // Skip if we weren't provided the tx and can't find the wtxid in the orphanage.\n+        if (tx == nullptr && !m_orphanage.HaveTx(GenTxid::Wtxid(wtxid))) return;\n+\n+        // Even though this stores the orphan wtxid, GenTxid::Txid instead of Wtxid because we will be requesting the parents via txid.\n+        orphan_request_tracker.ReceivedInv(nodeid, GenTxid::Txid(wtxid), is_preferred, reqtime);\n+\n+        if (tx != nullptr) {\n+            m_orphanage.AddTx(tx, nodeid);\n+        } else {\n+            m_orphanage.AddTx(m_orphanage.GetTx(wtxid), nodeid);\n+        }\n+        // DoS prevention: do not allow m_orphanage to grow unbounded (see CVE-2012-3789)\n+        m_orphanage.LimitOrphans(m_max_orphanage_count);\n+    }\n+    size_t CountInFlight(NodeId nodeid) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        AssertLockNotHeld(m_mutex);\n+        LOCK(m_mutex);\n+        auto count{orphan_request_tracker.CountInFlight(nodeid)};\n+        return count;\n+    }\n+    size_t Count(NodeId nodeid) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        AssertLockNotHeld(m_mutex);\n+        LOCK(m_mutex);\n+        auto count{orphan_request_tracker.Count(nodeid)};\n+        return count;\n+    }\n+\n+    std::vector<GenTxid> GetOrphanRequests(NodeId nodeid, std::chrono::microseconds current_time)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        AssertLockNotHeld(m_mutex);\n+        LOCK(m_mutex);\n+        std::vector<std::pair<NodeId, GenTxid>> expired;\n+        auto tracker_requestable = orphan_request_tracker.GetRequestable(nodeid, current_time, &expired);\n+        for (const auto& entry : expired) {\n+            LogPrint(BCLog::TXPACKAGES, \"\\nTimeout of inflight %s %s from peer=%d\\n\", entry.second.IsWtxid() ? \"ancpkginfo\" : \"orphan parent\",",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1261779747",
+      "id" : 1261779747,
+      "in_reply_to_id" : 1253459892,
+      "line" : 124,
+      "node_id" : "PRRC_kwDOABII585LNTsj",
+      "original_commit_id" : "116378efc1c9c1fe0d26cb42e2bdbb5770815c35",
+      "original_line" : 124,
+      "original_position" : 124,
+      "original_start_line" : null,
+      "path" : "src/node/txpackagetracker.cpp",
+      "position" : 124,
+      "pull_request_review_id" : 1527052773,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261779747/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-07-12T22:26:04Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261779747",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48763452?v=4",
+         "events_url" : "https://api.github.com/users/mzumsande/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/mzumsande/followers",
+         "following_url" : "https://api.github.com/users/mzumsande/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/mzumsande/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/mzumsande",
+         "id" : 48763452,
+         "login" : "mzumsande",
+         "node_id" : "MDQ6VXNlcjQ4NzYzNDUy",
+         "organizations_url" : "https://api.github.com/users/mzumsande/orgs",
+         "received_events_url" : "https://api.github.com/users/mzumsande/received_events",
+         "repos_url" : "https://api.github.com/users/mzumsande/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/mzumsande/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/mzumsande/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/mzumsande"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1261786477"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261786477"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: could use `orphan_wtxid` introduced in the previous commit, here and in various other places.",
+      "commit_id" : "116378efc1c9c1fe0d26cb42e2bdbb5770815c35",
+      "created_at" : "2023-07-12T22:31:57Z",
+      "diff_hunk" : "@@ -2966,7 +2966,7 @@ bool PeerManagerImpl::ProcessOrphanTx(Peer& peer)\n             LogPrint(BCLog::MEMPOOL, \"   accepted orphan tx %s\\n\", orphan_wtxid.ToString());\n             RelayTransaction(orphanHash, porphanTx->GetWitnessHash());\n             m_txpackagetracker->AddChildrenToWorkSet(*porphanTx);\n-            m_txpackagetracker->EraseOrphanTx(orphanHash);\n+            m_txpackagetracker->EraseOrphanTx(porphanTx->GetWitnessHash());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1261786477",
+      "id" : 1261786477,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585LNVVt",
+      "original_commit_id" : "4cbb63175398d9b8afe755d2adb24edbd2b4913b",
+      "original_line" : 2969,
+      "original_position" : 5,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1527321195,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261786477/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-07-12T22:31:57Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1261786477",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48763452?v=4",
+         "events_url" : "https://api.github.com/users/mzumsande/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/mzumsande/followers",
+         "following_url" : "https://api.github.com/users/mzumsande/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/mzumsande/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/mzumsande",
+         "id" : 48763452,
+         "login" : "mzumsande",
+         "node_id" : "MDQ6VXNlcjQ4NzYzNDUy",
+         "organizations_url" : "https://api.github.com/users/mzumsande/orgs",
+         "received_events_url" : "https://api.github.com/users/mzumsande/received_events",
+         "repos_url" : "https://api.github.com/users/mzumsande/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/mzumsande/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/mzumsande/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/mzumsande"
+      }
    }
 ]
