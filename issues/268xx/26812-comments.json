@@ -5147,5 +5147,143 @@
          "type" : "User",
          "url" : "https://api.github.com/users/MarcoFalke"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1270498856"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1270498856"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "> Not sure about an infinite timeout for `ASSERT_DEBUG_LOG`. For example, this can easily be hit when the log string is modified by a developer, turning a (doc) change in one place into a hard to debug unit test issue.\r\n\r\nI agree. I will stick to a meaningful message after a timeout instead of infinite wait (without a message).\r\n \r\n> I know that it is possible to hit an infinite runtime in any other place, but that would generally mean a major fault or injected bug elsewhere. For example, if the scheduler thread is stopped and one called `SyncWithValidationInterfaceQueue()`...\r\n\r\nI agree with that too. But the parallel with `SyncWithValidationInterfaceQueue()` is not very close to the tests in this PR because `SyncWithValidationInterfaceQueue()` does not provide fine-grained sync points, see below what I mean.\r\n\r\n> It would be good to explain why you need the debug log to sync and why it is not (easily) possible to just sync in this pull.\r\n\r\nIt is possible to not use the debug log. Here is how it would look like:\r\n\r\n<details>\r\n<summary>[patch] use fine-grained sync points in high-level code</summary>\r\n\r\n```diff\r\ndiff --git i/src/net_processing.cpp w/src/net_processing.cpp\r\nindex 1c73ca4eb4..35301a6a2d 100644\r\n--- i/src/net_processing.cpp\r\n+++ w/src/net_processing.cpp\r\n@@ -3529,12 +3529,13 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type,\r\n     // At this point, the outgoing message serialization version can't change.\r\n     const CNetMsgMaker msgMaker(pfrom.GetCommonVersion());\r\n \r\n     if (msg_type == NetMsgType::VERACK) {\r\n         if (pfrom.fSuccessfullyConnected) {\r\n             LogPrint(BCLog::NET, \"ignoring redundant verack message from peer=%d\\n\", pfrom.GetId());\r\n+            g_stage_redundant_verack.post();\r\n             return;\r\n         }\r\n \r\n         if (!pfrom.IsInboundConn()) {\r\n             const auto mapped_as{m_connman.GetMappedAS(pfrom.addr)};\r\n             LogPrintf(\"New outbound peer connected: version: %d, blocks=%d, peer=%d%s%s (%s)\\n\",\r\n@@ -3781,12 +3782,14 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type,\r\n         }\r\n         peer->m_addr_processed += num_proc;\r\n         peer->m_addr_rate_limited += num_rate_limit;\r\n         LogPrint(BCLog::NET, \"Received addr: %u addresses (%u processed, %u rate-limited) from peer=%d\\n\",\r\n                  vAddr.size(), num_proc, num_rate_limit, pfrom.GetId());\r\n \r\n+        g_stage_received_addr.post();\r\n+\r\n         m_addrman.Add(vAddrOk, pfrom.addr, 2h);\r\n         if (vAddr.size() < 1000) peer->m_getaddr_sent = false;\r\n \r\n         // AddrFetch: Require multiple addresses to avoid disconnecting on self-announcements\r\n         if (pfrom.IsAddrFetchConn() && vAddr.size() > 1) {\r\n             LogPrint(BCLog::NET, \"addrfetch connection completed peer=%d; disconnecting\\n\", pfrom.GetId());\r\n@@ -3948,12 +3951,15 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type,\r\n \r\n         // Send the rest of the chain\r\n         if (pindex)\r\n             pindex = m_chainman.ActiveChain().Next(pindex);\r\n         int nLimit = 500;\r\n         LogPrint(BCLog::NET, \"getblocks %d to %s limit %d from peer=%d\\n\", (pindex ? pindex->nHeight : -1), hashStop.IsNull() ? \"end\" : hashStop.ToString(), nLimit, pfrom.GetId());\r\n+        if (pindex == nullptr && hashStop.IsNull()) {\r\n+            g_stage_getblocks_all.post();\r\n+        }\r\n         for (; pindex; pindex = m_chainman.ActiveChain().Next(pindex))\r\n         {\r\n             if (pindex->GetBlockHash() == hashStop)\r\n             {\r\n                 LogPrint(BCLog::NET, \"  getblocks stopping at %d %s\\n\", pindex->nHeight, pindex->GetBlockHash().ToString());\r\n                 break;\r\n@@ -4765,26 +4771,31 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type,\r\n                     } else {\r\n                         // This should never happen\r\n                         sProblem = \"Timing mishap\";\r\n                     }\r\n                 } else {\r\n                     // Nonce mismatches are normal when pings are overlapping\r\n-                    sProblem = \"Nonce mismatch\";\r\n                     if (nonce == 0) {\r\n                         // This is most likely a bug in another implementation somewhere; cancel this ping\r\n                         bPingFinished = true;\r\n                         sProblem = \"Nonce zero\";\r\n+                        g_stage_ping_nonce_zero.post();\r\n+                    } else {\r\n+                        sProblem = \"Nonce mismatch\";\r\n+                        g_stage_ping_nonce_mismatch.post();\r\n                     }\r\n                 }\r\n             } else {\r\n                 sProblem = \"Unsolicited pong without ping\";\r\n+                g_stage_unsolicited_pong_without_ping.post();\r\n             }\r\n         } else {\r\n             // This is most likely a bug in another implementation somewhere; cancel this ping\r\n             bPingFinished = true;\r\n             sProblem = \"Short payload\";\r\n+            g_stage_ping_short_payload.post();\r\n         }\r\n \r\n         if (!(sProblem.empty())) {\r\n             LogPrint(BCLog::NET, \"pong peer=%d: %s, %x expected, %x received, %u bytes\\n\",\r\n                 pfrom.GetId(),\r\n                 sProblem,\r\n@@ -5259,12 +5270,13 @@ void PeerManagerImpl::MaybeSendPing(CNode& node_to, Peer& peer, std::chrono::mic\r\n             m_connman.PushMessage(&node_to, msgMaker.Make(NetMsgType::PING, nonce));\r\n         } else {\r\n             // Peer is too old to support ping command with nonce, pong will never arrive.\r\n             peer.m_ping_nonce_sent = 0;\r\n             m_connman.PushMessage(&node_to, msgMaker.Make(NetMsgType::PING));\r\n         }\r\n+        g_stage_sending_ping.post();\r\n     }\r\n }\r\n \r\n void PeerManagerImpl::MaybeSendAddr(CNode& node, Peer& peer, std::chrono::microseconds current_time)\r\n {\r\n     // Nothing to do for non-address-relay peers\r\n@@ -5928,6 +5940,15 @@ bool PeerManagerImpl::SendMessages(CNode* pto)\r\n         if (!vGetData.empty())\r\n             m_connman.PushMessage(pto, msgMaker.Make(NetMsgType::GETDATA, vGetData));\r\n     } // release cs_main\r\n     MaybeSendFeefilter(*pto, *peer, current_time);\r\n     return true;\r\n }\r\n+\r\n+CSemaphore g_stage_received_addr{0};\r\n+CSemaphore g_stage_getblocks_all{0};\r\n+CSemaphore g_stage_sending_ping{0};\r\n+CSemaphore g_stage_ping_short_payload{0};\r\n+CSemaphore g_stage_unsolicited_pong_without_ping{0};\r\n+CSemaphore g_stage_ping_nonce_mismatch{0};\r\n+CSemaphore g_stage_ping_nonce_zero{0};\r\n+CSemaphore g_stage_redundant_verack{0};\r\ndiff --git i/src/net_processing.h w/src/net_processing.h\r\nindex 1bd2b1e8ca..de4a12705f 100644\r\n--- i/src/net_processing.h\r\n+++ w/src/net_processing.h\r\n@@ -91,7 +91,16 @@ public:\r\n                                 const std::chrono::microseconds time_received, const std::atomic<bool>& interruptMsgProc) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) = 0;\r\n \r\n     /** This function is used for testing the stale tip eviction logic, see denialofservice_tests.cpp */\r\n     virtual void UpdateLastBlockAnnounceTime(NodeId node, int64_t time_in_seconds) = 0;\r\n };\r\n \r\n+extern CSemaphore g_stage_received_addr;\r\n+extern CSemaphore g_stage_getblocks_all;\r\n+extern CSemaphore g_stage_sending_ping;\r\n+extern CSemaphore g_stage_ping_short_payload;\r\n+extern CSemaphore g_stage_unsolicited_pong_without_ping;\r\n+extern CSemaphore g_stage_ping_nonce_mismatch;\r\n+extern CSemaphore g_stage_ping_nonce_zero;\r\n+extern CSemaphore g_stage_redundant_verack;\r\n+\r\n #endif // BITCOIN_NET_PROCESSING_H\r\ndiff --git i/src/test/net_msg_tests.cpp w/src/test/net_msg_tests.cpp\r\nindex 49c97c1440..17bd74cb3a 100644\r\n--- i/src/test/net_msg_tests.cpp\r\n+++ w/src/test/net_msg_tests.cpp\r\n@@ -63,25 +63,27 @@ BOOST_AUTO_TEST_CASE(initial_messages_exchange)\r\n \r\n BOOST_AUTO_TEST_CASE(addr)\r\n {\r\n     const auto pipes{m_sockets_pipes.PopFront()};\r\n     std::vector<CAddress> addresses{5};\r\n \r\n-    ASSERT_DEBUG_LOG_WAIT(strprintf(\"Received addr: %u addresses\", addresses.size()), 30s);\r\n+    BOOST_REQUIRE(!g_stage_received_addr.try_wait());\r\n     pipes->recv.PushNetMsg(NetMsgType::ADDRV2, addresses);\r\n+    g_stage_received_addr.wait();\r\n }\r\n \r\n BOOST_AUTO_TEST_CASE(getblocks)\r\n {\r\n     const auto pipes{m_sockets_pipes.PopFront()};\r\n     std::vector<uint256> hashes{5};\r\n     CBlockLocator block_locator{std::move(hashes)};\r\n     uint256 hash_stop;\r\n \r\n-    ASSERT_DEBUG_LOG_WAIT(\"getblocks -1 to end\", 30s);\r\n+    BOOST_REQUIRE(!g_stage_getblocks_all.try_wait());\r\n     pipes->recv.PushNetMsg(NetMsgType::GETBLOCKS, block_locator, hash_stop);\r\n+    g_stage_getblocks_all.wait();\r\n }\r\n \r\n BOOST_AUTO_TEST_CASE(ping)\r\n {\r\n     const auto pipes{m_sockets_pipes.PopFront()};\r\n \r\n@@ -132,14 +134,16 @@ BOOST_AUTO_TEST_CASE(ping)\r\n             }\r\n         }\r\n     };\r\n \r\n     auto SendPing = [&]() {\r\n         {\r\n-            ASSERT_DEBUG_LOG_WAIT(\"sending ping\", 30s);\r\n+            while (g_stage_sending_ping.try_wait())\r\n+                ;\r\n             SetMockTime(GetMockTime() + PING_INTERVAL + 1s);\r\n+            g_stage_sending_ping.wait();\r\n         }\r\n         return GetPingNonceSent();\r\n     };\r\n \r\n     BOOST_TEST_MESSAGE(\"Ensure initial messages exchange has completed with the sending of a ping \"\r\n                        \"with nonce != 0 and the ping stats indicate a pending ping.\");\r\n@@ -147,37 +151,41 @@ BOOST_AUTO_TEST_CASE(ping)\r\n     auto time_elapsed = 1s;\r\n     SetMockTime(GetMockTime() + time_elapsed);\r\n     WaitForPingStats(/*min=*/std::chrono::microseconds::max(), /*last=*/0us, /*wait=*/time_elapsed);\r\n \r\n     BOOST_TEST_MESSAGE(\"Check that receiving a PONG without nonce cancels our PING\");\r\n     {\r\n-        ASSERT_DEBUG_LOG_WAIT(\"Short payload\", 30s);\r\n+        BOOST_REQUIRE(!g_stage_ping_short_payload.try_wait());\r\n         pipes->recv.PushNetMsg(NetMsgType::PONG);\r\n+        g_stage_ping_short_payload.wait();\r\n     }\r\n     WaitForPingStats(/*min=*/std::chrono::microseconds::max(), /*last=*/0us, /*wait=*/0us);\r\n \r\n     BOOST_TEST_MESSAGE(\"Check that receiving an unrequested PONG is logged and ignored\");\r\n     {\r\n-        ASSERT_DEBUG_LOG_WAIT(\"Unsolicited pong without ping\", 30s);\r\n+        BOOST_REQUIRE(!g_stage_unsolicited_pong_without_ping.try_wait());\r\n         pipes->recv.PushNetMsg(NetMsgType::PONG, /*nonce=*/uint64_t{0});\r\n+        g_stage_unsolicited_pong_without_ping.wait();\r\n     }\r\n \r\n     BOOST_TEST_MESSAGE(\"Check that receiving a PONG with the wrong nonce does not cancel our PING\");\r\n     uint64_t nonce{SendPing()};\r\n     {\r\n-        ASSERT_DEBUG_LOG_WAIT(\"Nonce mismatch\", 30s);\r\n+        BOOST_REQUIRE(!g_stage_ping_nonce_mismatch.try_wait());\r\n         pipes->recv.PushNetMsg(NetMsgType::PONG, nonce + 1);\r\n+        g_stage_ping_nonce_mismatch.wait();\r\n     }\r\n     time_elapsed = 5s;\r\n     SetMockTime(GetMockTime() + time_elapsed);\r\n     WaitForPingStats(/*min=*/std::chrono::microseconds::max(), /*last=*/0us, /*wait=*/time_elapsed);\r\n \r\n     BOOST_TEST_MESSAGE(\"Check that receiving a PONG with nonce=0 cancels our PING\");\r\n     {\r\n-        ASSERT_DEBUG_LOG_WAIT(\"Nonce zero\", 30s);\r\n+        BOOST_REQUIRE(!g_stage_ping_nonce_zero.try_wait());\r\n         pipes->recv.PushNetMsg(NetMsgType::PONG, /*nonce=*/uint64_t{0});\r\n+        g_stage_ping_nonce_zero.wait();\r\n     }\r\n     WaitForPingStats(/*min=*/std::chrono::microseconds::max(), /*last=*/0us, /*wait=*/0us);\r\n \r\n     BOOST_TEST_MESSAGE(\"Check that receiving a PONG with the correct nonce cancels our PING\");\r\n     nonce = SendPing();\r\n     time_elapsed = 5s;\r\n@@ -187,11 +195,12 @@ BOOST_AUTO_TEST_CASE(ping)\r\n }\r\n \r\n BOOST_AUTO_TEST_CASE(redundant_verack)\r\n {\r\n     const auto pipes{m_sockets_pipes.PopFront()};\r\n \r\n-    ASSERT_DEBUG_LOG_WAIT(\"ignoring redundant verack message\", 30s);\r\n+    BOOST_REQUIRE(!g_stage_redundant_verack.try_wait());\r\n     pipes->recv.PushNetMsg(NetMsgType::VERACK);\r\n+    g_stage_redundant_verack.wait();\r\n }\r\n \r\n BOOST_AUTO_TEST_SUITE_END()\r\n```\r\n</details>\r\n\r\nI could be missing some easier alternative. Let me know if you have something better in mind.",
+      "commit_id" : "55c84c2d3bff09784ad127aba68a166f3f36f215",
+      "created_at" : "2023-07-21T10:03:30Z",
+      "diff_hunk" : "@@ -5,37 +5,62 @@\n #ifndef BITCOIN_TEST_UTIL_LOGGING_H\n #define BITCOIN_TEST_UTIL_LOGGING_H\n \n+#include <sync.h>\n #include <util/macros.h>\n \n+#include <chrono>\n+#include <condition_variable>\n #include <functional>\n #include <list>\n+#include <optional>\n #include <string>\n \n class DebugLogHelper\n {\n+public:\n+    using MatchFn = std::function<bool(const std::string* line)>;\n+\n+    static bool MatchFnDefault(const std::string*)\n+    {\n+        return true;\n+    }\n+\n+    explicit DebugLogHelper(\n+        std::string message,\n+        MatchFn match = MatchFnDefault,\n+        std::optional<std::chrono::milliseconds> timeout = std::nullopt);\n+\n+    ~DebugLogHelper();\n+\n+private:\n     const std::string m_message;\n-    bool m_found{false};\n+    const std::optional<std::chrono::milliseconds> m_timeout;\n+    // Mutex + LOCK() is not usable here because LOCK() may print to the log\n+    // itself (see DEBUG_LOCKCONTENTION) causing a deadlock between this mutex\n+    // and BCLog::Logger::m_cs which is acquired when logging a message.\n+    StdMutex m_mutex;\n+    std::condition_variable_any m_cv;\n+    bool m_found GUARDED_BY(m_mutex){false};\n     std::list<std::function<void(const std::string&)>>::iterator m_print_connection;\n \n     //! Custom match checking function.\n     //!\n     //! Invoked with pointers to lines containing matching strings, and with\n-    //! null if check_found() is called without any successful match.\n+    //! nullptr if ~DebugLogHelper() is called without any successful match.\n     //!\n     //! Can return true to enable default DebugLogHelper behavior of:\n     //! (1) ending search after first successful match, and\n-    //! (2) raising an error in check_found if no match was found\n+    //! (2) raising an error in ~DebugLogHelper() if no match was found (will be called with nullptr then)\n     //! Can return false to do the opposite in either case.\n-    using MatchFn = std::function<bool(const std::string* line)>;\n     MatchFn m_match;\n \n-    void check_found();\n-\n-public:\n-    explicit DebugLogHelper(std::string message, MatchFn match = [](const std::string*){ return true; });\n-    ~DebugLogHelper() { check_found(); }\n+    bool m_receiving_log;\n+    void StopReceivingLog();\n };\n \n #define ASSERT_DEBUG_LOG(message) DebugLogHelper UNIQUE_NAME(debugloghelper)(message)\n \n+#define ASSERT_DEBUG_LOG_WAIT(message, timeout) \\",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1270498856",
+      "id" : 1270498856,
+      "in_reply_to_id" : 1269641610,
+      "line" : 63,
+      "node_id" : "PRRC_kwDOABII585LukYo",
+      "original_commit_id" : "55c84c2d3bff09784ad127aba68a166f3f36f215",
+      "original_line" : 63,
+      "original_position" : 68,
+      "original_start_line" : null,
+      "path" : "src/test/util/logging.h",
+      "position" : 68,
+      "pull_request_review_id" : 1540872486,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1270498856/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-07-21T10:03:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1270498856",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1270510651"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1270510651"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "> better in mind?\r\n\r\nYeah, any reason you can't just call `ProcessMessagesOnce`. Alternatively, except for the ping/verack case you can just do what the python `def sync_with_ping` does?",
+      "commit_id" : "55c84c2d3bff09784ad127aba68a166f3f36f215",
+      "created_at" : "2023-07-21T10:16:29Z",
+      "diff_hunk" : "@@ -5,37 +5,62 @@\n #ifndef BITCOIN_TEST_UTIL_LOGGING_H\n #define BITCOIN_TEST_UTIL_LOGGING_H\n \n+#include <sync.h>\n #include <util/macros.h>\n \n+#include <chrono>\n+#include <condition_variable>\n #include <functional>\n #include <list>\n+#include <optional>\n #include <string>\n \n class DebugLogHelper\n {\n+public:\n+    using MatchFn = std::function<bool(const std::string* line)>;\n+\n+    static bool MatchFnDefault(const std::string*)\n+    {\n+        return true;\n+    }\n+\n+    explicit DebugLogHelper(\n+        std::string message,\n+        MatchFn match = MatchFnDefault,\n+        std::optional<std::chrono::milliseconds> timeout = std::nullopt);\n+\n+    ~DebugLogHelper();\n+\n+private:\n     const std::string m_message;\n-    bool m_found{false};\n+    const std::optional<std::chrono::milliseconds> m_timeout;\n+    // Mutex + LOCK() is not usable here because LOCK() may print to the log\n+    // itself (see DEBUG_LOCKCONTENTION) causing a deadlock between this mutex\n+    // and BCLog::Logger::m_cs which is acquired when logging a message.\n+    StdMutex m_mutex;\n+    std::condition_variable_any m_cv;\n+    bool m_found GUARDED_BY(m_mutex){false};\n     std::list<std::function<void(const std::string&)>>::iterator m_print_connection;\n \n     //! Custom match checking function.\n     //!\n     //! Invoked with pointers to lines containing matching strings, and with\n-    //! null if check_found() is called without any successful match.\n+    //! nullptr if ~DebugLogHelper() is called without any successful match.\n     //!\n     //! Can return true to enable default DebugLogHelper behavior of:\n     //! (1) ending search after first successful match, and\n-    //! (2) raising an error in check_found if no match was found\n+    //! (2) raising an error in ~DebugLogHelper() if no match was found (will be called with nullptr then)\n     //! Can return false to do the opposite in either case.\n-    using MatchFn = std::function<bool(const std::string* line)>;\n     MatchFn m_match;\n \n-    void check_found();\n-\n-public:\n-    explicit DebugLogHelper(std::string message, MatchFn match = [](const std::string*){ return true; });\n-    ~DebugLogHelper() { check_found(); }\n+    bool m_receiving_log;\n+    void StopReceivingLog();\n };\n \n #define ASSERT_DEBUG_LOG(message) DebugLogHelper UNIQUE_NAME(debugloghelper)(message)\n \n+#define ASSERT_DEBUG_LOG_WAIT(message, timeout) \\",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1270510651",
+      "id" : 1270510651,
+      "in_reply_to_id" : 1269641610,
+      "line" : 63,
+      "node_id" : "PRRC_kwDOABII585LunQ7",
+      "original_commit_id" : "55c84c2d3bff09784ad127aba68a166f3f36f215",
+      "original_line" : 63,
+      "original_position" : 68,
+      "original_start_line" : null,
+      "path" : "src/test/util/logging.h",
+      "position" : 68,
+      "pull_request_review_id" : 1540893335,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1270510651/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-07-21T10:16:29Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1270510651",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
    }
 ]
