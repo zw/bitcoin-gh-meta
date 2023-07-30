@@ -448,5 +448,142 @@
          "type" : "User",
          "url" : "https://api.github.com/users/dergoegge"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28043#discussion_r1273466446"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1273466446"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "How is this different from CallOneOf?",
+      "commit_id" : "8a7feb65732742b2bd88263e751e9f9cdc21fdce",
+      "created_at" : "2023-07-25T12:35:21Z",
+      "diff_hunk" : "@@ -0,0 +1,197 @@\n+#include <blockencodings.h>\n+#include <net.h>\n+#include <net_processing.h>\n+#include <netmessagemaker.h>\n+#include <node/peerman_args.h>\n+#include <pow.h>\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+#include <test/util/net.h>\n+#include <test/util/script.h>\n+#include <test/util/setup_common.h>\n+#include <validation.h>\n+\n+namespace {\n+constexpr uint32_t FUZZ_MAX_HEADERS_RESULTS{16};\n+\n+class HeadersSyncSetup : public TestingSetup\n+{\n+    std::vector<CNode*> m_connections;\n+\n+public:\n+    HeadersSyncSetup(const ChainType chain_type = ChainType::MAIN,\n+                     const std::vector<const char*>& extra_args = {})\n+        : TestingSetup(chain_type, extra_args)\n+    {\n+        PeerManager::Options peerman_opts;\n+        node::ApplyArgsManOptions(*m_node.args, peerman_opts);\n+        peerman_opts.max_headers_result = FUZZ_MAX_HEADERS_RESULTS;\n+        m_node.peerman = PeerManager::make(*m_node.connman, *m_node.addrman,\n+                                           m_node.banman.get(), *m_node.chainman,\n+                                           *m_node.mempool, peerman_opts);\n+\n+        CConnman::Options options;\n+        options.m_msgproc = m_node.peerman.get();\n+        m_node.connman->Init(options);\n+    }\n+\n+    void ResetAndInitialize() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);\n+    void SendMessage(FuzzedDataProvider& fuzzed_data_provider, CSerializedNetMsg&& msg)\n+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);\n+};\n+\n+void HeadersSyncSetup::ResetAndInitialize()\n+{\n+    m_connections.clear();\n+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);\n+    connman.StopNodes();\n+\n+    NodeId id{0};\n+    std::vector<ConnectionType> conn_types = {};\n+    conn_types.resize(1, ConnectionType::OUTBOUND_FULL_RELAY);\n+    conn_types.resize(conn_types.size() + 1, ConnectionType::BLOCK_RELAY);\n+    conn_types.resize(conn_types.size() + 1, ConnectionType::INBOUND);\n+\n+    for (auto conn_type : conn_types) {\n+        CAddress addr{};\n+        m_connections.push_back(new CNode(id++, nullptr, addr, 0, 0, addr, \"\", conn_type, false));\n+        CNode& p2p_node = *m_connections.back();\n+\n+        connman.Handshake(\n+            /*node=*/p2p_node,\n+            /*successfully_connected=*/true,\n+            /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),\n+            /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),\n+            /*version=*/PROTOCOL_VERSION,\n+            /*relay_txs=*/true);\n+\n+        connman.AddTestNode(p2p_node);\n+    }\n+}\n+\n+void HeadersSyncSetup::SendMessage(FuzzedDataProvider& fuzzed_data_provider, CSerializedNetMsg&& msg)\n+{\n+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);\n+    CNode& connection = *PickValue(fuzzed_data_provider, m_connections);\n+\n+    (void)connman.ReceiveMsgFrom(connection, msg);\n+    connection.fPauseSend = false;\n+    try {\n+        connman.ProcessMessagesOnce(connection);\n+    } catch (const std::ios_base::failure&) {\n+    }\n+    m_node.peerman->SendMessages(&connection);\n+}\n+\n+CBlockHeader ConsumeHeader(FuzzedDataProvider& fuzzed_data_provider, const uint256& prev_hash, uint32_t prev_nbits)\n+{\n+    CBlockHeader header;\n+    header.nNonce = 0;\n+    // Either use the previous difficulty or let the fuzzer choose\n+    header.nBits = fuzzed_data_provider.ConsumeBool() ?\n+                       prev_nbits :\n+                       fuzzed_data_provider.ConsumeIntegralInRange<uint32_t>(0x17058EBE, 0x1D00FFFF);\n+    header.nTime = fuzzed_data_provider.ConsumeIntegral<uint32_t>();\n+    header.hashPrevBlock = prev_hash;\n+    return header;\n+}\n+\n+CBlock ConsumeBlock(FuzzedDataProvider& fuzzed_data_provider, const uint256& prev_hash, uint32_t prev_nbits)\n+{\n+    auto header = ConsumeHeader(fuzzed_data_provider, prev_hash, prev_nbits);\n+    // Doesn't need to be a valid block but it needs to have one transaction\n+    // for compact block construction.\n+    CBlock block{header};\n+    block.vtx.push_back(MakeTransactionRef(CMutableTransaction{}));\n+    return block;\n+}\n+\n+void FinalizeHeader(CBlockHeader& header)\n+{\n+    while (!CheckProofOfWork(header.GetHash(), header.nBits, Params().GetConsensus())) {\n+        ++(header.nNonce);\n+    }\n+}\n+\n+// Global setup works for this test as state modification (specifically in the\n+// block index) would indicate a bug.\n+HeadersSyncSetup* g_testing_setup;\n+\n+void initialize()\n+{\n+    // Reduce proof-of-work check to one bit.\n+    g_check_pow_mock = [](uint256 hash, unsigned int, const Consensus::Params&) {\n+        return (hash.data()[31] & 0x80) == 0;\n+    };\n+\n+    static auto setup = MakeNoLogFileContext<HeadersSyncSetup>(ChainType::MAIN, {\"-checkpoints=0\"});\n+    g_testing_setup = setup.get();\n+}\n+} // namespace\n+\n+FUZZ_TARGET(p2p_headers_sync, .init = initialize)\n+{\n+    ChainstateManager& chainman = *g_testing_setup->m_node.chainman;\n+\n+    LOCK(NetEventsInterface::g_msgproc_mutex);\n+\n+    g_testing_setup->ResetAndInitialize();\n+\n+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};\n+\n+    CBlockHeader base{Params().GenesisBlock()};\n+    SetMockTime(Params().GenesisBlock().nTime);\n+\n+    size_t original_index_size{WITH_LOCK(cs_main, return chainman.m_blockman.m_block_index.size())};\n+\n+    LIMITED_WHILE(fuzzed_data_provider.remaining_bytes(), 100)\n+    {\n+        auto finalized_block = [&]() {\n+            auto prev = WITH_LOCK(cs_main,\n+                                  return PickValue(fuzzed_data_provider, chainman.m_blockman.m_block_index))\n+                            .second.GetBlockHeader();\n+            CBlock block = ConsumeBlock(fuzzed_data_provider, prev.GetHash(), prev.nBits);\n+            FinalizeHeader(block);\n+            return block;\n+        };\n+\n+        std::vector<std::function<void()>> actions = {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28043#discussion_r1273466446",
+      "id" : 1273466446,
+      "line" : 159,
+      "node_id" : "PRRC_kwDOABII585L545O",
+      "original_commit_id" : "8a7feb65732742b2bd88263e751e9f9cdc21fdce",
+      "original_line" : 159,
+      "original_position" : 159,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/p2p_headers_sync.cpp",
+      "position" : 159,
+      "pull_request_review_id" : 1545352861,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1273466446/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-07-28T09:48:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1273466446",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28043#discussion_r1278551101"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1278551101"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "it's not, iirc I had some trouble with thread safety annotations but I'll give `CallOneOf` another try",
+      "commit_id" : "8a7feb65732742b2bd88263e751e9f9cdc21fdce",
+      "created_at" : "2023-07-30T11:12:47Z",
+      "diff_hunk" : "@@ -0,0 +1,197 @@\n+#include <blockencodings.h>\n+#include <net.h>\n+#include <net_processing.h>\n+#include <netmessagemaker.h>\n+#include <node/peerman_args.h>\n+#include <pow.h>\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+#include <test/util/net.h>\n+#include <test/util/script.h>\n+#include <test/util/setup_common.h>\n+#include <validation.h>\n+\n+namespace {\n+constexpr uint32_t FUZZ_MAX_HEADERS_RESULTS{16};\n+\n+class HeadersSyncSetup : public TestingSetup\n+{\n+    std::vector<CNode*> m_connections;\n+\n+public:\n+    HeadersSyncSetup(const ChainType chain_type = ChainType::MAIN,\n+                     const std::vector<const char*>& extra_args = {})\n+        : TestingSetup(chain_type, extra_args)\n+    {\n+        PeerManager::Options peerman_opts;\n+        node::ApplyArgsManOptions(*m_node.args, peerman_opts);\n+        peerman_opts.max_headers_result = FUZZ_MAX_HEADERS_RESULTS;\n+        m_node.peerman = PeerManager::make(*m_node.connman, *m_node.addrman,\n+                                           m_node.banman.get(), *m_node.chainman,\n+                                           *m_node.mempool, peerman_opts);\n+\n+        CConnman::Options options;\n+        options.m_msgproc = m_node.peerman.get();\n+        m_node.connman->Init(options);\n+    }\n+\n+    void ResetAndInitialize() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);\n+    void SendMessage(FuzzedDataProvider& fuzzed_data_provider, CSerializedNetMsg&& msg)\n+        EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex);\n+};\n+\n+void HeadersSyncSetup::ResetAndInitialize()\n+{\n+    m_connections.clear();\n+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);\n+    connman.StopNodes();\n+\n+    NodeId id{0};\n+    std::vector<ConnectionType> conn_types = {};\n+    conn_types.resize(1, ConnectionType::OUTBOUND_FULL_RELAY);\n+    conn_types.resize(conn_types.size() + 1, ConnectionType::BLOCK_RELAY);\n+    conn_types.resize(conn_types.size() + 1, ConnectionType::INBOUND);\n+\n+    for (auto conn_type : conn_types) {\n+        CAddress addr{};\n+        m_connections.push_back(new CNode(id++, nullptr, addr, 0, 0, addr, \"\", conn_type, false));\n+        CNode& p2p_node = *m_connections.back();\n+\n+        connman.Handshake(\n+            /*node=*/p2p_node,\n+            /*successfully_connected=*/true,\n+            /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),\n+            /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),\n+            /*version=*/PROTOCOL_VERSION,\n+            /*relay_txs=*/true);\n+\n+        connman.AddTestNode(p2p_node);\n+    }\n+}\n+\n+void HeadersSyncSetup::SendMessage(FuzzedDataProvider& fuzzed_data_provider, CSerializedNetMsg&& msg)\n+{\n+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);\n+    CNode& connection = *PickValue(fuzzed_data_provider, m_connections);\n+\n+    (void)connman.ReceiveMsgFrom(connection, msg);\n+    connection.fPauseSend = false;\n+    try {\n+        connman.ProcessMessagesOnce(connection);\n+    } catch (const std::ios_base::failure&) {\n+    }\n+    m_node.peerman->SendMessages(&connection);\n+}\n+\n+CBlockHeader ConsumeHeader(FuzzedDataProvider& fuzzed_data_provider, const uint256& prev_hash, uint32_t prev_nbits)\n+{\n+    CBlockHeader header;\n+    header.nNonce = 0;\n+    // Either use the previous difficulty or let the fuzzer choose\n+    header.nBits = fuzzed_data_provider.ConsumeBool() ?\n+                       prev_nbits :\n+                       fuzzed_data_provider.ConsumeIntegralInRange<uint32_t>(0x17058EBE, 0x1D00FFFF);\n+    header.nTime = fuzzed_data_provider.ConsumeIntegral<uint32_t>();\n+    header.hashPrevBlock = prev_hash;\n+    return header;\n+}\n+\n+CBlock ConsumeBlock(FuzzedDataProvider& fuzzed_data_provider, const uint256& prev_hash, uint32_t prev_nbits)\n+{\n+    auto header = ConsumeHeader(fuzzed_data_provider, prev_hash, prev_nbits);\n+    // Doesn't need to be a valid block but it needs to have one transaction\n+    // for compact block construction.\n+    CBlock block{header};\n+    block.vtx.push_back(MakeTransactionRef(CMutableTransaction{}));\n+    return block;\n+}\n+\n+void FinalizeHeader(CBlockHeader& header)\n+{\n+    while (!CheckProofOfWork(header.GetHash(), header.nBits, Params().GetConsensus())) {\n+        ++(header.nNonce);\n+    }\n+}\n+\n+// Global setup works for this test as state modification (specifically in the\n+// block index) would indicate a bug.\n+HeadersSyncSetup* g_testing_setup;\n+\n+void initialize()\n+{\n+    // Reduce proof-of-work check to one bit.\n+    g_check_pow_mock = [](uint256 hash, unsigned int, const Consensus::Params&) {\n+        return (hash.data()[31] & 0x80) == 0;\n+    };\n+\n+    static auto setup = MakeNoLogFileContext<HeadersSyncSetup>(ChainType::MAIN, {\"-checkpoints=0\"});\n+    g_testing_setup = setup.get();\n+}\n+} // namespace\n+\n+FUZZ_TARGET(p2p_headers_sync, .init = initialize)\n+{\n+    ChainstateManager& chainman = *g_testing_setup->m_node.chainman;\n+\n+    LOCK(NetEventsInterface::g_msgproc_mutex);\n+\n+    g_testing_setup->ResetAndInitialize();\n+\n+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};\n+\n+    CBlockHeader base{Params().GenesisBlock()};\n+    SetMockTime(Params().GenesisBlock().nTime);\n+\n+    size_t original_index_size{WITH_LOCK(cs_main, return chainman.m_blockman.m_block_index.size())};\n+\n+    LIMITED_WHILE(fuzzed_data_provider.remaining_bytes(), 100)\n+    {\n+        auto finalized_block = [&]() {\n+            auto prev = WITH_LOCK(cs_main,\n+                                  return PickValue(fuzzed_data_provider, chainman.m_blockman.m_block_index))\n+                            .second.GetBlockHeader();\n+            CBlock block = ConsumeBlock(fuzzed_data_provider, prev.GetHash(), prev.nBits);\n+            FinalizeHeader(block);\n+            return block;\n+        };\n+\n+        std::vector<std::function<void()>> actions = {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28043#discussion_r1278551101",
+      "id" : 1278551101,
+      "in_reply_to_id" : 1273466446,
+      "line" : 159,
+      "node_id" : "PRRC_kwDOABII585MNSQ9",
+      "original_commit_id" : "8a7feb65732742b2bd88263e751e9f9cdc21fdce",
+      "original_line" : 159,
+      "original_position" : 159,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/p2p_headers_sync.cpp",
+      "position" : 159,
+      "pull_request_review_id" : 1553624235,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1278551101/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-07-30T11:12:47Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1278551101",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/8077169?v=4",
+         "events_url" : "https://api.github.com/users/dergoegge/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/dergoegge/followers",
+         "following_url" : "https://api.github.com/users/dergoegge/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/dergoegge/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/dergoegge",
+         "id" : 8077169,
+         "login" : "dergoegge",
+         "node_id" : "MDQ6VXNlcjgwNzcxNjk=",
+         "organizations_url" : "https://api.github.com/users/dergoegge/orgs",
+         "received_events_url" : "https://api.github.com/users/dergoegge/received_events",
+         "repos_url" : "https://api.github.com/users/dergoegge/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/dergoegge/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/dergoegge/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/dergoegge"
+      }
    }
 ]
