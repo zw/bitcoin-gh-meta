@@ -9,7 +9,8 @@ issue 1234:
  * `issues/12xx/1234-comments.json` is all comments, both issue comments and PR
    review comments, in `created_at` order (so, a mixture of the
    [`/repos/:owner/:repo/issues/:number/comments`][comments] and
-   [`/repos/:owner/:repo/pulls/:number/comments`][reviews] endpoints)
+   [`/repos/:owner/:repo/pulls/:number/comments`][reviews] endpoints). However,
+   **review-comments are missing** from the backups. See #6 for more details.
 
 Note that issue descriptions are rendered as the first comment by GitHub's web
 interface but are seen as properties of the issues by the GitHub API, and
