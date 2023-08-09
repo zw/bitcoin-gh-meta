@@ -10665,5 +10665,74 @@
          "type" : "User",
          "url" : "https://api.github.com/users/glozow"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1288452570"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288452570"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Ah! Might be worth being overly explanatory here.",
+      "commit_id" : "faa9eddefdb1354ba193f29d85dc18bee14e0cb8",
+      "created_at" : "2023-08-09T13:05:47Z",
+      "diff_hunk" : "@@ -1423,62 +1428,164 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package,\n             assert(iter != std::nullopt);\n             // Provide the wtxid of the mempool tx so that the caller can look it up in the mempool.\n             results_final.emplace(wtxid, MempoolAcceptResult::MempoolTxDifferentWitness(iter.value()->GetTx().GetWitnessHash()));\n+            linearized_package.Skip(tx);\n         } else {\n-            // Transaction does not already exist in the mempool.\n-            // Try submitting the transaction on its own.\n-            const auto single_res = AcceptSingleTransaction(tx, single_args);\n-            if (single_res.m_result_type == MempoolAcceptResult::ResultType::VALID) {\n-                // The transaction succeeded on its own and is now in the mempool. Don't include it\n-                // in package validation, because its fees should only be \"used\" once.\n-                assert(m_pool.exists(GenTxid::Wtxid(wtxid)));\n-                results_final.emplace(wtxid, single_res);\n-            } else if (single_res.m_state.GetResult() != TxValidationResult::TX_MEMPOOL_POLICY &&\n-                       single_res.m_state.GetResult() != TxValidationResult::TX_MISSING_INPUTS) {\n-                // Package validation policy only differs from individual policy in its evaluation\n-                // of feerate. For example, if a transaction fails here due to violation of a\n-                // consensus rule, the result will not change when it is submitted as part of a\n-                // package. To minimize the amount of repeated work, unless the transaction fails\n-                // due to feerate or missing inputs (its parent is a previous transaction in the\n-                // package that failed due to feerate), don't run package validation. Note that this\n-                // decision might not make sense if different types of packages are allowed in the\n-                // future.  Continue individually validating the rest of the transactions, because\n-                // some of them may still be valid.\n-                quit_early = true;\n-                package_state_quit_early.Invalid(PackageValidationResult::PCKG_TX, \"transaction failed\");\n-                individual_results_nonfinal.emplace(wtxid, single_res);\n+            // Transaction does not already exist in the mempool. Call PreChecks to find any obvious\n+            // errors and grab the UTXOs so we can calculate fees.\n+            Workspace ws(tx);\n+            if (PreChecks(single_args, ws)) {\n+                linearized_package.AddFeeAndVsize(tx->GetHash(), ws.m_modified_fees, ws.m_vsize);\n             } else {\n-                individual_results_nonfinal.emplace(wtxid, single_res);\n-                txns_package_eval.push_back(tx);\n+                switch (ws.m_state.GetResult()) {\n+                case TxValidationResult::TX_SINGLE_FAILURE:\n+                {\n+                    // This error is fine, and we should continue under the assumption that the tx\n+                    // will be CPFP'd. We know that the fee and vsize values are populated because\n+                    // the only way to get this error is to have called CheckFeeRate() with them.\n+                    linearized_package.AddFeeAndVsize(tx->GetHash(), ws.m_modified_fees, ws.m_vsize);\n+                    individual_results_nonfinal.emplace(wtxid,\n+                        MempoolAcceptResult::FeeFailure(ws.m_state, CFeeRate(ws.m_modified_fees, ws.m_vsize), {tx->GetWitnessHash()}));\n+                    break;\n+                }\n+                case TxValidationResult::TX_MISSING_INPUTS: case TxValidationResult::TX_CONFLICT:\n+                {\n+                    // If there is a conflict that we won't be able to resolve, or we have no\n+                    // in-package dependencies but are still missing inputs, we know all of the\n+                    // package transactions that depend on this one \"dangle\" and won't make it.\n+                    // This error may happen if we have a different chainstate from our peer:\n+                    // - a package parent already confirmed for us (txn-already-known),\n+                    // - a package parent already confirmed for our peer so they didn't include it\n+                    //   in the ancestor package (bad-txns-inputs-missingorspent).\n+                    linearized_package.SkipWithDescendants(tx);\n+                    individual_results_nonfinal.emplace(wtxid, MempoolAcceptResult::Failure(ws.m_state));\n+                    break;\n+                }\n+                case TxValidationResult::TX_RESULT_UNSET: case TxValidationResult::TX_UNKNOWN: case TxValidationResult::TX_NO_MEMPOOL:\n+                {\n+                    // These results shouldn't be possible.\n+                    Assume(false);\n+                    break;\n+                }\n+                default:\n+                {\n+                    // If a transaction fails for any other reason, abort validation for the whole\n+                    // package because:\n+                    // - apart from TX_SINGLE_FAILURE (i.e. low feerate but can be CPFP'd), there is\n+                    //   no way for package validation policy to change the transaction from invalid\n+                    //   to valid.\n+                    // - assuming there are valid transactions in this package (which is the only\n+                    //   reason we would want to continue), the only computationally reasonable way\n+                    //   to deal with this situation is to wait for a different peer to announce\n+                    //   them to us and be open to retrying them. If the package has been\n+                    //   maliciously stuffed with invalid transactions, trying to find the optimal\n+                    //   subset of transactions to accept is too resource-intensive.\n+                    //\n+                    // This error may happen if we have a different policy from our peer or we\n+                    // have a conflicting transaction they didn't have.\n+                    quit_early = true;\n+                    individual_results_nonfinal.emplace(wtxid, MempoolAcceptResult::Failure(ws.m_state));\n+                    package_state_quit_early.Invalid(PackageValidationResult::PCKG_TX, \"transaction failed\");\n+                    break;\n+                }\n+                }\n+            }\n+            m_viewmempool.PackageAddTransaction(tx);\n+        }\n+    }\n+    // Clear the temporary coins in CCoinsViewMemPool and copies in CCoinsViewCache.\n+    for (const auto& outpoint : m_viewmempool.ClearPackageCoins()) {\n+        m_view.Uncache(outpoint);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1288452570",
+      "id" : 1288452570,
+      "in_reply_to_id" : 1272574534,
+      "line" : 1497,
+      "node_id" : "PRRC_kwDOABII585MzDna",
+      "original_commit_id" : "2be70a6d2694db7425619e97afc1a912b8504848",
+      "original_line" : 1497,
+      "original_position" : 336,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : 336,
+      "pull_request_review_id" : 1569510700,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288452570/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-09T13:05:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288452570",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
    }
 ]
