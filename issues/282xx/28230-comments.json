@@ -1404,8 +1404,8 @@
          }
       },
       "author_association" : "CONTRIBUTOR",
-      "body" : "Big fan of this rewrite, makes it pretty extensible without too much code duplication. Nice!\r\n\r\nBuilding on your new approach, the non-default parameters could potentially be handled with pointers, to avoid unnecessary copy operations. For example, I think these 2 lines: https://github.com/bitcoin/bitcoin/blob/b565485c24c0feacae559a7f6f7b83d7516ca58d/src/wallet/rpc/spend.cpp#L274-L275 \r\n\r\ncan be rewritten as: \r\n```cpp\r\n    if (auto comment{self.Arg<const std::string*>(2)}; comment && !(comment->empty())) {\r\n        mapValue[\"comment\"] = *comment;\r\n    }\r\n```\r\n\r\nNot necessarily shorter, but much more idiomatic imo? I've implemented it like this - can probably be cleaned up quite a bit more:\r\n\r\n<details>\r\n<summary>git diff on fa5468dcf0109d11ddaeb4b3591e6e04b4ea6125</summary>\r\n\r\n```diff\r\ndiff --git a/src/rpc/util.cpp b/src/rpc/util.cpp\r\nindex 0db66ec1b1..1f287fb291 100644\r\n--- a/src/rpc/util.cpp\r\n+++ b/src/rpc/util.cpp\r\n@@ -636,27 +636,47 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\r\n     return ret;\r\n }\r\n \r\n-static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\r\n+static const UniValue* ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\r\n {\r\n     CHECK_NONFATAL(i < params.size());\r\n     const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\r\n-    if (!arg.isNull()) return arg;\r\n+    if (!arg.isNull()) return &arg;\r\n     const RPCArg::Fallback& fallback{params.at(i).m_fallback};\r\n-    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\r\n-    return std::get<RPCArg::Default>(fallback);\r\n+    if (std::holds_alternative<RPCArg::Default>(fallback)) {\r\n+        return &(std::get<RPCArg::Default>(fallback));\r\n+    }\r\n+    return nullptr;\r\n }\r\n \r\n-#define TMPL_INST(ret_type, get_arg, get_type)            \\\r\n-    template <>                                           \\\r\n-    ret_type RPCHelpMan::get_arg(size_t i) const          \\\r\n-    {                                                     \\\r\n-        return ArgOrDefault(m_args, m_req, i).get_type(); \\\r\n-    }                                                     \\\r\n+#define TMPL_INST(ret_type, get_arg, get_type)        \\\r\n+    template <>                                       \\\r\n+    ret_type RPCHelpMan::get_arg(size_t i) const      \\\r\n+    {                                                 \\\r\n+        return CHECK_NONFATAL(ArgOrDefault(m_args, m_req, i))->get_type(); \\\r\n+    }                                                 \\\r\n+    void force_semicolon()\r\n+\r\n+#define TMPL_INST_PTR(ret_type, get_arg, get_type)    \\\r\n+    template <>                                       \\\r\n+    std::shared_ptr<ret_type> RPCHelpMan::get_arg(size_t i) const \\\r\n+    {                                                 \\\r\n+        auto result {ArgOrDefault(m_args, m_req, i)}; \\\r\n+        if (!result) return nullptr;                  \\\r\n+        auto& ref = result->get_type();               \\\r\n+        if constexpr (std::is_lvalue_reference_v<decltype(ref)>) { \\\r\n+            return std::shared_ptr<ret_type>(&ref, [](ret_type*) {}); \\\r\n+        } else { \\\r\n+            return std::make_shared<ret_type>(std::move(ref)); \\\r\n+        } \\\r\n+    }                                                 \\\r\n     void force_semicolon()\r\n \r\n+\r\n+\r\n TMPL_INST(int, ArgValue<int>, getInt<int>);\r\n TMPL_INST(uint64_t, ArgValue<uint64_t>, getInt<uint64_t>);\r\n TMPL_INST(const std::string&, ArgRef<std::string>, get_str);\r\n+TMPL_INST_PTR(const std::string, ArgPtr<const std::string>, get_str);\r\n \r\n bool RPCHelpMan::IsValidNumArgs(size_t num_args) const\r\n {\r\ndiff --git a/src/rpc/util.h b/src/rpc/util.h\r\nindex 0ef019a780..563a619208 100644\r\n--- a/src/rpc/util.h\r\n+++ b/src/rpc/util.h\r\n@@ -18,6 +18,7 @@\r\n #include <util/check.h>\r\n \r\n #include <string>\r\n+#include <type_traits>\r\n #include <variant>\r\n #include <vector>\r\n \r\n@@ -392,6 +393,8 @@ public:\r\n     {\r\n         if constexpr (std::is_integral_v<R>) {\r\n             return ArgValue<R>(i);\r\n+        } else if constexpr (std::is_pointer_v<R>) {\r\n+            return ArgPtr<std::remove_pointer_t<R>>(i);\r\n         } else {\r\n             return ArgRef<R>(i);\r\n         }\r\n@@ -417,6 +420,8 @@ private:\r\n     R ArgValue(size_t i) const;\r\n     template <typename R>\r\n     const R& ArgRef(size_t i) const;\r\n+    template <typename R>\r\n+    std::shared_ptr<R> ArgPtr(size_t i) const;\r\n };\r\n \r\n /**\r\ndiff --git a/src/wallet/rpc/spend.cpp b/src/wallet/rpc/spend.cpp\r\nindex b695d4bed3..420807bf1d 100644\r\n--- a/src/wallet/rpc/spend.cpp\r\n+++ b/src/wallet/rpc/spend.cpp\r\n@@ -271,8 +271,9 @@ RPCHelpMan sendtoaddress()\r\n \r\n     // Wallet comments\r\n     mapValue_t mapValue;\r\n-    if (!request.params[2].isNull() && !request.params[2].get_str().empty())\r\n-        mapValue[\"comment\"] = request.params[2].get_str();\r\n+    if (auto comment{self.Arg<const std::string*>(2)}; comment && !(comment->empty())) {\r\n+        mapValue[\"comment\"] = *comment;\r\n+    }\r\n     if (!request.params[3].isNull() && !request.params[3].get_str().empty())\r\n         mapValue[\"to\"] = request.params[3].get_str();\r\n \r\n\r\n```\r\n</details>\r\n\r\nI'm not married to this approach, and it doesn't need to be added in this PR either. But I think being able to use a consistent interface for `Arg` for all types of parameters would be nice.",
-      "commit_id" : "fa5468dcf0109d11ddaeb4b3591e6e04b4ea6125",
+      "body" : "Big fan of this rewrite, makes it pretty extensible without too much code duplication. Nice!\r\n\r\nBuilding on your new approach, the non-default parameters could potentially be handled with pointers, to avoid unnecessary copy operations. For example, I think these 2 lines: https://github.com/bitcoin/bitcoin/blob/b565485c24c0feacae559a7f6f7b83d7516ca58d/src/wallet/rpc/spend.cpp#L274-L275 \r\n\r\ncan be rewritten as: \r\n```cpp\r\n    if (auto comment{self.Arg<const std::string*>(2)}; comment && !(comment->empty())) {\r\n        mapValue[\"comment\"] = *comment;\r\n    }\r\n```\r\n\r\nNot necessarily shorter, but much more idiomatic imo? I've implemented it like this - can probably be cleaned up quite a bit more:\r\n\r\n<details>\r\n<summary>git diff on fa5468dcf0109d11ddaeb4b3591e6e04b4ea6125</summary>\r\n\r\n```diff\r\ndiff --git a/src/rpc/util.cpp b/src/rpc/util.cpp\r\nindex 0db66ec1b1..1f7bdac609 100644\r\n--- a/src/rpc/util.cpp\r\n+++ b/src/rpc/util.cpp\r\n@@ -636,27 +636,47 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\r\n     return ret;\r\n }\r\n \r\n-static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\r\n+static const UniValue* ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\r\n {\r\n     CHECK_NONFATAL(i < params.size());\r\n     const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\r\n-    if (!arg.isNull()) return arg;\r\n+    if (!arg.isNull()) return &arg;\r\n     const RPCArg::Fallback& fallback{params.at(i).m_fallback};\r\n-    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\r\n-    return std::get<RPCArg::Default>(fallback);\r\n+    if (std::holds_alternative<RPCArg::Default>(fallback)) {\r\n+        return &(std::get<RPCArg::Default>(fallback));\r\n+    }\r\n+    return nullptr;\r\n }\r\n \r\n-#define TMPL_INST(ret_type, get_arg, get_type)            \\\r\n-    template <>                                           \\\r\n-    ret_type RPCHelpMan::get_arg(size_t i) const          \\\r\n-    {                                                     \\\r\n-        return ArgOrDefault(m_args, m_req, i).get_type(); \\\r\n-    }                                                     \\\r\n+#define TMPL_INST(ret_type, get_arg, get_type)        \\\r\n+    template <>                                       \\\r\n+    ret_type RPCHelpMan::get_arg(size_t i) const      \\\r\n+    {                                                 \\\r\n+        return CHECK_NONFATAL(ArgOrDefault(m_args, m_req, i))->get_type(); \\\r\n+    }                                                 \\\r\n+    void force_semicolon()\r\n+\r\n+#define TMPL_INST_PTR(ret_type, get_arg, get_type)    \\\r\n+    template <>                                       \\\r\n+    std::shared_ptr<ret_type> RPCHelpMan::get_arg(size_t i) const \\\r\n+    {                                                 \\\r\n+        auto result {ArgOrDefault(m_args, m_req, i)}; \\\r\n+        if (!result) return nullptr;                  \\\r\n+        auto&& ref = result->get_type();               \\\r\n+        if constexpr (std::is_lvalue_reference_v<decltype(ref)>) { \\\r\n+            return std::shared_ptr<ret_type>(&ref, [](ret_type*) {}); \\\r\n+        } else { \\\r\n+            return std::make_shared<ret_type>(std::move(ref)); \\\r\n+        } \\\r\n+    }                                                 \\\r\n     void force_semicolon()\r\n \r\n+\r\n+\r\n TMPL_INST(int, ArgValue<int>, getInt<int>);\r\n TMPL_INST(uint64_t, ArgValue<uint64_t>, getInt<uint64_t>);\r\n TMPL_INST(const std::string&, ArgRef<std::string>, get_str);\r\n+TMPL_INST_PTR(const std::string, ArgPtr<const std::string>, get_str);\r\n \r\n bool RPCHelpMan::IsValidNumArgs(size_t num_args) const\r\n {\r\ndiff --git a/src/rpc/util.h b/src/rpc/util.h\r\nindex 0ef019a780..563a619208 100644\r\n--- a/src/rpc/util.h\r\n+++ b/src/rpc/util.h\r\n@@ -18,6 +18,7 @@\r\n #include <util/check.h>\r\n \r\n #include <string>\r\n+#include <type_traits>\r\n #include <variant>\r\n #include <vector>\r\n \r\n@@ -392,6 +393,8 @@ public:\r\n     {\r\n         if constexpr (std::is_integral_v<R>) {\r\n             return ArgValue<R>(i);\r\n+        } else if constexpr (std::is_pointer_v<R>) {\r\n+            return ArgPtr<std::remove_pointer_t<R>>(i);\r\n         } else {\r\n             return ArgRef<R>(i);\r\n         }\r\n@@ -417,6 +420,8 @@ private:\r\n     R ArgValue(size_t i) const;\r\n     template <typename R>\r\n     const R& ArgRef(size_t i) const;\r\n+    template <typename R>\r\n+    std::shared_ptr<R> ArgPtr(size_t i) const;\r\n };\r\n \r\n /**\r\ndiff --git a/src/wallet/rpc/spend.cpp b/src/wallet/rpc/spend.cpp\r\nindex b695d4bed3..420807bf1d 100644\r\n--- a/src/wallet/rpc/spend.cpp\r\n+++ b/src/wallet/rpc/spend.cpp\r\n@@ -271,8 +271,9 @@ RPCHelpMan sendtoaddress()\r\n \r\n     // Wallet comments\r\n     mapValue_t mapValue;\r\n-    if (!request.params[2].isNull() && !request.params[2].get_str().empty())\r\n-        mapValue[\"comment\"] = request.params[2].get_str();\r\n+    if (auto comment{self.Arg<const std::string*>(2)}; comment && !(comment->empty())) {\r\n+        mapValue[\"comment\"] = *comment;\r\n+    }\r\n     if (!request.params[3].isNull() && !request.params[3].get_str().empty())\r\n         mapValue[\"to\"] = request.params[3].get_str();\r\n\r\n```\r\n</details>\r\n\r\nI'm not married to this approach, and it doesn't need to be added in this PR either. But I think being able to use a consistent interface for `Arg` for all types of parameters would be nice.",
+      "commit_id" : "fa56ad74160ba3c07a16a661fc14cded6deed9eb",
       "created_at" : "2023-08-08T17:16:48Z",
       "diff_hunk" : "@@ -634,6 +636,21 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\n     return ret;\n }\n \n+static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\n+{\n+    CHECK_NONFATAL(i < params.size());\n+    const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\n+    const RPCArg::Fallback& fallback{params.at(i).m_fallback};\n+    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\n+    return arg.isNull() ? std::get<RPCArg::Default>(fallback) : arg;\n+}\n+\n+template <>\n+int RPCHelpMan::Arg<int>(size_t i) const",
       "html_url" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1287432683",
@@ -1437,7 +1437,7 @@
       "start_line" : null,
       "start_side" : null,
       "subject_type" : "line",
-      "updated_at" : "2023-08-08T17:53:06Z",
+      "updated_at" : "2023-08-09T10:14:33Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1287432683",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/69010457?v=4",
@@ -1846,6 +1846,558 @@
          "subscriptions_url" : "https://api.github.com/users/stickies-v/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/stickies-v"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288266548"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288266548"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "> It is not possible to \"move\" a const reference into a shared_ptr. It will be a copy again.\r\n\r\nSorry, I messed up my git diff a bit, posting a slightly older version, `auto& ref = result->get_type();` has to be `auto&& ref = result->get_type();`  (updated in the above diff now). With that, I think `std::move(ref)` is only called in case of an rvalue, and we use the (from what I understand without copy) `std::shared_ptr` constructor in case of an lvalue ref. I think that avoids unnecessary copies?\r\n\r\n> Or rather, std::optional<number> for stuff that is returned by value and const String* for stuff that is returned by reference?\r\n\r\nThat was my initial idea too, but I thought having a uniform interface (i.e. pointer for everything where it's not guaranteed to get a value) is quite a bit nicer than having to switch between std::optional and pointer depending on how we've implemented UniValue to return the value?  Although I suspect most callsites will just be using the boolean and dereference operators, which are the same for both (ignoring optional's commonly used `.value()` and `.value_or()` operators).\r\n\r\n> Simply using a raw pointer in your approach seems fine, though.\r\n\r\nBut if `get_type()` returns by value, how would we use a raw pointer? Who owns the underlying? That's why I went for `shared_ptr`, but I'm still easily confused by memory management so apologies if I'm being dim.",
+      "commit_id" : "fa56ad74160ba3c07a16a661fc14cded6deed9eb",
+      "created_at" : "2023-08-09T10:16:08Z",
+      "diff_hunk" : "@@ -634,6 +636,21 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\n     return ret;\n }\n \n+static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\n+{\n+    CHECK_NONFATAL(i < params.size());\n+    const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\n+    const RPCArg::Fallback& fallback{params.at(i).m_fallback};\n+    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\n+    return arg.isNull() ? std::get<RPCArg::Default>(fallback) : arg;\n+}\n+\n+template <>\n+int RPCHelpMan::Arg<int>(size_t i) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288266548",
+      "id" : 1288266548,
+      "in_reply_to_id" : 1286256642,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585MyWM0",
+      "original_commit_id" : "fa6b2da57ef7ff125a493c7835cb15935255ff8c",
+      "original_line" : 649,
+      "original_position" : 24,
+      "original_start_line" : null,
+      "path" : "src/rpc/util.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1569218744,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288266548/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-09T10:16:09Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288266548",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/69010457?v=4",
+         "events_url" : "https://api.github.com/users/stickies-v/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/stickies-v/followers",
+         "following_url" : "https://api.github.com/users/stickies-v/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/stickies-v/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/stickies-v",
+         "id" : 69010457,
+         "login" : "stickies-v",
+         "node_id" : "MDQ6VXNlcjY5MDEwNDU3",
+         "organizations_url" : "https://api.github.com/users/stickies-v/orgs",
+         "received_events_url" : "https://api.github.com/users/stickies-v/received_events",
+         "repos_url" : "https://api.github.com/users/stickies-v/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/stickies-v/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/stickies-v/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/stickies-v"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288269938"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288269938"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "> Sorry, I messed up my git diff a bit, posting a slightly older version, `auto& ref = result->get_type();` has to be `auto&& ref = result->get_type();` (updated in the above diff now). With that, I think `std::move(ref)` is only called in case of an rvalue, and we use the (from what I understand without copy) `std::shared_ptr` constructor in case of an lvalue ref. I think that avoids unnecessary copies?\r\n\r\nPretty sure it doesn't, when `get_type()` returns a `const std::string&`, both `auto&` and `auto&&` will just be a `const std::string&` as well. (It is not possible to remove const by using `auto`, `auto&`, or `auto&&`, or `std::move()`)",
+      "commit_id" : "fa56ad74160ba3c07a16a661fc14cded6deed9eb",
+      "created_at" : "2023-08-09T10:19:16Z",
+      "diff_hunk" : "@@ -634,6 +636,21 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\n     return ret;\n }\n \n+static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\n+{\n+    CHECK_NONFATAL(i < params.size());\n+    const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\n+    const RPCArg::Fallback& fallback{params.at(i).m_fallback};\n+    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\n+    return arg.isNull() ? std::get<RPCArg::Default>(fallback) : arg;\n+}\n+\n+template <>\n+int RPCHelpMan::Arg<int>(size_t i) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288269938",
+      "id" : 1288269938,
+      "in_reply_to_id" : 1286256642,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585MyXBy",
+      "original_commit_id" : "fa6b2da57ef7ff125a493c7835cb15935255ff8c",
+      "original_line" : 649,
+      "original_position" : 24,
+      "original_start_line" : null,
+      "path" : "src/rpc/util.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1569223897,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288269938/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-09T10:19:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288269938",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288270672"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288270672"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "> But if `get_type()` returns by value, how would we use a raw pointer? Who owns the underlying? That's why I went for `shared_ptr`, but I'm still easily confused by memory management so apologies if I'm being dim.\r\n\r\n`std::optional` can be used to own optional memory, see my previous reply to the thread and the current version of the code :)",
+      "commit_id" : "fa56ad74160ba3c07a16a661fc14cded6deed9eb",
+      "created_at" : "2023-08-09T10:19:58Z",
+      "diff_hunk" : "@@ -634,6 +636,21 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\n     return ret;\n }\n \n+static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\n+{\n+    CHECK_NONFATAL(i < params.size());\n+    const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\n+    const RPCArg::Fallback& fallback{params.at(i).m_fallback};\n+    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\n+    return arg.isNull() ? std::get<RPCArg::Default>(fallback) : arg;\n+}\n+\n+template <>\n+int RPCHelpMan::Arg<int>(size_t i) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288270672",
+      "id" : 1288270672,
+      "in_reply_to_id" : 1286256642,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585MyXNQ",
+      "original_commit_id" : "fa6b2da57ef7ff125a493c7835cb15935255ff8c",
+      "original_line" : 649,
+      "original_position" : 24,
+      "original_start_line" : null,
+      "path" : "src/rpc/util.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1569225000,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288270672/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-09T10:19:58Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288270672",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288286773"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288286773"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "> Pretty sure it doesn't, when get_type() returns a const std::string&, both auto& and auto&& will just be a const std::string& as well.\r\n\r\nOh yes, I agree. So in that case, `ref` will be ` const std::string&` lvalue, and we'll use `std::shared_ptr<ret_type>(&ref, [](ret_type*) {});` where I don't think any copies happen?\r\n\r\n> `std::optional` can be used to own optional memory\r\n\r\nI know, I was answering your suggestion of using raw pointers instead of shared_ptr. `std::optional` solves the memory management issues, but I was just trying to avoid it to keep the interface consistent (i.e. not use optional for one thing and pointers for another) while avoiding unnecessary copies, which I think is only possible with pointers. ",
+      "commit_id" : "fa56ad74160ba3c07a16a661fc14cded6deed9eb",
+      "created_at" : "2023-08-09T10:35:19Z",
+      "diff_hunk" : "@@ -634,6 +636,21 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\n     return ret;\n }\n \n+static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\n+{\n+    CHECK_NONFATAL(i < params.size());\n+    const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\n+    const RPCArg::Fallback& fallback{params.at(i).m_fallback};\n+    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\n+    return arg.isNull() ? std::get<RPCArg::Default>(fallback) : arg;\n+}\n+\n+template <>\n+int RPCHelpMan::Arg<int>(size_t i) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288286773",
+      "id" : 1288286773,
+      "in_reply_to_id" : 1286256642,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585MybI1",
+      "original_commit_id" : "fa6b2da57ef7ff125a493c7835cb15935255ff8c",
+      "original_line" : 649,
+      "original_position" : 24,
+      "original_start_line" : null,
+      "path" : "src/rpc/util.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1569249677,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288286773/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-09T10:35:20Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288286773",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/69010457?v=4",
+         "events_url" : "https://api.github.com/users/stickies-v/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/stickies-v/followers",
+         "following_url" : "https://api.github.com/users/stickies-v/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/stickies-v/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/stickies-v",
+         "id" : 69010457,
+         "login" : "stickies-v",
+         "node_id" : "MDQ6VXNlcjY5MDEwNDU3",
+         "organizations_url" : "https://api.github.com/users/stickies-v/orgs",
+         "received_events_url" : "https://api.github.com/users/stickies-v/received_events",
+         "repos_url" : "https://api.github.com/users/stickies-v/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/stickies-v/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/stickies-v/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/stickies-v"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288299967"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288299967"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Ok, I see you are only using shared_ptr to wrap a raw pointer without a deleter.\r\n\r\nHappy to switch to that, but I think it may be unintuitive, if sometimes a dev is allowed to keep the shared pointer around after the RPC, and sometimes not.",
+      "commit_id" : "fa56ad74160ba3c07a16a661fc14cded6deed9eb",
+      "created_at" : "2023-08-09T10:48:26Z",
+      "diff_hunk" : "@@ -634,6 +636,21 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\n     return ret;\n }\n \n+static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\n+{\n+    CHECK_NONFATAL(i < params.size());\n+    const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\n+    const RPCArg::Fallback& fallback{params.at(i).m_fallback};\n+    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\n+    return arg.isNull() ? std::get<RPCArg::Default>(fallback) : arg;\n+}\n+\n+template <>\n+int RPCHelpMan::Arg<int>(size_t i) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288299967",
+      "id" : 1288299967,
+      "in_reply_to_id" : 1286256642,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585MyeW_",
+      "original_commit_id" : "fa6b2da57ef7ff125a493c7835cb15935255ff8c",
+      "original_line" : 649,
+      "original_position" : 24,
+      "original_start_line" : null,
+      "path" : "src/rpc/util.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1569269718,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288299967/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-09T10:48:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288299967",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288309113"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288309113"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Enforcing/Documenting the lifetime behavior seems easier to understand with separate types (at least for me)",
+      "commit_id" : "fa56ad74160ba3c07a16a661fc14cded6deed9eb",
+      "created_at" : "2023-08-09T10:57:10Z",
+      "diff_hunk" : "@@ -634,6 +636,21 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\n     return ret;\n }\n \n+static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\n+{\n+    CHECK_NONFATAL(i < params.size());\n+    const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\n+    const RPCArg::Fallback& fallback{params.at(i).m_fallback};\n+    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\n+    return arg.isNull() ? std::get<RPCArg::Default>(fallback) : arg;\n+}\n+\n+template <>\n+int RPCHelpMan::Arg<int>(size_t i) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288309113",
+      "id" : 1288309113,
+      "in_reply_to_id" : 1286256642,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Mygl5",
+      "original_commit_id" : "fa6b2da57ef7ff125a493c7835cb15935255ff8c",
+      "original_line" : 649,
+      "original_position" : 24,
+      "original_start_line" : null,
+      "path" : "src/rpc/util.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1569284155,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288309113/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-09T10:57:11Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288309113",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288338213"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288338213"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "That's a good point. To confirm my understanding: the lifecycles are identical for both the (1) hybrid std::optional/pointer and the (2) uniform pointer approach (i.e. in both cases, reference types can only be used during the RPC call, value types can be used whenever), but for (2) the developer (user) would have to dive into the implementation to figure out what the exact lifecycle is, whereas if we use different types it's obvious from just looking at the return type.\r\n\r\nI'm going to think about it a bit more, but currently I'm leaning towards agreeing that the interface \"inconsistency\"  as per the current implementation then actually becomes a good thing. Thanks.",
+      "commit_id" : "fa56ad74160ba3c07a16a661fc14cded6deed9eb",
+      "created_at" : "2023-08-09T11:24:39Z",
+      "diff_hunk" : "@@ -634,6 +636,21 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\n     return ret;\n }\n \n+static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\n+{\n+    CHECK_NONFATAL(i < params.size());\n+    const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\n+    const RPCArg::Fallback& fallback{params.at(i).m_fallback};\n+    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\n+    return arg.isNull() ? std::get<RPCArg::Default>(fallback) : arg;\n+}\n+\n+template <>\n+int RPCHelpMan::Arg<int>(size_t i) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288338213",
+      "id" : 1288338213,
+      "in_reply_to_id" : 1286256642,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Mynsl",
+      "original_commit_id" : "fa6b2da57ef7ff125a493c7835cb15935255ff8c",
+      "original_line" : 649,
+      "original_position" : 24,
+      "original_start_line" : null,
+      "path" : "src/rpc/util.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1569332626,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288338213/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-09T11:24:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288338213",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/69010457?v=4",
+         "events_url" : "https://api.github.com/users/stickies-v/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/stickies-v/followers",
+         "following_url" : "https://api.github.com/users/stickies-v/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/stickies-v/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/stickies-v",
+         "id" : 69010457,
+         "login" : "stickies-v",
+         "node_id" : "MDQ6VXNlcjY5MDEwNDU3",
+         "organizations_url" : "https://api.github.com/users/stickies-v/orgs",
+         "received_events_url" : "https://api.github.com/users/stickies-v/received_events",
+         "repos_url" : "https://api.github.com/users/stickies-v/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/stickies-v/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/stickies-v/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/stickies-v"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288355467"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288355467"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I could also imagine a third alternative (3) std::shared_ptr/raw pointer, so that everything is a pointer, but there are still different types for each lifetime. (Basically only replacing std::optional in the current approach with std::shared_ptr)\r\n\r\nBut this also may be more confusing than it helping.",
+      "commit_id" : "fa56ad74160ba3c07a16a661fc14cded6deed9eb",
+      "created_at" : "2023-08-09T11:42:06Z",
+      "diff_hunk" : "@@ -634,6 +636,21 @@ UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const\n     return ret;\n }\n \n+static const UniValue& ArgOrDefault(const std::vector<RPCArg>& params, const JSONRPCRequest* req, size_t i)\n+{\n+    CHECK_NONFATAL(i < params.size());\n+    const UniValue& arg{CHECK_NONFATAL(req)->params[i]};\n+    const RPCArg::Fallback& fallback{params.at(i).m_fallback};\n+    CHECK_NONFATAL(std::holds_alternative<RPCArg::Default>(fallback));\n+    return arg.isNull() ? std::get<RPCArg::Default>(fallback) : arg;\n+}\n+\n+template <>\n+int RPCHelpMan::Arg<int>(size_t i) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28230#discussion_r1288355467",
+      "id" : 1288355467,
+      "in_reply_to_id" : 1286256642,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Myr6L",
+      "original_commit_id" : "fa6b2da57ef7ff125a493c7835cb15935255ff8c",
+      "original_line" : 649,
+      "original_position" : 24,
+      "original_start_line" : null,
+      "path" : "src/rpc/util.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1569360454,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28230",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288355467/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-09T11:42:07Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1288355467",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/MarcoFalke/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/MarcoFalke/followers",
+         "following_url" : "https://api.github.com/users/MarcoFalke/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/MarcoFalke/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/MarcoFalke",
+         "id" : 6399679,
+         "login" : "MarcoFalke",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/MarcoFalke/orgs",
+         "received_events_url" : "https://api.github.com/users/MarcoFalke/received_events",
+         "repos_url" : "https://api.github.com/users/MarcoFalke/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/MarcoFalke/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/MarcoFalke/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/MarcoFalke"
       }
    }
 ]
