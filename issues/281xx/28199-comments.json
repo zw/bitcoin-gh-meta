@@ -2612,5 +2612,74 @@
          "type" : "User",
          "url" : "https://api.github.com/users/ajtowns"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28199#discussion_r1291012828"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28199"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1291012828"
+         }
+      },
+      "author_association" : "NONE",
+      "body" : "Release ",
+      "commit_id" : "abe8536192c9f2cd6ba9d0e083f23dec4d20841f",
+      "created_at" : "2023-08-11T07:49:03Z",
+      "diff_hunk" : "@@ -0,0 +1,424 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2023 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+import time\n+\n+from test_framework.messages import (\n+    CInv,\n+    MSG_TX,\n+    MSG_WITNESS_TX,\n+    MSG_WTX,\n+    msg_getdata,\n+    msg_inv,\n+    msg_notfound,\n+    msg_tx,\n+    tx_from_hex,\n+)\n+from test_framework.p2p import (\n+    GETDATA_TX_INTERVAL,\n+    NONPREF_PEER_TX_DELAY,\n+    OVERLOADED_PEER_TX_DELAY,\n+    p2p_lock,\n+    P2PTxInvStore,\n+    TXID_RELAY_DELAY,\n+)\n+from test_framework.util import (\n+    assert_equal,\n+)\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.wallet import (\n+    MiniWallet,\n+    MiniWalletMode,\n+)\n+\n+# Time to fastforward (using setmocktime) before waiting for the node to send getdata(tx) in response\n+# to an inv(tx), in seconds. This delay includes all possible delays + 1, so it should only be used\n+# when the value of the delay is not interesting. If we want to test that the node waits x seconds\n+# for one peer and y seconds for another, use specific values instead.\n+TXREQUEST_TIME_SKIP = NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY + OVERLOADED_PEER_TX_DELAY + 1\n+\n+def cleanup(func):\n+    # Time to fastfoward (using setmocktime) in between subtests to ensure they do not interfere with\n+    # one another, in seconds. Equal to 12 hours, which is enough to expire anything that may exist\n+    # (though nothing should since state should be cleared) in p2p data structures.\n+    LONG_TIME_SKIP = 12 * 60 * 60\n+\n+    def wrapper(self):\n+        try:\n+            func(self)\n+        finally:\n+            # Clear mempool\n+            self.generate(self.nodes[0], 1)\n+            self.nodes[0].disconnect_p2ps()\n+            self.mocktime += LONG_TIME_SKIP\n+            self.nodes[0].setmocktime(self.mocktime)\n+    return wrapper\n+\n+class PeerTxRelayer(P2PTxInvStore):\n+    \"\"\"A P2PTxInvStore that also remembers all of the getdata and tx messages it receives.\"\"\"\n+    def __init__(self):\n+        super().__init__()\n+        self._tx_received = []\n+        self._getdata_received = []\n+\n+    @property\n+    def tx_received(self):\n+        with p2p_lock:\n+            return self._tx_received\n+\n+    @property\n+    def getdata_received(self):\n+        with p2p_lock:\n+            return self._getdata_received\n+\n+    def on_tx(self, message):\n+        self._tx_received.append(message)\n+\n+    def on_getdata(self, message):\n+        self._getdata_received.append(message)\n+\n+    def wait_for_parent_requests(self, txids):\n+        \"\"\"Wait for requests for missing parents by txid with witness data (MSG_WITNESS_TX or\n+        WitnessTx). Requires that the getdata message match these txids exactly; all txids must be\n+        requested and no additional requests are allowed.\"\"\"\n+        def test_function():\n+            last_getdata = self.last_message.get('getdata')\n+            if not last_getdata:\n+                return False\n+            return len(last_getdata.inv) == len(txids) and all([item.type == MSG_WITNESS_TX and item.hash in txids for item in last_getdata.inv])\n+        self.wait_until(test_function, timeout=10)\n+\n+    def assert_no_immediate_response(self, message):\n+        \"\"\"Check that the node does not immediately respond to this message with any of getdata,\n+        inv, tx. The node may respond later.\n+        \"\"\"\n+        prev_lastmessage = self.last_message\n+        self.send_and_ping(message)\n+        after_lastmessage = self.last_message\n+        for msgtype in [\"getdata\", \"inv\", \"tx\"]:\n+            if msgtype not in prev_lastmessage:\n+                assert msgtype not in after_lastmessage\n+            else:\n+                assert_equal(prev_lastmessage[msgtype], after_lastmessage[msgtype])\n+\n+    def assert_never_requested(self, txhash):\n+        \"\"\"Check that the node has never sent us a getdata for this hash (int type)\"\"\"\n+        for getdata in self.getdata_received:\n+            for request in getdata.inv:\n+                assert request.hash != txhash\n+\n+class OrphanHandlingTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.extra_args = [[]]\n+        self.mocktime = int(time.time())\n+\n+    def create_parent_and_child(self):\n+        \"\"\"Create package with 1 parent and 1 child, normal fees (no cpfp).\"\"\"\n+        parent = self.wallet.create_self_transfer()\n+        child = self.wallet.create_self_transfer(utxo_to_spend=parent['new_utxo'])\n+        return child[\"tx\"].getwtxid(), child[\"tx\"], parent[\"tx\"]\n+\n+    def fastforward(self, seconds):\n+        \"\"\"Convenience helper function to fast-forward, so we don't need to keep track of the\n+        starting time when we call setmocktime.\"\"\"\n+        self.mocktime += seconds\n+        self.nodes[0].setmocktime(self.mocktime)\n+\n+    def relay_transaction(self, peer, tx):\n+        \"\"\"Relay transaction using MSG_WTX\"\"\"\n+        wtxid = int(tx.getwtxid(), 16)\n+        peer.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=wtxid)]))\n+        self.fastforward(TXREQUEST_TIME_SKIP)\n+        peer.wait_for_getdata([wtxid])\n+        peer.send_and_ping(msg_tx(tx))\n+\n+    @cleanup\n+    def test_arrival_timing_orphan(self):\n+        self.log.info(\"Test missing parents that arrive during delay are not requested\")\n+        node = self.nodes[0]\n+        tx_parent_arrives = self.wallet.create_self_transfer()\n+        tx_parent_doesnt_arrive = self.wallet.create_self_transfer()\n+        # Fake orphan spends nonexistent outputs of the two parents\n+        tx_fake_orphan = self.wallet.create_self_transfer_multi(utxos_to_spend=[\n+            {\"txid\": tx_parent_doesnt_arrive[\"txid\"], \"vout\": 10, \"value\": tx_parent_doesnt_arrive[\"new_utxo\"][\"value\"]},\n+            {\"txid\": tx_parent_arrives[\"txid\"], \"vout\": 10, \"value\": tx_parent_arrives[\"new_utxo\"][\"value\"]}\n+        ])\n+\n+        peer_spy = node.add_p2p_connection(PeerTxRelayer())\n+        peer_normal = node.add_p2p_connection(PeerTxRelayer())\n+        # This transaction is an orphan because it is missing inputs.\n+        # The node should not immediately respond with a request for orphan parents.\n+        # Also, no request should be sent later because it will be resolved by\n+        # the time the request is scheduled to be sent.\n+        peer_spy.assert_no_immediate_response(msg_tx(tx_fake_orphan[\"tx\"]))\n+\n+        # Node receives transaction. It attempts to obfuscate the exact timing at which this\n+        # transaction entered its mempool. Send unsolicited because otherwise we need to wait for\n+        # request delays.\n+        peer_normal.send_and_ping(msg_tx(tx_parent_arrives[\"tx\"]))",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28199#discussion_r1291012828",
+      "id" : 1291012828,
+      "in_reply_to_id" : 1283241941,
+      "line" : 161,
+      "node_id" : "PRRC_kwDOABII585M80rc",
+      "original_commit_id" : "abe8536192c9f2cd6ba9d0e083f23dec4d20841f",
+      "original_line" : 161,
+      "original_position" : 161,
+      "original_start_line" : null,
+      "path" : "test/functional/p2p_orphan_handling.py",
+      "position" : 161,
+      "pull_request_review_id" : 1573171643,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28199",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1291012828/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-11T07:49:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1291012828",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/108148678?v=4",
+         "events_url" : "https://api.github.com/users/Jones098/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Jones098/followers",
+         "following_url" : "https://api.github.com/users/Jones098/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Jones098/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Jones098",
+         "id" : 108148678,
+         "login" : "Jones098",
+         "node_id" : "U_kgDOBnI3xg",
+         "organizations_url" : "https://api.github.com/users/Jones098/orgs",
+         "received_events_url" : "https://api.github.com/users/Jones098/received_events",
+         "repos_url" : "https://api.github.com/users/Jones098/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Jones098/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Jones098/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Jones098"
+      }
    }
 ]
