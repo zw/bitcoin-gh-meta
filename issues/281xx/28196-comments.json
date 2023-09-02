@@ -6800,5 +6800,690 @@
          "type" : "User",
          "url" : "https://api.github.com/users/sipa"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313686515"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313686515"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: as `m_recv_buffer` has exactly the size of an ellswift pubkey at this point (ensured by the if a few lines above), the `.first` call isn't needed:\r\n```suggestion\r\n        EllSwiftPubKey ellswift(MakeByteSpan(m_recv_buffer));\r\n```\r\n",
+      "commit_id" : "59f1dd13958ab76ff9ea34a47b60bb73f336c81e",
+      "created_at" : "2023-09-02T02:05:55Z",
+      "diff_hunk" : "@@ -912,6 +912,420 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept\n     return m_message_to_send.GetMemoryUsage();\n }\n \n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in) noexcept :\n+    m_cipher{}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in, const CKey& key, Span<const std::byte> ent32) noexcept :\n+    m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+void V2Transport::SetReceiveState(RecvState recv_state) noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    // No-op if no change is desired.\n+    if (recv_state == m_recv_state) return;\n+    // Enforce allowed state transitions.\n+    switch (recv_state) {\n+    case RecvState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case RecvState::GARB_GARBTERM:\n+        Assume(m_recv_state == RecvState::KEY);\n+        break;\n+    case RecvState::GARBAUTH:\n+        Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+        break;\n+    case RecvState::VERSION:\n+        Assume(m_recv_state == RecvState::GARBAUTH);\n+        break;\n+    case RecvState::APP:\n+        Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::APP_READY);\n+        break;\n+    case RecvState::APP_READY:\n+        Assume(m_recv_state == RecvState::APP);\n+        break;\n+    }\n+    // Change state.\n+    m_recv_state = recv_state;\n+}\n+\n+void V2Transport::SetSendState(SendState send_state) noexcept\n+{\n+    AssertLockHeld(m_send_mutex);\n+    // No-op if no change is desired.\n+    if (send_state == m_send_state) return;\n+    // Enforce allowed state transitions.\n+    switch (send_state) {\n+    case SendState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case SendState::KEY_GARBTERM_GARBAUTH_VERSION:\n+        Assume(m_send_state == SendState::KEY);\n+        break;\n+    case SendState::APP_READY:\n+        Assume(m_send_state == SendState::KEY_GARBTERM_GARBAUTH_VERSION ||\n+               m_send_state == SendState::APP);\n+        break;\n+    case SendState::APP:\n+        Assume(m_send_state == SendState::APP_READY);\n+        break;\n+    }\n+    // Change state.\n+    m_send_state = send_state;\n+}\n+\n+bool V2Transport::ReceivedMessageComplete() const noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    return m_recv_state == RecvState::APP_READY;\n+}\n+\n+size_t V2Transport::GetMaxBytesToProcess() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    switch (m_recv_state) {\n+    case RecvState::KEY:\n+        // During the KEY state, we only allow the 64-byte key into the receive buffer.\n+        Assume(m_recv_buffer.size() <= EllSwiftPubKey::size());\n+        // As long as we have not received the other side's public key, don't receive more than\n+        // that (64 bytes), as garbage follows, and locating the garbage terminator requires the\n+        // key exchange first.\n+        return EllSwiftPubKey::size() - m_recv_buffer.size();\n+    case RecvState::GARB_GARBTERM:\n+        // Process garbage bytes one by one (because terminator may appear anywhere).\n+        return 1;\n+    case RecvState::GARBAUTH:\n+    case RecvState::VERSION:\n+    case RecvState::APP:\n+        // These three states all involve decoding a packet. Process the length descriptor first,\n+        // followed by the ciphertext.\n+        if (m_recv_buffer.size() < BIP324Cipher::LENGTH_LEN) {\n+            return BIP324Cipher::LENGTH_LEN - m_recv_buffer.size();\n+        } else {\n+            // Note that BIP324Cipher::EXPANSION is the total difference between contents size\n+            // and encoded packet size, which includes the 3 bytes due to the packet length.\n+            // When transitioning from receiving the packet length to receiving its ciphertext,\n+            // the encrypted packet length is left in the receive buffer.\n+            return BIP324Cipher::EXPANSION + m_recv_len - m_recv_buffer.size();\n+        }\n+    case RecvState::APP_READY:\n+        // No bytes can be processed until GetMessage() is called.\n+        return 0;\n+    }\n+    Assume(false); // unreachable\n+    return 0;\n+}\n+\n+void V2Transport::ProcessReceivedKey() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    AssertLockNotHeld(m_send_mutex);\n+    Assume(m_recv_state == RecvState::KEY);\n+    if (m_recv_buffer.size() == EllSwiftPubKey::size()) {\n+        // Other side's key has been fully received.\n+\n+        // Initialize the ciphers.\n+        EllSwiftPubKey ellswift(MakeByteSpan(m_recv_buffer).first(EllSwiftPubKey::size()));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313686515",
+      "id" : 1313686515,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585OTUPz",
+      "original_commit_id" : "ab9d292e3fa61824870bfcd31b0fb6f649eafa2d",
+      "original_line" : 1046,
+      "original_position" : 135,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1607831626,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313686515/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-02T02:41:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313686515",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/91535?v=4",
+         "events_url" : "https://api.github.com/users/theStack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theStack/followers",
+         "following_url" : "https://api.github.com/users/theStack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theStack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theStack",
+         "id" : 91535,
+         "login" : "theStack",
+         "node_id" : "MDQ6VXNlcjkxNTM1",
+         "organizations_url" : "https://api.github.com/users/theStack/orgs",
+         "received_events_url" : "https://api.github.com/users/theStack/received_events",
+         "repos_url" : "https://api.github.com/users/theStack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theStack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theStack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theStack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313686655"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313686655"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "~nit:~\r\n```suggestion\r\n        RandAddEvent(ReadLE32(m_recv_buffer.end() - 4));\r\n```\r\n(EDIT: oh nevermind, end() returns an iterator, not a pointer, so this won't work.)",
+      "commit_id" : "59f1dd13958ab76ff9ea34a47b60bb73f336c81e",
+      "created_at" : "2023-09-02T02:06:48Z",
+      "diff_hunk" : "@@ -912,6 +912,420 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept\n     return m_message_to_send.GetMemoryUsage();\n }\n \n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in) noexcept :\n+    m_cipher{}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in, const CKey& key, Span<const std::byte> ent32) noexcept :\n+    m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+void V2Transport::SetReceiveState(RecvState recv_state) noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    // No-op if no change is desired.\n+    if (recv_state == m_recv_state) return;\n+    // Enforce allowed state transitions.\n+    switch (recv_state) {\n+    case RecvState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case RecvState::GARB_GARBTERM:\n+        Assume(m_recv_state == RecvState::KEY);\n+        break;\n+    case RecvState::GARBAUTH:\n+        Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+        break;\n+    case RecvState::VERSION:\n+        Assume(m_recv_state == RecvState::GARBAUTH);\n+        break;\n+    case RecvState::APP:\n+        Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::APP_READY);\n+        break;\n+    case RecvState::APP_READY:\n+        Assume(m_recv_state == RecvState::APP);\n+        break;\n+    }\n+    // Change state.\n+    m_recv_state = recv_state;\n+}\n+\n+void V2Transport::SetSendState(SendState send_state) noexcept\n+{\n+    AssertLockHeld(m_send_mutex);\n+    // No-op if no change is desired.\n+    if (send_state == m_send_state) return;\n+    // Enforce allowed state transitions.\n+    switch (send_state) {\n+    case SendState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case SendState::KEY_GARBTERM_GARBAUTH_VERSION:\n+        Assume(m_send_state == SendState::KEY);\n+        break;\n+    case SendState::APP_READY:\n+        Assume(m_send_state == SendState::KEY_GARBTERM_GARBAUTH_VERSION ||\n+               m_send_state == SendState::APP);\n+        break;\n+    case SendState::APP:\n+        Assume(m_send_state == SendState::APP_READY);\n+        break;\n+    }\n+    // Change state.\n+    m_send_state = send_state;\n+}\n+\n+bool V2Transport::ReceivedMessageComplete() const noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    return m_recv_state == RecvState::APP_READY;\n+}\n+\n+size_t V2Transport::GetMaxBytesToProcess() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    switch (m_recv_state) {\n+    case RecvState::KEY:\n+        // During the KEY state, we only allow the 64-byte key into the receive buffer.\n+        Assume(m_recv_buffer.size() <= EllSwiftPubKey::size());\n+        // As long as we have not received the other side's public key, don't receive more than\n+        // that (64 bytes), as garbage follows, and locating the garbage terminator requires the\n+        // key exchange first.\n+        return EllSwiftPubKey::size() - m_recv_buffer.size();\n+    case RecvState::GARB_GARBTERM:\n+        // Process garbage bytes one by one (because terminator may appear anywhere).\n+        return 1;\n+    case RecvState::GARBAUTH:\n+    case RecvState::VERSION:\n+    case RecvState::APP:\n+        // These three states all involve decoding a packet. Process the length descriptor first,\n+        // followed by the ciphertext.\n+        if (m_recv_buffer.size() < BIP324Cipher::LENGTH_LEN) {\n+            return BIP324Cipher::LENGTH_LEN - m_recv_buffer.size();\n+        } else {\n+            // Note that BIP324Cipher::EXPANSION is the total difference between contents size\n+            // and encoded packet size, which includes the 3 bytes due to the packet length.\n+            // When transitioning from receiving the packet length to receiving its ciphertext,\n+            // the encrypted packet length is left in the receive buffer.\n+            return BIP324Cipher::EXPANSION + m_recv_len - m_recv_buffer.size();\n+        }\n+    case RecvState::APP_READY:\n+        // No bytes can be processed until GetMessage() is called.\n+        return 0;\n+    }\n+    Assume(false); // unreachable\n+    return 0;\n+}\n+\n+void V2Transport::ProcessReceivedKey() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    AssertLockNotHeld(m_send_mutex);\n+    Assume(m_recv_state == RecvState::KEY);\n+    if (m_recv_buffer.size() == EllSwiftPubKey::size()) {\n+        // Other side's key has been fully received.\n+\n+        // Initialize the ciphers.\n+        EllSwiftPubKey ellswift(MakeByteSpan(m_recv_buffer).first(EllSwiftPubKey::size()));\n+        LOCK(m_send_mutex);\n+        m_cipher.Initialize(ellswift, m_initiating);\n+\n+        // Switch receiver state to GARB_GARBTERM.\n+        SetReceiveState(RecvState::GARB_GARBTERM);\n+        m_recv_buffer.clear();\n+\n+        // Switch sender state to KEY_GARBTERM_GARBAUTH_VERSION.\n+        SetSendState(SendState::KEY_GARBTERM_GARBAUTH_VERSION);\n+        // Append the garbage terminator to the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+        std::copy(m_cipher.GetSendGarbageTerminator().begin(),\n+                  m_cipher.GetSendGarbageTerminator().end(),\n+                  MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::GARBAGE_TERMINATOR_LEN).begin());\n+        // Construct garbage authentication packet in the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION);\n+        m_cipher.Encrypt(\n+            {},\n+            {}, /* empty garbage for now */\n+            false,\n+            MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION));\n+        // Construct version packet in the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION + VERSION_CONTENTS.size());\n+        m_cipher.Encrypt(\n+            VERSION_CONTENTS,\n+            {},\n+            false,\n+            MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION + VERSION_CONTENTS.size()));\n+    }\n+}\n+\n+bool V2Transport::ProcessReceivedGarbage() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+    Assume(m_recv_buffer.size() <= MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+    if (m_recv_buffer.size() >= BIP324Cipher::GARBAGE_TERMINATOR_LEN) {\n+        if (MakeByteSpan(m_recv_buffer).last(BIP324Cipher::GARBAGE_TERMINATOR_LEN) == m_cipher.GetReceiveGarbageTerminator()) {\n+            // Garbage terminator received. Switch to receiving garbage authentication packet.\n+            m_recv_garbage = std::move(m_recv_buffer);\n+            m_recv_garbage.resize(m_recv_garbage.size() - BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+            m_recv_buffer.clear();\n+            SetReceiveState(RecvState::GARBAUTH);\n+        } else if (m_recv_buffer.size() == MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN) {\n+            // We've reached the maximum length for garbage + garbage terminator, and the\n+            // terminator still does not match. Abort.\n+            LogPrint(BCLog::NET, \"V2 transport error: missing garbage terminator, peer=%d\\n\", m_nodeid);\n+            return false;\n+        }\n+    }\n+    return true;\n+}\n+\n+bool V2Transport::ProcessReceivedPacket() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    Assume(m_recv_state == RecvState::GARBAUTH || m_recv_state == RecvState::VERSION ||\n+           m_recv_state == RecvState::APP);\n+\n+    // The maximum permitted contents length for a packet.\n+    static constexpr size_t MAX_CONTENTS_LEN =\n+        1 + CMessageHeader::COMMAND_SIZE + // The maximum length for encoding the message type.\n+        std::min<size_t>(MAX_SIZE, MAX_PROTOCOL_MESSAGE_LENGTH); // The maximum payload.\n+\n+    if (m_recv_buffer.size() == BIP324Cipher::LENGTH_LEN) {\n+        // Length descriptor received.\n+        m_recv_len = m_cipher.DecryptLength(MakeByteSpan(m_recv_buffer));\n+        if (m_recv_len > MAX_CONTENTS_LEN) {\n+            LogPrint(BCLog::NET, \"V2 transport error: packet too large (%u bytes), peer=%d\\n\", m_recv_len, m_nodeid);\n+            return false;\n+        }\n+    } else if (m_recv_buffer.size() > BIP324Cipher::LENGTH_LEN && m_recv_buffer.size() == m_recv_len + BIP324Cipher::EXPANSION) {\n+        // Ciphertext received, decrypt it into m_recv_decode_buffer.\n+        // Note that it is impossible to reach this branch without hitting the branch above first,\n+        // as GetMaxBytesToProcess only allows up to LENGTH_LEN into the buffer before that point.\n+        m_recv_decode_buffer.resize(m_recv_len);\n+        bool ignore{false};\n+        Span<const std::byte> aad;\n+        if (m_recv_state == RecvState::GARBAUTH) aad = MakeByteSpan(m_recv_garbage);\n+        bool ret = m_cipher.Decrypt(\n+            MakeByteSpan(m_recv_buffer).subspan(BIP324Cipher::LENGTH_LEN),\n+            aad,\n+            ignore,\n+            MakeWritableByteSpan(m_recv_decode_buffer));\n+        if (!ret) {\n+            LogPrint(BCLog::NET, \"V2 transport error: packet decryption failure (%u bytes), peer=%d\\n\", m_recv_len, m_nodeid);\n+            return false;\n+        }\n+        // Feed the last 4 bytes of the Poly1305 authentication tag (and its timing) into our RNG.\n+        RandAddEvent(ReadLE32(m_recv_buffer.data() + m_recv_buffer.size() - 4));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313686655",
+      "id" : 1313686655,
+      "line" : 1266,
+      "node_id" : "PRRC_kwDOABII585OTUR_",
+      "original_commit_id" : "ab9d292e3fa61824870bfcd31b0fb6f649eafa2d",
+      "original_line" : 1266,
+      "original_position" : 225,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 383,
+      "pull_request_review_id" : 1607831626,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313686655/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-02T03:02:42Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313686655",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/91535?v=4",
+         "events_url" : "https://api.github.com/users/theStack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theStack/followers",
+         "following_url" : "https://api.github.com/users/theStack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theStack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theStack",
+         "id" : 91535,
+         "login" : "theStack",
+         "node_id" : "MDQ6VXNlcjkxNTM1",
+         "organizations_url" : "https://api.github.com/users/theStack/orgs",
+         "received_events_url" : "https://api.github.com/users/theStack/received_events",
+         "repos_url" : "https://api.github.com/users/theStack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theStack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theStack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theStack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313692208"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313692208"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Should the size of the 3-byte length descriptor also be added here? (at least that would come close to what happens for v1, where HEADER_SIZE is accounted for).",
+      "commit_id" : "59f1dd13958ab76ff9ea34a47b60bb73f336c81e",
+      "created_at" : "2023-09-02T02:19:55Z",
+      "diff_hunk" : "@@ -912,6 +912,420 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept\n     return m_message_to_send.GetMemoryUsage();\n }\n \n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in) noexcept :\n+    m_cipher{}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in, const CKey& key, Span<const std::byte> ent32) noexcept :\n+    m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+void V2Transport::SetReceiveState(RecvState recv_state) noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    // No-op if no change is desired.\n+    if (recv_state == m_recv_state) return;\n+    // Enforce allowed state transitions.\n+    switch (recv_state) {\n+    case RecvState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case RecvState::GARB_GARBTERM:\n+        Assume(m_recv_state == RecvState::KEY);\n+        break;\n+    case RecvState::GARBAUTH:\n+        Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+        break;\n+    case RecvState::VERSION:\n+        Assume(m_recv_state == RecvState::GARBAUTH);\n+        break;\n+    case RecvState::APP:\n+        Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::APP_READY);\n+        break;\n+    case RecvState::APP_READY:\n+        Assume(m_recv_state == RecvState::APP);\n+        break;\n+    }\n+    // Change state.\n+    m_recv_state = recv_state;\n+}\n+\n+void V2Transport::SetSendState(SendState send_state) noexcept\n+{\n+    AssertLockHeld(m_send_mutex);\n+    // No-op if no change is desired.\n+    if (send_state == m_send_state) return;\n+    // Enforce allowed state transitions.\n+    switch (send_state) {\n+    case SendState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case SendState::KEY_GARBTERM_GARBAUTH_VERSION:\n+        Assume(m_send_state == SendState::KEY);\n+        break;\n+    case SendState::APP_READY:\n+        Assume(m_send_state == SendState::KEY_GARBTERM_GARBAUTH_VERSION ||\n+               m_send_state == SendState::APP);\n+        break;\n+    case SendState::APP:\n+        Assume(m_send_state == SendState::APP_READY);\n+        break;\n+    }\n+    // Change state.\n+    m_send_state = send_state;\n+}\n+\n+bool V2Transport::ReceivedMessageComplete() const noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    return m_recv_state == RecvState::APP_READY;\n+}\n+\n+size_t V2Transport::GetMaxBytesToProcess() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    switch (m_recv_state) {\n+    case RecvState::KEY:\n+        // During the KEY state, we only allow the 64-byte key into the receive buffer.\n+        Assume(m_recv_buffer.size() <= EllSwiftPubKey::size());\n+        // As long as we have not received the other side's public key, don't receive more than\n+        // that (64 bytes), as garbage follows, and locating the garbage terminator requires the\n+        // key exchange first.\n+        return EllSwiftPubKey::size() - m_recv_buffer.size();\n+    case RecvState::GARB_GARBTERM:\n+        // Process garbage bytes one by one (because terminator may appear anywhere).\n+        return 1;\n+    case RecvState::GARBAUTH:\n+    case RecvState::VERSION:\n+    case RecvState::APP:\n+        // These three states all involve decoding a packet. Process the length descriptor first,\n+        // followed by the ciphertext.\n+        if (m_recv_buffer.size() < BIP324Cipher::LENGTH_LEN) {\n+            return BIP324Cipher::LENGTH_LEN - m_recv_buffer.size();\n+        } else {\n+            // Note that BIP324Cipher::EXPANSION is the total difference between contents size\n+            // and encoded packet size, which includes the 3 bytes due to the packet length.\n+            // When transitioning from receiving the packet length to receiving its ciphertext,\n+            // the encrypted packet length is left in the receive buffer.\n+            return BIP324Cipher::EXPANSION + m_recv_len - m_recv_buffer.size();\n+        }\n+    case RecvState::APP_READY:\n+        // No bytes can be processed until GetMessage() is called.\n+        return 0;\n+    }\n+    Assume(false); // unreachable\n+    return 0;\n+}\n+\n+void V2Transport::ProcessReceivedKey() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    AssertLockNotHeld(m_send_mutex);\n+    Assume(m_recv_state == RecvState::KEY);\n+    if (m_recv_buffer.size() == EllSwiftPubKey::size()) {\n+        // Other side's key has been fully received.\n+\n+        // Initialize the ciphers.\n+        EllSwiftPubKey ellswift(MakeByteSpan(m_recv_buffer).first(EllSwiftPubKey::size()));\n+        LOCK(m_send_mutex);\n+        m_cipher.Initialize(ellswift, m_initiating);\n+\n+        // Switch receiver state to GARB_GARBTERM.\n+        SetReceiveState(RecvState::GARB_GARBTERM);\n+        m_recv_buffer.clear();\n+\n+        // Switch sender state to KEY_GARBTERM_GARBAUTH_VERSION.\n+        SetSendState(SendState::KEY_GARBTERM_GARBAUTH_VERSION);\n+        // Append the garbage terminator to the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+        std::copy(m_cipher.GetSendGarbageTerminator().begin(),\n+                  m_cipher.GetSendGarbageTerminator().end(),\n+                  MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::GARBAGE_TERMINATOR_LEN).begin());\n+        // Construct garbage authentication packet in the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION);\n+        m_cipher.Encrypt(\n+            {},\n+            {}, /* empty garbage for now */\n+            false,\n+            MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION));\n+        // Construct version packet in the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION + VERSION_CONTENTS.size());\n+        m_cipher.Encrypt(\n+            VERSION_CONTENTS,\n+            {},\n+            false,\n+            MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION + VERSION_CONTENTS.size()));\n+    }\n+}\n+\n+bool V2Transport::ProcessReceivedGarbage() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+    Assume(m_recv_buffer.size() <= MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+    if (m_recv_buffer.size() >= BIP324Cipher::GARBAGE_TERMINATOR_LEN) {\n+        if (MakeByteSpan(m_recv_buffer).last(BIP324Cipher::GARBAGE_TERMINATOR_LEN) == m_cipher.GetReceiveGarbageTerminator()) {\n+            // Garbage terminator received. Switch to receiving garbage authentication packet.\n+            m_recv_garbage = std::move(m_recv_buffer);\n+            m_recv_garbage.resize(m_recv_garbage.size() - BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+            m_recv_buffer.clear();\n+            SetReceiveState(RecvState::GARBAUTH);\n+        } else if (m_recv_buffer.size() == MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN) {\n+            // We've reached the maximum length for garbage + garbage terminator, and the\n+            // terminator still does not match. Abort.\n+            LogPrint(BCLog::NET, \"V2 transport error: missing garbage terminator, peer=%d\\n\", m_nodeid);\n+            return false;\n+        }\n+    }\n+    return true;\n+}\n+\n+bool V2Transport::ProcessReceivedPacket() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    Assume(m_recv_state == RecvState::GARBAUTH || m_recv_state == RecvState::VERSION ||\n+           m_recv_state == RecvState::APP);\n+\n+    // The maximum permitted contents length for a packet.\n+    static constexpr size_t MAX_CONTENTS_LEN =\n+        1 + CMessageHeader::COMMAND_SIZE + // The maximum length for encoding the message type.\n+        std::min<size_t>(MAX_SIZE, MAX_PROTOCOL_MESSAGE_LENGTH); // The maximum payload.\n+\n+    if (m_recv_buffer.size() == BIP324Cipher::LENGTH_LEN) {\n+        // Length descriptor received.\n+        m_recv_len = m_cipher.DecryptLength(MakeByteSpan(m_recv_buffer));\n+        if (m_recv_len > MAX_CONTENTS_LEN) {\n+            LogPrint(BCLog::NET, \"V2 transport error: packet too large (%u bytes), peer=%d\\n\", m_recv_len, m_nodeid);\n+            return false;\n+        }\n+    } else if (m_recv_buffer.size() > BIP324Cipher::LENGTH_LEN && m_recv_buffer.size() == m_recv_len + BIP324Cipher::EXPANSION) {\n+        // Ciphertext received, decrypt it into m_recv_decode_buffer.\n+        // Note that it is impossible to reach this branch without hitting the branch above first,\n+        // as GetMaxBytesToProcess only allows up to LENGTH_LEN into the buffer before that point.\n+        m_recv_decode_buffer.resize(m_recv_len);\n+        bool ignore{false};\n+        Span<const std::byte> aad;\n+        if (m_recv_state == RecvState::GARBAUTH) aad = MakeByteSpan(m_recv_garbage);\n+        bool ret = m_cipher.Decrypt(\n+            MakeByteSpan(m_recv_buffer).subspan(BIP324Cipher::LENGTH_LEN),\n+            aad,\n+            ignore,\n+            MakeWritableByteSpan(m_recv_decode_buffer));\n+        if (!ret) {\n+            LogPrint(BCLog::NET, \"V2 transport error: packet decryption failure (%u bytes), peer=%d\\n\", m_recv_len, m_nodeid);\n+            return false;\n+        }\n+        // Feed the last 4 bytes of the Poly1305 authentication tag (and its timing) into our RNG.\n+        RandAddEvent(ReadLE32(m_recv_buffer.data() + m_recv_buffer.size() - 4));\n+\n+        // At this point we have a valid packet decrypted into m_recv_decode_buffer. Depending on\n+        // the current state, decide what to do with it.\n+        switch (m_recv_state) {\n+        case RecvState::GARBAUTH:\n+            // Ignore flag does not matter for garbage authentication. Any valid packet functions\n+            // as authentication. Receive and process the version packet next.\n+            SetReceiveState(RecvState::VERSION);\n+            m_recv_garbage = {};\n+            break;\n+        case RecvState::VERSION:\n+            if (!ignore) {\n+                // Version message received; transition to application phase. The contents is\n+                // ignored, but can be used for future extensions.\n+                SetReceiveState(RecvState::APP);\n+            }\n+            break;\n+        case RecvState::APP:\n+            if (!ignore) {\n+                // Application message decrypted correctly. It can be extracted using GetMessage().\n+                SetReceiveState(RecvState::APP_READY);\n+            }\n+            break;\n+        default:\n+            // Any other state is invalid (this function should not have been called).\n+            Assume(false);\n+        }\n+        // Wipe the receive buffer where the next packet will be received into.\n+        m_recv_buffer = {};\n+        // In all but APP_READY state, we can wipe the decoded contents.\n+        if (m_recv_state != RecvState::APP_READY) m_recv_decode_buffer = {};\n+    }\n+    return true;\n+}\n+\n+bool V2Transport::ReceivedBytes(Span<const uint8_t>& msg_bytes) noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    while (!msg_bytes.empty()) {\n+        // Decide how many bytes to copy from msg_bytes to m_recv_buffer.\n+        size_t max_read = GetMaxBytesToProcess();\n+        // Can't read more than provided input.\n+        max_read = std::min(msg_bytes.size(), max_read);\n+        // Copy data to buffer.\n+        m_recv_buffer.insert(m_recv_buffer.end(), UCharCast(msg_bytes.data()), UCharCast(msg_bytes.data() + max_read));\n+        msg_bytes = msg_bytes.subspan(max_read);\n+\n+        // Process data in the buffer.\n+        switch (m_recv_state) {\n+        case RecvState::KEY:\n+            ProcessReceivedKey();\n+            break;\n+\n+        case RecvState::GARB_GARBTERM:\n+            if (!ProcessReceivedGarbage()) return false;\n+            break;\n+\n+        case RecvState::GARBAUTH:\n+        case RecvState::VERSION:\n+        case RecvState::APP:\n+            if (!ProcessReceivedPacket()) return false;\n+            break;\n+\n+        case RecvState::APP_READY:\n+            return true;\n+        }\n+    }\n+\n+    return true;\n+}\n+\n+std::optional<std::string> V2Transport::GetMessageType(Span<const uint8_t>& contents) noexcept\n+{\n+    if (contents.size() == 0) return std::nullopt; // Empty contents\n+    uint8_t first_byte = contents[0];\n+    contents = contents.subspan(1); // Strip first byte.\n+\n+    if (first_byte != 0) return std::nullopt; // TODO: implement short encoding\n+\n+    if (contents.size() < CMessageHeader::COMMAND_SIZE) {\n+        return std::nullopt; // Long encoding needs 12 message type bytes.\n+    }\n+\n+    size_t msg_type_len{0};\n+    while (msg_type_len < CMessageHeader::COMMAND_SIZE && contents[msg_type_len] != 0) {\n+        // Verify that message type bytes before the first 0x00 are in range.\n+        if (contents[msg_type_len] < ' ' || contents[msg_type_len] > 0x7F) {\n+            return {};\n+        }\n+        ++msg_type_len;\n+    }\n+    std::string ret{reinterpret_cast<const char*>(contents.data()), msg_type_len};\n+    while (msg_type_len < CMessageHeader::COMMAND_SIZE) {\n+        // Verify that message type bytes after the first 0x00 are also 0x00.\n+        if (contents[msg_type_len] != 0) return {};\n+        ++msg_type_len;\n+    }\n+    // Strip message type bytes of contents.\n+    contents = contents.subspan(CMessageHeader::COMMAND_SIZE);\n+    return {std::move(ret)};\n+}\n+\n+CNetMessage V2Transport::GetReceivedMessage(std::chrono::microseconds time, bool& reject_message) noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    Assume(m_recv_state == RecvState::APP_READY);\n+    Span<const uint8_t> contents{m_recv_decode_buffer};\n+    auto msg_type = GetMessageType(contents);\n+    CDataStream ret(m_recv_type, m_recv_version);\n+    CNetMessage msg{std::move(ret)};\n+    msg.m_raw_message_size = m_recv_decode_buffer.size() + BIP324Cipher::EXPANSION;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313692208",
+      "id" : 1313692208,
+      "line" : 1422,
+      "node_id" : "PRRC_kwDOABII585OTVow",
+      "original_commit_id" : "ab9d292e3fa61824870bfcd31b0fb6f649eafa2d",
+      "original_line" : 1422,
+      "original_position" : 338,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 539,
+      "pull_request_review_id" : 1607831626,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313692208/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-02T02:41:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313692208",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/91535?v=4",
+         "events_url" : "https://api.github.com/users/theStack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theStack/followers",
+         "following_url" : "https://api.github.com/users/theStack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theStack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theStack",
+         "id" : 91535,
+         "login" : "theStack",
+         "node_id" : "MDQ6VXNlcjkxNTM1",
+         "organizations_url" : "https://api.github.com/users/theStack/orgs",
+         "received_events_url" : "https://api.github.com/users/theStack/received_events",
+         "repos_url" : "https://api.github.com/users/theStack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theStack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theStack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theStack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313692979"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313692979"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "missing verb after \"BIP324\":\r\n```suggestion\r\n    /** Contents of the version packet to send. BIP324 stipulates that senders should leave this empty, and\r\n```",
+      "commit_id" : "59f1dd13958ab76ff9ea34a47b60bb73f336c81e",
+      "created_at" : "2023-09-02T02:24:59Z",
+      "diff_hunk" : "@@ -417,6 +419,194 @@ class V1Transport final : public Transport\n     size_t GetSendMemoryUsage() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);\n };\n \n+class V2Transport final : public Transport\n+{\n+private:\n+    /** Contents of the version packet to send. BIP324 that senders should leave this empty, and",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313692979",
+      "id" : 1313692979,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585OTV0z",
+      "original_commit_id" : "ab9d292e3fa61824870bfcd31b0fb6f649eafa2d",
+      "original_line" : 425,
+      "original_position" : 25,
+      "original_start_line" : null,
+      "path" : "src/net.h",
+      "position" : null,
+      "pull_request_review_id" : 1607831626,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313692979/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-02T02:41:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313692979",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/91535?v=4",
+         "events_url" : "https://api.github.com/users/theStack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theStack/followers",
+         "following_url" : "https://api.github.com/users/theStack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theStack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theStack",
+         "id" : 91535,
+         "login" : "theStack",
+         "node_id" : "MDQ6VXNlcjkxNTM1",
+         "organizations_url" : "https://api.github.com/users/theStack/orgs",
+         "received_events_url" : "https://api.github.com/users/theStack/received_events",
+         "repos_url" : "https://api.github.com/users/theStack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theStack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theStack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theStack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313695214"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313695214"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: in `Set{Send,Receive}State`, at least for my brain the state transition checks would be slightly easier to grasp if the current state is switch/case-d and the allowed next state(s) are `Assume`d (i.e. asserting \"where can I go to?\" rather than \"where could I have come from?\").",
+      "commit_id" : "59f1dd13958ab76ff9ea34a47b60bb73f336c81e",
+      "created_at" : "2023-09-02T02:31:56Z",
+      "diff_hunk" : "@@ -912,6 +912,420 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept\n     return m_message_to_send.GetMemoryUsage();\n }\n \n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in) noexcept :\n+    m_cipher{}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in, const CKey& key, Span<const std::byte> ent32) noexcept :\n+    m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+void V2Transport::SetReceiveState(RecvState recv_state) noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    // No-op if no change is desired.\n+    if (recv_state == m_recv_state) return;\n+    // Enforce allowed state transitions.\n+    switch (recv_state) {\n+    case RecvState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case RecvState::GARB_GARBTERM:\n+        Assume(m_recv_state == RecvState::KEY);\n+        break;\n+    case RecvState::GARBAUTH:\n+        Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+        break;\n+    case RecvState::VERSION:\n+        Assume(m_recv_state == RecvState::GARBAUTH);\n+        break;\n+    case RecvState::APP:\n+        Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::APP_READY);\n+        break;\n+    case RecvState::APP_READY:\n+        Assume(m_recv_state == RecvState::APP);\n+        break;\n+    }\n+    // Change state.\n+    m_recv_state = recv_state;\n+}\n+\n+void V2Transport::SetSendState(SendState send_state) noexcept\n+{\n+    AssertLockHeld(m_send_mutex);\n+    // No-op if no change is desired.\n+    if (send_state == m_send_state) return;\n+    // Enforce allowed state transitions.\n+    switch (send_state) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313695214",
+      "id" : 1313695214,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585OTWXu",
+      "original_commit_id" : "ab9d292e3fa61824870bfcd31b0fb6f649eafa2d",
+      "original_line" : 974,
+      "original_position" : 63,
+      "original_start_line" : 973,
+      "path" : "src/net.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1607831626,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313695214/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-09-02T02:41:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313695214",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/91535?v=4",
+         "events_url" : "https://api.github.com/users/theStack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theStack/followers",
+         "following_url" : "https://api.github.com/users/theStack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theStack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theStack",
+         "id" : 91535,
+         "login" : "theStack",
+         "node_id" : "MDQ6VXNlcjkxNTM1",
+         "organizations_url" : "https://api.github.com/users/theStack/orgs",
+         "received_events_url" : "https://api.github.com/users/theStack/received_events",
+         "repos_url" : "https://api.github.com/users/theStack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theStack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theStack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theStack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313708390"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708390"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Nice, done.",
+      "commit_id" : "59f1dd13958ab76ff9ea34a47b60bb73f336c81e",
+      "created_at" : "2023-09-02T03:39:01Z",
+      "diff_hunk" : "@@ -912,6 +912,420 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept\n     return m_message_to_send.GetMemoryUsage();\n }\n \n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in) noexcept :\n+    m_cipher{}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in, const CKey& key, Span<const std::byte> ent32) noexcept :\n+    m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+void V2Transport::SetReceiveState(RecvState recv_state) noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    // No-op if no change is desired.\n+    if (recv_state == m_recv_state) return;\n+    // Enforce allowed state transitions.\n+    switch (recv_state) {\n+    case RecvState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case RecvState::GARB_GARBTERM:\n+        Assume(m_recv_state == RecvState::KEY);\n+        break;\n+    case RecvState::GARBAUTH:\n+        Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+        break;\n+    case RecvState::VERSION:\n+        Assume(m_recv_state == RecvState::GARBAUTH);\n+        break;\n+    case RecvState::APP:\n+        Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::APP_READY);\n+        break;\n+    case RecvState::APP_READY:\n+        Assume(m_recv_state == RecvState::APP);\n+        break;\n+    }\n+    // Change state.\n+    m_recv_state = recv_state;\n+}\n+\n+void V2Transport::SetSendState(SendState send_state) noexcept\n+{\n+    AssertLockHeld(m_send_mutex);\n+    // No-op if no change is desired.\n+    if (send_state == m_send_state) return;\n+    // Enforce allowed state transitions.\n+    switch (send_state) {\n+    case SendState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case SendState::KEY_GARBTERM_GARBAUTH_VERSION:\n+        Assume(m_send_state == SendState::KEY);\n+        break;\n+    case SendState::APP_READY:\n+        Assume(m_send_state == SendState::KEY_GARBTERM_GARBAUTH_VERSION ||\n+               m_send_state == SendState::APP);\n+        break;\n+    case SendState::APP:\n+        Assume(m_send_state == SendState::APP_READY);\n+        break;\n+    }\n+    // Change state.\n+    m_send_state = send_state;\n+}\n+\n+bool V2Transport::ReceivedMessageComplete() const noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    return m_recv_state == RecvState::APP_READY;\n+}\n+\n+size_t V2Transport::GetMaxBytesToProcess() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    switch (m_recv_state) {\n+    case RecvState::KEY:\n+        // During the KEY state, we only allow the 64-byte key into the receive buffer.\n+        Assume(m_recv_buffer.size() <= EllSwiftPubKey::size());\n+        // As long as we have not received the other side's public key, don't receive more than\n+        // that (64 bytes), as garbage follows, and locating the garbage terminator requires the\n+        // key exchange first.\n+        return EllSwiftPubKey::size() - m_recv_buffer.size();\n+    case RecvState::GARB_GARBTERM:\n+        // Process garbage bytes one by one (because terminator may appear anywhere).\n+        return 1;\n+    case RecvState::GARBAUTH:\n+    case RecvState::VERSION:\n+    case RecvState::APP:\n+        // These three states all involve decoding a packet. Process the length descriptor first,\n+        // followed by the ciphertext.\n+        if (m_recv_buffer.size() < BIP324Cipher::LENGTH_LEN) {\n+            return BIP324Cipher::LENGTH_LEN - m_recv_buffer.size();\n+        } else {\n+            // Note that BIP324Cipher::EXPANSION is the total difference between contents size\n+            // and encoded packet size, which includes the 3 bytes due to the packet length.\n+            // When transitioning from receiving the packet length to receiving its ciphertext,\n+            // the encrypted packet length is left in the receive buffer.\n+            return BIP324Cipher::EXPANSION + m_recv_len - m_recv_buffer.size();\n+        }\n+    case RecvState::APP_READY:\n+        // No bytes can be processed until GetMessage() is called.\n+        return 0;\n+    }\n+    Assume(false); // unreachable\n+    return 0;\n+}\n+\n+void V2Transport::ProcessReceivedKey() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    AssertLockNotHeld(m_send_mutex);\n+    Assume(m_recv_state == RecvState::KEY);\n+    if (m_recv_buffer.size() == EllSwiftPubKey::size()) {\n+        // Other side's key has been fully received.\n+\n+        // Initialize the ciphers.\n+        EllSwiftPubKey ellswift(MakeByteSpan(m_recv_buffer).first(EllSwiftPubKey::size()));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313708390",
+      "id" : 1313708390,
+      "in_reply_to_id" : 1313686515,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585OTZlm",
+      "original_commit_id" : "ab9d292e3fa61824870bfcd31b0fb6f649eafa2d",
+      "original_line" : 1046,
+      "original_position" : 135,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1607869598,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708390/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-02T03:39:01Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708390",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313708398"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708398"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Sadly, indeed.",
+      "commit_id" : "59f1dd13958ab76ff9ea34a47b60bb73f336c81e",
+      "created_at" : "2023-09-02T03:39:10Z",
+      "diff_hunk" : "@@ -912,6 +912,420 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept\n     return m_message_to_send.GetMemoryUsage();\n }\n \n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in) noexcept :\n+    m_cipher{}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in, const CKey& key, Span<const std::byte> ent32) noexcept :\n+    m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+void V2Transport::SetReceiveState(RecvState recv_state) noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    // No-op if no change is desired.\n+    if (recv_state == m_recv_state) return;\n+    // Enforce allowed state transitions.\n+    switch (recv_state) {\n+    case RecvState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case RecvState::GARB_GARBTERM:\n+        Assume(m_recv_state == RecvState::KEY);\n+        break;\n+    case RecvState::GARBAUTH:\n+        Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+        break;\n+    case RecvState::VERSION:\n+        Assume(m_recv_state == RecvState::GARBAUTH);\n+        break;\n+    case RecvState::APP:\n+        Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::APP_READY);\n+        break;\n+    case RecvState::APP_READY:\n+        Assume(m_recv_state == RecvState::APP);\n+        break;\n+    }\n+    // Change state.\n+    m_recv_state = recv_state;\n+}\n+\n+void V2Transport::SetSendState(SendState send_state) noexcept\n+{\n+    AssertLockHeld(m_send_mutex);\n+    // No-op if no change is desired.\n+    if (send_state == m_send_state) return;\n+    // Enforce allowed state transitions.\n+    switch (send_state) {\n+    case SendState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case SendState::KEY_GARBTERM_GARBAUTH_VERSION:\n+        Assume(m_send_state == SendState::KEY);\n+        break;\n+    case SendState::APP_READY:\n+        Assume(m_send_state == SendState::KEY_GARBTERM_GARBAUTH_VERSION ||\n+               m_send_state == SendState::APP);\n+        break;\n+    case SendState::APP:\n+        Assume(m_send_state == SendState::APP_READY);\n+        break;\n+    }\n+    // Change state.\n+    m_send_state = send_state;\n+}\n+\n+bool V2Transport::ReceivedMessageComplete() const noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    return m_recv_state == RecvState::APP_READY;\n+}\n+\n+size_t V2Transport::GetMaxBytesToProcess() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    switch (m_recv_state) {\n+    case RecvState::KEY:\n+        // During the KEY state, we only allow the 64-byte key into the receive buffer.\n+        Assume(m_recv_buffer.size() <= EllSwiftPubKey::size());\n+        // As long as we have not received the other side's public key, don't receive more than\n+        // that (64 bytes), as garbage follows, and locating the garbage terminator requires the\n+        // key exchange first.\n+        return EllSwiftPubKey::size() - m_recv_buffer.size();\n+    case RecvState::GARB_GARBTERM:\n+        // Process garbage bytes one by one (because terminator may appear anywhere).\n+        return 1;\n+    case RecvState::GARBAUTH:\n+    case RecvState::VERSION:\n+    case RecvState::APP:\n+        // These three states all involve decoding a packet. Process the length descriptor first,\n+        // followed by the ciphertext.\n+        if (m_recv_buffer.size() < BIP324Cipher::LENGTH_LEN) {\n+            return BIP324Cipher::LENGTH_LEN - m_recv_buffer.size();\n+        } else {\n+            // Note that BIP324Cipher::EXPANSION is the total difference between contents size\n+            // and encoded packet size, which includes the 3 bytes due to the packet length.\n+            // When transitioning from receiving the packet length to receiving its ciphertext,\n+            // the encrypted packet length is left in the receive buffer.\n+            return BIP324Cipher::EXPANSION + m_recv_len - m_recv_buffer.size();\n+        }\n+    case RecvState::APP_READY:\n+        // No bytes can be processed until GetMessage() is called.\n+        return 0;\n+    }\n+    Assume(false); // unreachable\n+    return 0;\n+}\n+\n+void V2Transport::ProcessReceivedKey() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    AssertLockNotHeld(m_send_mutex);\n+    Assume(m_recv_state == RecvState::KEY);\n+    if (m_recv_buffer.size() == EllSwiftPubKey::size()) {\n+        // Other side's key has been fully received.\n+\n+        // Initialize the ciphers.\n+        EllSwiftPubKey ellswift(MakeByteSpan(m_recv_buffer).first(EllSwiftPubKey::size()));\n+        LOCK(m_send_mutex);\n+        m_cipher.Initialize(ellswift, m_initiating);\n+\n+        // Switch receiver state to GARB_GARBTERM.\n+        SetReceiveState(RecvState::GARB_GARBTERM);\n+        m_recv_buffer.clear();\n+\n+        // Switch sender state to KEY_GARBTERM_GARBAUTH_VERSION.\n+        SetSendState(SendState::KEY_GARBTERM_GARBAUTH_VERSION);\n+        // Append the garbage terminator to the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+        std::copy(m_cipher.GetSendGarbageTerminator().begin(),\n+                  m_cipher.GetSendGarbageTerminator().end(),\n+                  MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::GARBAGE_TERMINATOR_LEN).begin());\n+        // Construct garbage authentication packet in the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION);\n+        m_cipher.Encrypt(\n+            {},\n+            {}, /* empty garbage for now */\n+            false,\n+            MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION));\n+        // Construct version packet in the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION + VERSION_CONTENTS.size());\n+        m_cipher.Encrypt(\n+            VERSION_CONTENTS,\n+            {},\n+            false,\n+            MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION + VERSION_CONTENTS.size()));\n+    }\n+}\n+\n+bool V2Transport::ProcessReceivedGarbage() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+    Assume(m_recv_buffer.size() <= MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+    if (m_recv_buffer.size() >= BIP324Cipher::GARBAGE_TERMINATOR_LEN) {\n+        if (MakeByteSpan(m_recv_buffer).last(BIP324Cipher::GARBAGE_TERMINATOR_LEN) == m_cipher.GetReceiveGarbageTerminator()) {\n+            // Garbage terminator received. Switch to receiving garbage authentication packet.\n+            m_recv_garbage = std::move(m_recv_buffer);\n+            m_recv_garbage.resize(m_recv_garbage.size() - BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+            m_recv_buffer.clear();\n+            SetReceiveState(RecvState::GARBAUTH);\n+        } else if (m_recv_buffer.size() == MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN) {\n+            // We've reached the maximum length for garbage + garbage terminator, and the\n+            // terminator still does not match. Abort.\n+            LogPrint(BCLog::NET, \"V2 transport error: missing garbage terminator, peer=%d\\n\", m_nodeid);\n+            return false;\n+        }\n+    }\n+    return true;\n+}\n+\n+bool V2Transport::ProcessReceivedPacket() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    Assume(m_recv_state == RecvState::GARBAUTH || m_recv_state == RecvState::VERSION ||\n+           m_recv_state == RecvState::APP);\n+\n+    // The maximum permitted contents length for a packet.\n+    static constexpr size_t MAX_CONTENTS_LEN =\n+        1 + CMessageHeader::COMMAND_SIZE + // The maximum length for encoding the message type.\n+        std::min<size_t>(MAX_SIZE, MAX_PROTOCOL_MESSAGE_LENGTH); // The maximum payload.\n+\n+    if (m_recv_buffer.size() == BIP324Cipher::LENGTH_LEN) {\n+        // Length descriptor received.\n+        m_recv_len = m_cipher.DecryptLength(MakeByteSpan(m_recv_buffer));\n+        if (m_recv_len > MAX_CONTENTS_LEN) {\n+            LogPrint(BCLog::NET, \"V2 transport error: packet too large (%u bytes), peer=%d\\n\", m_recv_len, m_nodeid);\n+            return false;\n+        }\n+    } else if (m_recv_buffer.size() > BIP324Cipher::LENGTH_LEN && m_recv_buffer.size() == m_recv_len + BIP324Cipher::EXPANSION) {\n+        // Ciphertext received, decrypt it into m_recv_decode_buffer.\n+        // Note that it is impossible to reach this branch without hitting the branch above first,\n+        // as GetMaxBytesToProcess only allows up to LENGTH_LEN into the buffer before that point.\n+        m_recv_decode_buffer.resize(m_recv_len);\n+        bool ignore{false};\n+        Span<const std::byte> aad;\n+        if (m_recv_state == RecvState::GARBAUTH) aad = MakeByteSpan(m_recv_garbage);\n+        bool ret = m_cipher.Decrypt(\n+            MakeByteSpan(m_recv_buffer).subspan(BIP324Cipher::LENGTH_LEN),\n+            aad,\n+            ignore,\n+            MakeWritableByteSpan(m_recv_decode_buffer));\n+        if (!ret) {\n+            LogPrint(BCLog::NET, \"V2 transport error: packet decryption failure (%u bytes), peer=%d\\n\", m_recv_len, m_nodeid);\n+            return false;\n+        }\n+        // Feed the last 4 bytes of the Poly1305 authentication tag (and its timing) into our RNG.\n+        RandAddEvent(ReadLE32(m_recv_buffer.data() + m_recv_buffer.size() - 4));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313708398",
+      "id" : 1313708398,
+      "in_reply_to_id" : 1313686655,
+      "line" : 1266,
+      "node_id" : "PRRC_kwDOABII585OTZlu",
+      "original_commit_id" : "ab9d292e3fa61824870bfcd31b0fb6f649eafa2d",
+      "original_line" : 1266,
+      "original_position" : 225,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 383,
+      "pull_request_review_id" : 1607869614,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708398/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-02T03:39:11Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708398",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313708417"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708417"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "That's included in EXPANSION. I've added a comment to clarify that.",
+      "commit_id" : "59f1dd13958ab76ff9ea34a47b60bb73f336c81e",
+      "created_at" : "2023-09-02T03:39:30Z",
+      "diff_hunk" : "@@ -912,6 +912,420 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept\n     return m_message_to_send.GetMemoryUsage();\n }\n \n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in) noexcept :\n+    m_cipher{}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in, const CKey& key, Span<const std::byte> ent32) noexcept :\n+    m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+void V2Transport::SetReceiveState(RecvState recv_state) noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    // No-op if no change is desired.\n+    if (recv_state == m_recv_state) return;\n+    // Enforce allowed state transitions.\n+    switch (recv_state) {\n+    case RecvState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case RecvState::GARB_GARBTERM:\n+        Assume(m_recv_state == RecvState::KEY);\n+        break;\n+    case RecvState::GARBAUTH:\n+        Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+        break;\n+    case RecvState::VERSION:\n+        Assume(m_recv_state == RecvState::GARBAUTH);\n+        break;\n+    case RecvState::APP:\n+        Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::APP_READY);\n+        break;\n+    case RecvState::APP_READY:\n+        Assume(m_recv_state == RecvState::APP);\n+        break;\n+    }\n+    // Change state.\n+    m_recv_state = recv_state;\n+}\n+\n+void V2Transport::SetSendState(SendState send_state) noexcept\n+{\n+    AssertLockHeld(m_send_mutex);\n+    // No-op if no change is desired.\n+    if (send_state == m_send_state) return;\n+    // Enforce allowed state transitions.\n+    switch (send_state) {\n+    case SendState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case SendState::KEY_GARBTERM_GARBAUTH_VERSION:\n+        Assume(m_send_state == SendState::KEY);\n+        break;\n+    case SendState::APP_READY:\n+        Assume(m_send_state == SendState::KEY_GARBTERM_GARBAUTH_VERSION ||\n+               m_send_state == SendState::APP);\n+        break;\n+    case SendState::APP:\n+        Assume(m_send_state == SendState::APP_READY);\n+        break;\n+    }\n+    // Change state.\n+    m_send_state = send_state;\n+}\n+\n+bool V2Transport::ReceivedMessageComplete() const noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    return m_recv_state == RecvState::APP_READY;\n+}\n+\n+size_t V2Transport::GetMaxBytesToProcess() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    switch (m_recv_state) {\n+    case RecvState::KEY:\n+        // During the KEY state, we only allow the 64-byte key into the receive buffer.\n+        Assume(m_recv_buffer.size() <= EllSwiftPubKey::size());\n+        // As long as we have not received the other side's public key, don't receive more than\n+        // that (64 bytes), as garbage follows, and locating the garbage terminator requires the\n+        // key exchange first.\n+        return EllSwiftPubKey::size() - m_recv_buffer.size();\n+    case RecvState::GARB_GARBTERM:\n+        // Process garbage bytes one by one (because terminator may appear anywhere).\n+        return 1;\n+    case RecvState::GARBAUTH:\n+    case RecvState::VERSION:\n+    case RecvState::APP:\n+        // These three states all involve decoding a packet. Process the length descriptor first,\n+        // followed by the ciphertext.\n+        if (m_recv_buffer.size() < BIP324Cipher::LENGTH_LEN) {\n+            return BIP324Cipher::LENGTH_LEN - m_recv_buffer.size();\n+        } else {\n+            // Note that BIP324Cipher::EXPANSION is the total difference between contents size\n+            // and encoded packet size, which includes the 3 bytes due to the packet length.\n+            // When transitioning from receiving the packet length to receiving its ciphertext,\n+            // the encrypted packet length is left in the receive buffer.\n+            return BIP324Cipher::EXPANSION + m_recv_len - m_recv_buffer.size();\n+        }\n+    case RecvState::APP_READY:\n+        // No bytes can be processed until GetMessage() is called.\n+        return 0;\n+    }\n+    Assume(false); // unreachable\n+    return 0;\n+}\n+\n+void V2Transport::ProcessReceivedKey() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    AssertLockNotHeld(m_send_mutex);\n+    Assume(m_recv_state == RecvState::KEY);\n+    if (m_recv_buffer.size() == EllSwiftPubKey::size()) {\n+        // Other side's key has been fully received.\n+\n+        // Initialize the ciphers.\n+        EllSwiftPubKey ellswift(MakeByteSpan(m_recv_buffer).first(EllSwiftPubKey::size()));\n+        LOCK(m_send_mutex);\n+        m_cipher.Initialize(ellswift, m_initiating);\n+\n+        // Switch receiver state to GARB_GARBTERM.\n+        SetReceiveState(RecvState::GARB_GARBTERM);\n+        m_recv_buffer.clear();\n+\n+        // Switch sender state to KEY_GARBTERM_GARBAUTH_VERSION.\n+        SetSendState(SendState::KEY_GARBTERM_GARBAUTH_VERSION);\n+        // Append the garbage terminator to the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+        std::copy(m_cipher.GetSendGarbageTerminator().begin(),\n+                  m_cipher.GetSendGarbageTerminator().end(),\n+                  MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::GARBAGE_TERMINATOR_LEN).begin());\n+        // Construct garbage authentication packet in the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION);\n+        m_cipher.Encrypt(\n+            {},\n+            {}, /* empty garbage for now */\n+            false,\n+            MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION));\n+        // Construct version packet in the send buffer.\n+        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION + VERSION_CONTENTS.size());\n+        m_cipher.Encrypt(\n+            VERSION_CONTENTS,\n+            {},\n+            false,\n+            MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION + VERSION_CONTENTS.size()));\n+    }\n+}\n+\n+bool V2Transport::ProcessReceivedGarbage() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+    Assume(m_recv_buffer.size() <= MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+    if (m_recv_buffer.size() >= BIP324Cipher::GARBAGE_TERMINATOR_LEN) {\n+        if (MakeByteSpan(m_recv_buffer).last(BIP324Cipher::GARBAGE_TERMINATOR_LEN) == m_cipher.GetReceiveGarbageTerminator()) {\n+            // Garbage terminator received. Switch to receiving garbage authentication packet.\n+            m_recv_garbage = std::move(m_recv_buffer);\n+            m_recv_garbage.resize(m_recv_garbage.size() - BIP324Cipher::GARBAGE_TERMINATOR_LEN);\n+            m_recv_buffer.clear();\n+            SetReceiveState(RecvState::GARBAUTH);\n+        } else if (m_recv_buffer.size() == MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN) {\n+            // We've reached the maximum length for garbage + garbage terminator, and the\n+            // terminator still does not match. Abort.\n+            LogPrint(BCLog::NET, \"V2 transport error: missing garbage terminator, peer=%d\\n\", m_nodeid);\n+            return false;\n+        }\n+    }\n+    return true;\n+}\n+\n+bool V2Transport::ProcessReceivedPacket() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    Assume(m_recv_state == RecvState::GARBAUTH || m_recv_state == RecvState::VERSION ||\n+           m_recv_state == RecvState::APP);\n+\n+    // The maximum permitted contents length for a packet.\n+    static constexpr size_t MAX_CONTENTS_LEN =\n+        1 + CMessageHeader::COMMAND_SIZE + // The maximum length for encoding the message type.\n+        std::min<size_t>(MAX_SIZE, MAX_PROTOCOL_MESSAGE_LENGTH); // The maximum payload.\n+\n+    if (m_recv_buffer.size() == BIP324Cipher::LENGTH_LEN) {\n+        // Length descriptor received.\n+        m_recv_len = m_cipher.DecryptLength(MakeByteSpan(m_recv_buffer));\n+        if (m_recv_len > MAX_CONTENTS_LEN) {\n+            LogPrint(BCLog::NET, \"V2 transport error: packet too large (%u bytes), peer=%d\\n\", m_recv_len, m_nodeid);\n+            return false;\n+        }\n+    } else if (m_recv_buffer.size() > BIP324Cipher::LENGTH_LEN && m_recv_buffer.size() == m_recv_len + BIP324Cipher::EXPANSION) {\n+        // Ciphertext received, decrypt it into m_recv_decode_buffer.\n+        // Note that it is impossible to reach this branch without hitting the branch above first,\n+        // as GetMaxBytesToProcess only allows up to LENGTH_LEN into the buffer before that point.\n+        m_recv_decode_buffer.resize(m_recv_len);\n+        bool ignore{false};\n+        Span<const std::byte> aad;\n+        if (m_recv_state == RecvState::GARBAUTH) aad = MakeByteSpan(m_recv_garbage);\n+        bool ret = m_cipher.Decrypt(\n+            MakeByteSpan(m_recv_buffer).subspan(BIP324Cipher::LENGTH_LEN),\n+            aad,\n+            ignore,\n+            MakeWritableByteSpan(m_recv_decode_buffer));\n+        if (!ret) {\n+            LogPrint(BCLog::NET, \"V2 transport error: packet decryption failure (%u bytes), peer=%d\\n\", m_recv_len, m_nodeid);\n+            return false;\n+        }\n+        // Feed the last 4 bytes of the Poly1305 authentication tag (and its timing) into our RNG.\n+        RandAddEvent(ReadLE32(m_recv_buffer.data() + m_recv_buffer.size() - 4));\n+\n+        // At this point we have a valid packet decrypted into m_recv_decode_buffer. Depending on\n+        // the current state, decide what to do with it.\n+        switch (m_recv_state) {\n+        case RecvState::GARBAUTH:\n+            // Ignore flag does not matter for garbage authentication. Any valid packet functions\n+            // as authentication. Receive and process the version packet next.\n+            SetReceiveState(RecvState::VERSION);\n+            m_recv_garbage = {};\n+            break;\n+        case RecvState::VERSION:\n+            if (!ignore) {\n+                // Version message received; transition to application phase. The contents is\n+                // ignored, but can be used for future extensions.\n+                SetReceiveState(RecvState::APP);\n+            }\n+            break;\n+        case RecvState::APP:\n+            if (!ignore) {\n+                // Application message decrypted correctly. It can be extracted using GetMessage().\n+                SetReceiveState(RecvState::APP_READY);\n+            }\n+            break;\n+        default:\n+            // Any other state is invalid (this function should not have been called).\n+            Assume(false);\n+        }\n+        // Wipe the receive buffer where the next packet will be received into.\n+        m_recv_buffer = {};\n+        // In all but APP_READY state, we can wipe the decoded contents.\n+        if (m_recv_state != RecvState::APP_READY) m_recv_decode_buffer = {};\n+    }\n+    return true;\n+}\n+\n+bool V2Transport::ReceivedBytes(Span<const uint8_t>& msg_bytes) noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    while (!msg_bytes.empty()) {\n+        // Decide how many bytes to copy from msg_bytes to m_recv_buffer.\n+        size_t max_read = GetMaxBytesToProcess();\n+        // Can't read more than provided input.\n+        max_read = std::min(msg_bytes.size(), max_read);\n+        // Copy data to buffer.\n+        m_recv_buffer.insert(m_recv_buffer.end(), UCharCast(msg_bytes.data()), UCharCast(msg_bytes.data() + max_read));\n+        msg_bytes = msg_bytes.subspan(max_read);\n+\n+        // Process data in the buffer.\n+        switch (m_recv_state) {\n+        case RecvState::KEY:\n+            ProcessReceivedKey();\n+            break;\n+\n+        case RecvState::GARB_GARBTERM:\n+            if (!ProcessReceivedGarbage()) return false;\n+            break;\n+\n+        case RecvState::GARBAUTH:\n+        case RecvState::VERSION:\n+        case RecvState::APP:\n+            if (!ProcessReceivedPacket()) return false;\n+            break;\n+\n+        case RecvState::APP_READY:\n+            return true;\n+        }\n+    }\n+\n+    return true;\n+}\n+\n+std::optional<std::string> V2Transport::GetMessageType(Span<const uint8_t>& contents) noexcept\n+{\n+    if (contents.size() == 0) return std::nullopt; // Empty contents\n+    uint8_t first_byte = contents[0];\n+    contents = contents.subspan(1); // Strip first byte.\n+\n+    if (first_byte != 0) return std::nullopt; // TODO: implement short encoding\n+\n+    if (contents.size() < CMessageHeader::COMMAND_SIZE) {\n+        return std::nullopt; // Long encoding needs 12 message type bytes.\n+    }\n+\n+    size_t msg_type_len{0};\n+    while (msg_type_len < CMessageHeader::COMMAND_SIZE && contents[msg_type_len] != 0) {\n+        // Verify that message type bytes before the first 0x00 are in range.\n+        if (contents[msg_type_len] < ' ' || contents[msg_type_len] > 0x7F) {\n+            return {};\n+        }\n+        ++msg_type_len;\n+    }\n+    std::string ret{reinterpret_cast<const char*>(contents.data()), msg_type_len};\n+    while (msg_type_len < CMessageHeader::COMMAND_SIZE) {\n+        // Verify that message type bytes after the first 0x00 are also 0x00.\n+        if (contents[msg_type_len] != 0) return {};\n+        ++msg_type_len;\n+    }\n+    // Strip message type bytes of contents.\n+    contents = contents.subspan(CMessageHeader::COMMAND_SIZE);\n+    return {std::move(ret)};\n+}\n+\n+CNetMessage V2Transport::GetReceivedMessage(std::chrono::microseconds time, bool& reject_message) noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    Assume(m_recv_state == RecvState::APP_READY);\n+    Span<const uint8_t> contents{m_recv_decode_buffer};\n+    auto msg_type = GetMessageType(contents);\n+    CDataStream ret(m_recv_type, m_recv_version);\n+    CNetMessage msg{std::move(ret)};\n+    msg.m_raw_message_size = m_recv_decode_buffer.size() + BIP324Cipher::EXPANSION;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313708417",
+      "id" : 1313708417,
+      "in_reply_to_id" : 1313692208,
+      "line" : 1422,
+      "node_id" : "PRRC_kwDOABII585OTZmB",
+      "original_commit_id" : "ab9d292e3fa61824870bfcd31b0fb6f649eafa2d",
+      "original_line" : 1422,
+      "original_position" : 338,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 539,
+      "pull_request_review_id" : 1607869649,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708417/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-02T03:39:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708417",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313708498"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708498"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed.",
+      "commit_id" : "59f1dd13958ab76ff9ea34a47b60bb73f336c81e",
+      "created_at" : "2023-09-02T03:39:39Z",
+      "diff_hunk" : "@@ -417,6 +419,194 @@ class V1Transport final : public Transport\n     size_t GetSendMemoryUsage() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);\n };\n \n+class V2Transport final : public Transport\n+{\n+private:\n+    /** Contents of the version packet to send. BIP324 that senders should leave this empty, and",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313708498",
+      "id" : 1313708498,
+      "in_reply_to_id" : 1313692979,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585OTZnS",
+      "original_commit_id" : "ab9d292e3fa61824870bfcd31b0fb6f649eafa2d",
+      "original_line" : 425,
+      "original_position" : 25,
+      "original_start_line" : null,
+      "path" : "src/net.h",
+      "position" : null,
+      "pull_request_review_id" : 1607869703,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708498/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-02T03:39:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708498",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313708718"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708718"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Agreed, changed. It's also a bit simpler now actually.",
+      "commit_id" : "59f1dd13958ab76ff9ea34a47b60bb73f336c81e",
+      "created_at" : "2023-09-02T03:40:26Z",
+      "diff_hunk" : "@@ -912,6 +912,420 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept\n     return m_message_to_send.GetMemoryUsage();\n }\n \n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in) noexcept :\n+    m_cipher{}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in, const CKey& key, Span<const std::byte> ent32) noexcept :\n+    m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+void V2Transport::SetReceiveState(RecvState recv_state) noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    // No-op if no change is desired.\n+    if (recv_state == m_recv_state) return;\n+    // Enforce allowed state transitions.\n+    switch (recv_state) {\n+    case RecvState::KEY:\n+        // Initial state, cannot be transitioned into.\n+        Assume(false);\n+        break;\n+    case RecvState::GARB_GARBTERM:\n+        Assume(m_recv_state == RecvState::KEY);\n+        break;\n+    case RecvState::GARBAUTH:\n+        Assume(m_recv_state == RecvState::GARB_GARBTERM);\n+        break;\n+    case RecvState::VERSION:\n+        Assume(m_recv_state == RecvState::GARBAUTH);\n+        break;\n+    case RecvState::APP:\n+        Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::APP_READY);\n+        break;\n+    case RecvState::APP_READY:\n+        Assume(m_recv_state == RecvState::APP);\n+        break;\n+    }\n+    // Change state.\n+    m_recv_state = recv_state;\n+}\n+\n+void V2Transport::SetSendState(SendState send_state) noexcept\n+{\n+    AssertLockHeld(m_send_mutex);\n+    // No-op if no change is desired.\n+    if (send_state == m_send_state) return;\n+    // Enforce allowed state transitions.\n+    switch (send_state) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1313708718",
+      "id" : 1313708718,
+      "in_reply_to_id" : 1313695214,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585OTZqu",
+      "original_commit_id" : "ab9d292e3fa61824870bfcd31b0fb6f649eafa2d",
+      "original_line" : 974,
+      "original_position" : 63,
+      "original_start_line" : 973,
+      "path" : "src/net.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1607870108,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708718/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-09-02T03:40:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1313708718",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
    }
 ]
