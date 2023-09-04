@@ -8309,5 +8309,210 @@
          "type" : "User",
          "url" : "https://api.github.com/users/sipa"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1315181053"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1315181053"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "25b0668c72f762df474c29e678e4baf69cff506c: maybe also `Assume(m_recv_buffer.size() <= EllSwiftPubKey::size())`",
+      "commit_id" : "e5d464907c5e7769ee1cce66ca2ae847875bd3c8",
+      "created_at" : "2023-09-04T19:56:11Z",
+      "diff_hunk" : "@@ -912,6 +912,418 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept\n     return m_message_to_send.GetMemoryUsage();\n }\n \n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in) noexcept :\n+    m_cipher{}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in, const CKey& key, Span<const std::byte> ent32) noexcept :\n+    m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+void V2Transport::SetReceiveState(RecvState recv_state) noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    // No-op if no change is desired.\n+    if (recv_state == m_recv_state) return;\n+    // Enforce allowed state transitions.\n+    switch (m_recv_state) {\n+    case RecvState::KEY:\n+        Assume(recv_state == RecvState::GARB_GARBTERM);\n+        break;\n+    case RecvState::GARB_GARBTERM:\n+        Assume(recv_state == RecvState::GARBAUTH);\n+        break;\n+    case RecvState::GARBAUTH:\n+        Assume(recv_state == RecvState::VERSION);\n+        break;\n+    case RecvState::VERSION:\n+        Assume(recv_state == RecvState::APP);\n+        break;\n+    case RecvState::APP:\n+        Assume(recv_state == RecvState::APP_READY);\n+        break;\n+    case RecvState::APP_READY:\n+        Assume(recv_state == RecvState::APP);\n+        break;\n+    }\n+    // Change state.\n+    m_recv_state = recv_state;\n+}\n+\n+void V2Transport::SetSendState(SendState send_state) noexcept\n+{\n+    AssertLockHeld(m_send_mutex);\n+    // No-op if no change is desired.\n+    if (send_state == m_send_state) return;\n+    // Enforce allowed state transitions.\n+    switch (m_send_state) {\n+    case SendState::KEY:\n+        Assume(send_state == SendState::KEY_GARBTERM_GARBAUTH_VERSION);\n+        break;\n+    case SendState::KEY_GARBTERM_GARBAUTH_VERSION:\n+        Assume(send_state == SendState::APP_READY);\n+        break;\n+    case SendState::APP_READY:\n+        Assume(send_state == SendState::APP);\n+        break;\n+    case SendState::APP:\n+        Assume(send_state == SendState::APP_READY);\n+        break;\n+    }\n+    // Change state.\n+    m_send_state = send_state;\n+}\n+\n+bool V2Transport::ReceivedMessageComplete() const noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    return m_recv_state == RecvState::APP_READY;\n+}\n+\n+size_t V2Transport::GetMaxBytesToProcess() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    switch (m_recv_state) {\n+    case RecvState::KEY:\n+        // During the KEY state, we only allow the 64-byte key into the receive buffer.\n+        Assume(m_recv_buffer.size() <= EllSwiftPubKey::size());\n+        // As long as we have not received the other side's public key, don't receive more than\n+        // that (64 bytes), as garbage follows, and locating the garbage terminator requires the\n+        // key exchange first.\n+        return EllSwiftPubKey::size() - m_recv_buffer.size();\n+    case RecvState::GARB_GARBTERM:\n+        // Process garbage bytes one by one (because terminator may appear anywhere).\n+        return 1;\n+    case RecvState::GARBAUTH:\n+    case RecvState::VERSION:\n+    case RecvState::APP:\n+        // These three states all involve decoding a packet. Process the length descriptor first,\n+        // followed by the ciphertext.\n+        if (m_recv_buffer.size() < BIP324Cipher::LENGTH_LEN) {\n+            return BIP324Cipher::LENGTH_LEN - m_recv_buffer.size();\n+        } else {\n+            // Note that BIP324Cipher::EXPANSION is the total difference between contents size\n+            // and encoded packet size, which includes the 3 bytes due to the packet length.\n+            // When transitioning from receiving the packet length to receiving its ciphertext,\n+            // the encrypted packet length is left in the receive buffer.\n+            return BIP324Cipher::EXPANSION + m_recv_len - m_recv_buffer.size();\n+        }\n+    case RecvState::APP_READY:\n+        // No bytes can be processed until GetMessage() is called.\n+        return 0;\n+    }\n+    Assume(false); // unreachable\n+    return 0;\n+}\n+\n+void V2Transport::ProcessReceivedKey() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    AssertLockNotHeld(m_send_mutex);\n+    Assume(m_recv_state == RecvState::KEY);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1315181053",
+      "id" : 1315181053,
+      "line" : 1161,
+      "node_id" : "PRRC_kwDOABII585OZBH9",
+      "original_commit_id" : "25b0668c72f762df474c29e678e4baf69cff506c",
+      "original_line" : 1161,
+      "original_position" : 127,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 278,
+      "pull_request_review_id" : 1609921570,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1315181053/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-04T20:05:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1315181053",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1315182195"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1315182195"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "25b0668c72f762df474c29e678e4baf69cff506c `// , and can now be DiffieâHellman combined with our key.`",
+      "commit_id" : "e5d464907c5e7769ee1cce66ca2ae847875bd3c8",
+      "created_at" : "2023-09-04T19:59:55Z",
+      "diff_hunk" : "@@ -912,6 +912,418 @@ size_t V1Transport::GetSendMemoryUsage() const noexcept\n     return m_message_to_send.GetMemoryUsage();\n }\n \n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in) noexcept :\n+    m_cipher{}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+V2Transport::V2Transport(NodeId nodeid, bool initiating, int type_in, int version_in, const CKey& key, Span<const std::byte> ent32) noexcept :\n+    m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},\n+    m_recv_type{type_in}, m_recv_version{version_in},\n+    m_recv_state{RecvState::KEY},\n+    m_send_state{SendState::KEY}\n+{\n+    // Initialize the send buffer with ellswift pubkey.\n+    m_send_buffer.resize(EllSwiftPubKey::size());\n+    std::copy(std::begin(m_cipher.GetOurPubKey()), std::end(m_cipher.GetOurPubKey()), MakeWritableByteSpan(m_send_buffer).begin());\n+}\n+\n+void V2Transport::SetReceiveState(RecvState recv_state) noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    // No-op if no change is desired.\n+    if (recv_state == m_recv_state) return;\n+    // Enforce allowed state transitions.\n+    switch (m_recv_state) {\n+    case RecvState::KEY:\n+        Assume(recv_state == RecvState::GARB_GARBTERM);\n+        break;\n+    case RecvState::GARB_GARBTERM:\n+        Assume(recv_state == RecvState::GARBAUTH);\n+        break;\n+    case RecvState::GARBAUTH:\n+        Assume(recv_state == RecvState::VERSION);\n+        break;\n+    case RecvState::VERSION:\n+        Assume(recv_state == RecvState::APP);\n+        break;\n+    case RecvState::APP:\n+        Assume(recv_state == RecvState::APP_READY);\n+        break;\n+    case RecvState::APP_READY:\n+        Assume(recv_state == RecvState::APP);\n+        break;\n+    }\n+    // Change state.\n+    m_recv_state = recv_state;\n+}\n+\n+void V2Transport::SetSendState(SendState send_state) noexcept\n+{\n+    AssertLockHeld(m_send_mutex);\n+    // No-op if no change is desired.\n+    if (send_state == m_send_state) return;\n+    // Enforce allowed state transitions.\n+    switch (m_send_state) {\n+    case SendState::KEY:\n+        Assume(send_state == SendState::KEY_GARBTERM_GARBAUTH_VERSION);\n+        break;\n+    case SendState::KEY_GARBTERM_GARBAUTH_VERSION:\n+        Assume(send_state == SendState::APP_READY);\n+        break;\n+    case SendState::APP_READY:\n+        Assume(send_state == SendState::APP);\n+        break;\n+    case SendState::APP:\n+        Assume(send_state == SendState::APP_READY);\n+        break;\n+    }\n+    // Change state.\n+    m_send_state = send_state;\n+}\n+\n+bool V2Transport::ReceivedMessageComplete() const noexcept\n+{\n+    AssertLockNotHeld(m_recv_mutex);\n+    LOCK(m_recv_mutex);\n+    return m_recv_state == RecvState::APP_READY;\n+}\n+\n+size_t V2Transport::GetMaxBytesToProcess() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    switch (m_recv_state) {\n+    case RecvState::KEY:\n+        // During the KEY state, we only allow the 64-byte key into the receive buffer.\n+        Assume(m_recv_buffer.size() <= EllSwiftPubKey::size());\n+        // As long as we have not received the other side's public key, don't receive more than\n+        // that (64 bytes), as garbage follows, and locating the garbage terminator requires the\n+        // key exchange first.\n+        return EllSwiftPubKey::size() - m_recv_buffer.size();\n+    case RecvState::GARB_GARBTERM:\n+        // Process garbage bytes one by one (because terminator may appear anywhere).\n+        return 1;\n+    case RecvState::GARBAUTH:\n+    case RecvState::VERSION:\n+    case RecvState::APP:\n+        // These three states all involve decoding a packet. Process the length descriptor first,\n+        // followed by the ciphertext.\n+        if (m_recv_buffer.size() < BIP324Cipher::LENGTH_LEN) {\n+            return BIP324Cipher::LENGTH_LEN - m_recv_buffer.size();\n+        } else {\n+            // Note that BIP324Cipher::EXPANSION is the total difference between contents size\n+            // and encoded packet size, which includes the 3 bytes due to the packet length.\n+            // When transitioning from receiving the packet length to receiving its ciphertext,\n+            // the encrypted packet length is left in the receive buffer.\n+            return BIP324Cipher::EXPANSION + m_recv_len - m_recv_buffer.size();\n+        }\n+    case RecvState::APP_READY:\n+        // No bytes can be processed until GetMessage() is called.\n+        return 0;\n+    }\n+    Assume(false); // unreachable\n+    return 0;\n+}\n+\n+void V2Transport::ProcessReceivedKey() noexcept\n+{\n+    AssertLockHeld(m_recv_mutex);\n+    AssertLockNotHeld(m_send_mutex);\n+    Assume(m_recv_state == RecvState::KEY);\n+    if (m_recv_buffer.size() == EllSwiftPubKey::size()) {\n+        // Other side's key has been fully received.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1315182195",
+      "id" : 1315182195,
+      "line" : 1163,
+      "node_id" : "PRRC_kwDOABII585OZBZz",
+      "original_commit_id" : "25b0668c72f762df474c29e678e4baf69cff506c",
+      "original_line" : 1163,
+      "original_position" : 129,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 280,
+      "pull_request_review_id" : 1609921570,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1315182195/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-04T20:05:39Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1315182195",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1315184166"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1315184166"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I suppose the big conceptual difference between our send and receive state machines is that the latter has a clearly defined moment when the key exchange is complete, i.e. once it received the public key bytes. That's when it performs a Diff-Hellman exchange and sets m_cipher. From the `send` state machine point of view this happens in the background at some unpredictable point. So it does make sense that's represented by a state transition there (to `KEY_GARBTERM_GARBAUTH_VERSION`).",
+      "commit_id" : "e5d464907c5e7769ee1cce66ca2ae847875bd3c8",
+      "created_at" : "2023-09-04T20:05:39Z",
+      "diff_hunk" : "@@ -417,6 +419,187 @@ class V1Transport final : public Transport\n     size_t GetSendMemoryUsage() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);\n };\n \n+class V2Transport final : public Transport\n+{\n+private:\n+    /** Contents of the version packet to send. BIP324 stipulates this is supposed to be empty,\n+     *  and ignored by receivers. If extensions are defined, they can change what is sent as long\n+     *  as an empty version packet contents is interpreted as no extensions present. */\n+    static constexpr std::array<std::byte, 0> VERSION_CONTENTS = {};\n+\n+    // The sender side and receiver side of V2Transport are largely independent state machines that\n+    // are transitioned through, where each state corresponds to the meaning of the data in (or to\n+    // be received to) the respective (send/receive) buffer. The sender side is primarily\n+    // controlled by send-side functions (SetMessageToSend, MarkBytesSent), while the received side\n+    // is primarily controlled by receiver-side functions (ReceivedBytes, GetReceivedMessage),\n+    // though in some cases the sender state can also change as a result of receiving bytes.\n+\n+    /** State type that defines the current contents of the receive buffer and/or how the next\n+     *  received bytes added to it will be interpreted.\n+     *\n+     * Diagram:\n+     *\n+     *   start                                            /---------\\\n+     *     |                                              |         |\n+     *     v                                              v         |\n+     *    KEY -> GARB_GARBTERM -> GARBAUTH -> VERSION -> APP -> APP_READY\n+     */\n+    enum class RecvState : uint8_t {\n+        /** Public key.\n+         *\n+         * This is the initial state, during which the other side's public key is\n+         * received. When that information arrives, the ciphers get initialized and the state\n+         * becomes GARB_GARBTERM. */\n+        KEY,\n+\n+        /** Garbage and garbage terminator.\n+         *\n+         * Whenever a byte is received, the last 16 bytes are compared with the expected garbage\n+         * terminator. When that happens, the state becomes GARBAUTH. If no matching terminator is\n+         * received in 4111 bytes (4095 for the maximum garbage length, and 16 bytes for the\n+         * terminator), the connection aborts. */\n+        GARB_GARBTERM,\n+\n+        /** Garbage authentication packet.\n+         *\n+         * A packet is received, and decrypted/verified with AAD set to the garbage received during\n+         * the GARB_GARBTERM state. If that succeeds, the state becomes VERSION. If it fails the\n+         * connection aborts. */\n+        GARBAUTH,\n+\n+        /** Version packet.\n+         *\n+         * A packet is received, and decrypted/verified. If that succeeds, the state becomes APP,\n+         * and the decrypted contents is interpreted as version negotiation (currently, that means\n+         * ignoring it, but it can be used for negotiating future extensions). If it fails, the\n+         * connection aborts. */\n+        VERSION,\n+\n+        /** Application packet.\n+         *\n+         * A packet is received, and decrypted/verified. If that succeeds, the state becomes\n+         * APP_READY and the decrypted contents is kept in m_recv_decode_buffer until it is\n+         * retrieved as a message by GetMessage(). */\n+        APP,\n+\n+        /** Nothing (an application packet is available for GetMessage()).\n+         *\n+         * Nothing can be received in this state. When the message is retrieved by GetMessage,\n+         * the state becomes APP again. */\n+        APP_READY,\n+    };\n+\n+    /** State type that defines the contents of the send buffer.\n+     *\n+     * Diagram:\n+     *\n+     *   start                                       /----------\\\n+     *     |                                         |          |\n+     *     v                                         v          |\n+     *    KEY -> KEY_GARBTERM_GARBAUTH_VERSION -> APP_READY -> APP\n+     */\n+    enum class SendState : uint8_t {\n+        /** Public key.\n+         *\n+         * This is the initial state. The public key is sent out. When the receiver\n+         * receives the other side's public key and transitions to GARB_GARBTERM, the sender state\n+         * becomes KEY_GARBTERM_GARBAUTH_VERSION. The key is left in the send buffer when this\n+         * happens, because it may not have been fully sent out yet. */",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28196#discussion_r1315184166",
+      "id" : 1315184166,
+      "in_reply_to_id" : 1313408730,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585OZB4m",
+      "original_commit_id" : "fb3ec8fd9e96f6c2d16db02fd2d683ea097a90ff",
+      "original_line" : 507,
+      "original_position" : 107,
+      "original_start_line" : null,
+      "path" : "src/net.h",
+      "position" : null,
+      "pull_request_review_id" : 1609921570,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28196",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1315184166/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-04T20:11:34Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1315184166",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
    }
 ]
