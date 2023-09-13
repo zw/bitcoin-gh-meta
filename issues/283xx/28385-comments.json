@@ -6580,5 +6580,281 @@
          "type" : "User",
          "url" : "https://api.github.com/users/glozow"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28385#discussion_r1324409286"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28385"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324409286"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done",
+      "commit_id" : "4313c77400eb8eaa8586db39a7e29a861772ea80",
+      "created_at" : "2023-09-13T12:04:30Z",
+      "diff_hunk" : "@@ -0,0 +1,133 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_KERNEL_DISCONNECTED_TRANSACTIONS_H\n+#define BITCOIN_KERNEL_DISCONNECTED_TRANSACTIONS_H\n+\n+#include <core_memusage.h>\n+#include <memusage.h>\n+#include <primitives/transaction.h>\n+#include <util/hasher.h>\n+\n+#include <list>\n+#include <unordered_map>\n+\n+/** Maximum kilobytes for transactions to store for processing during reorg */\n+static const unsigned int MAX_DISCONNECTED_TX_POOL_SIZE = 20'000;\n+/**\n+ * DisconnectedBlockTransactions\n+\n+ * During the reorg, it's desirable to re-add previously confirmed transactions\n+ * to the mempool, so that anything not re-confirmed in the new chain is\n+ * available to be mined. However, it's more efficient to wait until the reorg\n+ * is complete and process all still-unconfirmed transactions at that time,\n+ * since we expect most confirmed transactions to (typically) still be\n+ * confirmed in the new chain, and re-accepting to the memory pool is expensive\n+ * (and therefore better to not do in the middle of reorg-processing).\n+ * Instead, store the disconnected transactions (in order!) as we go, remove any\n+ * that are included in blocks in the new chain, and then process the remaining\n+ * still-unconfirmed transactions at the end.\n+ *\n+ * Order of queuedTx:\n+ * The front of the list should be the most recently-confirmed transactions (transactions at the\n+ * end of vtx of blocks closer to the tip). If memory usage grows too large, we trim from the front\n+ * of the list. After trimming, transactions can be re-added to the mempool from the back of the\n+ * list to the front without running into missing inputs.\n+ */\n+class DisconnectedBlockTransactions {\n+private:\n+    uint64_t cachedInnerUsage = 0;\n+    const size_t m_max_mem_usage;\n+    std::list<CTransactionRef> queuedTx;\n+    using TxList = decltype(queuedTx);\n+    std::unordered_map<uint256, TxList::iterator, SaltedTxidHasher> iters_by_txid;\n+\n+    /** Trim the earliest-added entries until we are within memory bounds. */\n+    std::vector<CTransactionRef> LimitMemoryUsage()\n+    {\n+        std::vector<CTransactionRef> evicted;\n+\n+        while (!queuedTx.empty() && DynamicMemoryUsage() > m_max_mem_usage) {\n+            evicted.emplace_back(queuedTx.front());\n+            cachedInnerUsage -= RecursiveDynamicUsage(queuedTx.front());\n+            iters_by_txid.erase(queuedTx.front()->GetHash());\n+            queuedTx.pop_front();\n+        }\n+        return evicted;\n+    }\n+\n+public:\n+    DisconnectedBlockTransactions(size_t max_mem_usage) : m_max_mem_usage{max_mem_usage} {}\n+\n+    // It's almost certainly a logic bug if we don't clear out queuedTx before\n+    // destruction, as we add to it while disconnecting blocks, and then we\n+    // need to re-process remaining transactions to ensure mempool consistency.\n+    // For now, assert() that we've emptied out this object on destruction.\n+    // This assert() can always be removed if the reorg-processing code were\n+    // to be refactored such that this assumption is no longer true (for\n+    // instance if there was some other way we cleaned up the mempool after a\n+    // reorg, besides draining this object).\n+    ~DisconnectedBlockTransactions() {\n+        assert(queuedTx.empty());\n+        assert(iters_by_txid.empty());\n+        assert(cachedInnerUsage == 0);\n+    }\n+\n+    size_t DynamicMemoryUsage() const {\n+        return cachedInnerUsage + memusage::DynamicUsage(iters_by_txid) + memusage::DynamicUsage(queuedTx);\n+    }\n+\n+    /** Add transactions from the block, iterating through vtx in reverse order. Callers should call\n+     * this function for blocks in descending order by block height.\n+     * We assume that callers never pass multiple transactions with the same txid, otherwise things\n+     * can go very wrong in removeForBlock due to queuedTx containing an item without a\n+     * corresponding entry in iters_by_txid.\n+     * @returns vector of transactions that were evicted for size-limiting.\n+     */\n+    [[nodiscard]] std::vector<CTransactionRef> AddTransactionsFromBlock(const std::vector<CTransactionRef>& vtx)\n+    {\n+        iters_by_txid.reserve(iters_by_txid.size() + vtx.size());\n+        for (auto block_it = vtx.rbegin(); block_it != vtx.rend(); ++block_it) {\n+            auto it = queuedTx.insert(queuedTx.end(), *block_it);\n+            iters_by_txid.emplace((*block_it)->GetHash(), it);\n+            cachedInnerUsage += RecursiveDynamicUsage(*block_it);\n+        }\n+        return LimitMemoryUsage();\n+    }\n+\n+    /** Remove any entries that are in this block. */\n+    void removeForBlock(const std::vector<CTransactionRef>& vtx)\n+    {\n+        // Short-circuit in the common case of a block being added to the tip\n+        if (queuedTx.empty()) {\n+            return;\n+        }\n+        for (const auto& tx : vtx) {\n+            auto iter = iters_by_txid.find(tx->GetHash());\n+            if (iter != iters_by_txid.end()) {\n+                auto list_iter = iter->second;\n+                iters_by_txid.erase(iter);\n+                cachedInnerUsage -= RecursiveDynamicUsage(*list_iter);\n+                queuedTx.erase(list_iter);\n+            }\n+        }\n+    }\n+\n+    size_t size() const { return queuedTx.size(); }\n+\n+    void clear()\n+    {\n+        cachedInnerUsage = 0;\n+        iters_by_txid.clear();\n+        queuedTx.clear();\n+    }\n+\n+    /** Clear all data structures and return the list of transactions. */\n+    std::list<CTransactionRef> take() {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28385#discussion_r1324409286",
+      "id" : 1324409286,
+      "in_reply_to_id" : 1323108081,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585O8OHG",
+      "original_commit_id" : "9dcef47e4d52b15ffe88be7ddf5ea626121e5f0d",
+      "original_line" : 130,
+      "original_position" : 127,
+      "original_start_line" : null,
+      "path" : "src/kernel/disconnected_transactions.h",
+      "position" : null,
+      "pull_request_review_id" : 1624375319,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28385",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324409286/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-13T12:04:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324409286",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28385#discussion_r1324409363"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28385"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324409363"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done",
+      "commit_id" : "4313c77400eb8eaa8586db39a7e29a861772ea80",
+      "created_at" : "2023-09-13T12:04:35Z",
+      "diff_hunk" : "@@ -2720,15 +2721,10 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra\n     }\n \n     if (disconnectpool && m_mempool) {\n-        // Save transactions to re-add to mempool at end of reorg\n-        for (auto it = block.vtx.rbegin(); it != block.vtx.rend(); ++it) {\n-            disconnectpool->addTransaction(*it);\n-        }\n-        while (disconnectpool->DynamicMemoryUsage() > MAX_DISCONNECTED_TX_POOL_SIZE * 1000) {\n-            // Drop the earliest entry, and remove its children from the mempool.\n-            auto it = disconnectpool->queuedTx.get<insertion_order>().begin();\n-            m_mempool->removeRecursive(**it, MemPoolRemovalReason::REORG);\n-            disconnectpool->removeEntry(it);\n+        // Save transactions to re-add to mempool at end of reorg. If any entries are dropped,\n+        // remove their descendants from the mempool.\n+        for (auto&& ptx : disconnectpool->AddTransactionsFromBlock(block.vtx)) {\n+            m_mempool->removeRecursive(*ptx, MemPoolRemovalReason::REORG);\n         }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28385#discussion_r1324409363",
+      "id" : 1324409363,
+      "in_reply_to_id" : 1323146048,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585O8OIT",
+      "original_commit_id" : "9dcef47e4d52b15ffe88be7ddf5ea626121e5f0d",
+      "original_line" : 2728,
+      "original_position" : 87,
+      "original_start_line" : 2724,
+      "path" : "src/validation.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1624375455,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28385",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324409363/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-09-13T12:04:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324409363",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28385#discussion_r1324482843"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28385"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324482843"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Ah yes, you're right.",
+      "commit_id" : "4313c77400eb8eaa8586db39a7e29a861772ea80",
+      "created_at" : "2023-09-13T13:04:12Z",
+      "diff_hunk" : "@@ -0,0 +1,89 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+//\n+#include <test/util/setup_common.h>\n+#include <kernel/disconnected_transactions.h>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+BOOST_FIXTURE_TEST_SUITE(disconnected_transactions, TestChain100Setup)\n+\n+//! Tests that DisconnectedBlockTransactions limits its own memory properly\n+BOOST_AUTO_TEST_CASE(disconnectpool_memory_limits)\n+{\n+    if (sizeof(void*) != 8) {\n+        BOOST_TEST_MESSAGE(\"Exiting disconnected_transactions memory usage test early due to unsupported arch\");\n+    }\n+\n+    // Use the coinbase transactions from TestChain100Setup. It doesn't matter whether these\n+    // transactions would realistically be in a block together, they just need distinct txids and\n+    // uniform size for this test to work.\n+    std::vector<CTransactionRef> block_vtx(m_coinbase_txns);\n+    BOOST_CHECK_EQUAL(block_vtx.size(), 100);\n+\n+    // Roughly estimate sizes to sanity check that DisconnectedBlockTransactions::DynamicMemoryUsage\n+    // is within an expected range.\n+\n+    // Overhead for the hashmap depends on number of buckets\n+    std::unordered_map<uint256, CTransaction*, SaltedTxidHasher> temp_map;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28385#discussion_r1324482843",
+      "id" : 1324482843,
+      "in_reply_to_id" : 1323243772,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585O8gEb",
+      "original_commit_id" : "9dcef47e4d52b15ffe88be7ddf5ea626121e5f0d",
+      "original_line" : 29,
+      "original_position" : 29,
+      "original_start_line" : null,
+      "path" : "src/test/disconnected_transactions.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1624495030,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28385",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324482843/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-13T13:04:12Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324482843",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/69010457?v=4",
+         "events_url" : "https://api.github.com/users/stickies-v/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/stickies-v/followers",
+         "following_url" : "https://api.github.com/users/stickies-v/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/stickies-v/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/stickies-v",
+         "id" : 69010457,
+         "login" : "stickies-v",
+         "node_id" : "MDQ6VXNlcjY5MDEwNDU3",
+         "organizations_url" : "https://api.github.com/users/stickies-v/orgs",
+         "received_events_url" : "https://api.github.com/users/stickies-v/received_events",
+         "repos_url" : "https://api.github.com/users/stickies-v/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/stickies-v/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/stickies-v/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/stickies-v"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28385#discussion_r1324503221"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28385"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324503221"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "What do you mean with the other way around?\r\n\r\nStill nit, but, I think the first part of the new description (i.e. \"Add transactions from DisconnectedBlockTransactions, remove all but one (the disconnected block's coinbase transaction) of them, and then pop from the front until empty.\") is too much of an implementation detail for this docstring. And the other 2 benches would probably benefit from a consistent docstring. So new suggestion:\r\n\r\n\"Test DisconnectedBlockTransactions in a reorg in which {\\*all\\*, \\*90%\\*, \\*10%\\*} of the non-coinbase transactions in the disconnected chain also exist in the new chain.\"\r\n\r\n\r\n\r\n\r\n\r\n",
+      "commit_id" : "4313c77400eb8eaa8586db39a7e29a861772ea80",
+      "created_at" : "2023-09-13T13:18:09Z",
+      "diff_hunk" : "@@ -0,0 +1,127 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <bench/bench.h>\n+#include <kernel/disconnected_transactions.h>\n+#include <primitives/block.h>\n+#include <test/util/random.h>\n+#include <test/util/setup_common.h>\n+\n+constexpr size_t BLOCK_VTX_COUNT{4000};\n+constexpr size_t BLOCK_VTX_COUNT_10PERCENT{400};\n+\n+using BlockTxns = decltype(CBlock::vtx);\n+\n+/** Reorg where 1 block is disconnected and 2 blocks are connected. */\n+struct ReorgTxns {\n+    /** Disconnected block. */\n+    BlockTxns disconnected_txns;\n+    /** First connected block. */\n+    BlockTxns connected_txns_1;\n+    /** Second connected block, new chain tip. Has no overlap with disconnected_txns. */\n+    BlockTxns connected_txns_2;\n+    /** Transactions shared between disconnected_txns and connected_txns_1. */\n+    size_t num_shared;\n+};\n+\n+static BlockTxns CreateRandomTransactions(size_t num_txns)\n+{\n+    // Ensure every transaction has a different txid by having each one spend the previous one.\n+    static uint256 prevout_hash{uint256::ZERO};\n+\n+    BlockTxns txns;\n+    txns.reserve(num_txns);\n+    // Simplest spk for every tx\n+    CScript spk = CScript() << OP_TRUE;\n+    for (uint32_t i = 0; i < num_txns; ++i) {\n+        CMutableTransaction tx;\n+        tx.vin.resize(1);\n+        tx.vin.emplace_back(CTxIn{COutPoint{prevout_hash, 0}});\n+        tx.vout.resize(1);\n+        tx.vout.emplace_back(CTxOut{CENT, spk});\n+        auto ptx{MakeTransactionRef(tx)};\n+        txns.emplace_back(ptx);\n+        prevout_hash = ptx->GetHash();\n+    }\n+    return txns;\n+}\n+\n+/** Creates 2 blocks with BLOCK_VTX_COUNT transactions each. There will be num_not_shared\n+ * transactions that are different, all other transactions the exact same. This is to simulate a\n+ * reorg in which all but num_not_shared transactions are confirmed in the new chain. */\n+static ReorgTxns CreateBlocks(size_t num_not_shared)\n+{\n+    auto num_shared{BLOCK_VTX_COUNT - num_not_shared};\n+    const auto shared_txns{CreateRandomTransactions(/*num_txns=*/num_shared)};\n+\n+    // Create different sets of transactions...\n+    auto disconnected_block_txns{CreateRandomTransactions(/*num_txns=*/num_not_shared)};\n+    std::copy(shared_txns.begin(), shared_txns.end(), std::back_inserter(disconnected_block_txns));\n+\n+    auto connected_block_txns{CreateRandomTransactions(/*num_txns=*/num_not_shared)};\n+    std::copy(shared_txns.begin(), shared_txns.end(), std::back_inserter(connected_block_txns));\n+\n+    assert(disconnected_block_txns.size() == BLOCK_VTX_COUNT);\n+    assert(connected_block_txns.size() == BLOCK_VTX_COUNT);\n+\n+    return ReorgTxns{/*disconnected_txns=*/disconnected_block_txns,\n+                     /*connected_txns_1=*/connected_block_txns,\n+                     /*connected_txns_2=*/CreateRandomTransactions(BLOCK_VTX_COUNT),\n+                     /*num_shared=*/num_shared};\n+}\n+\n+static void Reorg(const ReorgTxns& reorg)\n+{\n+    DisconnectedBlockTransactions disconnectpool{MAX_DISCONNECTED_TX_POOL_SIZE * 1000};\n+    // Disconnect block\n+    const auto evicted = disconnectpool.AddTransactionsFromBlock(reorg.disconnected_txns);\n+    assert(evicted.empty());\n+\n+    // Connect first block\n+    disconnectpool.removeForBlock(reorg.connected_txns_1);\n+    // Connect new tip\n+    disconnectpool.removeForBlock(reorg.connected_txns_2);\n+\n+    // Sanity Check\n+    assert(disconnectpool.size() == BLOCK_VTX_COUNT - reorg.num_shared);\n+\n+    disconnectpool.clear();\n+}\n+\n+/** Add transactions from DisconnectedBlockTransactions, remove all of them, and then pop from the front until empty. */",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28385#discussion_r1324503221",
+      "id" : 1324503221,
+      "in_reply_to_id" : 1323091031,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585O8lC1",
+      "original_commit_id" : "9dcef47e4d52b15ffe88be7ddf5ea626121e5f0d",
+      "original_line" : 92,
+      "original_position" : 92,
+      "original_start_line" : null,
+      "path" : "src/bench/disconnected_transactions.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1624532574,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28385",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324503221/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-13T13:18:56Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1324503221",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/69010457?v=4",
+         "events_url" : "https://api.github.com/users/stickies-v/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/stickies-v/followers",
+         "following_url" : "https://api.github.com/users/stickies-v/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/stickies-v/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/stickies-v",
+         "id" : 69010457,
+         "login" : "stickies-v",
+         "node_id" : "MDQ6VXNlcjY5MDEwNDU3",
+         "organizations_url" : "https://api.github.com/users/stickies-v/orgs",
+         "received_events_url" : "https://api.github.com/users/stickies-v/received_events",
+         "repos_url" : "https://api.github.com/users/stickies-v/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/stickies-v/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/stickies-v/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/stickies-v"
+      }
    }
 ]
