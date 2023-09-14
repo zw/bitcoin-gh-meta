@@ -11718,5 +11718,118 @@
          "type" : "User",
          "url" : "https://api.github.com/users/DrahtBot"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1325767451"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1325767451"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I've fixed this by filtering the `descendant_caches` before passing it to `MiniMiner` (seemed cleaner than deleting from `descendant_subset`).",
+      "commit_id" : "0b98391134811cf0cb809566d67174cd4148364a",
+      "created_at" : "2023-09-14T10:49:30Z",
+      "diff_hunk" : "@@ -0,0 +1,213 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+#include <policy/ancestor_packages.h>\n+\n+#include <node/mini_miner.h>\n+#include <util/check.h>\n+\n+#include <algorithm>\n+#include <iterator>\n+#include <memory>\n+#include <numeric>\n+\n+\n+/**Comparator for sorting m_txns which contains reference wrappers.*/\n+struct CompareEntry {\n+    template<typename T>\n+    bool operator()(const std::reference_wrapper<T> a, const std::reference_wrapper<T> b) const\n+    {\n+        return a.get() < b.get();\n+    }\n+};\n+// Calculates curr_tx's in-package ancestor set. If the tx spends another tx in the package, calls\n+// visit() for that transaction first, since any transaction's ancestor set includes its parents'\n+// ancestor sets. Transaction dependency cycles are not possible without breaking sha256 and\n+// duplicate transactions were checked in the AncestorPackage() ctor, so this won't recurse infinitely.\n+// After this function returns, entry is guaranteed to contain a non-empty ancestor_subset.\n+void AncestorPackage::visit(const CTransactionRef& curr_tx)\n+{\n+    const uint256& curr_txid = curr_tx->GetHash();\n+    auto& entry = m_txid_to_entry.at(curr_txid);\n+    if (!entry.ancestor_subset.empty()) return;\n+    std::set<uint256> my_ancestors;\n+    my_ancestors.insert(curr_txid);\n+    for (const auto& input : curr_tx->vin) {\n+        const auto& parent_txid = input.prevout.hash;\n+        if (m_txid_to_entry.count(parent_txid) == 0) continue;\n+        auto parent_tx = m_txid_to_entry.at(parent_txid).tx;\n+        if (m_txid_to_entry.at(parent_txid).ancestor_subset.empty()) {\n+            visit(parent_tx);\n+        }\n+        auto parent_ancestor_set = m_txid_to_entry.at(parent_txid).ancestor_subset;\n+        Assume(!parent_ancestor_set.empty());\n+        my_ancestors.insert(parent_ancestor_set.cbegin(), parent_ancestor_set.cend());\n+    }\n+    entry.ancestor_subset = std::move(my_ancestors);\n+}\n+\n+AncestorPackage::AncestorPackage(const Package& txns_in)\n+{\n+    // Duplicate transactions are not allowed, as they will result in infinite visit() recursion.\n+    Assume(IsConsistent(txns_in));\n+    if (txns_in.empty() || !IsConsistent(txns_in)) return;\n+    // Populate m_txid_to_entry for quick lookup\n+    for (const auto& tx : txns_in) {\n+        m_txid_to_entry.emplace(tx->GetHash(), PackageEntry{tx});\n+        m_txns.push_back(std::ref(m_txid_to_entry.at(tx->GetHash())));\n+    }\n+    // DFS-based algorithm to sort transactions by ancestor count and populate ancestor_subset.\n+    // Best case runtime is if the package is already sorted and no recursive calls happen.\n+    // An empty PackageEntry::ancestor_subset is equivalent to not yet being processed.\n+    size_t i{0};\n+    while (i < txns_in.size()) {\n+        const auto& tx = txns_in[i];\n+        if (m_txid_to_entry.at(tx->GetHash()).ancestor_subset.empty()) visit(tx);\n+        Assume(!m_txid_to_entry.at(tx->GetHash()).ancestor_subset.empty());\n+        ++i;\n+    }\n+    // Sort by the number of in-package ancestors.\n+    std::sort(m_txns.begin(), m_txns.end(), CompareEntry());\n+    Assume(m_txns.size() == txns_in.size() && IsSorted(Txns()));\n+    // This package is ancestor package-shaped if every transaction is an ancestor of the last tx.\n+    m_ancestor_package_shaped = m_txns.back().get().ancestor_subset.size() == m_txns.size();\n+    // Now populate the descendant caches\n+    for (const auto& [txid, entry] : m_txid_to_entry) {\n+        for (const auto& anc_txid : entry.ancestor_subset) {\n+            m_txid_to_entry.at(anc_txid).descendant_subset.insert(txid);\n+        }\n+    }\n+}\n+\n+Package AncestorPackage::Txns() const\n+{\n+    Package result;\n+    std::transform(m_txns.cbegin(), m_txns.cend(), std::back_inserter(result),\n+                   [](const auto refentry){ return refentry.get().tx; });\n+    return result;\n+}\n+\n+Package AncestorPackage::FilteredTxns() const\n+{\n+    Package result;\n+    for (const auto entryref : m_txns) {\n+        if (!entryref.get().skip && !entryref.get().dangles) result.push_back(entryref.get().tx);\n+    }\n+    return result;\n+}\n+\n+std::optional<std::vector<CTransactionRef>> AncestorPackage::FilteredAncestorSet(const CTransactionRef& tx) const\n+{\n+    const auto& entry_it = m_txid_to_entry.find(tx->GetHash());\n+    if (entry_it == m_txid_to_entry.end()) return std::nullopt;\n+    const auto& entry = entry_it->second;\n+    if (entry.dangles) return std::nullopt;\n+    std::vector<CTransactionRef> result;\n+    result.reserve(entry.ancestor_subset.size());\n+    for (const auto entryref : m_txns) {\n+        if (!entryref.get().skip && entry.ancestor_subset.count(entryref.get().tx->GetHash()) > 0) {\n+            Assume(!entryref.get().dangles);\n+            result.push_back(entryref.get().tx);\n+        }\n+    }\n+    return result;\n+}\n+\n+std::optional<std::pair<CAmount, int64_t>> AncestorPackage::GetFeeAndVsize(const CTransactionRef& tx) const\n+{\n+    const auto& entry_it = m_txid_to_entry.find(tx->GetHash());\n+    if (entry_it == m_txid_to_entry.end()) return std::nullopt;\n+    const auto& entry = entry_it->second;\n+    if (!entry.fee.has_value() || !entry.vsize.has_value()) return std::nullopt;\n+    return std::make_pair(entry.fee.value(), entry.vsize.value());\n+}\n+\n+std::optional<std::pair<CAmount, int64_t>> AncestorPackage::FilteredAncestorFeeAndVsize(const CTransactionRef& tx) const\n+{\n+    const auto& entry_it = m_txid_to_entry.find(tx->GetHash());\n+    if (entry_it == m_txid_to_entry.end()) return std::nullopt;\n+    const auto& entry = entry_it->second;\n+    if (entry.dangles || !entry.fee.has_value() || !entry.vsize.has_value()) return std::nullopt;\n+    CAmount total_fee{0};\n+    int64_t total_vsize{0};\n+    for (const auto& txid : entry.ancestor_subset) {\n+        const auto& anc_entry = m_txid_to_entry.at(txid);\n+        Assume(!anc_entry.dangles);\n+        if (!anc_entry.skip && !anc_entry.dangles) {\n+            // If tx has fee and vsize, then any of its non-skipped ancestors should too.\n+            if (anc_entry.fee.has_value() && anc_entry.vsize.has_value()) {\n+                total_fee += anc_entry.fee.value();\n+                total_vsize += anc_entry.vsize.value();\n+            } else {\n+                // If any fee or vsize information is missing, we can't return an accurate result.\n+                return std::nullopt;\n+            }\n+        }\n+    }\n+    return std::make_pair(total_fee, total_vsize);\n+}\n+\n+void AncestorPackage::Skip(const CTransactionRef& transaction)\n+{\n+    if (m_txid_to_entry.count(transaction->GetHash()) == 0) return;\n+    m_txid_to_entry.at(transaction->GetHash()).skip = true;\n+}\n+void AncestorPackage::SkipWithDescendants(const CTransactionRef& transaction)\n+{\n+    if (m_txid_to_entry.count(transaction->GetHash()) == 0) return;\n+    m_txid_to_entry.at(transaction->GetHash()).skip = true;\n+    for (const auto& descendant_txid : m_txid_to_entry.at(transaction->GetHash()).descendant_subset) {\n+        m_txid_to_entry.at(descendant_txid).skip = true;\n+        m_txid_to_entry.at(descendant_txid).dangles = true;\n+    }\n+}\n+\n+void AncestorPackage::AddFeeAndVsize(const uint256& txid, CAmount fee, int64_t vsize)\n+{\n+    if (m_txid_to_entry.count(txid) == 0) return;\n+    m_txid_to_entry.at(txid).fee = fee;\n+    m_txid_to_entry.at(txid).vsize = vsize;\n+}\n+\n+bool AncestorPackage::LinearizeWithFees()\n+{\n+    if (!m_ancestor_package_shaped) return false;\n+    // All fee and vsize information for non-skipped transactions must be available, otherwise linearization cannot be done.\n+    if (!std::all_of(m_txid_to_entry.cbegin(), m_txid_to_entry.cend(),\n+        [](const auto& entry) { return entry.second.skip || entry.second.dangles ||\n+                                 (entry.second.fee.has_value() && entry.second.vsize.has_value()); })) {\n+        return false;\n+    }\n+    // Clear any previously-calculated mining sequences for all transactions.\n+    for (auto& [_, entry] : m_txid_to_entry) entry.mining_sequence = std::nullopt;\n+    std::vector<node::MiniMinerMempoolEntry> miniminer_info;\n+    std::map<uint256, std::set<uint256>> descendant_caches;\n+    // For each non-skipped transaction, calculate their ancestor fee and vsize.\n+    for (const auto& [txid, entry] : m_txid_to_entry) {\n+        if (entry.skip) continue;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1325767451",
+      "id" : 1325767451,
+      "in_reply_to_id" : 1322059487,
+      "line" : 187,
+      "node_id" : "PRRC_kwDOABII585PBZsb",
+      "original_commit_id" : "b8cd561b13ce1dfcca0b82835b8bf918d6f8a985",
+      "original_line" : 187,
+      "original_position" : 187,
+      "original_start_line" : null,
+      "path" : "src/policy/ancestor_packages.cpp",
+      "position" : 187,
+      "pull_request_review_id" : 1626601300,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1325767451/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-09-14T10:49:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1325767451",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "Rebased this on top of master +#28471 +#28450 +#28472",
+      "created_at" : "2023-09-14T10:50:30Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#issuecomment-1719220554",
+      "id" : 1719220554,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/26711",
+      "node_id" : "IC_kwDOABII585meTlK",
+      "performed_via_github_app" : null,
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1719220554/reactions"
+      },
+      "updated_at" : "2023-09-14T10:50:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1719220554",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
    }
 ]
