@@ -940,5 +940,74 @@
          "type" : "User",
          "url" : "https://api.github.com/users/achow101"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28450#discussion_r1331652861"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28450"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1331652861"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "That's chain limits vs package limit checks, I think it's useful",
+      "commit_id" : "93d7c5c09c86f9543433d87a2ca074f35cac0fe6",
+      "created_at" : "2023-09-20T13:40:30Z",
+      "diff_hunk" : "@@ -0,0 +1,341 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <consensus/validation.h>\n+#include <node/context.h>\n+#include <node/mempool_args.h>\n+#include <node/miner.h>\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+#include <test/fuzz/util/mempool.h>\n+#include <test/util/mining.h>\n+#include <test/util/script.h>\n+#include <test/util/setup_common.h>\n+#include <test/util/txmempool.h>\n+#include <util/rbf.h>\n+#include <validation.h>\n+#include <validationinterface.h>\n+\n+using node::BlockAssembler;\n+using node::NodeContext;\n+\n+namespace {\n+\n+const TestingSetup* g_setup;\n+std::vector<COutPoint> g_outpoints_coinbase_init_mature;\n+std::vector<COutPoint> g_outpoints_coinbase_init_immature;\n+\n+struct MockedTxPool : public CTxMemPool {\n+    void RollingFeeUpdate() EXCLUSIVE_LOCKS_REQUIRED(!cs)\n+    {\n+        LOCK(cs);\n+        lastRollingFeeUpdate = GetTime();\n+        blockSinceLastRollingFeeBump = true;\n+    }\n+};\n+\n+void initialize_tx_pool()\n+{\n+    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();\n+    g_setup = testing_setup.get();\n+\n+    for (int i = 0; i < 2 * COINBASE_MATURITY; ++i) {\n+        COutPoint prevout{MineBlock(g_setup->m_node, P2WSH_OP_TRUE)};\n+        // Remember the txids to avoid expensive disk access later on\n+        auto& outpoints = i < COINBASE_MATURITY ?\n+                              g_outpoints_coinbase_init_mature :\n+                              g_outpoints_coinbase_init_immature;\n+        outpoints.push_back(prevout);\n+    }\n+    SyncWithValidationInterfaceQueue();\n+}\n+\n+struct TransactionsDelta final : public CValidationInterface {\n+    std::set<CTransactionRef>& m_removed;\n+    std::set<CTransactionRef>& m_added;\n+\n+    explicit TransactionsDelta(std::set<CTransactionRef>& r, std::set<CTransactionRef>& a)\n+        : m_removed{r}, m_added{a} {}\n+\n+    void TransactionAddedToMempool(const CTransactionRef& tx, uint64_t /* mempool_sequence */) override\n+    {\n+        // Transactions may be entered and booted any number of times\n+        m_added.insert(tx);\n+    }\n+\n+    void TransactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason, uint64_t /* mempool_sequence */) override\n+    {\n+        // Transactions may be entered and booted any number of times\n+        m_removed.insert(tx);\n+    }\n+};\n+\n+void Finish(FuzzedDataProvider& fuzzed_data_provider, MockedTxPool& tx_pool, Chainstate& chainstate)\n+{\n+    WITH_LOCK(::cs_main, tx_pool.check(chainstate.CoinsTip(), chainstate.m_chain.Height() + 1));\n+    {\n+        BlockAssembler::Options options;\n+        options.nBlockMaxWeight = fuzzed_data_provider.ConsumeIntegralInRange(0U, MAX_BLOCK_WEIGHT);\n+        options.blockMinFeeRate = CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/COIN)};\n+        auto assembler = BlockAssembler{chainstate, &tx_pool, options};\n+        auto block_template = assembler.CreateNewBlock(CScript{} << OP_TRUE);\n+        Assert(block_template->block.vtx.size() >= 1);\n+    }\n+    const auto info_all = tx_pool.infoAll();\n+    if (!info_all.empty()) {\n+        const auto& tx_to_remove = *PickValue(fuzzed_data_provider, info_all).tx;\n+        WITH_LOCK(tx_pool.cs, tx_pool.removeRecursive(tx_to_remove, MemPoolRemovalReason::BLOCK /* dummy */));\n+        std::vector<uint256> all_txids;\n+        tx_pool.queryHashes(all_txids);\n+        assert(all_txids.size() < info_all.size());\n+        WITH_LOCK(::cs_main, tx_pool.check(chainstate.CoinsTip(), chainstate.m_chain.Height() + 1));\n+    }\n+    SyncWithValidationInterfaceQueue();\n+}\n+\n+void MockTime(FuzzedDataProvider& fuzzed_data_provider, const Chainstate& chainstate)\n+{\n+    const auto time = ConsumeTime(fuzzed_data_provider,\n+                                  chainstate.m_chain.Tip()->GetMedianTimePast() + 1,\n+                                  std::numeric_limits<decltype(chainstate.m_chain.Tip()->nTime)>::max());\n+    SetMockTime(time);\n+}\n+\n+CTxMemPool MakeMempool(FuzzedDataProvider& fuzzed_data_provider, const NodeContext& node)\n+{\n+    // Take the default options for tests...\n+    CTxMemPool::Options mempool_opts{MemPoolOptionsForTest(node)};\n+\n+\n+    // ...override specific options for this specific fuzz suite\n+    mempool_opts.limits.ancestor_count = fuzzed_data_provider.ConsumeIntegralInRange<unsigned>(0, 50);\n+    mempool_opts.limits.ancestor_size_vbytes = fuzzed_data_provider.ConsumeIntegralInRange<unsigned>(0, 202) * 1'000;\n+    mempool_opts.limits.descendant_count = fuzzed_data_provider.ConsumeIntegralInRange<unsigned>(0, 50);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28450#discussion_r1331652861",
+      "id" : 1331652861,
+      "in_reply_to_id" : 1331488544,
+      "line" : 115,
+      "node_id" : "PRRC_kwDOABII585PX2j9",
+      "original_commit_id" : "93d7c5c09c86f9543433d87a2ca074f35cac0fe6",
+      "original_line" : 115,
+      "original_position" : 115,
+      "original_start_line" : 113,
+      "path" : "src/test/fuzz/package_eval.cpp",
+      "position" : 115,
+      "pull_request_review_id" : 1635676679,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28450",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1331652861/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 113,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-09-20T13:40:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1331652861",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
    }
 ]
