@@ -350,5 +350,73 @@
          "type" : "User",
          "url" : "https://api.github.com/users/DrahtBot"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28550#discussion_r1345769688"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28550"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1345769688"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This is unreachable? Since OP_VAULT is only defined for v1 and we don't know what v2 could even look like this might as well not introduce the `m_curr_witversion` variable and explicitly check for witness version 1 above?\r\n\r\n(was just checking the code corresponding to https://github.com/bitcoin/bips/pull/1421#discussion_r1345761010)",
+      "commit_id" : "86454de4caeff4712513dd9864b51fdd94d01f93",
+      "created_at" : "2023-10-04T13:08:02Z",
+      "diff_hunk" : "@@ -1781,6 +2062,222 @@ bool GenericTransactionSignatureChecker<T>::CheckSequence(const CScriptNum& nSeq\n     return true;\n }\n \n+template <class T>\n+bool GenericTransactionSignatureChecker<T>::CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const\n+{\n+    // Should already be checked before calling...\n+    assert(hash.size() == 32);\n+    if (txdata && txdata->m_bip119_ctv_ready) {\n+        assert(txTo != nullptr);\n+        uint256 hash_tmpl = txdata->m_scriptSigs_single_hash.IsNull() ?\n+            GetDefaultCheckTemplateVerifyHashEmptyScript(*txTo, txdata->m_outputs_single_hash, txdata->m_sequences_single_hash, nIn) :\n+            GetDefaultCheckTemplateVerifyHashWithScript(*txTo, txdata->m_outputs_single_hash, txdata->m_sequences_single_hash,\n+                    txdata->m_scriptSigs_single_hash, nIn);\n+        return std::equal(hash_tmpl.begin(), hash_tmpl.end(), hash.data());\n+    } else {\n+        return HandleMissingData(m_mdb);\n+    }\n+}\n+//! Return true if the given output is a 0-value anchor output.\n+//!\n+//! Note, this is stolen from https://github.com/bitcoin/bitcoin/pull/26403, and so\n+//! should be updated to use whatever lands there.\n+static bool IsOutputEphemeralAnchor(const CTxOut& out)\n+{\n+    if (out.nValue != 0) {\n+        return false;\n+    }\n+    const CScript& spk = out.scriptPubKey;\n+    if (!(spk.size() == 1 && spk[0] == OP_2)) {\n+        return false;\n+    }\n+    return true;\n+}\n+\n+template <class T>\n+std::optional<ScriptError> GenericTransactionSignatureChecker<T>::CheckVaultRecover(\n+    const size_t recovery_vout_idx,\n+    ScriptExecutionData& execdata,\n+    const uint256& expected_recovery_spk_hash,\n+    const CScript& executing_script,\n+    unsigned int flags) const\n+{\n+    const auto& vout = this->txTo->vout;\n+    const auto num_vout = vout.size();\n+\n+    assert(recovery_vout_idx >= 0);\n+    if (num_vout <= recovery_vout_idx) {\n+        return SCRIPT_ERR_VAULT_BAD_VOUT_IDX;\n+    }\n+    const CTxOut& recovery_out{vout[recovery_vout_idx]};\n+    const uint256 output_spk_hash = VaultScriptHash(\n+        HASHER_VAULT_RECOVERY_SPK, recovery_out.scriptPubKey);\n+\n+    if (output_spk_hash != expected_recovery_spk_hash) {\n+        return SCRIPT_ERR_VAULT_BAD_RECOVERY_OUTPUTS;\n+\n+    }\n+\n+    if (recovery_out.nValue < this->amount) {\n+        // Recovery out value doesn't cover _at least_ the amount of this input.\n+        //\n+        // Note that because there may be multiple vaulted inputs paying to the same\n+        // recovery output, we must use a deferred check to ensure the sum value of\n+        // all compatible vaults is paid out.\n+        return SCRIPT_ERR_VAULT_LOW_RECOVERY_AMOUNT;\n+    }\n+\n+    const CTxIn& this_in{this->txTo->vin[this->nIn]};\n+\n+    // Ensure that the recovery transaction is replaceable (by policy).\n+    if (flags & SCRIPT_VERIFY_VAULT_REPLACEABLE_RECOVERY &&\n+            this_in.nSequence > MAX_BIP125_RBF_SEQUENCE) {\n+        // TODO: when transaction nVersion=3 policy is merged, this should be updated\n+        // since the goal here is to ensure that recovery transactions are replaceable.\n+        return SCRIPT_ERR_VAULT_RECOVERY_NOT_REPLACEABLE;\n+    }\n+\n+    // If there are additional bytes beyond \"<recovery-path-sPK-hash> OP_VAULT_RECOVER\",\n+    // then this is considered an authorized recovery.\n+    //\n+    // FIXME document the comparison more.\n+    const bool is_authed_recovery{executing_script.size() > (uint256::WIDTH + 2)};\n+\n+    // If this is an unauthenticated recovery, ensure that the only other\n+    // output is an ephemeral anchor (by policy).\n+    if (flags & SCRIPT_VERIFY_VAULT_UNAUTH_RECOVERY_STRUCTURE && !is_authed_recovery) {\n+        const size_t optional_ea_idx{recovery_vout_idx == 0 ? 1U : 0U};\n+        if (num_vout != 2 || !IsOutputEphemeralAnchor(vout[optional_ea_idx])) {\n+            return SCRIPT_ERR_VAULT_BAD_RECOVERY_OUTPUTS;\n+        }\n+    }\n+\n+    execdata.AddDeferredVaultRecoveryCheck(recovery_vout_idx, this->amount);\n+\n+    return std::nullopt;\n+}\n+\n+template <class T>\n+std::optional<ScriptError> GenericTransactionSignatureChecker<T>::CheckVaultTrigger(\n+    ScriptExecutionData& execdata,\n+    const size_t trigger_out_idx,\n+    const int maybe_revault_out_idx,\n+    const CAmount revault_amount,\n+    CScript flu_script,\n+    unsigned int flags,\n+    ScriptError* serror) const\n+{\n+    assert(execdata.m_curr_witversion);\n+\n+    // Implement the sigops/witnesssize ratio test.\n+    // Passing with an upgradable public key version is also counted.\n+    assert(execdata.m_validation_weight_left_init);\n+    execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_TAPTWEAKCHECK;\n+    if (execdata.m_validation_weight_left < 0) {\n+        return SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT;\n+    }\n+\n+    if (!this->txdata) {\n+        HandleMissingData(m_mdb);\n+        return SCRIPT_ERR_UNKNOWN_ERROR;\n+    }\n+    const auto& txd{*this->txdata};\n+    const auto& vout{this->txTo->vout};\n+\n+    assert(txd.m_spent_outputs_ready);\n+    const CScript& vault_spk = txd.m_spent_outputs[this->nIn].scriptPubKey;\n+\n+    if (trigger_out_idx >= vout.size()) {\n+        return SCRIPT_ERR_UNVAULT_MISMATCH;\n+    }\n+\n+    // Ensure that the output creating the unvault trigger matches the\n+    // expected scriptPubKey.\n+    const auto& value_out = vout[trigger_out_idx];\n+\n+    int trigger_witversion;\n+    valtype trigger_witprogram;\n+    const bool is_unvault_output_wit =\n+        value_out.scriptPubKey.IsWitnessProgram(trigger_witversion, trigger_witprogram);\n+\n+    if (!is_unvault_output_wit || trigger_witversion < 1 ||\n+            trigger_witversion != *execdata.m_curr_witversion) {\n+        return SCRIPT_ERR_UNVAULT_INCOMPAT_OUTPUT_TYPE;\n+    }\n+    else if (trigger_witversion == 1) {\n+        assert(execdata.m_internal_key);\n+        assert(execdata.m_taproot_control.size() > 0);\n+\n+        const valtype& control = execdata.m_taproot_control;\n+        const valtype val_sPK{\n+            value_out.scriptPubKey.begin(), value_out.scriptPubKey.end()};\n+\n+        if (val_sPK.size() != 34) {\n+            return SCRIPT_ERR_UNVAULT_MISMATCH;\n+        }\n+        const XOnlyPubKey val_pk{Span{val_sPK}.subspan(2)};\n+\n+        const auto tapleaf_hash = ComputeTapleafHash(\n+            control[0] & TAPROOT_LEAF_MASK, flu_script);\n+        const uint256 merkle_root = ComputeTaprootMerkleRoot(control, tapleaf_hash);\n+        const auto expected_pk = (*execdata.m_internal_key).CreateTapTweak(&merkle_root);\n+\n+        // Ensure the currently executing OP_VAULT tapleaf is substituted for the\n+        // expected replacement.\n+        if (!(expected_pk && val_pk == expected_pk->first)) {\n+            return SCRIPT_ERR_UNVAULT_MISMATCH;\n+        }\n+    }\n+    // Append the handling of future witness versions with `else if`s here.\n+    else {\n+        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) {\n+            return SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM;\n+        }\n+        set_success(serror);\n+        return std::nullopt;\n+    }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28550#discussion_r1345769688",
+      "id" : 1345769688,
+      "line" : 2238,
+      "node_id" : "PRRC_kwDOABII585QNtDY",
+      "original_commit_id" : "86454de4caeff4712513dd9864b51fdd94d01f93",
+      "original_line" : 2238,
+      "original_position" : 668,
+      "original_start_line" : 2231,
+      "path" : "src/script/interpreter.cpp",
+      "position" : 668,
+      "pull_request_review_id" : 1657492785,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28550",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1345769688/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 2231,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-10-04T13:08:02Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1345769688",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/22457751?v=4",
+         "events_url" : "https://api.github.com/users/darosior/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/darosior/followers",
+         "following_url" : "https://api.github.com/users/darosior/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/darosior/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/darosior",
+         "id" : 22457751,
+         "login" : "darosior",
+         "node_id" : "MDQ6VXNlcjIyNDU3NzUx",
+         "organizations_url" : "https://api.github.com/users/darosior/orgs",
+         "received_events_url" : "https://api.github.com/users/darosior/received_events",
+         "repos_url" : "https://api.github.com/users/darosior/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/darosior/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/darosior/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/darosior"
+      }
    }
 ]
