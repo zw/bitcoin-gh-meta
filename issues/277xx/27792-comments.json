@@ -858,5 +858,349 @@
          "type" : "User",
          "url" : "https://api.github.com/users/denavila"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27792#discussion_r1349555508"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27792"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349555508"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I suggest that you operate entirely on `CScript`s rather than `CTxDestination`s. Under the previous semantics, P2PK and P2PKH scripts would be bundled together which I don't think is actually the behavior that you want. It would be better to use `CScript` and the `Solver` to get precise script types, and avoid using `CTxDestination` and `OutputType`. The latter two are more for user input and display rather than providing precise distinction between scripts. Scripts are always precise and accurate as they are what appear in transactions. We sometimes abstract away things about addresses and address types to the user to make things easier to understand and so meaning can be lost.",
+      "commit_id" : "937e17a94a70b707170467b74cea1696d6286030",
+      "created_at" : "2023-10-07T18:02:53Z",
+      "diff_hunk" : "@@ -1392,4 +1392,302 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,\n \n     return true;\n }\n+\n+constexpr int NUM_DENIABILIZATION_OUTPUTS = 2;\n+\n+static unsigned int CalculateDeniabilizationTxSize(const CTxDestination& address, CAmount value, unsigned int numTxIn)\n+{\n+    // Calculation based on the comments and code in GetDustThreshold and CreateTransactionInternal\n+    CScript script = GetScriptForDestination(address);\n+    unsigned int txOutSize = (unsigned int)GetSerializeSize(CTxOut(value, script), PROTOCOL_VERSION);\n+\n+    const size_t txOutCount = NUM_DENIABILIZATION_OUTPUTS;\n+    unsigned int txSize = 10 + GetSizeOfCompactSize(txOutCount); // bytes for output count\n+    txSize += txOutSize * txOutCount;\n+\n+    int witnessversion = 0;\n+    std::vector<unsigned char> witnessprogram;\n+    if (script.IsWitnessProgram(witnessversion, witnessprogram)) {\n+        txSize += (unsigned int)(numTxIn * 67.75f + 0.5f);\n+    } else {\n+        txSize += numTxIn * 148;\n+    }\n+    return txSize;\n+}\n+\n+float CalculateDeniabilizationProbability(unsigned int deniabilization_cycles)\n+{\n+    // 100%, 50%, 25%, 13%, 6%, 3%, 2%, 1%\n+    return powf(0.5f, deniabilization_cycles);\n+}\n+\n+bool IsDeniabilizationWorthwhile(CAmount total_value, CAmount fee_estimate)\n+{\n+    constexpr CAmount value_to_fee_ratio = 10;\n+    return total_value > fee_estimate * value_to_fee_ratio;\n+}\n+\n+CCoinControl SetupDeniabilizationCoinControl(unsigned int confirm_target)\n+{\n+    CCoinControl coin_control;\n+    coin_control.m_avoid_address_reuse = true;\n+    coin_control.m_avoid_partial_spends = true;\n+    coin_control.m_allow_other_inputs = false;\n+    coin_control.m_signal_bip125_rbf = true;\n+    coin_control.m_confirm_target = confirm_target;\n+    // we'll automatically bump the fee if economical ends up not confirming by the next deniabilization cycle\n+    coin_control.m_fee_mode = FeeEstimateMode::ECONOMICAL;\n+    return coin_control;\n+}\n+\n+CFeeRate CalculateDeniabilizationFeeRate(const CWallet& wallet, unsigned int confirm_target)\n+{\n+    CCoinControl coin_control = SetupDeniabilizationCoinControl(confirm_target);\n+\n+    CFeeRate requiredFeeRate = GetRequiredFeeRate(wallet);\n+    FeeCalculation fee_calc;\n+    CFeeRate minFeeRate = GetMinimumFeeRate(wallet, coin_control, &fee_calc);\n+    if (fee_calc.reason == FeeReason::FALLBACK || requiredFeeRate > minFeeRate)\n+        return requiredFeeRate;\n+    return minFeeRate;\n+}\n+\n+static CAmount CalculateDeniabilizationTxFee(const CTxDestination& shared_destination, CAmount total_value, unsigned int num_utxos, const CFeeRate& fee_rate)\n+{\n+    Assert(num_utxos > 0);\n+    unsigned int deniabilization_tx_size = CalculateDeniabilizationTxSize(shared_destination, total_value, num_utxos);\n+    return fee_rate.GetFee(deniabilization_tx_size);\n+}\n+\n+CAmount CalculateDeniabilizationFeeEstimate(const CTxDestination& shared_destination, CAmount total_value, unsigned int num_utxos, unsigned int deniabilization_cycles, const CFeeRate& fee_rate)\n+{\n+    float deniabilizationProbability = CalculateDeniabilizationProbability(deniabilization_cycles);\n+    // convert to integer percent to truncate and check for zero probability\n+    unsigned int deniabilizationProbabilityPercent = deniabilizationProbability * 100;\n+    if (deniabilizationProbabilityPercent == 0) {\n+        return 0;\n+    }\n+\n+    // this cycle will use all the UTXOs, while following cycles will have just one UTXO\n+    CAmount deniabilizationFee = CalculateDeniabilizationTxFee(shared_destination, total_value, num_utxos, fee_rate);\n+\n+    // calculate the fees from future deniabilization cycles\n+    CAmount futureDeniabilizationFee = CalculateDeniabilizationFeeEstimate(shared_destination, total_value / NUM_DENIABILIZATION_OUTPUTS, 1, deniabilization_cycles + 1, fee_rate) * 2;\n+\n+    // if it's worthwhile to do future deniabilizations then add them to this cycle estimate\n+    if (IsDeniabilizationWorthwhile(total_value, deniabilizationFee + futureDeniabilizationFee)) {\n+        deniabilizationFee += futureDeniabilizationFee;\n+    }\n+    return deniabilizationFee;\n+}\n+\n+std::pair<unsigned int, bool> CalculateDeniabilizationCycles(CWallet& wallet, const COutPoint& outpoint)\n+{\n+    LOCK(wallet.cs_wallet);\n+    auto walletTx = wallet.GetWalletTx(outpoint.hash);\n+    if (!walletTx) {\n+        return std::make_pair(0, false);\n+    }\n+    auto tx = walletTx->tx;\n+\n+    if (tx->IsCoinBase()) {\n+        // this is a block reward tx, so we tag it as such\n+        return std::make_pair(0, true);\n+    }\n+\n+    // an deniabilized coin is one we sent to ourselves\n+    // all txIn should belong to our wallet\n+    if (tx->vin.empty()) {\n+        return std::make_pair(0, false);\n+    }\n+    for (const auto& txIn : tx->vin) {\n+        if (InputIsMine(wallet, txIn) == ISMINE_NO) {\n+            return std::make_pair(0, false);\n+        }\n+    }\n+\n+    // all txOut should belong to our wallet\n+    Assert(outpoint.n < tx->vout.size());\n+    unsigned int n = 0;\n+    for (const auto& txOut : tx->vout) {\n+        if (wallet.IsMine(txOut) == ISMINE_NO) {\n+            Assert(n != outpoint.n);\n+            return std::make_pair(0, false);\n+        }\n+        n++;\n+    }\n+\n+    unsigned int uniqueTxOutCount = 0;\n+    for (const auto& txOut : tx->vout) {\n+        // check if it's a valid destination\n+        CTxDestination txOutDestination;\n+        ExtractDestination(txOut.scriptPubKey, txOutDestination);\n+        if (std::get_if<CNoDestination>(&txOutDestination)) {\n+            continue;\n+        }\n+\n+        // don't count outputs that match any input addresses (eg it's change output)\n+        bool matchesInput = false;\n+        for (const auto& txIn : tx->vin) {\n+            auto prevWalletTx = wallet.GetWalletTx(txIn.prevout.hash);\n+            if (prevWalletTx && prevWalletTx->tx->vout[txIn.prevout.n].scriptPubKey == txOut.scriptPubKey) {\n+                matchesInput = true;\n+                break;\n+            }\n+        }\n+        if (matchesInput) {\n+            continue;\n+        }\n+\n+        uniqueTxOutCount++;\n+    }\n+\n+    // we consider two or more unique outputs an \"deniabilization\" of the coin\n+    unsigned int deniabilizationCycles = uniqueTxOutCount >= 2 ? 1 : 0;\n+\n+    // all txIn and txOut are from our wallet\n+    // however if we have multiple txIn this was either an initial deniabilization of multiple UTXOs or the user manually merged deniabilized UTXOs\n+    // in either case we don't need to recurse into parent transactions and we can return the calculated cycles\n+    if (tx->vin.size() > 1) {\n+        return std::make_pair(deniabilizationCycles, false);\n+    }\n+\n+    const auto& txIn = tx->vin[0];\n+    // now recursively calculate the deniabilization cycles of the input\n+    auto inputStats = CalculateDeniabilizationCycles(wallet, txIn.prevout);\n+    return std::make_pair(inputStats.first + deniabilizationCycles, inputStats.second);\n+};\n+\n+util::Result<CreatedTransactionResult> CreateDeniabilizationTransaction(CWallet& wallet, const std::set<COutPoint>& inputs, unsigned int confirm_target, unsigned int deniabilization_cycles, bool sign, bool& insufficient_amount)\n+{\n+    if (inputs.empty()) {\n+        return util::Error{_(\"Inputs must not be empty\")};\n+    }\n+\n+    CCoinControl coin_control = SetupDeniabilizationCoinControl(confirm_target);\n+    for (const auto& input : inputs) {\n+        coin_control.Select(input);\n+    }\n+    Assert(coin_control.HasSelected());\n+    CFeeRate deniabilization_fee_rate = CalculateDeniabilizationFeeRate(wallet, confirm_target);\n+    coin_control.m_feerate = deniabilization_fee_rate;\n+\n+    LOCK(wallet.cs_wallet);\n+\n+    FastRandomContext rng_fast;\n+    CoinSelectionParams coin_selection_params{rng_fast};\n+    auto res_fetch_inputs = FetchSelectedInputs(wallet, coin_control, coin_selection_params);\n+    if (!res_fetch_inputs) {\n+        return util::Error{util::ErrorString(res_fetch_inputs)};\n+    }\n+    PreSelectedInputs preset_inputs = *res_fetch_inputs;\n+    CAmount total_amount = preset_inputs.total_amount;\n+\n+    // validate that all UTXOs share the same address\n+    std::optional<CTxDestination> op_shared_destination;\n+    for (const auto& coin : preset_inputs.coins) {\n+        CTxDestination destination = CNoDestination();\n+        ExtractDestination(coin->txout.scriptPubKey, destination);\n+        if (!std::get_if<CNoDestination>(&destination) && !op_shared_destination) {\n+            op_shared_destination = destination;\n+        }\n+        if (!op_shared_destination || !(*op_shared_destination == destination)) {\n+            return util::Error{_(\"Input addresses must all match.\")};\n+        }\n+    }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27792#discussion_r1349555508",
+      "id" : 1349555508,
+      "in_reply_to_id" : 1349552527,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585QcJU0",
+      "original_commit_id" : "4c731398d3b62b68581f65dd2a9e4246eae017c3",
+      "original_line" : 1597,
+      "original_position" : 206,
+      "original_start_line" : 1586,
+      "path" : "src/wallet/spend.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1663091519,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27792",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349555508/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-10-07T18:03:56Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349555508",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27792#discussion_r1349558005"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27792"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349558005"
+         }
+      },
+      "author_association" : "NONE",
+      "body" : "How do I compare one CScript with another (in particular one txout.scriptPubKey with another). \r\nThe idea being that I want to issue a transaction where the inputs are strictly inputs that share the same \"address\" (address in layman terms - the address that people copy/paste to receive BTC).",
+      "commit_id" : "937e17a94a70b707170467b74cea1696d6286030",
+      "created_at" : "2023-10-07T18:19:25Z",
+      "diff_hunk" : "@@ -1392,4 +1392,302 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,\n \n     return true;\n }\n+\n+constexpr int NUM_DENIABILIZATION_OUTPUTS = 2;\n+\n+static unsigned int CalculateDeniabilizationTxSize(const CTxDestination& address, CAmount value, unsigned int numTxIn)\n+{\n+    // Calculation based on the comments and code in GetDustThreshold and CreateTransactionInternal\n+    CScript script = GetScriptForDestination(address);\n+    unsigned int txOutSize = (unsigned int)GetSerializeSize(CTxOut(value, script), PROTOCOL_VERSION);\n+\n+    const size_t txOutCount = NUM_DENIABILIZATION_OUTPUTS;\n+    unsigned int txSize = 10 + GetSizeOfCompactSize(txOutCount); // bytes for output count\n+    txSize += txOutSize * txOutCount;\n+\n+    int witnessversion = 0;\n+    std::vector<unsigned char> witnessprogram;\n+    if (script.IsWitnessProgram(witnessversion, witnessprogram)) {\n+        txSize += (unsigned int)(numTxIn * 67.75f + 0.5f);\n+    } else {\n+        txSize += numTxIn * 148;\n+    }\n+    return txSize;\n+}\n+\n+float CalculateDeniabilizationProbability(unsigned int deniabilization_cycles)\n+{\n+    // 100%, 50%, 25%, 13%, 6%, 3%, 2%, 1%\n+    return powf(0.5f, deniabilization_cycles);\n+}\n+\n+bool IsDeniabilizationWorthwhile(CAmount total_value, CAmount fee_estimate)\n+{\n+    constexpr CAmount value_to_fee_ratio = 10;\n+    return total_value > fee_estimate * value_to_fee_ratio;\n+}\n+\n+CCoinControl SetupDeniabilizationCoinControl(unsigned int confirm_target)\n+{\n+    CCoinControl coin_control;\n+    coin_control.m_avoid_address_reuse = true;\n+    coin_control.m_avoid_partial_spends = true;\n+    coin_control.m_allow_other_inputs = false;\n+    coin_control.m_signal_bip125_rbf = true;\n+    coin_control.m_confirm_target = confirm_target;\n+    // we'll automatically bump the fee if economical ends up not confirming by the next deniabilization cycle\n+    coin_control.m_fee_mode = FeeEstimateMode::ECONOMICAL;\n+    return coin_control;\n+}\n+\n+CFeeRate CalculateDeniabilizationFeeRate(const CWallet& wallet, unsigned int confirm_target)\n+{\n+    CCoinControl coin_control = SetupDeniabilizationCoinControl(confirm_target);\n+\n+    CFeeRate requiredFeeRate = GetRequiredFeeRate(wallet);\n+    FeeCalculation fee_calc;\n+    CFeeRate minFeeRate = GetMinimumFeeRate(wallet, coin_control, &fee_calc);\n+    if (fee_calc.reason == FeeReason::FALLBACK || requiredFeeRate > minFeeRate)\n+        return requiredFeeRate;\n+    return minFeeRate;\n+}\n+\n+static CAmount CalculateDeniabilizationTxFee(const CTxDestination& shared_destination, CAmount total_value, unsigned int num_utxos, const CFeeRate& fee_rate)\n+{\n+    Assert(num_utxos > 0);\n+    unsigned int deniabilization_tx_size = CalculateDeniabilizationTxSize(shared_destination, total_value, num_utxos);\n+    return fee_rate.GetFee(deniabilization_tx_size);\n+}\n+\n+CAmount CalculateDeniabilizationFeeEstimate(const CTxDestination& shared_destination, CAmount total_value, unsigned int num_utxos, unsigned int deniabilization_cycles, const CFeeRate& fee_rate)\n+{\n+    float deniabilizationProbability = CalculateDeniabilizationProbability(deniabilization_cycles);\n+    // convert to integer percent to truncate and check for zero probability\n+    unsigned int deniabilizationProbabilityPercent = deniabilizationProbability * 100;\n+    if (deniabilizationProbabilityPercent == 0) {\n+        return 0;\n+    }\n+\n+    // this cycle will use all the UTXOs, while following cycles will have just one UTXO\n+    CAmount deniabilizationFee = CalculateDeniabilizationTxFee(shared_destination, total_value, num_utxos, fee_rate);\n+\n+    // calculate the fees from future deniabilization cycles\n+    CAmount futureDeniabilizationFee = CalculateDeniabilizationFeeEstimate(shared_destination, total_value / NUM_DENIABILIZATION_OUTPUTS, 1, deniabilization_cycles + 1, fee_rate) * 2;\n+\n+    // if it's worthwhile to do future deniabilizations then add them to this cycle estimate\n+    if (IsDeniabilizationWorthwhile(total_value, deniabilizationFee + futureDeniabilizationFee)) {\n+        deniabilizationFee += futureDeniabilizationFee;\n+    }\n+    return deniabilizationFee;\n+}\n+\n+std::pair<unsigned int, bool> CalculateDeniabilizationCycles(CWallet& wallet, const COutPoint& outpoint)\n+{\n+    LOCK(wallet.cs_wallet);\n+    auto walletTx = wallet.GetWalletTx(outpoint.hash);\n+    if (!walletTx) {\n+        return std::make_pair(0, false);\n+    }\n+    auto tx = walletTx->tx;\n+\n+    if (tx->IsCoinBase()) {\n+        // this is a block reward tx, so we tag it as such\n+        return std::make_pair(0, true);\n+    }\n+\n+    // an deniabilized coin is one we sent to ourselves\n+    // all txIn should belong to our wallet\n+    if (tx->vin.empty()) {\n+        return std::make_pair(0, false);\n+    }\n+    for (const auto& txIn : tx->vin) {\n+        if (InputIsMine(wallet, txIn) == ISMINE_NO) {\n+            return std::make_pair(0, false);\n+        }\n+    }\n+\n+    // all txOut should belong to our wallet\n+    Assert(outpoint.n < tx->vout.size());\n+    unsigned int n = 0;\n+    for (const auto& txOut : tx->vout) {\n+        if (wallet.IsMine(txOut) == ISMINE_NO) {\n+            Assert(n != outpoint.n);\n+            return std::make_pair(0, false);\n+        }\n+        n++;\n+    }\n+\n+    unsigned int uniqueTxOutCount = 0;\n+    for (const auto& txOut : tx->vout) {\n+        // check if it's a valid destination\n+        CTxDestination txOutDestination;\n+        ExtractDestination(txOut.scriptPubKey, txOutDestination);\n+        if (std::get_if<CNoDestination>(&txOutDestination)) {\n+            continue;\n+        }\n+\n+        // don't count outputs that match any input addresses (eg it's change output)\n+        bool matchesInput = false;\n+        for (const auto& txIn : tx->vin) {\n+            auto prevWalletTx = wallet.GetWalletTx(txIn.prevout.hash);\n+            if (prevWalletTx && prevWalletTx->tx->vout[txIn.prevout.n].scriptPubKey == txOut.scriptPubKey) {\n+                matchesInput = true;\n+                break;\n+            }\n+        }\n+        if (matchesInput) {\n+            continue;\n+        }\n+\n+        uniqueTxOutCount++;\n+    }\n+\n+    // we consider two or more unique outputs an \"deniabilization\" of the coin\n+    unsigned int deniabilizationCycles = uniqueTxOutCount >= 2 ? 1 : 0;\n+\n+    // all txIn and txOut are from our wallet\n+    // however if we have multiple txIn this was either an initial deniabilization of multiple UTXOs or the user manually merged deniabilized UTXOs\n+    // in either case we don't need to recurse into parent transactions and we can return the calculated cycles\n+    if (tx->vin.size() > 1) {\n+        return std::make_pair(deniabilizationCycles, false);\n+    }\n+\n+    const auto& txIn = tx->vin[0];\n+    // now recursively calculate the deniabilization cycles of the input\n+    auto inputStats = CalculateDeniabilizationCycles(wallet, txIn.prevout);\n+    return std::make_pair(inputStats.first + deniabilizationCycles, inputStats.second);\n+};\n+\n+util::Result<CreatedTransactionResult> CreateDeniabilizationTransaction(CWallet& wallet, const std::set<COutPoint>& inputs, unsigned int confirm_target, unsigned int deniabilization_cycles, bool sign, bool& insufficient_amount)\n+{\n+    if (inputs.empty()) {\n+        return util::Error{_(\"Inputs must not be empty\")};\n+    }\n+\n+    CCoinControl coin_control = SetupDeniabilizationCoinControl(confirm_target);\n+    for (const auto& input : inputs) {\n+        coin_control.Select(input);\n+    }\n+    Assert(coin_control.HasSelected());\n+    CFeeRate deniabilization_fee_rate = CalculateDeniabilizationFeeRate(wallet, confirm_target);\n+    coin_control.m_feerate = deniabilization_fee_rate;\n+\n+    LOCK(wallet.cs_wallet);\n+\n+    FastRandomContext rng_fast;\n+    CoinSelectionParams coin_selection_params{rng_fast};\n+    auto res_fetch_inputs = FetchSelectedInputs(wallet, coin_control, coin_selection_params);\n+    if (!res_fetch_inputs) {\n+        return util::Error{util::ErrorString(res_fetch_inputs)};\n+    }\n+    PreSelectedInputs preset_inputs = *res_fetch_inputs;\n+    CAmount total_amount = preset_inputs.total_amount;\n+\n+    // validate that all UTXOs share the same address\n+    std::optional<CTxDestination> op_shared_destination;\n+    for (const auto& coin : preset_inputs.coins) {\n+        CTxDestination destination = CNoDestination();\n+        ExtractDestination(coin->txout.scriptPubKey, destination);\n+        if (!std::get_if<CNoDestination>(&destination) && !op_shared_destination) {\n+            op_shared_destination = destination;\n+        }\n+        if (!op_shared_destination || !(*op_shared_destination == destination)) {\n+            return util::Error{_(\"Input addresses must all match.\")};\n+        }\n+    }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27792#discussion_r1349558005",
+      "id" : 1349558005,
+      "in_reply_to_id" : 1349552527,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585QcJ71",
+      "original_commit_id" : "4c731398d3b62b68581f65dd2a9e4246eae017c3",
+      "original_line" : 1597,
+      "original_position" : 206,
+      "original_start_line" : 1586,
+      "path" : "src/wallet/spend.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1663094812,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27792",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349558005/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-10-07T18:46:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349558005",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/123340139?v=4",
+         "events_url" : "https://api.github.com/users/denavila/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/denavila/followers",
+         "following_url" : "https://api.github.com/users/denavila/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/denavila/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/denavila",
+         "id" : 123340139,
+         "login" : "denavila",
+         "node_id" : "U_kgDOB1oFaw",
+         "organizations_url" : "https://api.github.com/users/denavila/orgs",
+         "received_events_url" : "https://api.github.com/users/denavila/received_events",
+         "repos_url" : "https://api.github.com/users/denavila/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/denavila/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/denavila/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/denavila"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27792#discussion_r1349564359"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27792"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349564359"
+         }
+      },
+      "author_association" : "NONE",
+      "body" : "I think I figured it out. CScript appears to have an operator== so I switched to using that. I'm hoping this works in the way I wanted to compare equality of laymen \"addresses\".\r\n \r\nI pushed an update to the PR. Please let me know if this makes sense.",
+      "commit_id" : "937e17a94a70b707170467b74cea1696d6286030",
+      "created_at" : "2023-10-07T19:20:48Z",
+      "diff_hunk" : "@@ -1392,4 +1392,302 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,\n \n     return true;\n }\n+\n+constexpr int NUM_DENIABILIZATION_OUTPUTS = 2;\n+\n+static unsigned int CalculateDeniabilizationTxSize(const CTxDestination& address, CAmount value, unsigned int numTxIn)\n+{\n+    // Calculation based on the comments and code in GetDustThreshold and CreateTransactionInternal\n+    CScript script = GetScriptForDestination(address);\n+    unsigned int txOutSize = (unsigned int)GetSerializeSize(CTxOut(value, script), PROTOCOL_VERSION);\n+\n+    const size_t txOutCount = NUM_DENIABILIZATION_OUTPUTS;\n+    unsigned int txSize = 10 + GetSizeOfCompactSize(txOutCount); // bytes for output count\n+    txSize += txOutSize * txOutCount;\n+\n+    int witnessversion = 0;\n+    std::vector<unsigned char> witnessprogram;\n+    if (script.IsWitnessProgram(witnessversion, witnessprogram)) {\n+        txSize += (unsigned int)(numTxIn * 67.75f + 0.5f);\n+    } else {\n+        txSize += numTxIn * 148;\n+    }\n+    return txSize;\n+}\n+\n+float CalculateDeniabilizationProbability(unsigned int deniabilization_cycles)\n+{\n+    // 100%, 50%, 25%, 13%, 6%, 3%, 2%, 1%\n+    return powf(0.5f, deniabilization_cycles);\n+}\n+\n+bool IsDeniabilizationWorthwhile(CAmount total_value, CAmount fee_estimate)\n+{\n+    constexpr CAmount value_to_fee_ratio = 10;\n+    return total_value > fee_estimate * value_to_fee_ratio;\n+}\n+\n+CCoinControl SetupDeniabilizationCoinControl(unsigned int confirm_target)\n+{\n+    CCoinControl coin_control;\n+    coin_control.m_avoid_address_reuse = true;\n+    coin_control.m_avoid_partial_spends = true;\n+    coin_control.m_allow_other_inputs = false;\n+    coin_control.m_signal_bip125_rbf = true;\n+    coin_control.m_confirm_target = confirm_target;\n+    // we'll automatically bump the fee if economical ends up not confirming by the next deniabilization cycle\n+    coin_control.m_fee_mode = FeeEstimateMode::ECONOMICAL;\n+    return coin_control;\n+}\n+\n+CFeeRate CalculateDeniabilizationFeeRate(const CWallet& wallet, unsigned int confirm_target)\n+{\n+    CCoinControl coin_control = SetupDeniabilizationCoinControl(confirm_target);\n+\n+    CFeeRate requiredFeeRate = GetRequiredFeeRate(wallet);\n+    FeeCalculation fee_calc;\n+    CFeeRate minFeeRate = GetMinimumFeeRate(wallet, coin_control, &fee_calc);\n+    if (fee_calc.reason == FeeReason::FALLBACK || requiredFeeRate > minFeeRate)\n+        return requiredFeeRate;\n+    return minFeeRate;\n+}\n+\n+static CAmount CalculateDeniabilizationTxFee(const CTxDestination& shared_destination, CAmount total_value, unsigned int num_utxos, const CFeeRate& fee_rate)\n+{\n+    Assert(num_utxos > 0);\n+    unsigned int deniabilization_tx_size = CalculateDeniabilizationTxSize(shared_destination, total_value, num_utxos);\n+    return fee_rate.GetFee(deniabilization_tx_size);\n+}\n+\n+CAmount CalculateDeniabilizationFeeEstimate(const CTxDestination& shared_destination, CAmount total_value, unsigned int num_utxos, unsigned int deniabilization_cycles, const CFeeRate& fee_rate)\n+{\n+    float deniabilizationProbability = CalculateDeniabilizationProbability(deniabilization_cycles);\n+    // convert to integer percent to truncate and check for zero probability\n+    unsigned int deniabilizationProbabilityPercent = deniabilizationProbability * 100;\n+    if (deniabilizationProbabilityPercent == 0) {\n+        return 0;\n+    }\n+\n+    // this cycle will use all the UTXOs, while following cycles will have just one UTXO\n+    CAmount deniabilizationFee = CalculateDeniabilizationTxFee(shared_destination, total_value, num_utxos, fee_rate);\n+\n+    // calculate the fees from future deniabilization cycles\n+    CAmount futureDeniabilizationFee = CalculateDeniabilizationFeeEstimate(shared_destination, total_value / NUM_DENIABILIZATION_OUTPUTS, 1, deniabilization_cycles + 1, fee_rate) * 2;\n+\n+    // if it's worthwhile to do future deniabilizations then add them to this cycle estimate\n+    if (IsDeniabilizationWorthwhile(total_value, deniabilizationFee + futureDeniabilizationFee)) {\n+        deniabilizationFee += futureDeniabilizationFee;\n+    }\n+    return deniabilizationFee;\n+}\n+\n+std::pair<unsigned int, bool> CalculateDeniabilizationCycles(CWallet& wallet, const COutPoint& outpoint)\n+{\n+    LOCK(wallet.cs_wallet);\n+    auto walletTx = wallet.GetWalletTx(outpoint.hash);\n+    if (!walletTx) {\n+        return std::make_pair(0, false);\n+    }\n+    auto tx = walletTx->tx;\n+\n+    if (tx->IsCoinBase()) {\n+        // this is a block reward tx, so we tag it as such\n+        return std::make_pair(0, true);\n+    }\n+\n+    // an deniabilized coin is one we sent to ourselves\n+    // all txIn should belong to our wallet\n+    if (tx->vin.empty()) {\n+        return std::make_pair(0, false);\n+    }\n+    for (const auto& txIn : tx->vin) {\n+        if (InputIsMine(wallet, txIn) == ISMINE_NO) {\n+            return std::make_pair(0, false);\n+        }\n+    }\n+\n+    // all txOut should belong to our wallet\n+    Assert(outpoint.n < tx->vout.size());\n+    unsigned int n = 0;\n+    for (const auto& txOut : tx->vout) {\n+        if (wallet.IsMine(txOut) == ISMINE_NO) {\n+            Assert(n != outpoint.n);\n+            return std::make_pair(0, false);\n+        }\n+        n++;\n+    }\n+\n+    unsigned int uniqueTxOutCount = 0;\n+    for (const auto& txOut : tx->vout) {\n+        // check if it's a valid destination\n+        CTxDestination txOutDestination;\n+        ExtractDestination(txOut.scriptPubKey, txOutDestination);\n+        if (std::get_if<CNoDestination>(&txOutDestination)) {\n+            continue;\n+        }\n+\n+        // don't count outputs that match any input addresses (eg it's change output)\n+        bool matchesInput = false;\n+        for (const auto& txIn : tx->vin) {\n+            auto prevWalletTx = wallet.GetWalletTx(txIn.prevout.hash);\n+            if (prevWalletTx && prevWalletTx->tx->vout[txIn.prevout.n].scriptPubKey == txOut.scriptPubKey) {\n+                matchesInput = true;\n+                break;\n+            }\n+        }\n+        if (matchesInput) {\n+            continue;\n+        }\n+\n+        uniqueTxOutCount++;\n+    }\n+\n+    // we consider two or more unique outputs an \"deniabilization\" of the coin\n+    unsigned int deniabilizationCycles = uniqueTxOutCount >= 2 ? 1 : 0;\n+\n+    // all txIn and txOut are from our wallet\n+    // however if we have multiple txIn this was either an initial deniabilization of multiple UTXOs or the user manually merged deniabilized UTXOs\n+    // in either case we don't need to recurse into parent transactions and we can return the calculated cycles\n+    if (tx->vin.size() > 1) {\n+        return std::make_pair(deniabilizationCycles, false);\n+    }\n+\n+    const auto& txIn = tx->vin[0];\n+    // now recursively calculate the deniabilization cycles of the input\n+    auto inputStats = CalculateDeniabilizationCycles(wallet, txIn.prevout);\n+    return std::make_pair(inputStats.first + deniabilizationCycles, inputStats.second);\n+};\n+\n+util::Result<CreatedTransactionResult> CreateDeniabilizationTransaction(CWallet& wallet, const std::set<COutPoint>& inputs, unsigned int confirm_target, unsigned int deniabilization_cycles, bool sign, bool& insufficient_amount)\n+{\n+    if (inputs.empty()) {\n+        return util::Error{_(\"Inputs must not be empty\")};\n+    }\n+\n+    CCoinControl coin_control = SetupDeniabilizationCoinControl(confirm_target);\n+    for (const auto& input : inputs) {\n+        coin_control.Select(input);\n+    }\n+    Assert(coin_control.HasSelected());\n+    CFeeRate deniabilization_fee_rate = CalculateDeniabilizationFeeRate(wallet, confirm_target);\n+    coin_control.m_feerate = deniabilization_fee_rate;\n+\n+    LOCK(wallet.cs_wallet);\n+\n+    FastRandomContext rng_fast;\n+    CoinSelectionParams coin_selection_params{rng_fast};\n+    auto res_fetch_inputs = FetchSelectedInputs(wallet, coin_control, coin_selection_params);\n+    if (!res_fetch_inputs) {\n+        return util::Error{util::ErrorString(res_fetch_inputs)};\n+    }\n+    PreSelectedInputs preset_inputs = *res_fetch_inputs;\n+    CAmount total_amount = preset_inputs.total_amount;\n+\n+    // validate that all UTXOs share the same address\n+    std::optional<CTxDestination> op_shared_destination;\n+    for (const auto& coin : preset_inputs.coins) {\n+        CTxDestination destination = CNoDestination();\n+        ExtractDestination(coin->txout.scriptPubKey, destination);\n+        if (!std::get_if<CNoDestination>(&destination) && !op_shared_destination) {\n+            op_shared_destination = destination;\n+        }\n+        if (!op_shared_destination || !(*op_shared_destination == destination)) {\n+            return util::Error{_(\"Input addresses must all match.\")};\n+        }\n+    }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27792#discussion_r1349564359",
+      "id" : 1349564359,
+      "in_reply_to_id" : 1349552527,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585QcLfH",
+      "original_commit_id" : "4c731398d3b62b68581f65dd2a9e4246eae017c3",
+      "original_line" : 1597,
+      "original_position" : 206,
+      "original_start_line" : 1586,
+      "path" : "src/wallet/spend.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1663101013,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27792",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349564359/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-10-07T19:20:48Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349564359",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/123340139?v=4",
+         "events_url" : "https://api.github.com/users/denavila/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/denavila/followers",
+         "following_url" : "https://api.github.com/users/denavila/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/denavila/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/denavila",
+         "id" : 123340139,
+         "login" : "denavila",
+         "node_id" : "U_kgDOB1oFaw",
+         "organizations_url" : "https://api.github.com/users/denavila/orgs",
+         "received_events_url" : "https://api.github.com/users/denavila/received_events",
+         "repos_url" : "https://api.github.com/users/denavila/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/denavila/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/denavila/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/denavila"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27792#discussion_r1349564944"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27792"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349564944"
+         }
+      },
+      "author_association" : "NONE",
+      "body" : "@achow101 m\r\nIs this a correct way to get an OutputType from a CScript? I need the OutputType for the ReserveDestination constructor.\r\nFor coinbase key wallet scripts, the destination gets classified as PubKeyDestination, thus OutputTypeFromDestination will return nullopt, so we'll end up using the wallet.m_default_address_type.\r\nThis appears to work, but I'm not sure if it's kosher ...",
+      "commit_id" : "937e17a94a70b707170467b74cea1696d6286030",
+      "created_at" : "2023-10-07T19:26:52Z",
+      "diff_hunk" : "@@ -1392,4 +1392,293 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,\n \n     return true;\n }\n+\n+constexpr int NUM_DENIABILIZATION_OUTPUTS = 2;\n+\n+static unsigned int CalculateDeniabilizationTxSize(const CScript& script, CAmount value, unsigned int numTxIn)\n+{\n+    // Calculation based on the comments and code in GetDustThreshold and CreateTransactionInternal\n+    unsigned int txOutSize = (unsigned int)GetSerializeSize(CTxOut(value, script), PROTOCOL_VERSION);\n+\n+    const size_t txOutCount = NUM_DENIABILIZATION_OUTPUTS;\n+    unsigned int txSize = 10 + GetSizeOfCompactSize(txOutCount); // bytes for output count\n+    txSize += txOutSize * txOutCount;\n+\n+    int witnessversion = 0;\n+    std::vector<unsigned char> witnessprogram;\n+    if (script.IsWitnessProgram(witnessversion, witnessprogram)) {\n+        txSize += (unsigned int)(numTxIn * 67.75f + 0.5f);\n+    } else {\n+        txSize += numTxIn * 148;\n+    }\n+    return txSize;\n+}\n+\n+float CalculateDeniabilizationProbability(unsigned int deniabilization_cycles)\n+{\n+    // 100%, 50%, 25%, 13%, 6%, 3%, 2%, 1%\n+    return powf(0.5f, deniabilization_cycles);\n+}\n+\n+bool IsDeniabilizationWorthwhile(CAmount total_value, CAmount fee_estimate)\n+{\n+    constexpr CAmount value_to_fee_ratio = 10;\n+    return total_value > fee_estimate * value_to_fee_ratio;\n+}\n+\n+CCoinControl SetupDeniabilizationCoinControl(unsigned int confirm_target)\n+{\n+    CCoinControl coin_control;\n+    coin_control.m_avoid_address_reuse = true;\n+    coin_control.m_avoid_partial_spends = true;\n+    coin_control.m_allow_other_inputs = false;\n+    coin_control.m_signal_bip125_rbf = true;\n+    coin_control.m_confirm_target = confirm_target;\n+    // we'll automatically bump the fee if economical ends up not confirming by the next deniabilization cycle\n+    coin_control.m_fee_mode = FeeEstimateMode::ECONOMICAL;\n+    return coin_control;\n+}\n+\n+CFeeRate CalculateDeniabilizationFeeRate(const CWallet& wallet, unsigned int confirm_target)\n+{\n+    CCoinControl coin_control = SetupDeniabilizationCoinControl(confirm_target);\n+\n+    CFeeRate requiredFeeRate = GetRequiredFeeRate(wallet);\n+    FeeCalculation fee_calc;\n+    CFeeRate minFeeRate = GetMinimumFeeRate(wallet, coin_control, &fee_calc);\n+    if (fee_calc.reason == FeeReason::FALLBACK || requiredFeeRate > minFeeRate)\n+        return requiredFeeRate;\n+    return minFeeRate;\n+}\n+\n+static CAmount CalculateDeniabilizationTxFee(const CScript& shared_script, CAmount total_value, unsigned int num_utxos, const CFeeRate& fee_rate)\n+{\n+    Assert(num_utxos > 0);\n+    unsigned int deniabilization_tx_size = CalculateDeniabilizationTxSize(shared_script, total_value, num_utxos);\n+    return fee_rate.GetFee(deniabilization_tx_size);\n+}\n+\n+CAmount CalculateDeniabilizationFeeEstimate(const CScript& shared_script, CAmount total_value, unsigned int num_utxos, unsigned int deniabilization_cycles, const CFeeRate& fee_rate)\n+{\n+    float deniabilizationProbability = CalculateDeniabilizationProbability(deniabilization_cycles);\n+    // convert to integer percent to truncate and check for zero probability\n+    unsigned int deniabilizationProbabilityPercent = deniabilizationProbability * 100;\n+    if (deniabilizationProbabilityPercent == 0) {\n+        return 0;\n+    }\n+\n+    // this cycle will use all the UTXOs, while following cycles will have just one UTXO\n+    CAmount deniabilizationFee = CalculateDeniabilizationTxFee(shared_script, total_value, num_utxos, fee_rate);\n+\n+    // calculate the fees from future deniabilization cycles\n+    CAmount futureDeniabilizationFee = CalculateDeniabilizationFeeEstimate(shared_script, total_value / NUM_DENIABILIZATION_OUTPUTS, 1, deniabilization_cycles + 1, fee_rate) * 2;\n+\n+    // if it's worthwhile to do future deniabilizations then add them to this cycle estimate\n+    if (IsDeniabilizationWorthwhile(total_value, deniabilizationFee + futureDeniabilizationFee)) {\n+        deniabilizationFee += futureDeniabilizationFee;\n+    }\n+    return deniabilizationFee;\n+}\n+\n+std::pair<unsigned int, bool> CalculateDeniabilizationCycles(CWallet& wallet, const COutPoint& outpoint)\n+{\n+    LOCK(wallet.cs_wallet);\n+    auto walletTx = wallet.GetWalletTx(outpoint.hash);\n+    if (!walletTx) {\n+        return std::make_pair(0, false);\n+    }\n+    auto tx = walletTx->tx;\n+\n+    if (tx->IsCoinBase()) {\n+        // this is a block reward tx, so we tag it as such\n+        return std::make_pair(0, true);\n+    }\n+\n+    // an deniabilized coin is one we sent to ourselves\n+    // all txIn should belong to our wallet\n+    if (tx->vin.empty()) {\n+        return std::make_pair(0, false);\n+    }\n+    for (const auto& txIn : tx->vin) {\n+        if (InputIsMine(wallet, txIn) == ISMINE_NO) {\n+            return std::make_pair(0, false);\n+        }\n+    }\n+\n+    // all txOut should belong to our wallet\n+    Assert(outpoint.n < tx->vout.size());\n+    unsigned int n = 0;\n+    for (const auto& txOut : tx->vout) {\n+        if (wallet.IsMine(txOut) == ISMINE_NO) {\n+            Assert(n != outpoint.n);\n+            return std::make_pair(0, false);\n+        }\n+        n++;\n+    }\n+\n+    unsigned int uniqueTxOutCount = 0;\n+    for (const auto& txOut : tx->vout) {\n+        // check if it's a valid destination\n+        CTxDestination txOutDestination;\n+        ExtractDestination(txOut.scriptPubKey, txOutDestination);\n+        if (std::get_if<CNoDestination>(&txOutDestination)) {\n+            continue;\n+        }\n+\n+        // don't count outputs that match any input addresses (eg it's change output)\n+        bool matchesInput = false;\n+        for (const auto& txIn : tx->vin) {\n+            auto prevWalletTx = wallet.GetWalletTx(txIn.prevout.hash);\n+            if (prevWalletTx && prevWalletTx->tx->vout[txIn.prevout.n].scriptPubKey == txOut.scriptPubKey) {\n+                matchesInput = true;\n+                break;\n+            }\n+        }\n+        if (matchesInput) {\n+            continue;\n+        }\n+\n+        uniqueTxOutCount++;\n+    }\n+\n+    // we consider two or more unique outputs an \"deniabilization\" of the coin\n+    unsigned int deniabilizationCycles = uniqueTxOutCount >= 2 ? 1 : 0;\n+\n+    // all txIn and txOut are from our wallet\n+    // however if we have multiple txIn this was either an initial deniabilization of multiple UTXOs or the user manually merged deniabilized UTXOs\n+    // in either case we don't need to recurse into parent transactions and we can return the calculated cycles\n+    if (tx->vin.size() > 1) {\n+        return std::make_pair(deniabilizationCycles, false);\n+    }\n+\n+    const auto& txIn = tx->vin[0];\n+    // now recursively calculate the deniabilization cycles of the input\n+    auto inputStats = CalculateDeniabilizationCycles(wallet, txIn.prevout);\n+    return std::make_pair(inputStats.first + deniabilizationCycles, inputStats.second);\n+};\n+\n+util::Result<CreatedTransactionResult> CreateDeniabilizationTransaction(CWallet& wallet, const std::set<COutPoint>& inputs, unsigned int confirm_target, unsigned int deniabilization_cycles, bool sign, bool& insufficient_amount)\n+{\n+    if (inputs.empty()) {\n+        return util::Error{_(\"Inputs must not be empty\")};\n+    }\n+\n+    CCoinControl coin_control = SetupDeniabilizationCoinControl(confirm_target);\n+    for (const auto& input : inputs) {\n+        coin_control.Select(input);\n+    }\n+    Assert(coin_control.HasSelected());\n+    CFeeRate deniabilization_fee_rate = CalculateDeniabilizationFeeRate(wallet, confirm_target);\n+    coin_control.m_feerate = deniabilization_fee_rate;\n+\n+    LOCK(wallet.cs_wallet);\n+\n+    FastRandomContext rng_fast;\n+    CoinSelectionParams coin_selection_params{rng_fast};\n+    auto res_fetch_inputs = FetchSelectedInputs(wallet, coin_control, coin_selection_params);\n+    if (!res_fetch_inputs) {\n+        return util::Error{util::ErrorString(res_fetch_inputs)};\n+    }\n+    PreSelectedInputs preset_inputs = *res_fetch_inputs;\n+    CAmount total_amount = preset_inputs.total_amount;\n+\n+    // validate that all UTXOs share the same address\n+    std::optional<CScript> op_shared_script;\n+    for (const auto& coin : preset_inputs.coins) {\n+        if (!op_shared_script) {\n+            op_shared_script = coin->txout.scriptPubKey;\n+        }\n+        if (!op_shared_script || !(*op_shared_script == coin->txout.scriptPubKey)) {\n+            return util::Error{_(\"Input addresses must all match.\")};\n+        }\n+    }\n+    Assert(op_shared_script);\n+    CScript shared_script = *op_shared_script;\n+\n+    CFeeRate discard_feerate = GetDiscardRate(wallet);\n+    CAmount dust_threshold = GetDustThreshold(CTxOut(total_amount, shared_script), discard_feerate);\n+\n+    // deniabilize the UTXOs by splitting the value randomly\n+    // find a split that leaves enough amount post split to finish the deniabilization process in each new UTXO\n+    CAmount min_post_split_amount = CalculateDeniabilizationFeeEstimate(shared_script, total_amount / NUM_DENIABILIZATION_OUTPUTS, 1, deniabilization_cycles + 1, deniabilization_fee_rate) + dust_threshold;\n+    CAmount estimated_tx_fee = CalculateDeniabilizationTxFee(shared_script, total_amount, preset_inputs.coins.size(), deniabilization_fee_rate);\n+\n+    CAmount total_random_range = total_amount - min_post_split_amount * NUM_DENIABILIZATION_OUTPUTS - estimated_tx_fee;\n+    if (total_random_range < 0) {\n+        insufficient_amount = true;\n+        return util::Error{strprintf(_(\"Insufficient amount (%d) for a deniabilization transaction, min amount (%d), tx fee (%d).\"), total_amount, min_post_split_amount, estimated_tx_fee)};\n+    }\n+\n+    CTxDestination shared_destination = CNoDestination();\n+    ExtractDestination(shared_script, shared_destination);\n+    std::optional<OutputType> op_output_type = OutputTypeFromDestination(shared_destination);\n+    if (!op_output_type) {\n+        op_output_type = wallet.m_default_change_type;\n+    }\n+    OutputType output_type = op_output_type ? *op_output_type : wallet.m_default_address_type;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27792#discussion_r1349564944",
+      "id" : 1349564944,
+      "line" : 1618,
+      "node_id" : "PRRC_kwDOABII585QcLoQ",
+      "original_commit_id" : "937e17a94a70b707170467b74cea1696d6286030",
+      "original_line" : 1618,
+      "original_position" : 227,
+      "original_start_line" : 1612,
+      "path" : "src/wallet/spend.cpp",
+      "position" : 227,
+      "pull_request_review_id" : 1663101478,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27792",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349564944/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 1612,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-10-07T19:26:56Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349564944",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/123340139?v=4",
+         "events_url" : "https://api.github.com/users/denavila/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/denavila/followers",
+         "following_url" : "https://api.github.com/users/denavila/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/denavila/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/denavila",
+         "id" : 123340139,
+         "login" : "denavila",
+         "node_id" : "U_kgDOB1oFaw",
+         "organizations_url" : "https://api.github.com/users/denavila/orgs",
+         "received_events_url" : "https://api.github.com/users/denavila/received_events",
+         "repos_url" : "https://api.github.com/users/denavila/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/denavila/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/denavila/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/denavila"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27792#discussion_r1349567860"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27792"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349567860"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "That looks fine.",
+      "commit_id" : "937e17a94a70b707170467b74cea1696d6286030",
+      "created_at" : "2023-10-07T19:57:14Z",
+      "diff_hunk" : "@@ -1392,4 +1392,293 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,\n \n     return true;\n }\n+\n+constexpr int NUM_DENIABILIZATION_OUTPUTS = 2;\n+\n+static unsigned int CalculateDeniabilizationTxSize(const CScript& script, CAmount value, unsigned int numTxIn)\n+{\n+    // Calculation based on the comments and code in GetDustThreshold and CreateTransactionInternal\n+    unsigned int txOutSize = (unsigned int)GetSerializeSize(CTxOut(value, script), PROTOCOL_VERSION);\n+\n+    const size_t txOutCount = NUM_DENIABILIZATION_OUTPUTS;\n+    unsigned int txSize = 10 + GetSizeOfCompactSize(txOutCount); // bytes for output count\n+    txSize += txOutSize * txOutCount;\n+\n+    int witnessversion = 0;\n+    std::vector<unsigned char> witnessprogram;\n+    if (script.IsWitnessProgram(witnessversion, witnessprogram)) {\n+        txSize += (unsigned int)(numTxIn * 67.75f + 0.5f);\n+    } else {\n+        txSize += numTxIn * 148;\n+    }\n+    return txSize;\n+}\n+\n+float CalculateDeniabilizationProbability(unsigned int deniabilization_cycles)\n+{\n+    // 100%, 50%, 25%, 13%, 6%, 3%, 2%, 1%\n+    return powf(0.5f, deniabilization_cycles);\n+}\n+\n+bool IsDeniabilizationWorthwhile(CAmount total_value, CAmount fee_estimate)\n+{\n+    constexpr CAmount value_to_fee_ratio = 10;\n+    return total_value > fee_estimate * value_to_fee_ratio;\n+}\n+\n+CCoinControl SetupDeniabilizationCoinControl(unsigned int confirm_target)\n+{\n+    CCoinControl coin_control;\n+    coin_control.m_avoid_address_reuse = true;\n+    coin_control.m_avoid_partial_spends = true;\n+    coin_control.m_allow_other_inputs = false;\n+    coin_control.m_signal_bip125_rbf = true;\n+    coin_control.m_confirm_target = confirm_target;\n+    // we'll automatically bump the fee if economical ends up not confirming by the next deniabilization cycle\n+    coin_control.m_fee_mode = FeeEstimateMode::ECONOMICAL;\n+    return coin_control;\n+}\n+\n+CFeeRate CalculateDeniabilizationFeeRate(const CWallet& wallet, unsigned int confirm_target)\n+{\n+    CCoinControl coin_control = SetupDeniabilizationCoinControl(confirm_target);\n+\n+    CFeeRate requiredFeeRate = GetRequiredFeeRate(wallet);\n+    FeeCalculation fee_calc;\n+    CFeeRate minFeeRate = GetMinimumFeeRate(wallet, coin_control, &fee_calc);\n+    if (fee_calc.reason == FeeReason::FALLBACK || requiredFeeRate > minFeeRate)\n+        return requiredFeeRate;\n+    return minFeeRate;\n+}\n+\n+static CAmount CalculateDeniabilizationTxFee(const CScript& shared_script, CAmount total_value, unsigned int num_utxos, const CFeeRate& fee_rate)\n+{\n+    Assert(num_utxos > 0);\n+    unsigned int deniabilization_tx_size = CalculateDeniabilizationTxSize(shared_script, total_value, num_utxos);\n+    return fee_rate.GetFee(deniabilization_tx_size);\n+}\n+\n+CAmount CalculateDeniabilizationFeeEstimate(const CScript& shared_script, CAmount total_value, unsigned int num_utxos, unsigned int deniabilization_cycles, const CFeeRate& fee_rate)\n+{\n+    float deniabilizationProbability = CalculateDeniabilizationProbability(deniabilization_cycles);\n+    // convert to integer percent to truncate and check for zero probability\n+    unsigned int deniabilizationProbabilityPercent = deniabilizationProbability * 100;\n+    if (deniabilizationProbabilityPercent == 0) {\n+        return 0;\n+    }\n+\n+    // this cycle will use all the UTXOs, while following cycles will have just one UTXO\n+    CAmount deniabilizationFee = CalculateDeniabilizationTxFee(shared_script, total_value, num_utxos, fee_rate);\n+\n+    // calculate the fees from future deniabilization cycles\n+    CAmount futureDeniabilizationFee = CalculateDeniabilizationFeeEstimate(shared_script, total_value / NUM_DENIABILIZATION_OUTPUTS, 1, deniabilization_cycles + 1, fee_rate) * 2;\n+\n+    // if it's worthwhile to do future deniabilizations then add them to this cycle estimate\n+    if (IsDeniabilizationWorthwhile(total_value, deniabilizationFee + futureDeniabilizationFee)) {\n+        deniabilizationFee += futureDeniabilizationFee;\n+    }\n+    return deniabilizationFee;\n+}\n+\n+std::pair<unsigned int, bool> CalculateDeniabilizationCycles(CWallet& wallet, const COutPoint& outpoint)\n+{\n+    LOCK(wallet.cs_wallet);\n+    auto walletTx = wallet.GetWalletTx(outpoint.hash);\n+    if (!walletTx) {\n+        return std::make_pair(0, false);\n+    }\n+    auto tx = walletTx->tx;\n+\n+    if (tx->IsCoinBase()) {\n+        // this is a block reward tx, so we tag it as such\n+        return std::make_pair(0, true);\n+    }\n+\n+    // an deniabilized coin is one we sent to ourselves\n+    // all txIn should belong to our wallet\n+    if (tx->vin.empty()) {\n+        return std::make_pair(0, false);\n+    }\n+    for (const auto& txIn : tx->vin) {\n+        if (InputIsMine(wallet, txIn) == ISMINE_NO) {\n+            return std::make_pair(0, false);\n+        }\n+    }\n+\n+    // all txOut should belong to our wallet\n+    Assert(outpoint.n < tx->vout.size());\n+    unsigned int n = 0;\n+    for (const auto& txOut : tx->vout) {\n+        if (wallet.IsMine(txOut) == ISMINE_NO) {\n+            Assert(n != outpoint.n);\n+            return std::make_pair(0, false);\n+        }\n+        n++;\n+    }\n+\n+    unsigned int uniqueTxOutCount = 0;\n+    for (const auto& txOut : tx->vout) {\n+        // check if it's a valid destination\n+        CTxDestination txOutDestination;\n+        ExtractDestination(txOut.scriptPubKey, txOutDestination);\n+        if (std::get_if<CNoDestination>(&txOutDestination)) {\n+            continue;\n+        }\n+\n+        // don't count outputs that match any input addresses (eg it's change output)\n+        bool matchesInput = false;\n+        for (const auto& txIn : tx->vin) {\n+            auto prevWalletTx = wallet.GetWalletTx(txIn.prevout.hash);\n+            if (prevWalletTx && prevWalletTx->tx->vout[txIn.prevout.n].scriptPubKey == txOut.scriptPubKey) {\n+                matchesInput = true;\n+                break;\n+            }\n+        }\n+        if (matchesInput) {\n+            continue;\n+        }\n+\n+        uniqueTxOutCount++;\n+    }\n+\n+    // we consider two or more unique outputs an \"deniabilization\" of the coin\n+    unsigned int deniabilizationCycles = uniqueTxOutCount >= 2 ? 1 : 0;\n+\n+    // all txIn and txOut are from our wallet\n+    // however if we have multiple txIn this was either an initial deniabilization of multiple UTXOs or the user manually merged deniabilized UTXOs\n+    // in either case we don't need to recurse into parent transactions and we can return the calculated cycles\n+    if (tx->vin.size() > 1) {\n+        return std::make_pair(deniabilizationCycles, false);\n+    }\n+\n+    const auto& txIn = tx->vin[0];\n+    // now recursively calculate the deniabilization cycles of the input\n+    auto inputStats = CalculateDeniabilizationCycles(wallet, txIn.prevout);\n+    return std::make_pair(inputStats.first + deniabilizationCycles, inputStats.second);\n+};\n+\n+util::Result<CreatedTransactionResult> CreateDeniabilizationTransaction(CWallet& wallet, const std::set<COutPoint>& inputs, unsigned int confirm_target, unsigned int deniabilization_cycles, bool sign, bool& insufficient_amount)\n+{\n+    if (inputs.empty()) {\n+        return util::Error{_(\"Inputs must not be empty\")};\n+    }\n+\n+    CCoinControl coin_control = SetupDeniabilizationCoinControl(confirm_target);\n+    for (const auto& input : inputs) {\n+        coin_control.Select(input);\n+    }\n+    Assert(coin_control.HasSelected());\n+    CFeeRate deniabilization_fee_rate = CalculateDeniabilizationFeeRate(wallet, confirm_target);\n+    coin_control.m_feerate = deniabilization_fee_rate;\n+\n+    LOCK(wallet.cs_wallet);\n+\n+    FastRandomContext rng_fast;\n+    CoinSelectionParams coin_selection_params{rng_fast};\n+    auto res_fetch_inputs = FetchSelectedInputs(wallet, coin_control, coin_selection_params);\n+    if (!res_fetch_inputs) {\n+        return util::Error{util::ErrorString(res_fetch_inputs)};\n+    }\n+    PreSelectedInputs preset_inputs = *res_fetch_inputs;\n+    CAmount total_amount = preset_inputs.total_amount;\n+\n+    // validate that all UTXOs share the same address\n+    std::optional<CScript> op_shared_script;\n+    for (const auto& coin : preset_inputs.coins) {\n+        if (!op_shared_script) {\n+            op_shared_script = coin->txout.scriptPubKey;\n+        }\n+        if (!op_shared_script || !(*op_shared_script == coin->txout.scriptPubKey)) {\n+            return util::Error{_(\"Input addresses must all match.\")};\n+        }\n+    }\n+    Assert(op_shared_script);\n+    CScript shared_script = *op_shared_script;\n+\n+    CFeeRate discard_feerate = GetDiscardRate(wallet);\n+    CAmount dust_threshold = GetDustThreshold(CTxOut(total_amount, shared_script), discard_feerate);\n+\n+    // deniabilize the UTXOs by splitting the value randomly\n+    // find a split that leaves enough amount post split to finish the deniabilization process in each new UTXO\n+    CAmount min_post_split_amount = CalculateDeniabilizationFeeEstimate(shared_script, total_amount / NUM_DENIABILIZATION_OUTPUTS, 1, deniabilization_cycles + 1, deniabilization_fee_rate) + dust_threshold;\n+    CAmount estimated_tx_fee = CalculateDeniabilizationTxFee(shared_script, total_amount, preset_inputs.coins.size(), deniabilization_fee_rate);\n+\n+    CAmount total_random_range = total_amount - min_post_split_amount * NUM_DENIABILIZATION_OUTPUTS - estimated_tx_fee;\n+    if (total_random_range < 0) {\n+        insufficient_amount = true;\n+        return util::Error{strprintf(_(\"Insufficient amount (%d) for a deniabilization transaction, min amount (%d), tx fee (%d).\"), total_amount, min_post_split_amount, estimated_tx_fee)};\n+    }\n+\n+    CTxDestination shared_destination = CNoDestination();\n+    ExtractDestination(shared_script, shared_destination);\n+    std::optional<OutputType> op_output_type = OutputTypeFromDestination(shared_destination);\n+    if (!op_output_type) {\n+        op_output_type = wallet.m_default_change_type;\n+    }\n+    OutputType output_type = op_output_type ? *op_output_type : wallet.m_default_address_type;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27792#discussion_r1349567860",
+      "id" : 1349567860,
+      "in_reply_to_id" : 1349564944,
+      "line" : 1618,
+      "node_id" : "PRRC_kwDOABII585QcMV0",
+      "original_commit_id" : "937e17a94a70b707170467b74cea1696d6286030",
+      "original_line" : 1618,
+      "original_position" : 227,
+      "original_start_line" : 1612,
+      "path" : "src/wallet/spend.cpp",
+      "position" : 227,
+      "pull_request_review_id" : 1663103891,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27792",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349567860/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 1612,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-10-07T19:57:14Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1349567860",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/3782274?v=4",
+         "events_url" : "https://api.github.com/users/achow101/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/achow101/followers",
+         "following_url" : "https://api.github.com/users/achow101/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/achow101/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/achow101",
+         "id" : 3782274,
+         "login" : "achow101",
+         "node_id" : "MDQ6VXNlcjM3ODIyNzQ=",
+         "organizations_url" : "https://api.github.com/users/achow101/orgs",
+         "received_events_url" : "https://api.github.com/users/achow101/received_events",
+         "repos_url" : "https://api.github.com/users/achow101/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/achow101/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/achow101/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/achow101"
+      }
    }
 ]
