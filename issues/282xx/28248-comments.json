@@ -1579,5 +1579,74 @@
          "type" : "User",
          "url" : "https://api.github.com/users/dergoegge"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356400497"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356400497"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Right. Comparing ports for incoming connections is problematic also. I think the right approach for determining if we are connected to `addr:port`:\r\n\r\n* For incoming connections, compare just `addr` and ignore `port`\r\n* For outgoing connections, compare both `addr` and `port`.\r\n\r\nThis can't be done with a single map of either `CService` or `CNetAddr`. I guess two containers are needed, as this:\r\n\r\n<details>\r\n<summary>[patch] compare differently inbound and outbound addresses</summary>\r\n\r\n```diff\r\ndiff --git i/src/net.cpp w/src/net.cpp\r\nindex 91282d927d..0eb0023112 100644\r\n--- i/src/net.cpp\r\n+++ w/src/net.cpp\r\n@@ -2809,41 +2809,49 @@ std::vector<AddedNodeInfo> CConnman::GetAddedNodeInfo() const\r\n         LOCK(m_added_nodes_mutex);\r\n         ret.reserve(m_added_node_params.size());\r\n         std::copy(m_added_node_params.cbegin(), m_added_node_params.cend(), std::back_inserter(lAddresses));\r\n     }\r\n \r\n \r\n-    // Build a map of all already connected addresses (by IP:port and by name) to inbound/outbound and resolved CService\r\n-    std::map<CNetAddr, bool> mapConnected;\r\n+    // Collect all addresses to which we are already connected.\r\n+    std::unordered_set<CNetAddr, CNetAddrHash> connected_to_inbound;\r\n+    std::unordered_set<CService, CServiceHash> connected_to_outbound;\r\n     std::map<std::string, std::pair<bool, CService>> mapConnectedByName;\r\n     {\r\n         LOCK(m_nodes_mutex);\r\n         for (const CNode* pnode : m_nodes) {\r\n             if (pnode->addr.IsValid()) {\r\n-                mapConnected[static_cast<CNetAddr>(pnode->addr)] = pnode->IsInboundConn();\r\n+                if (pnode->IsInboundConn()) {\r\n+                    connected_to_inbound.insert(pnode->addr);\r\n+                } else {\r\n+                    connected_to_outbound.insert(pnode->addr);\r\n+                }\r\n             }\r\n             std::string addrName{pnode->m_addr_name};\r\n             if (!addrName.empty()) {\r\n                 mapConnectedByName[std::move(addrName)] = std::make_pair(pnode->IsInboundConn(), static_cast<const CService&>(pnode->addr));\r\n             }\r\n         }\r\n     }\r\n \r\n     for (const auto& addr : lAddresses) {\r\n         CService service(LookupNumeric(addr.m_added_node, GetDefaultPort(addr.m_added_node)));\r\n         AddedNodeInfo addedNode{addr, CService(), false, false};\r\n         if (service.IsValid()) {\r\n-            // strAddNode is an IP:port\r\n-            auto it = mapConnected.find(static_cast<CNetAddr>(service));\r\n-            if (it != mapConnected.end()) {\r\n+            // addr.m_added_node is an addr:port\r\n+            if (connected_to_outbound.count(service) > 0) {\r\n+                addedNode.resolvedAddress = service;\r\n+                addedNode.fConnected = true;\r\n+                addedNode.fInbound = false;\r\n+            } else if (connected_to_inbound.count(service) > 0) {\r\n                 addedNode.resolvedAddress = service;\r\n                 addedNode.fConnected = true;\r\n-                addedNode.fInbound = it->second;\r\n+                addedNode.fInbound = true;\r\n             }\r\n         } else {\r\n-            // strAddNode is a name\r\n+            // addr.m_added_node is a name\r\n             auto it = mapConnectedByName.find(addr.m_added_node);\r\n             if (it != mapConnectedByName.end()) {\r\n                 addedNode.resolvedAddress = it->second.second;\r\n                 addedNode.fConnected = true;\r\n                 addedNode.fInbound = it->second.first;\r\n             }\r\ndiff --git i/src/netaddress.h w/src/netaddress.h\r\nindex ad09f16799..99a3b0fc22 100644\r\n--- i/src/netaddress.h\r\n+++ w/src/netaddress.h\r\n@@ -254,12 +254,13 @@ public:\r\n             UnserializeV2Stream(s);\r\n         } else {\r\n             UnserializeV1Stream(s);\r\n         }\r\n     }\r\n \r\n+    friend class CNetAddrHash;\r\n     friend class CSubNet;\r\n \r\n private:\r\n     /**\r\n      * Parse a Tor address and set this object to it.\r\n      * @param[in] addr Address to parse, must be a valid C string, for example\r\n@@ -473,12 +474,36 @@ private:\r\n         // will not be gossiped, but continue reading next addresses from the stream.\r\n         m_net = NET_IPV6;\r\n         m_addr.assign(ADDR_IPV6_SIZE, 0x0);\r\n     }\r\n };\r\n \r\n+class CNetAddrHash\r\n+{\r\n+public:\r\n+    CNetAddrHash()\r\n+        : m_salt_k0{GetRand<uint64_t>()},\r\n+          m_salt_k1{GetRand<uint64_t>()}\r\n+    {\r\n+    }\r\n+\r\n+    CNetAddrHash(uint64_t salt_k0, uint64_t salt_k1) : m_salt_k0{salt_k0}, m_salt_k1{salt_k1} {}\r\n+\r\n+    size_t operator()(const CNetAddr& a) const noexcept\r\n+    {\r\n+        CSipHasher hasher(m_salt_k0, m_salt_k1);\r\n+        hasher.Write(a.m_net);\r\n+        hasher.Write(a.m_addr);\r\n+        return static_cast<size_t>(hasher.Finalize());\r\n+    }\r\n+\r\n+private:\r\n+    const uint64_t m_salt_k0;\r\n+    const uint64_t m_salt_k1;\r\n+};\r\n+\r\n class CSubNet\r\n {\r\n protected:\r\n     /// Network (base) address\r\n     CNetAddr network;\r\n     /// Netmask, in network byte order\r\n```\r\n</details>",
+      "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "created_at" : "2023-10-12T07:39:25Z",
+      "diff_hunk" : "@@ -2734,13 +2734,13 @@ std::vector<AddedNodeInfo> CConnman::GetAddedNodeInfo() const\n \n \n     // Build a map of all already connected addresses (by IP:port and by name) to inbound/outbound and resolved CService\n-    std::map<CService, bool> mapConnected;\n+    std::map<CNetAddr, bool> mapConnected;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356400497",
+      "id" : 1356400497,
+      "in_reply_to_id" : 1323598562,
+      "line" : 2858,
+      "node_id" : "PRRC_kwDOABII585Q2Qdx",
+      "original_commit_id" : "54804cba858b614462b21e20dac088b2e7740e11",
+      "original_line" : 2858,
+      "original_position" : 5,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 218,
+      "pull_request_review_id" : 1673481614,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356400497/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-12T07:39:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356400497",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
    }
 ]
