@@ -1593,7 +1593,7 @@
          }
       },
       "author_association" : "CONTRIBUTOR",
-      "body" : "Right. Comparing ports for incoming connections is problematic also. I think the right approach for determining if we are connected to `addr:port`:\r\n\r\n* For incoming connections, compare just `addr` and ignore `port`\r\n* For outgoing connections, compare both `addr` and `port`.\r\n\r\nThis can't be done with a single map of either `CService` or `CNetAddr`. I guess two containers are needed, as this:\r\n\r\n<details>\r\n<summary>[patch] compare differently inbound and outbound addresses</summary>\r\n\r\n```diff\r\ndiff --git i/src/net.cpp w/src/net.cpp\r\nindex 91282d927d..0eb0023112 100644\r\n--- i/src/net.cpp\r\n+++ w/src/net.cpp\r\n@@ -2809,41 +2809,49 @@ std::vector<AddedNodeInfo> CConnman::GetAddedNodeInfo() const\r\n         LOCK(m_added_nodes_mutex);\r\n         ret.reserve(m_added_node_params.size());\r\n         std::copy(m_added_node_params.cbegin(), m_added_node_params.cend(), std::back_inserter(lAddresses));\r\n     }\r\n \r\n \r\n-    // Build a map of all already connected addresses (by IP:port and by name) to inbound/outbound and resolved CService\r\n-    std::map<CNetAddr, bool> mapConnected;\r\n+    // Collect all addresses to which we are already connected.\r\n+    std::unordered_set<CNetAddr, CNetAddrHash> connected_to_inbound;\r\n+    std::unordered_set<CService, CServiceHash> connected_to_outbound;\r\n     std::map<std::string, std::pair<bool, CService>> mapConnectedByName;\r\n     {\r\n         LOCK(m_nodes_mutex);\r\n         for (const CNode* pnode : m_nodes) {\r\n             if (pnode->addr.IsValid()) {\r\n-                mapConnected[static_cast<CNetAddr>(pnode->addr)] = pnode->IsInboundConn();\r\n+                if (pnode->IsInboundConn()) {\r\n+                    connected_to_inbound.insert(pnode->addr);\r\n+                } else {\r\n+                    connected_to_outbound.insert(pnode->addr);\r\n+                }\r\n             }\r\n             std::string addrName{pnode->m_addr_name};\r\n             if (!addrName.empty()) {\r\n                 mapConnectedByName[std::move(addrName)] = std::make_pair(pnode->IsInboundConn(), static_cast<const CService&>(pnode->addr));\r\n             }\r\n         }\r\n     }\r\n \r\n     for (const auto& addr : lAddresses) {\r\n         CService service(LookupNumeric(addr.m_added_node, GetDefaultPort(addr.m_added_node)));\r\n         AddedNodeInfo addedNode{addr, CService(), false, false};\r\n         if (service.IsValid()) {\r\n-            // strAddNode is an IP:port\r\n-            auto it = mapConnected.find(static_cast<CNetAddr>(service));\r\n-            if (it != mapConnected.end()) {\r\n+            // addr.m_added_node is an addr:port\r\n+            if (connected_to_outbound.count(service) > 0) {\r\n+                addedNode.resolvedAddress = service;\r\n+                addedNode.fConnected = true;\r\n+                addedNode.fInbound = false;\r\n+            } else if (connected_to_inbound.count(service) > 0) {\r\n                 addedNode.resolvedAddress = service;\r\n                 addedNode.fConnected = true;\r\n-                addedNode.fInbound = it->second;\r\n+                addedNode.fInbound = true;\r\n             }\r\n         } else {\r\n-            // strAddNode is a name\r\n+            // addr.m_added_node is a name\r\n             auto it = mapConnectedByName.find(addr.m_added_node);\r\n             if (it != mapConnectedByName.end()) {\r\n                 addedNode.resolvedAddress = it->second.second;\r\n                 addedNode.fConnected = true;\r\n                 addedNode.fInbound = it->second.first;\r\n             }\r\ndiff --git i/src/netaddress.h w/src/netaddress.h\r\nindex ad09f16799..99a3b0fc22 100644\r\n--- i/src/netaddress.h\r\n+++ w/src/netaddress.h\r\n@@ -254,12 +254,13 @@ public:\r\n             UnserializeV2Stream(s);\r\n         } else {\r\n             UnserializeV1Stream(s);\r\n         }\r\n     }\r\n \r\n+    friend class CNetAddrHash;\r\n     friend class CSubNet;\r\n \r\n private:\r\n     /**\r\n      * Parse a Tor address and set this object to it.\r\n      * @param[in] addr Address to parse, must be a valid C string, for example\r\n@@ -473,12 +474,36 @@ private:\r\n         // will not be gossiped, but continue reading next addresses from the stream.\r\n         m_net = NET_IPV6;\r\n         m_addr.assign(ADDR_IPV6_SIZE, 0x0);\r\n     }\r\n };\r\n \r\n+class CNetAddrHash\r\n+{\r\n+public:\r\n+    CNetAddrHash()\r\n+        : m_salt_k0{GetRand<uint64_t>()},\r\n+          m_salt_k1{GetRand<uint64_t>()}\r\n+    {\r\n+    }\r\n+\r\n+    CNetAddrHash(uint64_t salt_k0, uint64_t salt_k1) : m_salt_k0{salt_k0}, m_salt_k1{salt_k1} {}\r\n+\r\n+    size_t operator()(const CNetAddr& a) const noexcept\r\n+    {\r\n+        CSipHasher hasher(m_salt_k0, m_salt_k1);\r\n+        hasher.Write(a.m_net);\r\n+        hasher.Write(a.m_addr);\r\n+        return static_cast<size_t>(hasher.Finalize());\r\n+    }\r\n+\r\n+private:\r\n+    const uint64_t m_salt_k0;\r\n+    const uint64_t m_salt_k1;\r\n+};\r\n+\r\n class CSubNet\r\n {\r\n protected:\r\n     /// Network (base) address\r\n     CNetAddr network;\r\n     /// Netmask, in network byte order\r\n```\r\n</details>",
+      "body" : "Right. Comparing ports for incoming connections is problematic also. I think the right approach for determining if we are connected to `addr:port`, _for the purposes of making an outbound connection_:\r\n\r\n* For incoming connections, compare just `addr` and ignore `port`\r\n* For outgoing connections, compare both `addr` and `port`.\r\n\r\nThis can't be done with a single map of either `CService` or `CNetAddr`. I guess two containers are needed, as this:\r\n\r\n<details>\r\n<summary>[patch] compare differently inbound and outbound addresses</summary>\r\n\r\n```diff\r\ndiff --git i/src/net.cpp w/src/net.cpp\r\nindex 91282d927d..0eb0023112 100644\r\n--- i/src/net.cpp\r\n+++ w/src/net.cpp\r\n@@ -2809,41 +2809,49 @@ std::vector<AddedNodeInfo> CConnman::GetAddedNodeInfo() const\r\n         LOCK(m_added_nodes_mutex);\r\n         ret.reserve(m_added_node_params.size());\r\n         std::copy(m_added_node_params.cbegin(), m_added_node_params.cend(), std::back_inserter(lAddresses));\r\n     }\r\n \r\n \r\n-    // Build a map of all already connected addresses (by IP:port and by name) to inbound/outbound and resolved CService\r\n-    std::map<CNetAddr, bool> mapConnected;\r\n+    // Collect all addresses to which we are already connected.\r\n+    std::unordered_set<CNetAddr, CNetAddrHash> connected_to_inbound;\r\n+    std::unordered_set<CService, CServiceHash> connected_to_outbound;\r\n     std::map<std::string, std::pair<bool, CService>> mapConnectedByName;\r\n     {\r\n         LOCK(m_nodes_mutex);\r\n         for (const CNode* pnode : m_nodes) {\r\n             if (pnode->addr.IsValid()) {\r\n-                mapConnected[static_cast<CNetAddr>(pnode->addr)] = pnode->IsInboundConn();\r\n+                if (pnode->IsInboundConn()) {\r\n+                    connected_to_inbound.insert(pnode->addr);\r\n+                } else {\r\n+                    connected_to_outbound.insert(pnode->addr);\r\n+                }\r\n             }\r\n             std::string addrName{pnode->m_addr_name};\r\n             if (!addrName.empty()) {\r\n                 mapConnectedByName[std::move(addrName)] = std::make_pair(pnode->IsInboundConn(), static_cast<const CService&>(pnode->addr));\r\n             }\r\n         }\r\n     }\r\n \r\n     for (const auto& addr : lAddresses) {\r\n         CService service(LookupNumeric(addr.m_added_node, GetDefaultPort(addr.m_added_node)));\r\n         AddedNodeInfo addedNode{addr, CService(), false, false};\r\n         if (service.IsValid()) {\r\n-            // strAddNode is an IP:port\r\n-            auto it = mapConnected.find(static_cast<CNetAddr>(service));\r\n-            if (it != mapConnected.end()) {\r\n+            // addr.m_added_node is an addr:port\r\n+            if (connected_to_outbound.count(service) > 0) {\r\n+                addedNode.resolvedAddress = service;\r\n+                addedNode.fConnected = true;\r\n+                addedNode.fInbound = false;\r\n+            } else if (connected_to_inbound.count(service) > 0) {\r\n                 addedNode.resolvedAddress = service;\r\n                 addedNode.fConnected = true;\r\n-                addedNode.fInbound = it->second;\r\n+                addedNode.fInbound = true;\r\n             }\r\n         } else {\r\n-            // strAddNode is a name\r\n+            // addr.m_added_node is a name\r\n             auto it = mapConnectedByName.find(addr.m_added_node);\r\n             if (it != mapConnectedByName.end()) {\r\n                 addedNode.resolvedAddress = it->second.second;\r\n                 addedNode.fConnected = true;\r\n                 addedNode.fInbound = it->second.first;\r\n             }\r\ndiff --git i/src/netaddress.h w/src/netaddress.h\r\nindex ad09f16799..99a3b0fc22 100644\r\n--- i/src/netaddress.h\r\n+++ w/src/netaddress.h\r\n@@ -254,12 +254,13 @@ public:\r\n             UnserializeV2Stream(s);\r\n         } else {\r\n             UnserializeV1Stream(s);\r\n         }\r\n     }\r\n \r\n+    friend class CNetAddrHash;\r\n     friend class CSubNet;\r\n \r\n private:\r\n     /**\r\n      * Parse a Tor address and set this object to it.\r\n      * @param[in] addr Address to parse, must be a valid C string, for example\r\n@@ -473,12 +474,36 @@ private:\r\n         // will not be gossiped, but continue reading next addresses from the stream.\r\n         m_net = NET_IPV6;\r\n         m_addr.assign(ADDR_IPV6_SIZE, 0x0);\r\n     }\r\n };\r\n \r\n+class CNetAddrHash\r\n+{\r\n+public:\r\n+    CNetAddrHash()\r\n+        : m_salt_k0{GetRand<uint64_t>()},\r\n+          m_salt_k1{GetRand<uint64_t>()}\r\n+    {\r\n+    }\r\n+\r\n+    CNetAddrHash(uint64_t salt_k0, uint64_t salt_k1) : m_salt_k0{salt_k0}, m_salt_k1{salt_k1} {}\r\n+\r\n+    size_t operator()(const CNetAddr& a) const noexcept\r\n+    {\r\n+        CSipHasher hasher(m_salt_k0, m_salt_k1);\r\n+        hasher.Write(a.m_net);\r\n+        hasher.Write(a.m_addr);\r\n+        return static_cast<size_t>(hasher.Finalize());\r\n+    }\r\n+\r\n+private:\r\n+    const uint64_t m_salt_k0;\r\n+    const uint64_t m_salt_k1;\r\n+};\r\n+\r\n class CSubNet\r\n {\r\n protected:\r\n     /// Network (base) address\r\n     CNetAddr network;\r\n     /// Netmask, in network byte order\r\n```\r\n</details>",
       "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
       "created_at" : "2023-10-12T07:39:25Z",
       "diff_hunk" : "@@ -2734,13 +2734,13 @@ std::vector<AddedNodeInfo> CConnman::GetAddedNodeInfo() const\n \n \n     // Build a map of all already connected addresses (by IP:port and by name) to inbound/outbound and resolved CService\n-    std::map<CService, bool> mapConnected;\n+    std::map<CNetAddr, bool> mapConnected;",
@@ -1626,8 +1626,620 @@
       "start_line" : null,
       "start_side" : null,
       "subject_type" : "line",
-      "updated_at" : "2023-10-12T07:39:26Z",
+      "updated_at" : "2023-10-12T10:05:13Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356400497",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356484191"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356484191"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Two concerns about this interface change:\r\n\r\n1. The pointer could become stale as soon as this method returns. It is good that this method is private which somewhat limits the danger that somebody will dereference a stale pointer, but does not eliminate it. `FindNode()` already has such an unsafe interface where it locks `m_nodes_mutex`, fetches a pointer to an element inside `m_nodes`, releases the mutex and returns the (possibly stale) pointer. In `master`, all places where `FindNode()` is called either only check if the returned pointer is null without dereferencing it (ok), or lock the mutex, call `FindNode()` (requiring the mutex to be recursive), dereference the pointer, unlock the mutex. But this PR in commit cb3f5a805caa2d42fdab57b42e6aee820ccd347d `p2p, bugfix: correctly detect already connected peers in ConnectNode()` adds calls where the pointer is dereferenced after releasing the mutex. I would rather have less such unsafe interfaces than more. Maybe log the message from inside `AlreadyConnectedToAddress()` or have it return the message as a string, to be optionally logged by the caller?\r\n\r\n2. (minor) `optional` from a pointer is redundant - if the pointer will never be null, then it can be reference. If the pointer can be null, then the `optional` can be dropped and null pointer to mean \"not connected\".",
+      "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "created_at" : "2023-10-12T08:37:47Z",
+      "diff_hunk" : "@@ -408,9 +408,13 @@ CNode* CConnman::FindNode(const CService& addr)\n     return nullptr;\n }\n \n-bool CConnman::AlreadyConnectedToAddress(const CAddress& addr)\n+std::optional<CNode*> CConnman::AlreadyConnectedToAddress(const CAddress& addr)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356484191",
+      "id" : 1356484191,
+      "line" : 411,
+      "node_id" : "PRRC_kwDOABII585Q2k5f",
+      "original_commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "original_line" : 411,
+      "original_position" : 14,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 14,
+      "pull_request_review_id" : 1673614690,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356484191/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-12T11:16:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356484191",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356558158"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356558158"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "cb3f5a805caa2d42fdab57b42e6aee820ccd347d `p2p, bugfix: correctly detect already connected peers in ConnectNode()`\r\n\r\n>    - Remove an AlreadyConnectedToAddress() check in CConnman::OpenNetworkConnection,\r\n      as it is now redundant to the checks added in this commit, and it is\r\n      preferable to log if it occurs.\r\n\r\nIt might happen that `CConnman::ConnectNode()` skips the call to `AlreadyConnectedToAddress()` and connects - if `pszDest` is null and `Lookup(pszDest` returns empty result. Then it will go here:\r\n\r\nhttps://github.com/bitcoin/bitcoin/blob/4a5aae9330780c3740e27cc511f7cba1fab745b9/src/net.cpp#L549-L558\r\n\r\nSo maybe keep the call to `AlreadyConnectedToAddress()` from `CConnman::OpenNetworkConnection()`.",
+      "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "created_at" : "2023-10-12T09:34:26Z",
+      "diff_hunk" : "@@ -2902,7 +2944,7 @@ void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFai\n     }\n     if (!pszDest) {\n         bool banned_or_discouraged = m_banman && (m_banman->IsDiscouraged(addrConnect) || m_banman->IsBanned(addrConnect));\n-        if (IsLocal(addrConnect) || banned_or_discouraged || AlreadyConnectedToAddress(addrConnect)) {\n+        if (IsLocal(addrConnect) || banned_or_discouraged) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356558158",
+      "id" : 1356558158,
+      "line" : 2947,
+      "node_id" : "PRRC_kwDOABII585Q229O",
+      "original_commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "original_line" : 2947,
+      "original_position" : 248,
+      "original_start_line" : 2905,
+      "path" : "src/net.cpp",
+      "position" : 248,
+      "pull_request_review_id" : 1673614690,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356558158/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 2905,
+      "start_side" : "LEFT",
+      "subject_type" : "line",
+      "updated_at" : "2023-10-12T11:16:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356558158",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356561796"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356561796"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "```suggestion\r\n    // Skip this check for inbound Tor connections because all of them seem to come from the IP address of the Tor router (usually 127.0.0.1).\r\n```",
+      "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "created_at" : "2023-10-12T09:37:33Z",
+      "diff_hunk" : "@@ -1847,6 +1861,16 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,\n     }\n \n     const bool inbound_onion = std::find(m_onion_binds.begin(), m_onion_binds.end(), addr_bind) != m_onion_binds.end();\n+\n+    // Don't accept inbound connections from peers already connected to us.\n+    // Skip this check for inbound Tor connections, as each IP will differ.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356561796",
+      "id" : 1356561796,
+      "line" : 1866,
+      "node_id" : "PRRC_kwDOABII585Q232E",
+      "original_commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "original_line" : 1866,
+      "original_position" : 106,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 106,
+      "pull_request_review_id" : 1673614690,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356561796/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-12T11:16:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356561796",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356590348"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356590348"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "This needs to know whether to ignore the port or not in order to do the check properly:\r\n\r\n* if we are about to make an outbound connection and wonder whether we are already connected to the peer we intend to connect to\r\n  * for all existent outbound connections, compare the prospect's address and port and if both match, then we are already connected\r\n  * for all existent inbound connections, compare only the address and ignore the port, if a match is found, then we are already connected\r\n  * otherwise we are not connected\r\n* if we are accepting in inbound connection, for all existent inbound and outbound connections, compare only the address and if a match is found then we are already connected, otherwise we are not connected.",
+      "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "created_at" : "2023-10-12T10:02:13Z",
+      "diff_hunk" : "@@ -408,9 +408,13 @@ CNode* CConnman::FindNode(const CService& addr)\n     return nullptr;\n }\n \n-bool CConnman::AlreadyConnectedToAddress(const CAddress& addr)\n+std::optional<CNode*> CConnman::AlreadyConnectedToAddress(const CAddress& addr)\n {\n-    return FindNode(static_cast<CNetAddr>(addr)) || FindNode(addr.ToStringAddrPort());\n+    if (Params().IsTestChain()) return std::nullopt; // allow bilateral connections on test chains\n+    const CService service{MaybeFlipIPv6toCJDNS(addr)};\n+    if (auto pnode = FindNode(static_cast<CNetAddr>(service))) return pnode;\n+    if (auto pnode = FindNode(service.ToStringAddrPort())) return pnode;\n+    return std::nullopt;\n }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356590348",
+      "id" : 1356590348,
+      "line" : 418,
+      "node_id" : "PRRC_kwDOABII585Q2-0M",
+      "original_commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "original_line" : 418,
+      "original_position" : 22,
+      "original_start_line" : 411,
+      "path" : "src/net.cpp",
+      "position" : 22,
+      "pull_request_review_id" : 1673614690,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356590348/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 411,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-10-12T11:16:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356590348",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356598798"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356598798"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit, feel free to ignore: for consistency with `CServiceHash` this better end in `Hash`. Given that it operates on `AddedNodeParams` better use that name verbatim instead of shortening it to `AddedNode`. I.e. consider renaming this to `AddedNodeParamsHash`.",
+      "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "created_at" : "2023-10-12T10:10:07Z",
+      "diff_hunk" : "@@ -101,6 +101,17 @@ typedef int64_t NodeId;\n struct AddedNodeParams {\n     std::string m_added_node;\n     bool m_use_v2transport;\n+    bool operator==(const AddedNodeParams& p) const\n+    {\n+        return m_added_node == p.m_added_node && m_use_v2transport == p.m_use_v2transport;\n+    }\n+};\n+\n+struct AddedNodeHasher {\n+    size_t operator()(const AddedNodeParams& p) const noexcept",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356598798",
+      "id" : 1356598798,
+      "line" : 111,
+      "node_id" : "PRRC_kwDOABII585Q3A4O",
+      "original_commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "original_line" : 111,
+      "original_position" : 11,
+      "original_start_line" : 110,
+      "path" : "src/net.h",
+      "position" : 11,
+      "pull_request_review_id" : 1673614690,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356598798/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 110,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-10-12T11:16:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356598798",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356610866"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356610866"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Why `<< 1`?",
+      "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "created_at" : "2023-10-12T10:22:08Z",
+      "diff_hunk" : "@@ -101,6 +101,17 @@ typedef int64_t NodeId;\n struct AddedNodeParams {\n     std::string m_added_node;\n     bool m_use_v2transport;\n+    bool operator==(const AddedNodeParams& p) const\n+    {\n+        return m_added_node == p.m_added_node && m_use_v2transport == p.m_use_v2transport;\n+    }\n+};\n+\n+struct AddedNodeHasher {\n+    size_t operator()(const AddedNodeParams& p) const noexcept\n+    {\n+        return std::hash<std::string>()(p.m_added_node) ^ (std::hash<bool>()(p.m_use_v2transport) << 1);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356610866",
+      "id" : 1356610866,
+      "line" : 113,
+      "node_id" : "PRRC_kwDOABII585Q3D0y",
+      "original_commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "original_line" : 113,
+      "original_position" : 13,
+      "original_start_line" : null,
+      "path" : "src/net.h",
+      "position" : 13,
+      "pull_request_review_id" : 1673614690,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356610866/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-12T11:16:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356610866",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356628687"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356628687"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "If we have the address for manual connections (given to `addnode`) here we should ignore whether v1 or v2 is going to be used. It is the same peer after all, regardless of p2p encryption. I guess this better be something like:\r\n\r\n```cpp\r\nbool in_added_nodes;\r\n{\r\n    const std::string addr_str{addr.ToStringAddr()};\r\n    const std::string addr_port_str{addr.ToStringAddrPort()};\r\n    LOCK(m_added_nodes_mutex);\r\n    in_added_nodes =\r\n        m_added_node_params.count({addr_str, /*m_use_v2transport=*/true}) > 0 ||\r\n        m_added_node_params.count({addr_str, /*m_use_v2transport=*/false}) > 0 ||\r\n        m_added_node_params.count({addr_port_str, /*m_use_v2transport=*/true}) > 0 ||\r\n        m_added_node_params.count({addr_port_str, /*m_use_v2transport=*/false}) > 0;\r\n}\r\nif (in_added_nodes) {",
+      "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "created_at" : "2023-10-12T10:39:03Z",
+      "diff_hunk" : "@@ -2760,6 +2787,19 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)\n                 continue;\n             }\n \n+            // Do not make automatic outbound connections to addnode peers,\n+            // to allocate our limited outbound slots correctly and to ensure\n+            // addnode connections benefit from their intended protections.\n+            // Expect BIP324 transport when both us and them have NODE_V2_P2P set.\n+            const bool v2_p2p(addr.nServices & GetLocalServices() & NODE_P2P_V2);\n+            if (WITH_LOCK(m_added_nodes_mutex, return m_added_node_params.count({addr.ToStringAddr(), v2_p2p}) || m_added_node_params.count({addr.ToStringAddrPort(), v2_p2p}))) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356628687",
+      "id" : 1356628687,
+      "line" : 2795,
+      "node_id" : "PRRC_kwDOABII585Q3ILP",
+      "original_commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "original_line" : 2795,
+      "original_position" : 187,
+      "original_start_line" : 2794,
+      "path" : "src/net.cpp",
+      "position" : 187,
+      "pull_request_review_id" : 1673614690,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356628687/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 2794,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-10-12T11:16:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356628687",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356657006"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356657006"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit:\r\n```suggestion\r\n    LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"Trying v%i %s connection to net=%s%s, lastseen=%.1fh ago\\n\",\r\n```",
+      "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "created_at" : "2023-10-12T11:05:27Z",
+      "diff_hunk" : "@@ -474,15 +483,18 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo\n             }\n             // It is possible that we already have a connection to the IP/port pszDest resolved to.\n             // In that case, drop the connection that was just created.\n-            LOCK(m_nodes_mutex);\n-            CNode* pnode = FindNode(static_cast<CService>(addrConnect));\n-            if (pnode) {\n-                LogPrintf(\"Failed to open new connection, already connected\\n\");\n+            if (auto pnode = AlreadyConnectedToAddress(addrConnect)) {\n+                LogPrintLevel(BCLog::NET, BCLog::Level::Info, \"%s\\n\", AlreadyConnected(pnode.value(), addrConnect, conn_type));\n                 return nullptr;\n             }\n         }\n     }\n \n+    LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"Trying v%i %s connection to net=%s%s, lastseen=%.1fhrs\\n\",",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356657006",
+      "id" : 1356657006,
+      "line" : 493,
+      "node_id" : "PRRC_kwDOABII585Q3PFu",
+      "original_commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "original_line" : 493,
+      "original_position" : 81,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 81,
+      "pull_request_review_id" : 1673614690,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356657006/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-12T11:16:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356657006",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356660922"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356660922"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: I find \"...connection accepted from peer=5\"  a bit confusing. Maybe:\r\n```suggestion\r\n    LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"New %s connection accepted, peer=%d, net=%s%s\\n\",\r\n```",
+      "commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "created_at" : "2023-10-12T11:09:23Z",
+      "diff_hunk" : "@@ -1869,7 +1893,9 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,\n     pnode->AddRef();\n     m_msgproc->InitializeNode(*pnode, nodeServices);\n \n-    LogPrint(BCLog::NET, \"connection from %s accepted\\n\", addr.ToStringAddrPort());\n+    LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"New %s connection accepted from peer=%d, net=%s%s\\n\",",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28248#discussion_r1356660922",
+      "id" : 1356660922,
+      "line" : 1896,
+      "node_id" : "PRRC_kwDOABII585Q3QC6",
+      "original_commit_id" : "2a9db3a16a93d497bfe496b7c35edac975ee81d2",
+      "original_line" : 1896,
+      "original_position" : 122,
+      "original_start_line" : null,
+      "path" : "src/net.cpp",
+      "position" : 122,
+      "pull_request_review_id" : 1673614690,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28248",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356660922/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-12T11:16:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1356660922",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
          "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
