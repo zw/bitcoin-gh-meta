@@ -20988,6 +20988,282 @@
    {
       "_links" : {
          "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358376718"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358376718"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Makes sense, renamed to `IsInMempool`",
+      "commit_id" : "daad63c6878e01236b215827aeeb2d4fe70f733a",
+      "created_at" : "2023-10-13T14:56:01Z",
+      "diff_hunk" : "@@ -0,0 +1,166 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_POLICY_ANCESTOR_PACKAGES_H\n+#define BITCOIN_POLICY_ANCESTOR_PACKAGES_H\n+\n+#include <policy/feerate.h>\n+#include <policy/packages.h>\n+\n+#include <vector>\n+\n+/** A potential ancestor package, i.e. one transaction with its set of unconfirmed ancestors.\n+ * This class does not have any knowledge of chainstate, so it cannot determine whether all\n+ * unconfirmed ancestors are present. Its constructor accepts any list of transactions that\n+ * IsConsistent(), linearizes them topologically, and determines whether it IsAncestorPackage().\n+ * If fee and vsizes are given for each transaction, it can also linearize the transactions using\n+ * the ancestor score-based mining algorithm via MiniMiner.\n+ *\n+ * Skip() and SkipWithDescendants() can be used to omit transactions.\n+ * Txns() and FilteredTxns() return the linearized transactions; FilteredTxns excludes non-PACKAGE ones.\n+ * FilteredAncestorSet() can be used to get a transaction's \"subpackage,\" i.e. ancestor set within the\n+ * package. Also excludes non-PACKAGE ones.\n+ * */\n+class AncestorPackage\n+{\n+    /** Whether m_txns contains a connected package in which all transactions are ancestors of the\n+     * last transaction. This object is not aware of chainstate. So if m_txns only includes a\n+     * grandparent and not the \"connecting\" parent, this will (incorrectly) determine that the\n+     * grandparent is not an ancestor.\n+     * Set in the constructor and then does not change, even if transactions are skipped.\n+     * */\n+    bool m_ancestor_package_shaped{false};\n+\n+    struct PackageEntry {\n+        enum class State : uint8_t {\n+            /** Default value.\n+             * If calling LinearizeWithFees(), this tx must have a fee and vsize. */\n+            PACKAGE,\n+            /** Excluded from FilteredAncestor{Set,FeeAndVsize}.\n+             * Should not appear in any transaction's ancestor_subset.\n+             * Excluded in LinearizeWithFees().\n+             * Set by calling Skip() on this tx. */\n+            MEMPOOL,\n+            /** This and all descendant's FilteredAncestor{Set,FeeAndVsize} will be std::nullopt.\n+             * Should not appear in any transaction's ancestor_subset.\n+             * Excluded in LinearizeWithFees().\n+             * Set by calling SkipWithDescendants() on this tx or its ancestor. */\n+            DANGLING,\n+        // If a parent is DANGLING, all descendants must also be DANGLING.\n+        // If a child is MEMPOOL, all ancestors should also be MEMPOOL.\n+        };\n+\n+        CTransactionRef tx;\n+\n+        State m_state{State::PACKAGE};\n+\n+        /** This value starts as std::nullopt when we don't have any fee information yet. It can be\n+         * updated by calling LinearizeWithFees() if this entry isn't MEMPOOL or DANGLING. */\n+        std::optional<uint32_t> mining_sequence;\n+\n+        /** Fees of this transaction. Starts as std::nullopt, can be updated using AddFeeAndVsize(). */\n+        std::optional<CAmount> fee;\n+\n+        /** Virtual size of this transaction (depends on policy, calculated externally). Starts as\n+         * std::nullopt. Can be updated using AddFeeAndVsize(). */\n+        std::optional<int64_t> vsize;\n+\n+        /** Txids of all PACKAGE ancestors. Populated in AncestorPackage ctor. If an ancestor\n+         * becomes MEMPOOL or DANGLING, it is erased from this set. Use FilteredAncestorSet to get\n+         * filtered ancestor sets. */\n+        std::set<uint256> ancestor_subset;\n+\n+        /** Txids of all in-package descendant. Populated in AncestorPackage ctor and does not\n+         * change within AncestorPackage lifetime. */\n+        std::set<uint256> descendant_subset;\n+\n+        explicit PackageEntry(CTransactionRef tx_in) : tx(tx_in) {}\n+\n+        // Used to sort the result of Txns, FilteredTxns, and FilteredAncestorSet. Always guarantees\n+        // topological sort to the best of our knowledge (see IsSorted()), and puts the most\n+        // incentive-compatible subset(s) first if that information is available.\n+        //\n+        // If ancestor score-based linearization sequence exists for both transactions, the\n+        // transaction with the lower sequence number comes first.\n+        //    If unavailable or there is a tie, the transaction with fewer in-package ancestors comes first (topological sort).\n+        //       If there is still a tie, the transaction with the higher base feerate comes first.\n+        // Otherwise, the transaction with fewer in-package ancestors comes first (topological sort).\n+        bool operator<(const PackageEntry& rhs) const {\n+            if (mining_sequence == std::nullopt || rhs.mining_sequence == std::nullopt) {\n+                // If mining sequence is missing for either entry, default to topological order.\n+                return ancestor_subset.size() < rhs.ancestor_subset.size();\n+            } else {\n+                if (mining_sequence.value() == rhs.mining_sequence.value()) {\n+                    // Identical mining sequence means they would be included in the same ancestor\n+                    // set. The one with fewer ancestors comes first.\n+                    if (ancestor_subset.size() == rhs.ancestor_subset.size()) {\n+                        // Individual feerate. This is not necessarily fee-optimal, but helps in some situations.\n+                        // (a.fee * b.vsize > b.fee * a.vsize) is a shortcut for (a.fee / a.vsize > b.fee / b.vsize)\n+                        return *fee * *rhs.vsize  > *rhs.fee * *vsize;\n+                    }\n+                    return ancestor_subset.size() < rhs.ancestor_subset.size();\n+                } else {\n+                    return mining_sequence.value() < rhs.mining_sequence.value();\n+                }\n+            }\n+        }\n+    };\n+    /** Map from each txid to PackageEntry */\n+    std::map<uint256, PackageEntry> m_txid_to_entry;\n+\n+    /** Linearized transactions. Always topologically sorted (IsSorted()). If fee information is\n+     * provided through LinearizeWithFees(), using mining_sequence scores. */\n+    std::vector<std::reference_wrapper<PackageEntry>> m_txns;\n+\n+    /** Helper function for recursively constructing ancestor caches in ctor. */\n+    void visit(const CTransactionRef&);\n+public:\n+    /** Constructs ancestor package, sorting the transactions topologically and constructing the\n+     * txid_to_tx and ancestor_subsets maps. It is ok if the input txns is not sorted.\n+     * Expects:\n+     * - No duplicate transactions.\n+     * - No conflicts between transactions.\n+     */\n+    AncestorPackage(const Package& txns_in);\n+\n+    bool IsAncestorPackage() const { return m_ancestor_package_shaped; }\n+\n+    /** Returns all of the transactions, linearized. */\n+    Package Txns() const;\n+\n+    /** Returns all of the transactions, without the skipped and dangling ones, linearized. */\n+    Package FilteredTxns() const;\n+\n+    /** Get the sorted, filtered ancestor subpackage for a tx. Includes the tx. Does not include\n+     * ancestors that are MEMPOOL. If this tx or any ancestors are DANGLING, returns std::nullopt. */\n+    std::optional<std::vector<CTransactionRef>> FilteredAncestorSet(const CTransactionRef& tx) const;\n+\n+    /** Get the total fee and vsize of the ancestor subpackage for a tx. Includes the tx. Does not\n+     * include ancestors that are MEMPOOL. If this tx or any ancestors are DANGLING, returns\n+     * std::nullopt. This result is always consistent with FilteredAncestorSet(). */\n+    std::optional<std::pair<CAmount, int64_t>> FilteredAncestorFeeAndVsize(const CTransactionRef& tx) const;\n+\n+    /** Get the fee and vsize of a tx. Returns std::nullopt if this information is unknown or this\n+     * tx is DANGLING. */\n+    std::optional<std::pair<CAmount, int64_t>> GetFeeAndVsize(const CTransactionRef& tx) const;\n+\n+    /** Should be called if a tx or same txid transaction is found in mempool or submitted to it.\n+     * From now on, skip this tx from any result in FilteredAncestorSet(). Does not affect Txns().\n+     */\n+    void Skip(const CTransactionRef& transaction);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358376718",
+      "id" : 1358376718,
+      "in_reply_to_id" : 1357181276,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Q9y8O",
+      "original_commit_id" : "ff27bc4203dcf2c46a610760411704fd3da3a998",
+      "original_line" : 151,
+      "original_position" : 151,
+      "original_start_line" : null,
+      "path" : "src/policy/ancestor_packages.h",
+      "position" : null,
+      "pull_request_review_id" : 1676681774,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358376718/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-13T17:03:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358376718",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358377096"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358377096"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Renamed to `IsDanglingWithDescendants` as suggested. Still chewing on the `TX_CONFLICT` case.",
+      "commit_id" : "daad63c6878e01236b215827aeeb2d4fe70f733a",
+      "created_at" : "2023-10-13T14:56:20Z",
+      "diff_hunk" : "@@ -0,0 +1,166 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_POLICY_ANCESTOR_PACKAGES_H\n+#define BITCOIN_POLICY_ANCESTOR_PACKAGES_H\n+\n+#include <policy/feerate.h>\n+#include <policy/packages.h>\n+\n+#include <vector>\n+\n+/** A potential ancestor package, i.e. one transaction with its set of unconfirmed ancestors.\n+ * This class does not have any knowledge of chainstate, so it cannot determine whether all\n+ * unconfirmed ancestors are present. Its constructor accepts any list of transactions that\n+ * IsConsistent(), linearizes them topologically, and determines whether it IsAncestorPackage().\n+ * If fee and vsizes are given for each transaction, it can also linearize the transactions using\n+ * the ancestor score-based mining algorithm via MiniMiner.\n+ *\n+ * Skip() and SkipWithDescendants() can be used to omit transactions.\n+ * Txns() and FilteredTxns() return the linearized transactions; FilteredTxns excludes non-PACKAGE ones.\n+ * FilteredAncestorSet() can be used to get a transaction's \"subpackage,\" i.e. ancestor set within the\n+ * package. Also excludes non-PACKAGE ones.\n+ * */\n+class AncestorPackage\n+{\n+    /** Whether m_txns contains a connected package in which all transactions are ancestors of the\n+     * last transaction. This object is not aware of chainstate. So if m_txns only includes a\n+     * grandparent and not the \"connecting\" parent, this will (incorrectly) determine that the\n+     * grandparent is not an ancestor.\n+     * Set in the constructor and then does not change, even if transactions are skipped.\n+     * */\n+    bool m_ancestor_package_shaped{false};\n+\n+    struct PackageEntry {\n+        enum class State : uint8_t {\n+            /** Default value.\n+             * If calling LinearizeWithFees(), this tx must have a fee and vsize. */\n+            PACKAGE,\n+            /** Excluded from FilteredAncestor{Set,FeeAndVsize}.\n+             * Should not appear in any transaction's ancestor_subset.\n+             * Excluded in LinearizeWithFees().\n+             * Set by calling Skip() on this tx. */\n+            MEMPOOL,\n+            /** This and all descendant's FilteredAncestor{Set,FeeAndVsize} will be std::nullopt.\n+             * Should not appear in any transaction's ancestor_subset.\n+             * Excluded in LinearizeWithFees().\n+             * Set by calling SkipWithDescendants() on this tx or its ancestor. */\n+            DANGLING,\n+        // If a parent is DANGLING, all descendants must also be DANGLING.\n+        // If a child is MEMPOOL, all ancestors should also be MEMPOOL.\n+        };\n+\n+        CTransactionRef tx;\n+\n+        State m_state{State::PACKAGE};\n+\n+        /** This value starts as std::nullopt when we don't have any fee information yet. It can be\n+         * updated by calling LinearizeWithFees() if this entry isn't MEMPOOL or DANGLING. */\n+        std::optional<uint32_t> mining_sequence;\n+\n+        /** Fees of this transaction. Starts as std::nullopt, can be updated using AddFeeAndVsize(). */\n+        std::optional<CAmount> fee;\n+\n+        /** Virtual size of this transaction (depends on policy, calculated externally). Starts as\n+         * std::nullopt. Can be updated using AddFeeAndVsize(). */\n+        std::optional<int64_t> vsize;\n+\n+        /** Txids of all PACKAGE ancestors. Populated in AncestorPackage ctor. If an ancestor\n+         * becomes MEMPOOL or DANGLING, it is erased from this set. Use FilteredAncestorSet to get\n+         * filtered ancestor sets. */\n+        std::set<uint256> ancestor_subset;\n+\n+        /** Txids of all in-package descendant. Populated in AncestorPackage ctor and does not\n+         * change within AncestorPackage lifetime. */\n+        std::set<uint256> descendant_subset;\n+\n+        explicit PackageEntry(CTransactionRef tx_in) : tx(tx_in) {}\n+\n+        // Used to sort the result of Txns, FilteredTxns, and FilteredAncestorSet. Always guarantees\n+        // topological sort to the best of our knowledge (see IsSorted()), and puts the most\n+        // incentive-compatible subset(s) first if that information is available.\n+        //\n+        // If ancestor score-based linearization sequence exists for both transactions, the\n+        // transaction with the lower sequence number comes first.\n+        //    If unavailable or there is a tie, the transaction with fewer in-package ancestors comes first (topological sort).\n+        //       If there is still a tie, the transaction with the higher base feerate comes first.\n+        // Otherwise, the transaction with fewer in-package ancestors comes first (topological sort).\n+        bool operator<(const PackageEntry& rhs) const {\n+            if (mining_sequence == std::nullopt || rhs.mining_sequence == std::nullopt) {\n+                // If mining sequence is missing for either entry, default to topological order.\n+                return ancestor_subset.size() < rhs.ancestor_subset.size();\n+            } else {\n+                if (mining_sequence.value() == rhs.mining_sequence.value()) {\n+                    // Identical mining sequence means they would be included in the same ancestor\n+                    // set. The one with fewer ancestors comes first.\n+                    if (ancestor_subset.size() == rhs.ancestor_subset.size()) {\n+                        // Individual feerate. This is not necessarily fee-optimal, but helps in some situations.\n+                        // (a.fee * b.vsize > b.fee * a.vsize) is a shortcut for (a.fee / a.vsize > b.fee / b.vsize)\n+                        return *fee * *rhs.vsize  > *rhs.fee * *vsize;\n+                    }\n+                    return ancestor_subset.size() < rhs.ancestor_subset.size();\n+                } else {\n+                    return mining_sequence.value() < rhs.mining_sequence.value();\n+                }\n+            }\n+        }\n+    };\n+    /** Map from each txid to PackageEntry */\n+    std::map<uint256, PackageEntry> m_txid_to_entry;\n+\n+    /** Linearized transactions. Always topologically sorted (IsSorted()). If fee information is\n+     * provided through LinearizeWithFees(), using mining_sequence scores. */\n+    std::vector<std::reference_wrapper<PackageEntry>> m_txns;\n+\n+    /** Helper function for recursively constructing ancestor caches in ctor. */\n+    void visit(const CTransactionRef&);\n+public:\n+    /** Constructs ancestor package, sorting the transactions topologically and constructing the\n+     * txid_to_tx and ancestor_subsets maps. It is ok if the input txns is not sorted.\n+     * Expects:\n+     * - No duplicate transactions.\n+     * - No conflicts between transactions.\n+     */\n+    AncestorPackage(const Package& txns_in);\n+\n+    bool IsAncestorPackage() const { return m_ancestor_package_shaped; }\n+\n+    /** Returns all of the transactions, linearized. */\n+    Package Txns() const;\n+\n+    /** Returns all of the transactions, without the skipped and dangling ones, linearized. */\n+    Package FilteredTxns() const;\n+\n+    /** Get the sorted, filtered ancestor subpackage for a tx. Includes the tx. Does not include\n+     * ancestors that are MEMPOOL. If this tx or any ancestors are DANGLING, returns std::nullopt. */\n+    std::optional<std::vector<CTransactionRef>> FilteredAncestorSet(const CTransactionRef& tx) const;\n+\n+    /** Get the total fee and vsize of the ancestor subpackage for a tx. Includes the tx. Does not\n+     * include ancestors that are MEMPOOL. If this tx or any ancestors are DANGLING, returns\n+     * std::nullopt. This result is always consistent with FilteredAncestorSet(). */\n+    std::optional<std::pair<CAmount, int64_t>> FilteredAncestorFeeAndVsize(const CTransactionRef& tx) const;\n+\n+    /** Get the fee and vsize of a tx. Returns std::nullopt if this information is unknown or this\n+     * tx is DANGLING. */\n+    std::optional<std::pair<CAmount, int64_t>> GetFeeAndVsize(const CTransactionRef& tx) const;\n+\n+    /** Should be called if a tx or same txid transaction is found in mempool or submitted to it.\n+     * From now on, skip this tx from any result in FilteredAncestorSet(). Does not affect Txns().\n+     */\n+    void Skip(const CTransactionRef& transaction);\n+\n+    /** Should be called if a tx will not be considered because it is missing inputs.\n+     * Skip a transaction and all of its descendants. From now on, if this transaction is present\n+     * in the ancestor set, FilteredAncestorSet() returns std::nullopt for that tx. Does not affect Txns(). */\n+    void SkipWithDescendants(const CTransactionRef& transaction);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358377096",
+      "id" : 1358377096,
+      "in_reply_to_id" : 1357188257,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Q9zCI",
+      "original_commit_id" : "ff27bc4203dcf2c46a610760411704fd3da3a998",
+      "original_line" : 156,
+      "original_position" : 156,
+      "original_start_line" : null,
+      "path" : "src/policy/ancestor_packages.h",
+      "position" : null,
+      "pull_request_review_id" : 1676681774,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358377096/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-13T17:03:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358377096",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358379473"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358379473"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Ok, I've changed this to a list of bullet points that each begin with a verb so that it's easier to parse than a comma-separated list.\r\nI've also added quotes around \"bump fees\" - please note this term was chosen in #26152 and I'm just using it.",
+      "commit_id" : "daad63c6878e01236b215827aeeb2d4fe70f733a",
+      "created_at" : "2023-10-13T14:58:00Z",
+      "diff_hunk" : "@@ -55,8 +55,11 @@ struct IteratorComparator\n     }\n };\n \n-/** A minimal version of BlockAssembler. Allows us to run the mining algorithm on a subset of\n- * mempool transactions, ignoring consensus rules, to calculate mining scores. */\n+/** A minimal version of BlockAssembler. Allows us to run the mining algorithm on a limited set of\n+ * transactions (e.g. subset of mempool or transactions that are not yet in mempool) instead of the entire\n+ * mempool, ignoring consensus rules. Callers may use this to calculate mining scores, bump fees, or\n+ * linearization order of a list of transactions.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358379473",
+      "id" : 1358379473,
+      "in_reply_to_id" : 1345473164,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Q9znR",
+      "original_commit_id" : "5826d9960161ed8b6d6fe4985ff7495c4456c737",
+      "original_line" : 61,
+      "original_position" : 42,
+      "original_start_line" : null,
+      "path" : "src/node/mini_miner.h",
+      "position" : null,
+      "pull_request_review_id" : 1676681774,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358379473/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-13T17:03:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358379473",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358381451"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358381451"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Taken",
+      "commit_id" : "daad63c6878e01236b215827aeeb2d4fe70f733a",
+      "created_at" : "2023-10-13T14:59:46Z",
+      "diff_hunk" : "@@ -1403,63 +1433,32 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package,\n \n     // Check that the package is well-formed. If it isn't, we won't try to validate any of the\n     // transactions and thus won't return any MempoolAcceptResults, just a package-wide error.\n-\n     // Context-free package checks.\n-    if (!CheckPackage(package, package_state_quit_early)) return PackageMempoolAcceptResult(package_state_quit_early, {});\n-\n-    // All transactions in the package must be a parent of the last transaction. This is just an\n-    // opportunity for us to fail fast on a context-free check without taking the mempool lock.\n-    if (!IsChildWithParents(package)) {\n-        package_state_quit_early.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-parents\");\n+    if (!package.empty() && !IsPackageWellFormed(package, package_state_quit_early, /*require_sorted=*/false)) {\n         return PackageMempoolAcceptResult(package_state_quit_early, {});\n     }\n+    AncestorPackage linearized_package{package};\n \n-    // IsChildWithParents() guarantees the package is > 1 transactions.\n-    assert(package.size() > 1);\n-    // The package must be 1 child with all of its unconfirmed parents. The package is expected to\n-    // be sorted, so the last transaction is the child.\n-    const auto& child = package.back();\n-    std::unordered_set<uint256, SaltedTxidHasher> unconfirmed_parent_txids;\n-    std::transform(package.cbegin(), package.cend() - 1,\n-                   std::inserter(unconfirmed_parent_txids, unconfirmed_parent_txids.end()),\n-                   [](const auto& tx) { return tx->GetHash(); });\n-\n-    // All child inputs must refer to a preceding package transaction or a confirmed UTXO. The only\n-    // way to verify this is to look up the child's inputs in our current coins view (not including\n-    // mempool), and enforce that all parents not present in the package be available at chain tip.\n-    // Since this check can bring new coins into the coins cache, keep track of these coins and\n-    // uncache them if we don't end up submitting this package to the mempool.\n-    const CCoinsViewCache& coins_tip_cache = m_active_chainstate.CoinsTip();\n-    for (const auto& input : child->vin) {\n-        if (!coins_tip_cache.HaveCoinInCache(input.prevout)) {\n-            args.m_coins_to_uncache.push_back(input.prevout);\n-        }\n-    }\n-    // Using the MemPoolAccept m_view cache allows us to look up these same coins faster later.\n-    // This should be connecting directly to CoinsTip, not to m_viewmempool, because we specifically\n-    // require inputs to be confirmed if they aren't in the package.\n-    m_view.SetBackend(m_active_chainstate.CoinsTip());\n-    const auto package_or_confirmed = [this, &unconfirmed_parent_txids](const auto& input) {\n-         return unconfirmed_parent_txids.count(input.prevout.hash) > 0 || m_view.HaveCoin(input.prevout);\n-    };\n-    if (!std::all_of(child->vin.cbegin(), child->vin.cend(), package_or_confirmed)) {\n-        package_state_quit_early.Invalid(PackageValidationResult::PCKG_POLICY, \"package-not-child-with-unconfirmed-parents\");\n+    if (!linearized_package.IsAncestorPackage()) {\n+        package_state_quit_early.Invalid(PackageValidationResult::PCKG_POLICY, \"not-ancestor-package\");\n         return PackageMempoolAcceptResult(package_state_quit_early, {});\n     }\n-    // Protect against bugs where we pull more inputs from disk that miss being added to\n-    // coins_to_uncache. The backend will be connected again when needed in PreChecks.\n-    m_view.SetBackend(m_dummy);\n+    Assume(IsPackageWellFormed(linearized_package.Txns(), package_state_quit_early, /*require_sorted=*/true));\n \n     LOCK(m_pool.cs);\n     // Stores results from which we will create the returned PackageMempoolAcceptResult.\n     // A result may be changed if a mempool transaction is evicted later due to LimitMempoolSize().\n     std::map<uint256, MempoolAcceptResult> results_final;\n-    // Results from individual validation which will be returned if no other result is available for\n+    // Results from calling PreChecks() which will be returned if no other result is available for\n     // this transaction. \"Nonfinal\" because if a transaction fails by itself but succeeds later\n     // (i.e. when evaluated with a fee-bumping child), the result in this map may be discarded.\n     std::map<uint256, MempoolAcceptResult> individual_results_nonfinal;\n+    // Call PreChecks() for every transaction in topological order, de-duplicating and skipping\n+    // transactions we can't validate, making each transaction's inputs available for subsequent\n+    // transactions to spend. If we encounter a failure that isn't TX_SINGLE_FAILURE, we continue to\n+    // call PreChecks() but will quit_early and not do package validation.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358381451",
+      "id" : 1358381451,
+      "in_reply_to_id" : 1357172527,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Q90GL",
+      "original_commit_id" : "ff27bc4203dcf2c46a610760411704fd3da3a998",
+      "original_line" : 1459,
+      "original_position" : 287,
+      "original_start_line" : null,
+      "path" : "src/validation.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1676681774,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358381451/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-13T17:03:30Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358381451",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
             "href" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358436527"
          },
          "pull_request" : {
@@ -21052,6 +21328,144 @@
          "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358520940"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358520940"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Ok makes sense. I will do this next week, need to add a different `MempoolAcceptResult::ResultType` I think, and will write some tests. Addressed the other comments though.",
+      "commit_id" : "daad63c6878e01236b215827aeeb2d4fe70f733a",
+      "created_at" : "2023-10-13T17:05:28Z",
+      "diff_hunk" : "@@ -0,0 +1,166 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_POLICY_ANCESTOR_PACKAGES_H\n+#define BITCOIN_POLICY_ANCESTOR_PACKAGES_H\n+\n+#include <policy/feerate.h>\n+#include <policy/packages.h>\n+\n+#include <vector>\n+\n+/** A potential ancestor package, i.e. one transaction with its set of unconfirmed ancestors.\n+ * This class does not have any knowledge of chainstate, so it cannot determine whether all\n+ * unconfirmed ancestors are present. Its constructor accepts any list of transactions that\n+ * IsConsistent(), linearizes them topologically, and determines whether it IsAncestorPackage().\n+ * If fee and vsizes are given for each transaction, it can also linearize the transactions using\n+ * the ancestor score-based mining algorithm via MiniMiner.\n+ *\n+ * Skip() and SkipWithDescendants() can be used to omit transactions.\n+ * Txns() and FilteredTxns() return the linearized transactions; FilteredTxns excludes non-PACKAGE ones.\n+ * FilteredAncestorSet() can be used to get a transaction's \"subpackage,\" i.e. ancestor set within the\n+ * package. Also excludes non-PACKAGE ones.\n+ * */\n+class AncestorPackage\n+{\n+    /** Whether m_txns contains a connected package in which all transactions are ancestors of the\n+     * last transaction. This object is not aware of chainstate. So if m_txns only includes a\n+     * grandparent and not the \"connecting\" parent, this will (incorrectly) determine that the\n+     * grandparent is not an ancestor.\n+     * Set in the constructor and then does not change, even if transactions are skipped.\n+     * */\n+    bool m_ancestor_package_shaped{false};\n+\n+    struct PackageEntry {\n+        enum class State : uint8_t {\n+            /** Default value.\n+             * If calling LinearizeWithFees(), this tx must have a fee and vsize. */\n+            PACKAGE,\n+            /** Excluded from FilteredAncestor{Set,FeeAndVsize}.\n+             * Should not appear in any transaction's ancestor_subset.\n+             * Excluded in LinearizeWithFees().\n+             * Set by calling Skip() on this tx. */\n+            MEMPOOL,\n+            /** This and all descendant's FilteredAncestor{Set,FeeAndVsize} will be std::nullopt.\n+             * Should not appear in any transaction's ancestor_subset.\n+             * Excluded in LinearizeWithFees().\n+             * Set by calling SkipWithDescendants() on this tx or its ancestor. */\n+            DANGLING,\n+        // If a parent is DANGLING, all descendants must also be DANGLING.\n+        // If a child is MEMPOOL, all ancestors should also be MEMPOOL.\n+        };\n+\n+        CTransactionRef tx;\n+\n+        State m_state{State::PACKAGE};\n+\n+        /** This value starts as std::nullopt when we don't have any fee information yet. It can be\n+         * updated by calling LinearizeWithFees() if this entry isn't MEMPOOL or DANGLING. */\n+        std::optional<uint32_t> mining_sequence;\n+\n+        /** Fees of this transaction. Starts as std::nullopt, can be updated using AddFeeAndVsize(). */\n+        std::optional<CAmount> fee;\n+\n+        /** Virtual size of this transaction (depends on policy, calculated externally). Starts as\n+         * std::nullopt. Can be updated using AddFeeAndVsize(). */\n+        std::optional<int64_t> vsize;\n+\n+        /** Txids of all PACKAGE ancestors. Populated in AncestorPackage ctor. If an ancestor\n+         * becomes MEMPOOL or DANGLING, it is erased from this set. Use FilteredAncestorSet to get\n+         * filtered ancestor sets. */\n+        std::set<uint256> ancestor_subset;\n+\n+        /** Txids of all in-package descendant. Populated in AncestorPackage ctor and does not\n+         * change within AncestorPackage lifetime. */\n+        std::set<uint256> descendant_subset;\n+\n+        explicit PackageEntry(CTransactionRef tx_in) : tx(tx_in) {}\n+\n+        // Used to sort the result of Txns, FilteredTxns, and FilteredAncestorSet. Always guarantees\n+        // topological sort to the best of our knowledge (see IsSorted()), and puts the most\n+        // incentive-compatible subset(s) first if that information is available.\n+        //\n+        // If ancestor score-based linearization sequence exists for both transactions, the\n+        // transaction with the lower sequence number comes first.\n+        //    If unavailable or there is a tie, the transaction with fewer in-package ancestors comes first (topological sort).\n+        //       If there is still a tie, the transaction with the higher base feerate comes first.\n+        // Otherwise, the transaction with fewer in-package ancestors comes first (topological sort).\n+        bool operator<(const PackageEntry& rhs) const {\n+            if (mining_sequence == std::nullopt || rhs.mining_sequence == std::nullopt) {\n+                // If mining sequence is missing for either entry, default to topological order.\n+                return ancestor_subset.size() < rhs.ancestor_subset.size();\n+            } else {\n+                if (mining_sequence.value() == rhs.mining_sequence.value()) {\n+                    // Identical mining sequence means they would be included in the same ancestor\n+                    // set. The one with fewer ancestors comes first.\n+                    if (ancestor_subset.size() == rhs.ancestor_subset.size()) {\n+                        // Individual feerate. This is not necessarily fee-optimal, but helps in some situations.\n+                        // (a.fee * b.vsize > b.fee * a.vsize) is a shortcut for (a.fee / a.vsize > b.fee / b.vsize)\n+                        return *fee * *rhs.vsize  > *rhs.fee * *vsize;\n+                    }\n+                    return ancestor_subset.size() < rhs.ancestor_subset.size();\n+                } else {\n+                    return mining_sequence.value() < rhs.mining_sequence.value();\n+                }\n+            }\n+        }\n+    };\n+    /** Map from each txid to PackageEntry */\n+    std::map<uint256, PackageEntry> m_txid_to_entry;\n+\n+    /** Linearized transactions. Always topologically sorted (IsSorted()). If fee information is\n+     * provided through LinearizeWithFees(), using mining_sequence scores. */\n+    std::vector<std::reference_wrapper<PackageEntry>> m_txns;\n+\n+    /** Helper function for recursively constructing ancestor caches in ctor. */\n+    void visit(const CTransactionRef&);\n+public:\n+    /** Constructs ancestor package, sorting the transactions topologically and constructing the\n+     * txid_to_tx and ancestor_subsets maps. It is ok if the input txns is not sorted.\n+     * Expects:\n+     * - No duplicate transactions.\n+     * - No conflicts between transactions.\n+     */\n+    AncestorPackage(const Package& txns_in);\n+\n+    bool IsAncestorPackage() const { return m_ancestor_package_shaped; }\n+\n+    /** Returns all of the transactions, linearized. */\n+    Package Txns() const;\n+\n+    /** Returns all of the transactions, without the skipped and dangling ones, linearized. */\n+    Package FilteredTxns() const;\n+\n+    /** Get the sorted, filtered ancestor subpackage for a tx. Includes the tx. Does not include\n+     * ancestors that are MEMPOOL. If this tx or any ancestors are DANGLING, returns std::nullopt. */\n+    std::optional<std::vector<CTransactionRef>> FilteredAncestorSet(const CTransactionRef& tx) const;\n+\n+    /** Get the total fee and vsize of the ancestor subpackage for a tx. Includes the tx. Does not\n+     * include ancestors that are MEMPOOL. If this tx or any ancestors are DANGLING, returns\n+     * std::nullopt. This result is always consistent with FilteredAncestorSet(). */\n+    std::optional<std::pair<CAmount, int64_t>> FilteredAncestorFeeAndVsize(const CTransactionRef& tx) const;\n+\n+    /** Get the fee and vsize of a tx. Returns std::nullopt if this information is unknown or this\n+     * tx is DANGLING. */\n+    std::optional<std::pair<CAmount, int64_t>> GetFeeAndVsize(const CTransactionRef& tx) const;\n+\n+    /** Should be called if a tx or same txid transaction is found in mempool or submitted to it.\n+     * From now on, skip this tx from any result in FilteredAncestorSet(). Does not affect Txns().\n+     */\n+    void Skip(const CTransactionRef& transaction);\n+\n+    /** Should be called if a tx will not be considered because it is missing inputs.\n+     * Skip a transaction and all of its descendants. From now on, if this transaction is present\n+     * in the ancestor set, FilteredAncestorSet() returns std::nullopt for that tx. Does not affect Txns(). */\n+    void SkipWithDescendants(const CTransactionRef& transaction);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1358520940",
+      "id" : 1358520940,
+      "in_reply_to_id" : 1357188257,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Q-WJs",
+      "original_commit_id" : "ff27bc4203dcf2c46a610760411704fd3da3a998",
+      "original_line" : 156,
+      "original_position" : 156,
+      "original_start_line" : null,
+      "path" : "src/policy/ancestor_packages.h",
+      "position" : null,
+      "pull_request_review_id" : 1676907362,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358520940/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-13T17:05:29Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358520940",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1360671986"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360671986"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Added, and moved `TX_PREMATURE_SPEND` into the dangle category. I decided not to make a new `ResultType` because the result itself isn't that different from the INVALID case. Also added a table to `MempoolAcceptResult` to illustrate what fields/properties each of the result types should have.",
+      "commit_id" : "daad63c6878e01236b215827aeeb2d4fe70f733a",
+      "created_at" : "2023-10-16T13:31:12Z",
+      "diff_hunk" : "@@ -0,0 +1,166 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_POLICY_ANCESTOR_PACKAGES_H\n+#define BITCOIN_POLICY_ANCESTOR_PACKAGES_H\n+\n+#include <policy/feerate.h>\n+#include <policy/packages.h>\n+\n+#include <vector>\n+\n+/** A potential ancestor package, i.e. one transaction with its set of unconfirmed ancestors.\n+ * This class does not have any knowledge of chainstate, so it cannot determine whether all\n+ * unconfirmed ancestors are present. Its constructor accepts any list of transactions that\n+ * IsConsistent(), linearizes them topologically, and determines whether it IsAncestorPackage().\n+ * If fee and vsizes are given for each transaction, it can also linearize the transactions using\n+ * the ancestor score-based mining algorithm via MiniMiner.\n+ *\n+ * Skip() and SkipWithDescendants() can be used to omit transactions.\n+ * Txns() and FilteredTxns() return the linearized transactions; FilteredTxns excludes non-PACKAGE ones.\n+ * FilteredAncestorSet() can be used to get a transaction's \"subpackage,\" i.e. ancestor set within the\n+ * package. Also excludes non-PACKAGE ones.\n+ * */\n+class AncestorPackage\n+{\n+    /** Whether m_txns contains a connected package in which all transactions are ancestors of the\n+     * last transaction. This object is not aware of chainstate. So if m_txns only includes a\n+     * grandparent and not the \"connecting\" parent, this will (incorrectly) determine that the\n+     * grandparent is not an ancestor.\n+     * Set in the constructor and then does not change, even if transactions are skipped.\n+     * */\n+    bool m_ancestor_package_shaped{false};\n+\n+    struct PackageEntry {\n+        enum class State : uint8_t {\n+            /** Default value.\n+             * If calling LinearizeWithFees(), this tx must have a fee and vsize. */\n+            PACKAGE,\n+            /** Excluded from FilteredAncestor{Set,FeeAndVsize}.\n+             * Should not appear in any transaction's ancestor_subset.\n+             * Excluded in LinearizeWithFees().\n+             * Set by calling Skip() on this tx. */\n+            MEMPOOL,\n+            /** This and all descendant's FilteredAncestor{Set,FeeAndVsize} will be std::nullopt.\n+             * Should not appear in any transaction's ancestor_subset.\n+             * Excluded in LinearizeWithFees().\n+             * Set by calling SkipWithDescendants() on this tx or its ancestor. */\n+            DANGLING,\n+        // If a parent is DANGLING, all descendants must also be DANGLING.\n+        // If a child is MEMPOOL, all ancestors should also be MEMPOOL.\n+        };\n+\n+        CTransactionRef tx;\n+\n+        State m_state{State::PACKAGE};\n+\n+        /** This value starts as std::nullopt when we don't have any fee information yet. It can be\n+         * updated by calling LinearizeWithFees() if this entry isn't MEMPOOL or DANGLING. */\n+        std::optional<uint32_t> mining_sequence;\n+\n+        /** Fees of this transaction. Starts as std::nullopt, can be updated using AddFeeAndVsize(). */\n+        std::optional<CAmount> fee;\n+\n+        /** Virtual size of this transaction (depends on policy, calculated externally). Starts as\n+         * std::nullopt. Can be updated using AddFeeAndVsize(). */\n+        std::optional<int64_t> vsize;\n+\n+        /** Txids of all PACKAGE ancestors. Populated in AncestorPackage ctor. If an ancestor\n+         * becomes MEMPOOL or DANGLING, it is erased from this set. Use FilteredAncestorSet to get\n+         * filtered ancestor sets. */\n+        std::set<uint256> ancestor_subset;\n+\n+        /** Txids of all in-package descendant. Populated in AncestorPackage ctor and does not\n+         * change within AncestorPackage lifetime. */\n+        std::set<uint256> descendant_subset;\n+\n+        explicit PackageEntry(CTransactionRef tx_in) : tx(tx_in) {}\n+\n+        // Used to sort the result of Txns, FilteredTxns, and FilteredAncestorSet. Always guarantees\n+        // topological sort to the best of our knowledge (see IsSorted()), and puts the most\n+        // incentive-compatible subset(s) first if that information is available.\n+        //\n+        // If ancestor score-based linearization sequence exists for both transactions, the\n+        // transaction with the lower sequence number comes first.\n+        //    If unavailable or there is a tie, the transaction with fewer in-package ancestors comes first (topological sort).\n+        //       If there is still a tie, the transaction with the higher base feerate comes first.\n+        // Otherwise, the transaction with fewer in-package ancestors comes first (topological sort).\n+        bool operator<(const PackageEntry& rhs) const {\n+            if (mining_sequence == std::nullopt || rhs.mining_sequence == std::nullopt) {\n+                // If mining sequence is missing for either entry, default to topological order.\n+                return ancestor_subset.size() < rhs.ancestor_subset.size();\n+            } else {\n+                if (mining_sequence.value() == rhs.mining_sequence.value()) {\n+                    // Identical mining sequence means they would be included in the same ancestor\n+                    // set. The one with fewer ancestors comes first.\n+                    if (ancestor_subset.size() == rhs.ancestor_subset.size()) {\n+                        // Individual feerate. This is not necessarily fee-optimal, but helps in some situations.\n+                        // (a.fee * b.vsize > b.fee * a.vsize) is a shortcut for (a.fee / a.vsize > b.fee / b.vsize)\n+                        return *fee * *rhs.vsize  > *rhs.fee * *vsize;\n+                    }\n+                    return ancestor_subset.size() < rhs.ancestor_subset.size();\n+                } else {\n+                    return mining_sequence.value() < rhs.mining_sequence.value();\n+                }\n+            }\n+        }\n+    };\n+    /** Map from each txid to PackageEntry */\n+    std::map<uint256, PackageEntry> m_txid_to_entry;\n+\n+    /** Linearized transactions. Always topologically sorted (IsSorted()). If fee information is\n+     * provided through LinearizeWithFees(), using mining_sequence scores. */\n+    std::vector<std::reference_wrapper<PackageEntry>> m_txns;\n+\n+    /** Helper function for recursively constructing ancestor caches in ctor. */\n+    void visit(const CTransactionRef&);\n+public:\n+    /** Constructs ancestor package, sorting the transactions topologically and constructing the\n+     * txid_to_tx and ancestor_subsets maps. It is ok if the input txns is not sorted.\n+     * Expects:\n+     * - No duplicate transactions.\n+     * - No conflicts between transactions.\n+     */\n+    AncestorPackage(const Package& txns_in);\n+\n+    bool IsAncestorPackage() const { return m_ancestor_package_shaped; }\n+\n+    /** Returns all of the transactions, linearized. */\n+    Package Txns() const;\n+\n+    /** Returns all of the transactions, without the skipped and dangling ones, linearized. */\n+    Package FilteredTxns() const;\n+\n+    /** Get the sorted, filtered ancestor subpackage for a tx. Includes the tx. Does not include\n+     * ancestors that are MEMPOOL. If this tx or any ancestors are DANGLING, returns std::nullopt. */\n+    std::optional<std::vector<CTransactionRef>> FilteredAncestorSet(const CTransactionRef& tx) const;\n+\n+    /** Get the total fee and vsize of the ancestor subpackage for a tx. Includes the tx. Does not\n+     * include ancestors that are MEMPOOL. If this tx or any ancestors are DANGLING, returns\n+     * std::nullopt. This result is always consistent with FilteredAncestorSet(). */\n+    std::optional<std::pair<CAmount, int64_t>> FilteredAncestorFeeAndVsize(const CTransactionRef& tx) const;\n+\n+    /** Get the fee and vsize of a tx. Returns std::nullopt if this information is unknown or this\n+     * tx is DANGLING. */\n+    std::optional<std::pair<CAmount, int64_t>> GetFeeAndVsize(const CTransactionRef& tx) const;\n+\n+    /** Should be called if a tx or same txid transaction is found in mempool or submitted to it.\n+     * From now on, skip this tx from any result in FilteredAncestorSet(). Does not affect Txns().\n+     */\n+    void Skip(const CTransactionRef& transaction);\n+\n+    /** Should be called if a tx will not be considered because it is missing inputs.\n+     * Skip a transaction and all of its descendants. From now on, if this transaction is present\n+     * in the ancestor set, FilteredAncestorSet() returns std::nullopt for that tx. Does not affect Txns(). */\n+    void SkipWithDescendants(const CTransactionRef& transaction);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26711#discussion_r1360671986",
+      "id" : 1360671986,
+      "in_reply_to_id" : 1357188257,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585RGjTy",
+      "original_commit_id" : "ff27bc4203dcf2c46a610760411704fd3da3a998",
+      "original_line" : 156,
+      "original_position" : 156,
+      "original_start_line" : null,
+      "path" : "src/policy/ancestor_packages.h",
+      "position" : null,
+      "pull_request_review_id" : 1679998089,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26711",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360671986/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-16T13:31:13Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360671986",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
       }
    }
 ]
