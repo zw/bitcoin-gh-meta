@@ -7904,6 +7904,484 @@
       }
    },
    {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1357413789"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1357413789"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "caught by your new fuzzer: Note that the parent txid is already in the orphanage by this line, we try to re-request something we already have locally in our orphanage. \r\n\r\n```Suggestion\r\n                if (m_orphanage.HaveTxAndPeer(GenTxid::Txid(txid), nodeid)) continue;\r\n                m_txrequest.ReceivedInv(nodeid, GenTxid::Txid(txid), info.m_preferred, current_time);\r\n```",
+      "commit_id" : "c8e701e379de2225e9f904d0946743167bf24700",
+      "created_at" : "2023-10-12T20:56:48Z",
+      "diff_hunk" : "@@ -0,0 +1,448 @@\n+// Copyright (c) 2023\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/txdownload_impl.h>\n+\n+namespace node {\n+/** How long to wait before requesting orphan ancpkginfo/parents from an additional peer. */\n+static constexpr auto ORPHAN_ANCESTOR_GETDATA_INTERVAL{60s};\n+\n+TxOrphanage& TxDownloadImpl::GetOrphanageRef() EXCLUSIVE_LOCKS_REQUIRED(m_tx_download_mutex) { return m_orphanage; }\n+TxRequestTracker& TxDownloadImpl::GetTxRequestRef() EXCLUSIVE_LOCKS_REQUIRED(m_tx_download_mutex) { return m_txrequest; }\n+\n+void TxDownloadImpl::ConnectedPeer(NodeId nodeid, const TxDownloadConnectionInfo& info)\n+    EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex)\n+{\n+    LOCK(m_tx_download_mutex);\n+    // If already connected (shouldn't happen in practice), exit early.\n+    if (m_peer_info.count(nodeid) > 0) return;\n+\n+    m_peer_info.emplace(nodeid, PeerInfo(info));\n+    if (info.m_wtxid_relay) m_num_wtxid_peers += 1;\n+}\n+void TxDownloadImpl::DisconnectedPeer(NodeId nodeid)\n+    EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex)\n+{\n+    LOCK(m_tx_download_mutex);\n+    m_orphanage.EraseForPeer(nodeid);\n+    m_txrequest.DisconnectedPeer(nodeid);\n+    m_orphan_resolution_tracker.DisconnectedPeer(nodeid);\n+\n+    if (m_peer_info.count(nodeid) > 0) {\n+        if (m_peer_info.at(nodeid).m_connection_info.m_wtxid_relay) m_num_wtxid_peers -= 1;\n+        m_peer_info.erase(nodeid);\n+    }\n+}\n+\n+void TxDownloadImpl::UpdatedBlockTipSync() EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex)\n+{\n+    LOCK(m_tx_download_mutex);\n+    // If the chain tip has changed previously rejected transactions\n+    // might be now valid, e.g. due to a nLockTime'd tx becoming valid,\n+    // or a double-spend. Reset the rejects filter and give those\n+    // txs a second chance.\n+    m_recent_rejects.reset();\n+}\n+\n+void TxDownloadImpl::BlockConnected(const CBlock& block, const uint256& tiphash)\n+    EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex)\n+{\n+    LOCK(m_tx_download_mutex);\n+    for (const auto& ptx : block.vtx) {\n+        m_txrequest.ForgetTxHash(ptx->GetHash());\n+        m_txrequest.ForgetTxHash(ptx->GetWitnessHash());\n+        m_recent_confirmed_transactions.insert(ptx->GetHash());\n+        if (ptx->HasWitness()) {\n+            m_recent_confirmed_transactions.insert(ptx->GetWitnessHash());\n+        }\n+    }\n+    // Orphanage may include transactions conflicted by this block. There should not be any\n+    // transactions in m_orphan_resolution_tracker that aren't in orphanage, so this should include\n+    // all of the relevant orphans we were working on.\n+    for (const auto& erased_wtxid : m_orphanage.EraseForBlock(block)) {\n+        // All hashes in m_orphan_resolution_tracker are wtxids.\n+        m_orphan_resolution_tracker.ForgetTxHash(erased_wtxid);\n+    }\n+\n+    // Stop trying to resolve orphans that were conflicted by the block.\n+    for (const auto& wtxid : m_orphanage.EraseForBlock(block)) {\n+        m_orphan_resolution_tracker.ForgetTxHash(wtxid);\n+    }\n+}\n+\n+void TxDownloadImpl::BlockDisconnected()\n+    EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex)\n+{\n+    LOCK(m_tx_download_mutex);\n+    // To avoid relay problems with transactions that were previously\n+    // confirmed, clear our filter of recently confirmed transactions whenever\n+    // there's a reorg.\n+    // This means that in a 1-block reorg (where 1 block is disconnected and\n+    // then another block reconnected), our filter will drop to having only one\n+    // block's worth of transactions in it, but that should be fine, since\n+    // presumably the most common case of relaying a confirmed transaction\n+    // should be just after a new block containing it is found.\n+    m_recent_confirmed_transactions.reset();\n+}\n+\n+void TxDownloadImpl::MempoolAcceptedTx(const CTransactionRef& tx)\n+    EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex)\n+{\n+    LOCK(m_tx_download_mutex);\n+    m_orphanage.AddChildrenToWorkSet(*tx);\n+    // As this version of the transaction was acceptable, we can forget about any requests for it.\n+    // No-op if the tx is not in txrequest.\n+    m_txrequest.ForgetTxHash(tx->GetHash());\n+    m_txrequest.ForgetTxHash(tx->GetWitnessHash());\n+    // If it came from the orphanage, remove it. No-op if the tx is not in txorphanage.\n+    m_orphanage.EraseTx(tx->GetWitnessHash());\n+    m_orphan_resolution_tracker.ForgetTxHash(tx->GetWitnessHash());\n+}\n+\n+bool TxDownloadImpl::MempoolRejectedTx(const CTransactionRef& tx, const TxValidationResult& result)\n+    EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex)\n+{\n+    LOCK(m_tx_download_mutex);\n+    switch (result) {\n+    case TxValidationResult::TX_RESULT_UNSET:\n+    case TxValidationResult::TX_NO_MEMPOOL:\n+    {\n+        // This function should only be called when a transaction fails validation.\n+        Assume(false);\n+        return false;\n+    }\n+    case TxValidationResult::TX_WITNESS_STRIPPED:\n+    {\n+        // Do not add txids of witness transactions or witness-stripped\n+        // transactions to the filter, as they can have been malleated;\n+        // adding such txids to the reject filter would potentially\n+        // interfere with relay of valid transactions from peers that\n+        // do not support wtxid-based relay. See\n+        // https://github.com/bitcoin/bitcoin/issues/8279 for details.\n+        // We can remove this restriction (and always add wtxids to\n+        // the filter even for witness stripped transactions) once\n+        // wtxid-based relay is broadly deployed.\n+        // See also comments in https://github.com/bitcoin/bitcoin/pull/18044#discussion_r443419034\n+        // for concerns around weakening security of unupgraded nodes\n+        // if we start doing this too early.\n+        return false;\n+    }\n+    case TxValidationResult::TX_MISSING_INPUTS:\n+    {\n+        if (std::any_of(tx->vin.cbegin(), tx->vin.cend(),\n+            [&](const auto& input) EXCLUSIVE_LOCKS_REQUIRED(m_tx_download_mutex)\n+            { return m_recent_rejects.contains(input.prevout.hash); })) {\n+            LogPrint(BCLog::MEMPOOL, \"not keeping orphan with rejected parents %s (wtxid=%s)\\n\",\n+                     tx->GetHash().ToString(),\n+                     tx->GetWitnessHash().ToString());\n+            // We will continue to reject this tx since it has rejected\n+            // parents so avoid re-requesting it from other peers.\n+            // Here we add both the txid and the wtxid, as we know that\n+            // regardless of what witness is provided, we will not accept\n+            // this, so we don't need to allow for redownload of this txid\n+            // from any of our non-wtxidrelay peers.\n+            m_recent_rejects.insert(tx->GetHash());\n+            m_recent_rejects.insert(tx->GetWitnessHash());\n+            m_txrequest.ForgetTxHash(tx->GetHash());\n+            m_txrequest.ForgetTxHash(tx->GetWitnessHash());\n+            return false;\n+        }\n+        return true;\n+    }\n+    case TxValidationResult::TX_INPUTS_NOT_STANDARD:\n+    {\n+        // If the transaction failed for TX_INPUTS_NOT_STANDARD,\n+        // then we know that the witness was irrelevant to the policy\n+        // failure, since this check depends only on the txid\n+        // (the scriptPubKey being spent is covered by the txid).\n+        // Add the txid to the reject filter to prevent repeated\n+        // processing of this transaction in the event that child\n+        // transactions are later received (resulting in\n+        // parent-fetching by txid via the orphan-handling logic).\n+        if (tx->GetWitnessHash() != tx->GetHash()) {\n+            m_recent_rejects.insert(tx->GetHash());\n+            m_txrequest.ForgetTxHash(tx->GetHash());\n+        }\n+        break;\n+    }\n+    case TxValidationResult::TX_CONSENSUS:\n+    case TxValidationResult::TX_RECENT_CONSENSUS_CHANGE:\n+    case TxValidationResult::TX_NOT_STANDARD:\n+    case TxValidationResult::TX_PREMATURE_SPEND:\n+    case TxValidationResult::TX_WITNESS_MUTATED:\n+    case TxValidationResult::TX_CONFLICT:\n+    case TxValidationResult::TX_MEMPOOL_POLICY:\n+        break;\n+    }\n+    // We can add the wtxid of this transaction to our reject filter.\n+    m_recent_rejects.insert(tx->GetWitnessHash());\n+    // Forget requests for this wtxid, but not for the txid, as another version of\n+    // transaction may be valid. No-op if the tx is not in txrequest.\n+    m_txrequest.ForgetTxHash(tx->GetWitnessHash());\n+    // If it came from the orphanage, remove it (this doesn't happen if the transaction was missing\n+    // inputs). No-op if the tx is not in the orphanage.\n+    m_orphanage.EraseTx(tx->GetWitnessHash());\n+    m_orphan_resolution_tracker.ForgetTxHash(tx->GetWitnessHash());\n+    return false;\n+}\n+\n+bool TxDownloadImpl::AlreadyHaveTxLocked(const GenTxid& gtxid) const\n+    EXCLUSIVE_LOCKS_REQUIRED(m_tx_download_mutex)\n+{\n+    const uint256& hash = gtxid.GetHash();\n+\n+    if (m_orphanage.HaveTx(gtxid)) return true;\n+\n+    if (m_recent_confirmed_transactions.contains(hash)) return true;\n+\n+    return m_recent_rejects.contains(hash) || m_opts.m_mempool_ref.exists(gtxid);\n+}\n+bool TxDownloadImpl::AlreadyHaveTx(const GenTxid& gtxid) const\n+    EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex)\n+{\n+    LOCK(m_tx_download_mutex);\n+    return AlreadyHaveTxLocked(gtxid);\n+}\n+\n+void TxDownloadImpl::AddTxAnnouncement(NodeId peer, const GenTxid& gtxid, std::chrono::microseconds now)\n+    EXCLUSIVE_LOCKS_REQUIRED(m_tx_download_mutex)\n+{\n+    if (m_peer_info.count(peer) == 0) return;\n+    if (m_orphanage.HaveTx(gtxid) || (gtxid.IsWtxid() && m_orphanage.HaveTx(GenTxid::Txid(gtxid.GetHash())))) {\n+        if (gtxid.IsWtxid()) {\n+            AddOrphanAnnouncer(peer, gtxid.GetHash(), now, /*is_new=*/false);\n+        }\n+        return;\n+    }\n+    // If this inv is by txid, check by txid. If it's by wtxid, also check by txid to attempt to\n+    // catch same-txid-different-witness.\n+    if (AlreadyHaveTxLocked(gtxid)) return;\n+    const auto& info = m_peer_info.at(peer).m_connection_info;\n+    if (!info.m_relay_permissions && m_txrequest.Count(peer) >= MAX_PEER_TX_ANNOUNCEMENTS) {\n+        // Too many queued announcements for this peer\n+        return;\n+    }\n+    // Decide the TxRequestTracker parameters for this announcement:\n+    // - \"preferred\": if fPreferredDownload is set (= outbound, or NetPermissionFlags::NoBan permission)\n+    // - \"reqtime\": current time plus delays for:\n+    //   - NONPREF_PEER_TX_DELAY for announcements from non-preferred connections\n+    //   - TXID_RELAY_DELAY for txid announcements while wtxid peers are available\n+    //   - OVERLOADED_PEER_TX_DELAY for announcements from peers which have at least\n+    //     MAX_PEER_TX_REQUEST_IN_FLIGHT requests in flight (and don't have NetPermissionFlags::Relay).\n+    auto delay{0us};\n+    if (!info.m_preferred) delay += NONPREF_PEER_TX_DELAY;\n+    if (!gtxid.IsWtxid() && m_num_wtxid_peers > 0) delay += TXID_RELAY_DELAY;\n+    const bool overloaded = !info.m_relay_permissions && m_txrequest.CountInFlight(peer) >= MAX_PEER_TX_REQUEST_IN_FLIGHT;\n+    if (overloaded) delay += OVERLOADED_PEER_TX_DELAY;\n+\n+    m_txrequest.ReceivedInv(peer, gtxid, info.m_preferred, now + delay);\n+}\n+\n+void TxDownloadImpl::ReceivedTxInv(NodeId peer, const GenTxid& gtxid, std::chrono::microseconds now)\n+    EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex)\n+{\n+    LOCK(m_tx_download_mutex);\n+    AddTxAnnouncement(peer, gtxid, now);\n+}\n+\n+std::vector<GenTxid> TxDownloadImpl::GetRequestsToSend(NodeId nodeid, std::chrono::microseconds current_time)\n+    EXCLUSIVE_LOCKS_REQUIRED(!m_tx_download_mutex)\n+{\n+    LOCK(m_tx_download_mutex);\n+    // First process orphan resolution so that the tx requests can be sent asap\n+    std::vector<std::pair<NodeId, GenTxid>> expired_orphan_resolution;\n+    const auto orphans_ready = m_orphan_resolution_tracker.GetRequestable(nodeid, current_time, &expired_orphan_resolution);\n+    // Expire orphan resolution attempts\n+    for (const auto& [nodeid, orphan_gtxid] : expired_orphan_resolution) {\n+        LogPrint(BCLog::TXPACKAGES, \"timeout of in-flight orphan resolution %s for peer=%d\\n\", orphan_gtxid.GetHash().ToString(), nodeid);\n+        // All txhashes in m_orphan_resolution_tracker are wtxids.\n+        Assume(orphan_gtxid.IsWtxid());\n+        m_orphanage.EraseOrphanOfPeer(orphan_gtxid.GetHash(), nodeid);\n+        Assume(!m_orphanage.HaveTxAndPeer(orphan_gtxid, nodeid));\n+    }\n+    for (const auto& orphan_gtxid : orphans_ready) {\n+        Assume(orphan_gtxid.IsWtxid());\n+        Assume(m_orphanage.HaveTxAndPeer(orphan_gtxid, nodeid));\n+        const auto parent_txids{m_orphanage.GetParentTxids(orphan_gtxid.GetHash())};\n+        if (parent_txids.has_value()) {\n+            if (!Assume(m_peer_info.count(nodeid) > 0)) continue;\n+            const auto& info = m_peer_info.at(nodeid).m_connection_info;\n+            for (const auto& txid : *parent_txids) {\n+                // Schedule with no delay instead of using ReceivedTxInv. This means it's scheduled\n+                // for request immediately unless there is already a request out for the same txhash\n+                // (e.g. if there is another orphan that needs this parent).\n+                m_txrequest.ReceivedInv(nodeid, GenTxid::Txid(txid), info.m_preferred, current_time);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1357413789",
+      "id" : 1357413789,
+      "line" : 279,
+      "node_id" : "PRRC_kwDOABII585Q6H2d",
+      "original_commit_id" : "36f4d0d544cf2170ec7b3ffc2a632e6ec869057d",
+      "original_line" : 279,
+      "original_position" : 275,
+      "original_start_line" : null,
+      "path" : "src/node/txdownload_impl.cpp",
+      "position" : 279,
+      "pull_request_review_id" : 1675011535,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1357413789/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-13T18:49:14Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1357413789",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1358488871"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358488871"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Looks like this happens in a few places? wouldn't type safety for the constructor be nice\r\n\r\n```suggestion\r\n                                   orphanage.HaveTx(GenTxid::Wtxid(ref->GetWitnessHash())));\r\n```",
+      "commit_id" : "c8e701e379de2225e9f904d0946743167bf24700",
+      "created_at" : "2023-10-13T16:29:56Z",
+      "diff_hunk" : "@@ -91,8 +93,11 @@ FUZZ_TARGET(txorphan, .init = initialize_orphanage)\n                     {\n                         CTransactionRef ref = orphanage.GetTxToReconsider(peer_id);\n                         if (ref) {\n-                            bool have_tx = orphanage.HaveTx(GenTxid::Txid(ref->GetHash())) || orphanage.HaveTx(GenTxid::Wtxid(ref->GetHash()));\n-                            Assert(have_tx);\n+                            Assert(orphanage.HaveTx(GenTxid::Txid(ref->GetHash())) ||\n+                                   orphanage.HaveTx(GenTxid::Wtxid(ref->GetHash())));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1358488871",
+      "id" : 1358488871,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Q-OUn",
+      "original_commit_id" : "36f4d0d544cf2170ec7b3ffc2a632e6ec869057d",
+      "original_line" : 97,
+      "original_position" : 18,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/txorphan.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1675011535,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358488871/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-13T18:47:24Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358488871",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1358646666"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358646666"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "we should `+=` like the above call or do `++` for both I think",
+      "commit_id" : "c8e701e379de2225e9f904d0946743167bf24700",
+      "created_at" : "2023-10-13T18:10:48Z",
+      "diff_hunk" : "@@ -138,32 +212,38 @@ void TxOrphanage::LimitOrphans(unsigned int max_orphans)\n         if (nErased > 0) LogPrint(BCLog::TXPACKAGES, \"Erased %d orphan tx due to expiration\\n\", nErased);\n     }\n     FastRandomContext rng;\n-    while (m_orphans.size() > max_orphans)\n+    while (m_orphans.size() > max_orphans || m_total_orphan_bytes > max_total_size)\n     {\n         // Evict a random orphan:\n         size_t randompos = rng.randrange(m_orphan_list.size());\n-        EraseTxNoLock(m_orphan_list[randompos]->first);\n+        const auto& wtxid = m_orphan_list[randompos]->second.tx->GetWitnessHash();\n+        expired_and_evicted.emplace_back(wtxid);\n+        EraseTxNoLock(wtxid);\n         ++nEvicted;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1358646666",
+      "id" : 1358646666,
+      "line" : 223,
+      "node_id" : "PRRC_kwDOABII585Q-02K",
+      "original_commit_id" : "36f4d0d544cf2170ec7b3ffc2a632e6ec869057d",
+      "original_line" : 223,
+      "original_position" : 195,
+      "original_start_line" : null,
+      "path" : "src/txorphanage.cpp",
+      "position" : 214,
+      "pull_request_review_id" : 1675011535,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358646666/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-13T18:47:24Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358646666",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1358670755"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358670755"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "for fuzz/txorphan\r\n```\r\necho Kv//////////////lJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSU//////////////////////////////+A////////kEEKJf//ev///////8P///////8AAIH//wkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkB/wD8///SQP///////////////////////////////////4D///////+QQQol//96////////w/////////8KJf//ev//////////kEEKJf//1v///wP/////kEH///+QQQo1//8BPwAAv67Kf/////8u//////////////////////////////////////////////////////////////////////////96AP/1///////S0P//IP96AP////////+A////////kEEKJf//ev//////////kEEKJf//1v///wP/////kEH///+QQQo1//96/////P////+QQQol/yX//3r//////////wol///W//////////97e3t7e3t7e3t7e3t7e3t7e3t7e/+QQQol//96//////////////8s/yb/ | base64 -d > crash.txt\r\n```\r\n\r\nThese call `EraseTxNoLock` without doing m_peer_work_set management:\r\nTxOrphanage::EraseForBlock\r\nTxOrphanage::LimitOrphans\r\n\r\nThis results in fuzzer crashes where it's (still) in the peer's work set, but not counted as an announcer since it's been evicted(then later sent).\r\n\r\nAny time `EraseTx{NoLock}` is called we need to make sure that `m_peer_work_set` is appropriately being cleaned.\r\n\r\nTwo other spots I haven't thought through yet but I suspect need the same fix:\r\nTxDownloadImpl::MempoolAcceptedTx\r\nTxDownloadImpl::MempoolRejectedTx\r\n\r\nedit:\r\n\r\nlatter two mempool things are called; cleanup needs to happen! working on it",
+      "commit_id" : "c8e701e379de2225e9f904d0946743167bf24700",
+      "created_at" : "2023-10-13T18:28:41Z",
+      "diff_hunk" : "@@ -226,18 +317,64 @@ void TxOrphanage::EraseForBlock(const CBlock& block)\n             if (itByPrev == m_outpoint_to_orphan_it.end()) continue;\n             for (auto mi = itByPrev->second.begin(); mi != itByPrev->second.end(); ++mi) {\n                 const CTransaction& orphanTx = *(*mi)->second.tx;\n-                const uint256& orphanHash = orphanTx.GetHash();\n-                vOrphanErase.push_back(orphanHash);\n+                const uint256& orphan_wtxid = orphanTx.GetWitnessHash();\n+                vOrphanErase.push_back(orphan_wtxid);\n             }\n         }\n     }\n \n     // Erase orphan transactions included or precluded by this block\n     if (vOrphanErase.size()) {\n         int nErased = 0;\n-        for (const uint256& orphanHash : vOrphanErase) {\n-            nErased += EraseTxNoLock(orphanHash);\n+        for (const uint256& orphan_wtxid : vOrphanErase) {\n+            nErased += EraseTxNoLock(orphan_wtxid);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1358670755",
+      "id" : 1358670755,
+      "line" : 330,
+      "node_id" : "PRRC_kwDOABII585Q-6uj",
+      "original_commit_id" : "36f4d0d544cf2170ec7b3ffc2a632e6ec869057d",
+      "original_line" : 330,
+      "original_position" : 285,
+      "original_start_line" : null,
+      "path" : "src/txorphanage.cpp",
+      "position" : 325,
+      "pull_request_review_id" : 1675011535,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358670755/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-16T14:27:40Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1358670755",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1360742645"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360742645"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "should be able to assert that there also exists an announcement for this node?",
+      "commit_id" : "c8e701e379de2225e9f904d0946743167bf24700",
+      "created_at" : "2023-10-16T14:21:35Z",
+      "diff_hunk" : "@@ -0,0 +1,406 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <consensus/validation.h>\n+#include <node/context.h>\n+#include <node/mempool_args.h>\n+#include <node/miner.h>\n+#include <node/txdownloadman.h>\n+#include <node/txdownload_impl.h>\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+#include <test/fuzz/util/mempool.h>\n+#include <test/util/mining.h>\n+#include <test/util/script.h>\n+#include <test/util/setup_common.h>\n+#include <test/util/txmempool.h>\n+#include <util/hasher.h>\n+#include <util/rbf.h>\n+#include <txmempool.h>\n+#include <validation.h>\n+#include <validationinterface.h>\n+\n+namespace {\n+\n+const TestingSetup* g_setup;\n+\n+constexpr size_t NUM_COINS{50};\n+COutPoint COINS[NUM_COINS];\n+\n+static TxValidationResult TESTED_TX_RESULTS[] = {\n+    // Skip TX_RESULT_UNSET\n+    TxValidationResult::TX_CONSENSUS,\n+    TxValidationResult::TX_RECENT_CONSENSUS_CHANGE,\n+    TxValidationResult::TX_INPUTS_NOT_STANDARD,\n+    TxValidationResult::TX_NOT_STANDARD,\n+    TxValidationResult::TX_MISSING_INPUTS,\n+    TxValidationResult::TX_PREMATURE_SPEND,\n+    TxValidationResult::TX_WITNESS_MUTATED,\n+    TxValidationResult::TX_WITNESS_STRIPPED,\n+    TxValidationResult::TX_CONFLICT,\n+    TxValidationResult::TX_MEMPOOL_POLICY,\n+    // Skip TX_NO_MEMPOOL\n+};\n+\n+// Precomputed transactions. Some may conflict with each other.\n+std::vector<CTransactionRef> TRANSACTIONS;\n+\n+// Limit the total number of peers because we don't expect coverage to change much with lots more peers.\n+constexpr int NUM_PEERS = 16;\n+\n+// Precomputed random durations (positive and negative, each ~exponentially distributed).\n+std::chrono::microseconds TIME_SKIPS[128];\n+\n+static CTransactionRef MakeTransactionSpending(const std::vector<COutPoint>& outpoints, size_t num_outputs, bool add_witness)\n+{\n+    CMutableTransaction tx;\n+    // If no outpoints are given, create a random one.\n+    for (const auto& outpoint : outpoints) {\n+        tx.vin.emplace_back(CTxIn(outpoint));\n+    }\n+    if (add_witness) {\n+        tx.vin[0].scriptWitness.stack.push_back({1});\n+    }\n+    tx.vout.emplace_back(CENT, P2WSH_OP_TRUE);\n+    return MakeTransactionRef(tx);\n+}\n+void initialize()\n+{\n+    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();\n+    g_setup = testing_setup.get();\n+    for (uint32_t i = 0; i < uint32_t{NUM_COINS}; ++i) {\n+        COINS[i] = COutPoint{(HashWriter() << i).GetHash(), i};\n+    }\n+    size_t outpoints_index = 0;\n+    // 2 transactions same txid different witness\n+    {\n+        auto tx1{MakeTransactionSpending({COINS[outpoints_index]}, /*num_outputs=*/5, /*add_witness=*/false)};\n+        auto tx2{MakeTransactionSpending({COINS[outpoints_index]}, /*num_outputs=*/5, /*add_witness=*/true)};\n+        Assert(tx1->GetHash() == tx2->GetHash());\n+        TRANSACTIONS.emplace_back(tx1);\n+        TRANSACTIONS.emplace_back(tx2);\n+        outpoints_index += 1;\n+    }\n+    // 2 parents 1 child\n+    {\n+        auto tx_parent_1{MakeTransactionSpending({COINS[outpoints_index++]}, /*num_outputs=*/1, /*add_witness=*/true)};\n+        TRANSACTIONS.emplace_back(tx_parent_1);\n+        auto tx_parent_2{MakeTransactionSpending({COINS[outpoints_index++]}, /*num_outputs=*/1, /*add_witness=*/false)};\n+        TRANSACTIONS.emplace_back(tx_parent_2);\n+        TRANSACTIONS.emplace_back(MakeTransactionSpending({COutPoint{tx_parent_1->GetHash(), 0}, COutPoint{tx_parent_2->GetHash(), 0}},\n+                                                            /*num_outputs=*/1, /*add_witness=*/true));\n+    }\n+    // 1 parent 2 children\n+    {\n+        auto tx_parent{MakeTransactionSpending({COINS[outpoints_index++]}, /*num_outputs=*/2, /*add_witness=*/true)};\n+        TRANSACTIONS.emplace_back(tx_parent);\n+        TRANSACTIONS.emplace_back(MakeTransactionSpending({COutPoint{tx_parent->GetHash(), 0}},\n+                                                            /*num_outputs=*/1, /*add_witness=*/true));\n+        TRANSACTIONS.emplace_back(MakeTransactionSpending({COutPoint{tx_parent->GetHash(), 1}},\n+                                                            /*num_outputs=*/1, /*add_witness=*/true));\n+    }\n+    // chain of 5 segwit\n+    {\n+        COutPoint& last_outpoint = COINS[outpoints_index++];\n+        for (auto i{0}; i < 5; ++i) {\n+            auto tx{MakeTransactionSpending({last_outpoint}, /*num_outputs=*/1, /*add_witness=*/true)};\n+            TRANSACTIONS.emplace_back(tx);\n+            last_outpoint = COutPoint{tx->GetHash(), 0};\n+        }\n+    }\n+    // chain of 5 non-segwit\n+    {\n+        COutPoint& last_outpoint = COINS[outpoints_index++];\n+        for (auto i{0}; i < 5; ++i) {\n+            auto tx{MakeTransactionSpending({last_outpoint}, /*num_outputs=*/1, /*add_witness=*/false)};\n+            TRANSACTIONS.emplace_back(tx);\n+            last_outpoint = COutPoint{tx->GetHash(), 0};\n+        }\n+    }\n+    // Also create a loose tx for each outpoint. Some of these transactions conflict with the above\n+    // or have the same txid.\n+    for (const auto& outpoint : COINS) {\n+        TRANSACTIONS.emplace_back(MakeTransactionSpending({outpoint}, /*num_outputs=*/1, /*add_witness=*/true));\n+    }\n+\n+    // Create random-looking time jumps\n+    int i = 0;\n+    // TIME_SKIPS[N] for N=0..15 is just N microseconds.\n+    for (; i < 16; ++i) {\n+        TIME_SKIPS[i] = std::chrono::microseconds{i};\n+    }\n+    // TIME_SKIPS[N] for N=16..127 has randomly-looking but roughly exponentially increasing values up to\n+    // 198.416453 seconds.\n+    for (; i < 128; ++i) {\n+        int diff_bits = ((i - 10) * 2) / 9;\n+        uint64_t diff = 1 + (CSipHasher(0, 0).Write(i).Finalize() >> (64 - diff_bits));\n+        TIME_SKIPS[i] = TIME_SKIPS[i - 1] + std::chrono::microseconds{diff};\n+    }\n+}\n+\n+FUZZ_TARGET(txdownloadman, .init = initialize)\n+{\n+    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());\n+\n+    // Initialize txdownloadman\n+    const auto& node = g_setup->m_node;\n+    CTxMemPool pool{MemPoolOptionsForTest(node)};\n+    const auto max_orphan_count = fuzzed_data_provider.ConsumeIntegralInRange<unsigned int>(0, 300);\n+    node::TxDownloadManager txdownloadman{node::TxDownloadOptions{max_orphan_count, pool}};\n+\n+    std::chrono::microseconds time{244466666};\n+\n+    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 10000)\n+    {\n+        NodeId rand_peer = fuzzed_data_provider.ConsumeIntegralInRange<int64_t>(0, NUM_PEERS);\n+\n+        // Transaction can be one of the premade ones or a randomly generated one\n+        auto rand_tx = fuzzed_data_provider.ConsumeBool() ?\n+            MakeTransactionSpending({fuzzed_data_provider.PickValueInArray(COINS)},\n+                                    /*num_outputs=*/fuzzed_data_provider.ConsumeIntegralInRange(1, 500),\n+                                    /*add_witness=*/fuzzed_data_provider.ConsumeBool()) :\n+            TRANSACTIONS.at(fuzzed_data_provider.ConsumeIntegralInRange<unsigned>(0, TRANSACTIONS.size() - 1));\n+\n+        CallOneOf(\n+            fuzzed_data_provider,\n+            [&] {\n+                node::TxDownloadConnectionInfo info{\n+                    .m_preferred = fuzzed_data_provider.ConsumeBool(),\n+                    .m_relay_permissions = fuzzed_data_provider.ConsumeBool(),\n+                    .m_wtxid_relay = fuzzed_data_provider.ConsumeBool()\n+                };\n+                txdownloadman.ConnectedPeer(rand_peer, info);\n+            },\n+            [&] {\n+                txdownloadman.DisconnectedPeer(rand_peer);\n+                txdownloadman.CheckIsEmpty(rand_peer);\n+            },\n+            [&] {\n+                txdownloadman.UpdatedBlockTipSync();\n+            },\n+            [&] {\n+                CBlock block;\n+                block.vtx.push_back(rand_tx);\n+                txdownloadman.BlockConnected(block, ConsumeUInt256(fuzzed_data_provider));\n+            },\n+            [&] {\n+                txdownloadman.BlockDisconnected();\n+            },\n+            [&] {\n+                txdownloadman.MempoolAcceptedTx(rand_tx);\n+            },\n+            [&] {\n+                auto result = fuzzed_data_provider.PickValueInArray(TESTED_TX_RESULTS);\n+                txdownloadman.MempoolRejectedTx(rand_tx, result);\n+            },\n+            [&] {\n+                GenTxid gtxid = fuzzed_data_provider.ConsumeBool() ?\n+                                GenTxid::Txid(rand_tx->GetHash()) :\n+                                GenTxid::Wtxid(rand_tx->GetWitnessHash());\n+                txdownloadman.ReceivedTxInv(rand_peer, gtxid, time);\n+            },\n+            [&] {\n+                txdownloadman.GetRequestsToSend(rand_peer, time);\n+            },\n+            [&] {\n+                txdownloadman.ReceivedTx(rand_peer, rand_tx);\n+            },\n+            [&] {\n+                txdownloadman.ReceivedNotFound(rand_peer, {rand_tx->GetWitnessHash()});\n+            },\n+            [&] {\n+                const auto res = txdownloadman.NewOrphanTx(rand_tx, rand_peer, time);\n+                if (res.first) {\n+                    Assert(txdownloadman.AlreadyHaveTx(GenTxid::Wtxid(rand_tx->GetWitnessHash())));\n+                }\n+            },\n+            [&] {\n+                const bool expect_work{txdownloadman.HaveMoreWork(rand_peer)};\n+                const auto ptx = txdownloadman.GetTxToReconsider(rand_peer);\n+                // expect_work=true doesn't necessarily mean the next item from the workset isn't a\n+                // nullptr, as the transaction could have been removed from orphanage without being\n+                // removed from the peer's workset.\n+                if (ptx) {\n+                    // However, if there was a non-null tx in the workset, HaveMoreWork should have\n+                    // returned true.\n+                    Assert(expect_work);\n+                    Assert(txdownloadman.AlreadyHaveTx(GenTxid::Wtxid(ptx->GetWitnessHash())));\n+                }\n+            }\n+        );\n+        time += fuzzed_data_provider.PickValueInArray(TIME_SKIPS);\n+    }\n+    // Disconnect everybody, check that all data structures are empty.\n+    for (NodeId nodeid = 0; nodeid <= NUM_PEERS; ++nodeid) {\n+        txdownloadman.DisconnectedPeer(nodeid);\n+        txdownloadman.CheckIsEmpty(nodeid);\n+    }\n+    txdownloadman.CheckIsEmpty();\n+}\n+\n+// Give node 0 relay permissions, and nobody else. This helps us remember who is a RelayPermissions\n+// peer without tracking anything (this is only for the txdownload_impl target).\n+static bool HasRelayPermissions(NodeId peer) { return peer == 0; }\n+\n+static void CheckInvariants(const node::TxDownloadImpl& txdownload_impl, size_t max_orphan_count, unsigned int max_orphan_size)\n+{\n+    LOCK(txdownload_impl.m_tx_download_mutex);\n+    const TxOrphanage& orphanage = txdownload_impl.m_orphanage;\n+    // All transactions in the orphanage should have unique txids.\n+    std::set<uint256> unique_orphanage_txids;\n+    unsigned int expected_total_orphan_bytes{0};\n+    for (const auto& wtxid : orphanage.GetAllWtxids()) {\n+        auto ptx{orphanage.GetTx(wtxid)};\n+        Assert(ptx);\n+        Assert(unique_orphanage_txids.insert(ptx->GetHash()).second);\n+        expected_total_orphan_bytes += ptx->GetTotalSize();\n+    }\n+    Assert(orphanage.TotalOrphanBytes() == expected_total_orphan_bytes);\n+    Assert(orphanage.TotalOrphanBytes() <= max_orphan_size);\n+    Assert(orphanage.Size() == unique_orphanage_txids.size());\n+    Assert(orphanage.Size() <= max_orphan_count);\n+\n+    // A transaction should never be both in m_txrequest and m_orphan_resolution_tracker. That would\n+    // mean that we have the tx in our orphanage and yet are still trying to download it.\n+    for (const auto& tx : TRANSACTIONS) {\n+        // We're using GetCandidatePeers() to check whether a hash is present in a TxRequestTracker.\n+        const auto txrequest_candidates_wtxid{txdownload_impl.m_txrequest.GetCandidatePeers(tx->GetWitnessHash())};\n+        const auto orphan_reso_candidates{txdownload_impl.m_orphan_resolution_tracker.GetCandidatePeers(tx->GetWitnessHash())};\n+        const bool in_txrequest{!txrequest_candidates_wtxid.empty()};\n+        const bool in_orphan_reso{!orphan_reso_candidates.empty()};\n+        // A transaction (by wtxid) should only be in either orphan_reso_candidates or m_txrequest.\n+        Assert(!in_txrequest || !in_orphan_reso);\n+        if (in_orphan_reso) Assert(orphanage.HaveTx(GenTxid::Wtxid(tx->GetWitnessHash())));\n+\n+        // If a (tx, peer) pair is in the orphan resolution tracker, it should also be in the orphanage.\n+        for (const auto nodeid : orphan_reso_candidates) {\n+            Assert(txdownload_impl.m_orphanage.HaveTxAndPeer(GenTxid::Wtxid(tx->GetWitnessHash()), nodeid));\n+            Assert(txdownload_impl.m_orphanage.HaveTxAndPeer(GenTxid::Txid(tx->GetHash()), nodeid));\n+        }\n+    }\n+\n+    // We should never have more than the maximum in-flight requests out for a peer.\n+    for (NodeId peer = 0; peer < NUM_PEERS; ++peer) {\n+        if (!HasRelayPermissions(peer)) {\n+            Assert(txdownload_impl.m_txrequest.CountInFlight(peer) <= node::MAX_PEER_TX_REQUEST_IN_FLIGHT);\n+        }\n+    }\n+}\n+\n+FUZZ_TARGET(txdownload_impl, .init = initialize)\n+{\n+    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());\n+\n+    // Initialize a TxDownloadImpl\n+    const auto& node = g_setup->m_node;\n+    CTxMemPool pool{MemPoolOptionsForTest(node)};\n+    const auto max_orphan_count = fuzzed_data_provider.ConsumeIntegralInRange<unsigned int>(0, 300);\n+    const auto max_orphan_size = DEFAULT_MAX_ORPHAN_TOTAL_SIZE;\n+    node::TxDownloadImpl txdownload_impl{node::TxDownloadOptions{max_orphan_count, pool}};\n+\n+    std::chrono::microseconds time{244466666};\n+\n+    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 10000)\n+    {\n+        NodeId rand_peer = fuzzed_data_provider.ConsumeIntegralInRange<int64_t>(0, NUM_PEERS);\n+\n+        // Transaction can be one of the premade ones or a randomly generated one\n+        auto rand_tx = fuzzed_data_provider.ConsumeBool() ?\n+            MakeTransactionSpending({fuzzed_data_provider.PickValueInArray(COINS)},\n+                                    /*num_outputs=*/fuzzed_data_provider.ConsumeIntegralInRange(1, 500),\n+                                    /*add_witness=*/fuzzed_data_provider.ConsumeBool()) :\n+            TRANSACTIONS.at(fuzzed_data_provider.ConsumeIntegralInRange<unsigned>(0, TRANSACTIONS.size() - 1));\n+\n+        CallOneOf(\n+            fuzzed_data_provider,\n+            [&] {\n+                node::TxDownloadConnectionInfo info{\n+                    .m_preferred = fuzzed_data_provider.ConsumeBool(),\n+                    .m_relay_permissions = HasRelayPermissions(rand_peer),\n+                    .m_wtxid_relay = fuzzed_data_provider.ConsumeBool()\n+                };\n+                txdownload_impl.ConnectedPeer(rand_peer, info);\n+            },\n+            [&] {\n+                txdownload_impl.DisconnectedPeer(rand_peer);\n+                txdownload_impl.CheckIsEmpty(rand_peer);\n+            },\n+            [&] {\n+                txdownload_impl.UpdatedBlockTipSync();\n+                LOCK(txdownload_impl.m_tx_download_mutex);\n+                Assert(!txdownload_impl.m_recent_rejects.contains(rand_tx->GetWitnessHash()));\n+                Assert(!txdownload_impl.m_recent_rejects.contains(rand_tx->GetHash()));\n+            },\n+            [&] {\n+                CBlock block;\n+                block.vtx.push_back(rand_tx);\n+                txdownload_impl.BlockConnected(block, ConsumeUInt256(fuzzed_data_provider));\n+            },\n+            [&] {\n+                txdownload_impl.BlockDisconnected();\n+                LOCK(txdownload_impl.m_tx_download_mutex);\n+                Assert(!txdownload_impl.m_recent_confirmed_transactions.contains(rand_tx->GetWitnessHash()));\n+                Assert(!txdownload_impl.m_recent_confirmed_transactions.contains(rand_tx->GetHash()));\n+            },\n+            [&] {\n+                txdownload_impl.MempoolAcceptedTx(rand_tx);\n+            },\n+            [&] {\n+                auto result = fuzzed_data_provider.PickValueInArray(TESTED_TX_RESULTS);\n+                txdownload_impl.MempoolRejectedTx(rand_tx, result);\n+            },\n+            [&] {\n+                GenTxid gtxid = fuzzed_data_provider.ConsumeBool() ?\n+                                GenTxid::Txid(rand_tx->GetHash()) :\n+                                GenTxid::Wtxid(rand_tx->GetWitnessHash());\n+                txdownload_impl.ReceivedTxInv(rand_peer, gtxid, time);\n+            },\n+            [&] {\n+                txdownload_impl.GetRequestsToSend(rand_peer, time);\n+            },\n+            [&] {\n+                txdownload_impl.ReceivedTx(rand_peer, rand_tx);\n+            },\n+            [&] {\n+                txdownload_impl.ReceivedNotFound(rand_peer, {rand_tx->GetWitnessHash()});\n+            },\n+            [&] {\n+                const auto res = txdownload_impl.NewOrphanTx(rand_tx, rand_peer, time);\n+                if (res.first) {\n+                    Assert(txdownload_impl.AlreadyHaveTx(GenTxid::Wtxid(rand_tx->GetWitnessHash())));\n+                    LOCK(txdownload_impl.m_tx_download_mutex);\n+                    Assert(txdownload_impl.m_orphanage.HaveTxAndPeer(GenTxid::Wtxid(rand_tx->GetWitnessHash()), rand_peer));\n+                }\n+            },\n+            [&] {\n+                const bool expect_work{txdownload_impl.HaveMoreWork(rand_peer)};\n+                const auto ptx = txdownload_impl.GetTxToReconsider(rand_peer);\n+                // expect_work=true doesn't necessarily mean the next item from the workset isn't a\n+                // nullptr, as the transaction could have been removed from orphanage without being\n+                // removed from the peer's workset.\n+                if (ptx) {\n+                    // However, if there was a non-null tx in the workset, HaveMoreWork should have\n+                    // returned true.\n+                    Assert(expect_work);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1360742645",
+      "id" : 1360742645,
+      "line" : 386,
+      "node_id" : "PRRC_kwDOABII585RG0j1",
+      "original_commit_id" : "36f4d0d544cf2170ec7b3ffc2a632e6ec869057d",
+      "original_line" : 386,
+      "original_position" : 386,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/txdownloadman.cpp",
+      "position" : 386,
+      "pull_request_review_id" : 1680112612,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360742645/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-16T16:56:34Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360742645",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1360781018"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360781018"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "pushed another couple fixes to https://github.com/instagibbs/bitcoin/tree/orphan-resolution-module-oct-12 , was same issue as before just in\r\n\r\nTxDownloadImpl::MempoolAcceptedTx\r\nTxDownloadImpl::MempoolRejectedTx\r\n\r\nas noted before",
+      "commit_id" : "c8e701e379de2225e9f904d0946743167bf24700",
+      "created_at" : "2023-10-16T14:46:36Z",
+      "diff_hunk" : "@@ -226,18 +317,64 @@ void TxOrphanage::EraseForBlock(const CBlock& block)\n             if (itByPrev == m_outpoint_to_orphan_it.end()) continue;\n             for (auto mi = itByPrev->second.begin(); mi != itByPrev->second.end(); ++mi) {\n                 const CTransaction& orphanTx = *(*mi)->second.tx;\n-                const uint256& orphanHash = orphanTx.GetHash();\n-                vOrphanErase.push_back(orphanHash);\n+                const uint256& orphan_wtxid = orphanTx.GetWitnessHash();\n+                vOrphanErase.push_back(orphan_wtxid);\n             }\n         }\n     }\n \n     // Erase orphan transactions included or precluded by this block\n     if (vOrphanErase.size()) {\n         int nErased = 0;\n-        for (const uint256& orphanHash : vOrphanErase) {\n-            nErased += EraseTxNoLock(orphanHash);\n+        for (const uint256& orphan_wtxid : vOrphanErase) {\n+            nErased += EraseTxNoLock(orphan_wtxid);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1360781018",
+      "id" : 1360781018,
+      "in_reply_to_id" : 1358670755,
+      "line" : 330,
+      "node_id" : "PRRC_kwDOABII585RG97a",
+      "original_commit_id" : "36f4d0d544cf2170ec7b3ffc2a632e6ec869057d",
+      "original_line" : 330,
+      "original_position" : 285,
+      "original_start_line" : null,
+      "path" : "src/txorphanage.cpp",
+      "position" : 325,
+      "pull_request_review_id" : 1680112612,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360781018/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-16T16:56:34Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360781018",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1360925170"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360925170"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "hahahahaha\r\nUnfortunately #28107 doesn't help in this case since this function takes a gentxid, but I've rebased on top of that PR.",
+      "commit_id" : "c8e701e379de2225e9f904d0946743167bf24700",
+      "created_at" : "2023-10-16T16:20:21Z",
+      "diff_hunk" : "@@ -91,8 +93,11 @@ FUZZ_TARGET(txorphan, .init = initialize_orphanage)\n                     {\n                         CTransactionRef ref = orphanage.GetTxToReconsider(peer_id);\n                         if (ref) {\n-                            bool have_tx = orphanage.HaveTx(GenTxid::Txid(ref->GetHash())) || orphanage.HaveTx(GenTxid::Wtxid(ref->GetHash()));\n-                            Assert(have_tx);\n+                            Assert(orphanage.HaveTx(GenTxid::Txid(ref->GetHash())) ||\n+                                   orphanage.HaveTx(GenTxid::Wtxid(ref->GetHash())));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1360925170",
+      "id" : 1360925170,
+      "in_reply_to_id" : 1358488871,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585RHhHy",
+      "original_commit_id" : "36f4d0d544cf2170ec7b3ffc2a632e6ec869057d",
+      "original_line" : 97,
+      "original_position" : 18,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/txorphan.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1680466402,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360925170/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-16T16:20:21Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1360925170",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
       "author_association" : "CONTRIBUTOR",
       "body" : "<!--cf906140f33d8803c4a75a2196329ecb-->\nð This pull request conflicts with the target branch and [needs rebase](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#rebasing-changes).\n",
       "created_at" : "2023-10-16T18:26:17Z",
@@ -7945,6 +8423,213 @@
          "subscriptions_url" : "https://api.github.com/users/DrahtBot/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/DrahtBot"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1361749152"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1361749152"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "an entry in `orphan_resolution_tracker`?",
+      "commit_id" : "c8e701e379de2225e9f904d0946743167bf24700",
+      "created_at" : "2023-10-17T08:45:50Z",
+      "diff_hunk" : "@@ -0,0 +1,406 @@\n+// Copyright (c) 2023 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <consensus/validation.h>\n+#include <node/context.h>\n+#include <node/mempool_args.h>\n+#include <node/miner.h>\n+#include <node/txdownloadman.h>\n+#include <node/txdownload_impl.h>\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+#include <test/fuzz/util/mempool.h>\n+#include <test/util/mining.h>\n+#include <test/util/script.h>\n+#include <test/util/setup_common.h>\n+#include <test/util/txmempool.h>\n+#include <util/hasher.h>\n+#include <util/rbf.h>\n+#include <txmempool.h>\n+#include <validation.h>\n+#include <validationinterface.h>\n+\n+namespace {\n+\n+const TestingSetup* g_setup;\n+\n+constexpr size_t NUM_COINS{50};\n+COutPoint COINS[NUM_COINS];\n+\n+static TxValidationResult TESTED_TX_RESULTS[] = {\n+    // Skip TX_RESULT_UNSET\n+    TxValidationResult::TX_CONSENSUS,\n+    TxValidationResult::TX_RECENT_CONSENSUS_CHANGE,\n+    TxValidationResult::TX_INPUTS_NOT_STANDARD,\n+    TxValidationResult::TX_NOT_STANDARD,\n+    TxValidationResult::TX_MISSING_INPUTS,\n+    TxValidationResult::TX_PREMATURE_SPEND,\n+    TxValidationResult::TX_WITNESS_MUTATED,\n+    TxValidationResult::TX_WITNESS_STRIPPED,\n+    TxValidationResult::TX_CONFLICT,\n+    TxValidationResult::TX_MEMPOOL_POLICY,\n+    // Skip TX_NO_MEMPOOL\n+};\n+\n+// Precomputed transactions. Some may conflict with each other.\n+std::vector<CTransactionRef> TRANSACTIONS;\n+\n+// Limit the total number of peers because we don't expect coverage to change much with lots more peers.\n+constexpr int NUM_PEERS = 16;\n+\n+// Precomputed random durations (positive and negative, each ~exponentially distributed).\n+std::chrono::microseconds TIME_SKIPS[128];\n+\n+static CTransactionRef MakeTransactionSpending(const std::vector<COutPoint>& outpoints, size_t num_outputs, bool add_witness)\n+{\n+    CMutableTransaction tx;\n+    // If no outpoints are given, create a random one.\n+    for (const auto& outpoint : outpoints) {\n+        tx.vin.emplace_back(CTxIn(outpoint));\n+    }\n+    if (add_witness) {\n+        tx.vin[0].scriptWitness.stack.push_back({1});\n+    }\n+    tx.vout.emplace_back(CENT, P2WSH_OP_TRUE);\n+    return MakeTransactionRef(tx);\n+}\n+void initialize()\n+{\n+    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();\n+    g_setup = testing_setup.get();\n+    for (uint32_t i = 0; i < uint32_t{NUM_COINS}; ++i) {\n+        COINS[i] = COutPoint{(HashWriter() << i).GetHash(), i};\n+    }\n+    size_t outpoints_index = 0;\n+    // 2 transactions same txid different witness\n+    {\n+        auto tx1{MakeTransactionSpending({COINS[outpoints_index]}, /*num_outputs=*/5, /*add_witness=*/false)};\n+        auto tx2{MakeTransactionSpending({COINS[outpoints_index]}, /*num_outputs=*/5, /*add_witness=*/true)};\n+        Assert(tx1->GetHash() == tx2->GetHash());\n+        TRANSACTIONS.emplace_back(tx1);\n+        TRANSACTIONS.emplace_back(tx2);\n+        outpoints_index += 1;\n+    }\n+    // 2 parents 1 child\n+    {\n+        auto tx_parent_1{MakeTransactionSpending({COINS[outpoints_index++]}, /*num_outputs=*/1, /*add_witness=*/true)};\n+        TRANSACTIONS.emplace_back(tx_parent_1);\n+        auto tx_parent_2{MakeTransactionSpending({COINS[outpoints_index++]}, /*num_outputs=*/1, /*add_witness=*/false)};\n+        TRANSACTIONS.emplace_back(tx_parent_2);\n+        TRANSACTIONS.emplace_back(MakeTransactionSpending({COutPoint{tx_parent_1->GetHash(), 0}, COutPoint{tx_parent_2->GetHash(), 0}},\n+                                                            /*num_outputs=*/1, /*add_witness=*/true));\n+    }\n+    // 1 parent 2 children\n+    {\n+        auto tx_parent{MakeTransactionSpending({COINS[outpoints_index++]}, /*num_outputs=*/2, /*add_witness=*/true)};\n+        TRANSACTIONS.emplace_back(tx_parent);\n+        TRANSACTIONS.emplace_back(MakeTransactionSpending({COutPoint{tx_parent->GetHash(), 0}},\n+                                                            /*num_outputs=*/1, /*add_witness=*/true));\n+        TRANSACTIONS.emplace_back(MakeTransactionSpending({COutPoint{tx_parent->GetHash(), 1}},\n+                                                            /*num_outputs=*/1, /*add_witness=*/true));\n+    }\n+    // chain of 5 segwit\n+    {\n+        COutPoint& last_outpoint = COINS[outpoints_index++];\n+        for (auto i{0}; i < 5; ++i) {\n+            auto tx{MakeTransactionSpending({last_outpoint}, /*num_outputs=*/1, /*add_witness=*/true)};\n+            TRANSACTIONS.emplace_back(tx);\n+            last_outpoint = COutPoint{tx->GetHash(), 0};\n+        }\n+    }\n+    // chain of 5 non-segwit\n+    {\n+        COutPoint& last_outpoint = COINS[outpoints_index++];\n+        for (auto i{0}; i < 5; ++i) {\n+            auto tx{MakeTransactionSpending({last_outpoint}, /*num_outputs=*/1, /*add_witness=*/false)};\n+            TRANSACTIONS.emplace_back(tx);\n+            last_outpoint = COutPoint{tx->GetHash(), 0};\n+        }\n+    }\n+    // Also create a loose tx for each outpoint. Some of these transactions conflict with the above\n+    // or have the same txid.\n+    for (const auto& outpoint : COINS) {\n+        TRANSACTIONS.emplace_back(MakeTransactionSpending({outpoint}, /*num_outputs=*/1, /*add_witness=*/true));\n+    }\n+\n+    // Create random-looking time jumps\n+    int i = 0;\n+    // TIME_SKIPS[N] for N=0..15 is just N microseconds.\n+    for (; i < 16; ++i) {\n+        TIME_SKIPS[i] = std::chrono::microseconds{i};\n+    }\n+    // TIME_SKIPS[N] for N=16..127 has randomly-looking but roughly exponentially increasing values up to\n+    // 198.416453 seconds.\n+    for (; i < 128; ++i) {\n+        int diff_bits = ((i - 10) * 2) / 9;\n+        uint64_t diff = 1 + (CSipHasher(0, 0).Write(i).Finalize() >> (64 - diff_bits));\n+        TIME_SKIPS[i] = TIME_SKIPS[i - 1] + std::chrono::microseconds{diff};\n+    }\n+}\n+\n+FUZZ_TARGET(txdownloadman, .init = initialize)\n+{\n+    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());\n+\n+    // Initialize txdownloadman\n+    const auto& node = g_setup->m_node;\n+    CTxMemPool pool{MemPoolOptionsForTest(node)};\n+    const auto max_orphan_count = fuzzed_data_provider.ConsumeIntegralInRange<unsigned int>(0, 300);\n+    node::TxDownloadManager txdownloadman{node::TxDownloadOptions{max_orphan_count, pool}};\n+\n+    std::chrono::microseconds time{244466666};\n+\n+    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 10000)\n+    {\n+        NodeId rand_peer = fuzzed_data_provider.ConsumeIntegralInRange<int64_t>(0, NUM_PEERS);\n+\n+        // Transaction can be one of the premade ones or a randomly generated one\n+        auto rand_tx = fuzzed_data_provider.ConsumeBool() ?\n+            MakeTransactionSpending({fuzzed_data_provider.PickValueInArray(COINS)},\n+                                    /*num_outputs=*/fuzzed_data_provider.ConsumeIntegralInRange(1, 500),\n+                                    /*add_witness=*/fuzzed_data_provider.ConsumeBool()) :\n+            TRANSACTIONS.at(fuzzed_data_provider.ConsumeIntegralInRange<unsigned>(0, TRANSACTIONS.size() - 1));\n+\n+        CallOneOf(\n+            fuzzed_data_provider,\n+            [&] {\n+                node::TxDownloadConnectionInfo info{\n+                    .m_preferred = fuzzed_data_provider.ConsumeBool(),\n+                    .m_relay_permissions = fuzzed_data_provider.ConsumeBool(),\n+                    .m_wtxid_relay = fuzzed_data_provider.ConsumeBool()\n+                };\n+                txdownloadman.ConnectedPeer(rand_peer, info);\n+            },\n+            [&] {\n+                txdownloadman.DisconnectedPeer(rand_peer);\n+                txdownloadman.CheckIsEmpty(rand_peer);\n+            },\n+            [&] {\n+                txdownloadman.UpdatedBlockTipSync();\n+            },\n+            [&] {\n+                CBlock block;\n+                block.vtx.push_back(rand_tx);\n+                txdownloadman.BlockConnected(block, ConsumeUInt256(fuzzed_data_provider));\n+            },\n+            [&] {\n+                txdownloadman.BlockDisconnected();\n+            },\n+            [&] {\n+                txdownloadman.MempoolAcceptedTx(rand_tx);\n+            },\n+            [&] {\n+                auto result = fuzzed_data_provider.PickValueInArray(TESTED_TX_RESULTS);\n+                txdownloadman.MempoolRejectedTx(rand_tx, result);\n+            },\n+            [&] {\n+                GenTxid gtxid = fuzzed_data_provider.ConsumeBool() ?\n+                                GenTxid::Txid(rand_tx->GetHash()) :\n+                                GenTxid::Wtxid(rand_tx->GetWitnessHash());\n+                txdownloadman.ReceivedTxInv(rand_peer, gtxid, time);\n+            },\n+            [&] {\n+                txdownloadman.GetRequestsToSend(rand_peer, time);\n+            },\n+            [&] {\n+                txdownloadman.ReceivedTx(rand_peer, rand_tx);\n+            },\n+            [&] {\n+                txdownloadman.ReceivedNotFound(rand_peer, {rand_tx->GetWitnessHash()});\n+            },\n+            [&] {\n+                const auto res = txdownloadman.NewOrphanTx(rand_tx, rand_peer, time);\n+                if (res.first) {\n+                    Assert(txdownloadman.AlreadyHaveTx(GenTxid::Wtxid(rand_tx->GetWitnessHash())));\n+                }\n+            },\n+            [&] {\n+                const bool expect_work{txdownloadman.HaveMoreWork(rand_peer)};\n+                const auto ptx = txdownloadman.GetTxToReconsider(rand_peer);\n+                // expect_work=true doesn't necessarily mean the next item from the workset isn't a\n+                // nullptr, as the transaction could have been removed from orphanage without being\n+                // removed from the peer's workset.\n+                if (ptx) {\n+                    // However, if there was a non-null tx in the workset, HaveMoreWork should have\n+                    // returned true.\n+                    Assert(expect_work);\n+                    Assert(txdownloadman.AlreadyHaveTx(GenTxid::Wtxid(ptx->GetWitnessHash())));\n+                }\n+            }\n+        );\n+        time += fuzzed_data_provider.PickValueInArray(TIME_SKIPS);\n+    }\n+    // Disconnect everybody, check that all data structures are empty.\n+    for (NodeId nodeid = 0; nodeid <= NUM_PEERS; ++nodeid) {\n+        txdownloadman.DisconnectedPeer(nodeid);\n+        txdownloadman.CheckIsEmpty(nodeid);\n+    }\n+    txdownloadman.CheckIsEmpty();\n+}\n+\n+// Give node 0 relay permissions, and nobody else. This helps us remember who is a RelayPermissions\n+// peer without tracking anything (this is only for the txdownload_impl target).\n+static bool HasRelayPermissions(NodeId peer) { return peer == 0; }\n+\n+static void CheckInvariants(const node::TxDownloadImpl& txdownload_impl, size_t max_orphan_count, unsigned int max_orphan_size)\n+{\n+    LOCK(txdownload_impl.m_tx_download_mutex);\n+    const TxOrphanage& orphanage = txdownload_impl.m_orphanage;\n+    // All transactions in the orphanage should have unique txids.\n+    std::set<uint256> unique_orphanage_txids;\n+    unsigned int expected_total_orphan_bytes{0};\n+    for (const auto& wtxid : orphanage.GetAllWtxids()) {\n+        auto ptx{orphanage.GetTx(wtxid)};\n+        Assert(ptx);\n+        Assert(unique_orphanage_txids.insert(ptx->GetHash()).second);\n+        expected_total_orphan_bytes += ptx->GetTotalSize();\n+    }\n+    Assert(orphanage.TotalOrphanBytes() == expected_total_orphan_bytes);\n+    Assert(orphanage.TotalOrphanBytes() <= max_orphan_size);\n+    Assert(orphanage.Size() == unique_orphanage_txids.size());\n+    Assert(orphanage.Size() <= max_orphan_count);\n+\n+    // A transaction should never be both in m_txrequest and m_orphan_resolution_tracker. That would\n+    // mean that we have the tx in our orphanage and yet are still trying to download it.\n+    for (const auto& tx : TRANSACTIONS) {\n+        // We're using GetCandidatePeers() to check whether a hash is present in a TxRequestTracker.\n+        const auto txrequest_candidates_wtxid{txdownload_impl.m_txrequest.GetCandidatePeers(tx->GetWitnessHash())};\n+        const auto orphan_reso_candidates{txdownload_impl.m_orphan_resolution_tracker.GetCandidatePeers(tx->GetWitnessHash())};\n+        const bool in_txrequest{!txrequest_candidates_wtxid.empty()};\n+        const bool in_orphan_reso{!orphan_reso_candidates.empty()};\n+        // A transaction (by wtxid) should only be in either orphan_reso_candidates or m_txrequest.\n+        Assert(!in_txrequest || !in_orphan_reso);\n+        if (in_orphan_reso) Assert(orphanage.HaveTx(GenTxid::Wtxid(tx->GetWitnessHash())));\n+\n+        // If a (tx, peer) pair is in the orphan resolution tracker, it should also be in the orphanage.\n+        for (const auto nodeid : orphan_reso_candidates) {\n+            Assert(txdownload_impl.m_orphanage.HaveTxAndPeer(GenTxid::Wtxid(tx->GetWitnessHash()), nodeid));\n+            Assert(txdownload_impl.m_orphanage.HaveTxAndPeer(GenTxid::Txid(tx->GetHash()), nodeid));\n+        }\n+    }\n+\n+    // We should never have more than the maximum in-flight requests out for a peer.\n+    for (NodeId peer = 0; peer < NUM_PEERS; ++peer) {\n+        if (!HasRelayPermissions(peer)) {\n+            Assert(txdownload_impl.m_txrequest.CountInFlight(peer) <= node::MAX_PEER_TX_REQUEST_IN_FLIGHT);\n+        }\n+    }\n+}\n+\n+FUZZ_TARGET(txdownload_impl, .init = initialize)\n+{\n+    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());\n+\n+    // Initialize a TxDownloadImpl\n+    const auto& node = g_setup->m_node;\n+    CTxMemPool pool{MemPoolOptionsForTest(node)};\n+    const auto max_orphan_count = fuzzed_data_provider.ConsumeIntegralInRange<unsigned int>(0, 300);\n+    const auto max_orphan_size = DEFAULT_MAX_ORPHAN_TOTAL_SIZE;\n+    node::TxDownloadImpl txdownload_impl{node::TxDownloadOptions{max_orphan_count, pool}};\n+\n+    std::chrono::microseconds time{244466666};\n+\n+    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 10000)\n+    {\n+        NodeId rand_peer = fuzzed_data_provider.ConsumeIntegralInRange<int64_t>(0, NUM_PEERS);\n+\n+        // Transaction can be one of the premade ones or a randomly generated one\n+        auto rand_tx = fuzzed_data_provider.ConsumeBool() ?\n+            MakeTransactionSpending({fuzzed_data_provider.PickValueInArray(COINS)},\n+                                    /*num_outputs=*/fuzzed_data_provider.ConsumeIntegralInRange(1, 500),\n+                                    /*add_witness=*/fuzzed_data_provider.ConsumeBool()) :\n+            TRANSACTIONS.at(fuzzed_data_provider.ConsumeIntegralInRange<unsigned>(0, TRANSACTIONS.size() - 1));\n+\n+        CallOneOf(\n+            fuzzed_data_provider,\n+            [&] {\n+                node::TxDownloadConnectionInfo info{\n+                    .m_preferred = fuzzed_data_provider.ConsumeBool(),\n+                    .m_relay_permissions = HasRelayPermissions(rand_peer),\n+                    .m_wtxid_relay = fuzzed_data_provider.ConsumeBool()\n+                };\n+                txdownload_impl.ConnectedPeer(rand_peer, info);\n+            },\n+            [&] {\n+                txdownload_impl.DisconnectedPeer(rand_peer);\n+                txdownload_impl.CheckIsEmpty(rand_peer);\n+            },\n+            [&] {\n+                txdownload_impl.UpdatedBlockTipSync();\n+                LOCK(txdownload_impl.m_tx_download_mutex);\n+                Assert(!txdownload_impl.m_recent_rejects.contains(rand_tx->GetWitnessHash()));\n+                Assert(!txdownload_impl.m_recent_rejects.contains(rand_tx->GetHash()));\n+            },\n+            [&] {\n+                CBlock block;\n+                block.vtx.push_back(rand_tx);\n+                txdownload_impl.BlockConnected(block, ConsumeUInt256(fuzzed_data_provider));\n+            },\n+            [&] {\n+                txdownload_impl.BlockDisconnected();\n+                LOCK(txdownload_impl.m_tx_download_mutex);\n+                Assert(!txdownload_impl.m_recent_confirmed_transactions.contains(rand_tx->GetWitnessHash()));\n+                Assert(!txdownload_impl.m_recent_confirmed_transactions.contains(rand_tx->GetHash()));\n+            },\n+            [&] {\n+                txdownload_impl.MempoolAcceptedTx(rand_tx);\n+            },\n+            [&] {\n+                auto result = fuzzed_data_provider.PickValueInArray(TESTED_TX_RESULTS);\n+                txdownload_impl.MempoolRejectedTx(rand_tx, result);\n+            },\n+            [&] {\n+                GenTxid gtxid = fuzzed_data_provider.ConsumeBool() ?\n+                                GenTxid::Txid(rand_tx->GetHash()) :\n+                                GenTxid::Wtxid(rand_tx->GetWitnessHash());\n+                txdownload_impl.ReceivedTxInv(rand_peer, gtxid, time);\n+            },\n+            [&] {\n+                txdownload_impl.GetRequestsToSend(rand_peer, time);\n+            },\n+            [&] {\n+                txdownload_impl.ReceivedTx(rand_peer, rand_tx);\n+            },\n+            [&] {\n+                txdownload_impl.ReceivedNotFound(rand_peer, {rand_tx->GetWitnessHash()});\n+            },\n+            [&] {\n+                const auto res = txdownload_impl.NewOrphanTx(rand_tx, rand_peer, time);\n+                if (res.first) {\n+                    Assert(txdownload_impl.AlreadyHaveTx(GenTxid::Wtxid(rand_tx->GetWitnessHash())));\n+                    LOCK(txdownload_impl.m_tx_download_mutex);\n+                    Assert(txdownload_impl.m_orphanage.HaveTxAndPeer(GenTxid::Wtxid(rand_tx->GetWitnessHash()), rand_peer));\n+                }\n+            },\n+            [&] {\n+                const bool expect_work{txdownload_impl.HaveMoreWork(rand_peer)};\n+                const auto ptx = txdownload_impl.GetTxToReconsider(rand_peer);\n+                // expect_work=true doesn't necessarily mean the next item from the workset isn't a\n+                // nullptr, as the transaction could have been removed from orphanage without being\n+                // removed from the peer's workset.\n+                if (ptx) {\n+                    // However, if there was a non-null tx in the workset, HaveMoreWork should have\n+                    // returned true.\n+                    Assert(expect_work);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1361749152",
+      "id" : 1361749152,
+      "in_reply_to_id" : 1360742645,
+      "line" : 386,
+      "node_id" : "PRRC_kwDOABII585RKqSg",
+      "original_commit_id" : "36f4d0d544cf2170ec7b3ffc2a632e6ec869057d",
+      "original_line" : 386,
+      "original_position" : 386,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/txdownloadman.cpp",
+      "position" : 386,
+      "pull_request_review_id" : 1681738183,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1361749152/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-17T08:45:51Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1361749152",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1361762903"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1361762903"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Is it a problem to lazily handle transactions in peer work sets that have been deleted from the orphanage? It's cleaner to `remove_work_from_all_sets` of course, but it iterates through every entry in `m_peer_work_set` so there is a performance difference but the external outcome is the same.\r\n\r\nI think erasing proactively in `EraseOrphanOfPeer` is necessary because the tx isn't deleted. Trying to avoid returning the tx in `GetTxToReconsider(peer)` after we've already decided to give up on (tx, peer).",
+      "commit_id" : "c8e701e379de2225e9f904d0946743167bf24700",
+      "created_at" : "2023-10-17T08:56:07Z",
+      "diff_hunk" : "@@ -226,18 +317,64 @@ void TxOrphanage::EraseForBlock(const CBlock& block)\n             if (itByPrev == m_outpoint_to_orphan_it.end()) continue;\n             for (auto mi = itByPrev->second.begin(); mi != itByPrev->second.end(); ++mi) {\n                 const CTransaction& orphanTx = *(*mi)->second.tx;\n-                const uint256& orphanHash = orphanTx.GetHash();\n-                vOrphanErase.push_back(orphanHash);\n+                const uint256& orphan_wtxid = orphanTx.GetWitnessHash();\n+                vOrphanErase.push_back(orphan_wtxid);\n             }\n         }\n     }\n \n     // Erase orphan transactions included or precluded by this block\n     if (vOrphanErase.size()) {\n         int nErased = 0;\n-        for (const uint256& orphanHash : vOrphanErase) {\n-            nErased += EraseTxNoLock(orphanHash);\n+        for (const uint256& orphan_wtxid : vOrphanErase) {\n+            nErased += EraseTxNoLock(orphan_wtxid);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1361762903",
+      "id" : 1361762903,
+      "in_reply_to_id" : 1358670755,
+      "line" : 330,
+      "node_id" : "PRRC_kwDOABII585RKtpX",
+      "original_commit_id" : "36f4d0d544cf2170ec7b3ffc2a632e6ec869057d",
+      "original_line" : 330,
+      "original_position" : 285,
+      "original_start_line" : null,
+      "path" : "src/txorphanage.cpp",
+      "position" : 325,
+      "pull_request_review_id" : 1681759296,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1361762903/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-17T08:56:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1361762903",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1361785701"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1361785701"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "> TxOrphanage::EraseForBlock\r\n> TxOrphanage::LimitOrphans\r\n\r\n> This results in fuzzer crashes where it's (still) in the peer's work set, but not counted as an announcer since it's been evicted(then later sent).\r\n\r\nQuestion: is it crashing because the tx is being returned from `GetTxToReconsider`? Seems weird as it should return a nullptr if it gets a tx that isn't there anymore...\r\n\r\nOOhhhhhhhhh could it be that it's re-added? My guess:\r\n1. `AddTx(tx_child, peer)`\r\n2. `AddChildrenToWorkSet(tx_parent)` -> peer workset contains tx_child\r\n3. `EraseTx(tx_child)` -> peer workset still contains tx_child but we expect orphanage to lazily delete that when we call `GetTxToReconsider`\r\n4. `AddTx(tx_child, other_peer)` (makes no sense but we're fuzzing)\r\n5. `GetTxToReconsider(peer)` returns `tx_child` even though it's not in `orphan_resolution_tracker`",
+      "commit_id" : "c8e701e379de2225e9f904d0946743167bf24700",
+      "created_at" : "2023-10-17T09:11:50Z",
+      "diff_hunk" : "@@ -226,18 +317,64 @@ void TxOrphanage::EraseForBlock(const CBlock& block)\n             if (itByPrev == m_outpoint_to_orphan_it.end()) continue;\n             for (auto mi = itByPrev->second.begin(); mi != itByPrev->second.end(); ++mi) {\n                 const CTransaction& orphanTx = *(*mi)->second.tx;\n-                const uint256& orphanHash = orphanTx.GetHash();\n-                vOrphanErase.push_back(orphanHash);\n+                const uint256& orphan_wtxid = orphanTx.GetWitnessHash();\n+                vOrphanErase.push_back(orphan_wtxid);\n             }\n         }\n     }\n \n     // Erase orphan transactions included or precluded by this block\n     if (vOrphanErase.size()) {\n         int nErased = 0;\n-        for (const uint256& orphanHash : vOrphanErase) {\n-            nErased += EraseTxNoLock(orphanHash);\n+        for (const uint256& orphan_wtxid : vOrphanErase) {\n+            nErased += EraseTxNoLock(orphan_wtxid);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28031#discussion_r1361785701",
+      "id" : 1361785701,
+      "in_reply_to_id" : 1358670755,
+      "line" : 330,
+      "node_id" : "PRRC_kwDOABII585RKzNl",
+      "original_commit_id" : "36f4d0d544cf2170ec7b3ffc2a632e6ec869057d",
+      "original_line" : 330,
+      "original_position" : 285,
+      "original_start_line" : null,
+      "path" : "src/txorphanage.cpp",
+      "position" : 325,
+      "pull_request_review_id" : 1681795962,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28031",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1361785701/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-17T09:11:51Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1361785701",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
       }
    }
 ]
