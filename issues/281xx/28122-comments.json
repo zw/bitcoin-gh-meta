@@ -7216,5 +7216,73 @@
          "type" : "User",
          "url" : "https://api.github.com/users/S3RK"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28122#discussion_r1365267891"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28122"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1365267891"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "According to the BIP we should skip the whole tx if there's unknown witness input. As currently, implemented it will silently skip just that input and attempt to proceed. I added a test vector for unknown witness version",
+      "commit_id" : "30bbeb38047e020926065a407d5195b684377857",
+      "created_at" : "2023-10-19T10:20:33Z",
+      "diff_hunk" : "@@ -0,0 +1,294 @@\n+#include <wallet/silentpayments.h>\n+#include <addresstype.h>\n+#include <arith_uint256.h>\n+#include <coins.h>\n+#include <crypto/common.h>\n+#include <crypto/hmac_sha512.h>\n+#include <key_io.h>\n+#include <undo.h>\n+#include <logging.h>\n+#include <pubkey.h>\n+#include <policy/policy.h>\n+#include <script/sign.h>\n+#include <script/solver.h>\n+#include <util/check.h>\n+\n+namespace wallet {\n+\n+uint256 GenerateSilentPaymentChangeTweak(const CKey& scan_key)\n+{\n+    HashWriter hasher;\n+    hasher.write(scan_key);\n+    return hasher.GetSHA256();\n+}\n+\n+V0SilentPaymentDestination GenerateSilentPaymentLabeledAddress(const V0SilentPaymentDestination& receiver, const uint256& label)\n+{\n+    CPubKey labeled_spend_pubkey{receiver.m_spend_pubkey};\n+    labeled_spend_pubkey.TweakAdd(label.data());\n+    return V0SilentPaymentDestination{receiver.m_scan_pubkey, labeled_spend_pubkey};\n+}\n+\n+CPubKey ComputeECDHSharedSecret(const CKey& scan_key, const CPubKey& sender_public_key, const uint256& outpoints_hash)\n+{\n+    CKey tweaked_scan_seckey{scan_key};\n+    tweaked_scan_seckey.TweakMultiply(outpoints_hash.begin());\n+    CPubKey result = tweaked_scan_seckey.UnhashedECDH(sender_public_key);\n+    assert(result.IsValid());\n+    return result;\n+}\n+\n+uint256 ComputeTweak(const CPubKey& ecdh_pubkey, const uint32_t output_index)\n+{\n+    HashWriter h;\n+    h.write(Span{ecdh_pubkey});\n+    unsigned char num[4];\n+    WriteBE32(num, output_index);\n+    h << num;\n+    return h.GetSHA256();\n+}\n+\n+CPubKey CreateOutput(const CKey& ecdh_scalar, const CPubKey& scan_pubkey, const CPubKey& spend_pubkey, const uint32_t output_index)\n+{\n+    CPubKey ecdh_pubkey = ecdh_scalar.UnhashedECDH(scan_pubkey);\n+    HashWriter h;\n+    h.write(Span{ecdh_pubkey});\n+    unsigned char num[4];\n+    WriteBE32(num, output_index);\n+    h << num;\n+    uint256 shared_secret = h.GetSHA256();\n+    CPubKey silent_payment_output{spend_pubkey};\n+    silent_payment_output.TweakAdd(shared_secret.begin());\n+    return silent_payment_output;\n+}\n+\n+CPubKey SumInputPubKeys(const std::vector<CPubKey>& pubkeys)\n+{\n+    CPubKey sum_pubkey{pubkeys.at(0)};\n+    if (pubkeys.size() == 1) return sum_pubkey;\n+    for (size_t i = 1; i < pubkeys.size(); i++) {\n+        sum_pubkey = sum_pubkey + pubkeys.at(i);\n+    }\n+    return sum_pubkey;\n+}\n+\n+CKey SumInputPrivKeys(const std::vector<std::pair<CKey, bool>>& sender_secret_keys)\n+{\n+    // Grab the first key, copy it to the accumulator, and negate if necessary\n+    const auto& [seckey, is_taproot] = sender_secret_keys.at(0);\n+    CKey sum_seckey{seckey};\n+    if (is_taproot && sum_seckey.GetPubKey()[0] == 3) sum_seckey.Negate();\n+    if (sender_secret_keys.size() == 1) return sum_seckey;\n+\n+    // If there are more keys, check if the key needs to be negated and add it to the accumulator\n+    for (size_t i = 1; i < sender_secret_keys.size(); i++) {\n+        const auto& [sender_seckey, sender_is_taproot] = sender_secret_keys.at(i);\n+        CKey temp_key{sender_seckey};\n+        if (sender_is_taproot && sender_seckey.GetPubKey()[0] == 3) {\n+            temp_key.Negate();\n+        }\n+        sum_seckey.TweakAdd(temp_key.begin());\n+    }\n+    return sum_seckey;\n+}\n+\n+CKey PrepareScalarECDHInput(const std::vector<std::pair<CKey, bool>>& sender_secret_keys, const std::vector<COutPoint>& tx_outpoints)\n+{\n+    CKey sum_input_secret_keys = SumInputPrivKeys(sender_secret_keys);\n+    uint256 outpoints_hash = HashOutpoints(tx_outpoints);\n+    sum_input_secret_keys.TweakMultiply(outpoints_hash.begin());\n+    return sum_input_secret_keys;\n+}\n+\n+std::map<size_t, WitnessV1Taproot> GenerateSilentPaymentTaprootDestinations(const CKey& ecdh_scalar, const std::map<size_t, V0SilentPaymentDestination>& sp_dests)\n+{\n+    std::map<CPubKey, std::vector<std::pair<CPubKey, size_t>>> sp_groups;\n+    std::map<size_t, WitnessV1Taproot> tr_dests;\n+\n+    for (const auto& [out_idx, sp_dest] : sp_dests) {\n+        sp_groups[sp_dest.m_scan_pubkey].emplace_back(sp_dest.m_spend_pubkey, out_idx);\n+    }\n+\n+    for (const auto& [scan_pubkey, spend_pubkeys] : sp_groups) {\n+        for (size_t i = 0; i < spend_pubkeys.size(); ++i) {\n+            const auto& [spend_pubkey, out_idx] = spend_pubkeys.at(i);\n+            tr_dests.emplace(out_idx, XOnlyPubKey{CreateOutput(ecdh_scalar, scan_pubkey, spend_pubkey, i)});\n+        }\n+    }\n+    return tr_dests;\n+}\n+\n+uint256 HashOutpoints(const std::vector<COutPoint>& tx_outpoints)\n+{\n+\n+    // Make a local copy of the outpoints so we can sort them before hashing.\n+    // This is to ensure the sender and receiver deterministically arrive at the same outpoint hash,\n+    // regardless of how the outpoints are ordered in the transaction.\n+\n+    std::vector<COutPoint> outpoints{tx_outpoints};\n+    std::sort(outpoints.begin(), outpoints.end());\n+\n+    HashWriter h;\n+    for (const auto& outpoint: outpoints) {\n+        h << outpoint;\n+    }\n+    return h.GetSHA256();\n+}\n+\n+std::vector<uint256> GetTxOutputTweaks(const CPubKey& spend_pubkey, const CPubKey& ecdh_pubkey, std::vector<XOnlyPubKey> output_pub_keys, const std::map<CPubKey, uint256>& labels)\n+{\n+    // Because a sender can create multiple outputs for us, we first check the outputs vector for an output with\n+    // output index 0. If we find it, we remove it from the vector and then iterate over the vector again looking for\n+    // an output with index 1, and so on until one of the following happens:\n+    //\n+    //     1. We have determined all outputs belong to us (the vector is empty)\n+    //     2. We have passed over the vector and found no outputs belonging to us\n+    //\n+\n+    // Define a convenience lambda for correctly combining uint256 tweak data\n+    auto combine_tweaks = [](const uint256& tweak, const uint256& label_tweak) -> uint256 {\n+        uint256 combined_tweaks;\n+        CKey tmp;\n+        tmp.Set(tweak.begin(), tweak.end(), /*fCompressedIn=*/true);\n+        tmp.TweakAdd(label_tweak.begin());\n+        std::copy(tmp.begin(), tmp.end(), combined_tweaks.begin());\n+        return combined_tweaks;\n+    };\n+\n+    bool keep_going;\n+    uint32_t k{0};\n+    std::vector<uint256> tweaks;\n+    do {\n+        // We haven't found anything yet on this pass and if we make to the end without finding any\n+        // silent payment outputs everything left in the vector is not for us, so we stop scanning.\n+        keep_going = false;\n+\n+        // t_k = hash(ecdh_shared_secret || k)\n+        uint256 t_k = ComputeTweak(ecdh_pubkey, k);\n+\n+        // Compute P_k = B_spend + t_k * G, convert P_k to a P2TR output\n+        CPubKey P_k{spend_pubkey};\n+        P_k.TweakAdd(t_k.data());\n+        const XOnlyPubKey& P_k_xonly = XOnlyPubKey{P_k};\n+\n+        // Scan the transaction outputs, only continue scanning if there is a match\n+        output_pub_keys.erase(std::remove_if(output_pub_keys.begin(), output_pub_keys.end(), [&](XOnlyPubKey output_pubkey) {\n+            bool found = P_k_xonly == output_pubkey;\n+            if (!found) {\n+                if (labels.size() < 3) {\n+                    // If we have less than 3 labels, it's cheaper to check by adding each label to each output.\n+                    // This ends up being at most N * 2 ECC additions, where N is the number of taproot outputs in the transaction.\n+                    // This is primarily for wallets that are only using a single label for generating silent payments change outputs.\n+                    for (const auto& [m_G, m] : labels) {\n+                        // Check P_k + m*G\n+                        CPubKey labeled_spend_key{P_k + m_G};\n+                        if (output_pubkey.ConvertToCompressedPubKey(/*even=*/true) == labeled_spend_key) {\n+                            t_k = combine_tweaks(t_k, m);\n+                            found = true;\n+                            break;\n+                        }\n+                        // If we don't find a label with the even output, also check the odd (negated) output\n+                        // Note: changing the parity byte from even to odd is not as expensive as negating an EC point\n+                        if (output_pubkey.ConvertToCompressedPubKey(/*even=*/false) == labeled_spend_key) {\n+                            t_k = combine_tweaks(t_k, m);\n+                            found = true;\n+                            break;\n+                        }\n+                    }\n+                } else {\n+                    // If we have 3 or more labels, checking via subtraction is cheaper.\n+                    // This ends up being at most N * 2 ECC operations (two subtractions) and a lookup in the labels map,\n+                    // where N is the number of taproot outputs in the transaction\n+                    std::map<CPubKey, uint256>::const_iterator it = labels.end();\n+                    // For an XOnlyPubKey, converting it to an odd compressed key is equivalent to negation.\n+                    // We use P_k_negated for subtraction: output + ( - P_k ),\n+                    // so first we need to check the parity byte of the compute P_K public key\n+                    bool parity = (P_k.begin()[0] == 0x02) ? true : false;\n+                    CPubKey P_k_negated = P_k_xonly.ConvertToCompressedPubKey(/*even=*/!parity);\n+                    it = labels.find(output_pubkey.ConvertToCompressedPubKey(/*even=*/true) + P_k_negated);\n+                    if (it == labels.end()) {\n+                        // If not found on the first try, negate the output and check again.\n+                        it = labels.find(output_pubkey.ConvertToCompressedPubKey(/*even=*/false) + P_k_negated);\n+                    }\n+                    if (it != labels.end()) {\n+                        t_k = combine_tweaks(t_k, it->second);\n+                        found = true;\n+                    }\n+                }\n+            }\n+            if (found) {\n+                // Since we found an output, we need to increment k and check the vector again\n+                tweaks.emplace_back(t_k);\n+                keep_going = true;\n+                k++;\n+                // Return true so that this output pubkey is removed the from vector and not checked again\n+                return true;\n+            }\n+            return false;\n+        }), output_pub_keys.end());\n+    } while (!output_pub_keys.empty() && keep_going);\n+    return tweaks;\n+}\n+\n+std::optional<std::pair<uint256, CPubKey>> GetSilentPaymentsTweakDataFromTxInputs(const std::vector<CTxIn>& vin, const std::map<COutPoint, Coin>& coins)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28122#discussion_r1365267891",
+      "id" : 1365267891,
+      "line" : 233,
+      "node_id" : "PRRC_kwDOABII585RYFWz",
+      "original_commit_id" : "699577c91101b4be56bffcec4f0fa48f7d8916f0",
+      "original_line" : 233,
+      "original_position" : 233,
+      "original_start_line" : null,
+      "path" : "src/wallet/silentpayments.cpp",
+      "position" : 233,
+      "pull_request_review_id" : 1687287831,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28122",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1365267891/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-10-19T10:20:33Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1365267891",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1466284?v=4",
+         "events_url" : "https://api.github.com/users/S3RK/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/S3RK/followers",
+         "following_url" : "https://api.github.com/users/S3RK/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/S3RK/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/S3RK",
+         "id" : 1466284,
+         "login" : "S3RK",
+         "node_id" : "MDQ6VXNlcjE0NjYyODQ=",
+         "organizations_url" : "https://api.github.com/users/S3RK/orgs",
+         "received_events_url" : "https://api.github.com/users/S3RK/received_events",
+         "repos_url" : "https://api.github.com/users/S3RK/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/S3RK/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/S3RK/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/S3RK"
+      }
    }
 ]
