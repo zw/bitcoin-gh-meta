@@ -177,7 +177,7 @@
    },
    {
       "author_association" : "MEMBER",
-      "body" : "Concept ACK\r\n\r\n## Naive approach\r\n\r\nOne approach to implement a package-aware mempool-based fee estimator is to modify the `miner.cpp` block-building algorithm to run without limit and be used to generate a mempool fee rate histogram (mempool fee rate histogram is an array of fee rates along with their corresponding sizes, arranged in descending order, the higher fee rate listed first with their corresponding vsize)\r\n@sipa has already done this https://github.com/sipa/bitcoin/commits/202111_mempoolfr.\r\n\r\n* This has the downside of locking `cs_main` and `mempool_cs` during template creation.\r\n\r\n## Improved approach\r\n\r\n* Implement a mempool-based fee estimator that will subscribe to the validation interface (similar to the one done in `CBlockPolicyEstimator` #28368)\r\n\r\n* Create a parallel (lightweight) \"mempool\" of unconfirmed transactions with their fee rates, ancestors and descendants.\r\n\r\n* Replicate/re-use the block-building algorithm like the one in miner.cpp `addPackages` to be generating the fee rate histogram.\r\n\r\n\r\n### Process\r\nWhenever we want to estimate fees for a confirmation target we:\r\n1. Generate the fee rate histogram with the mempool transactions.\r\n2. Aggregate the fee rates and their respective vsize values until reaching the desired confirmation target in terms of blocks:\r\n    i) For a 1 block confirmation target, aggregate the highest fee rates until the sum of their vsize's equals the maximum block weight.\r\n    e.g For a 3-block confirmation target, do the step above thrice using the third aggregated fee rates.\r\n3. Calculate the median fee rate of the confirmation target aggregated fee rates.\r\n4. Take the median fee rate as the confirmation target fee rate.\r\n\r\n### Sanity check\r\n* Whenever a new block is connected, we create a new block template which will give us the list of transactions we expect to be included in the new block. This can be used for comparison (as a sanity check) vs miner-generated blocks, to give us more confidence that our mempool somewhat-closely resembles miner mempools and can be somewhat relied upon for fee estimation:\r\n\r\n    * Tracking the number of times we expect a transaction to be mined and it's not.\r\n    * Track the number of times a high fee rate transaction is not confirmed. A transaction will be eligible to be high fee only if it's greater than e.g. the median fee rate of transactions in the newly connected block?\r\n\r\n* To determine whether node policy diverges from the network's aggregate policy we will:\r\n    1. Check that transactions we expect to be confirmed and are not (e.g. for up to three blocks) are below an as-yet undetermined threshold (10%?).\r\n    2. Check our mempool has seen another as-yet undetermined threshold % of the transactions in the last `n` (3?) blocks.\r\n\r\n    If both conditions are met, high fee-rate transactions in our mempool are getting confirmed, our mempool has likely not diverged from the global network aggregate policy.\r\n\r\n* Before generating any fee rate histogram we will:\r\n    1. exclude high fee rate transactions that failed to be included in block (e.g., three times) with all their descendants.\r\n\r\n## Questions\r\n\r\n1. Whenever we estimate fees with the naive approach we generate a fee rate histogram with the whole mempool, we are locking mempool `cs` and `cs_main`, is that efficient?\r\n\r\nWe have tested [this](https://github.com/sipa/bitcoin/commits/202111_mempoolfr) rebased on master with full mempool and it is very fast and efficient.\r\n\r\n2. Every time a new block is connected we generate a block template to perform a sanity check with the naive approach this also locks `cs_main` and mempool `cs`, is that efficient? \r\n\r\n    We are building a normal block template with the default limit for this, the sanity checks execute in the background.\r\n\r\nIf this locking issue is a concern, to solve it I think the mempool-based fee estimator will have to implement the improved approach, which has the downside of creating another lightweight mempool, for a resource-constrained node, we can provide the option of turning it off?\r\n\r\nThe lightweight mempool DS will be somewhat like\r\n\r\n    tx_ref: CTransactionRef\r\n    ancestors: std::set<FeeEstimatorEntry*>\r\n    descendants: std::set<FeeEstimatorEntry*>\r\n    vsize: uint64_t\r\n    nfee: CAmount\r\n    nFailedEntries: unsigned int\r\n    nHighFeeFailedEntries: unsigned int\r\n\r\nThis work is the result of some discussions with @willcl-ark @glozow\r\n\r\nI would like to have feedback on the approaches before creating a PR.",
+      "body" : "Concept ACK\r\n\r\nOne approach to implementing a package-aware mempool-based fee estimator (Edit after #28762)\r\n\r\n### Process\r\nWhenever we want to estimate fees for a confirmation target we:\r\n1. Generate the fee rate histogram with the mempool transactions.\r\n2. Aggregate the fee rates and their respective vsize values until reaching the desired confirmation target in terms of blocks:\r\n    i) For a 1 block confirmation target, aggregate the highest fee rates until the sum of their vsize's equals the maximum block weight.\r\n    e.g For a 3-block confirmation target, do the step above thrice using the third aggregated fee rates.\r\n3. Calculate the median fee rate of the confirmation target aggregated fee rates.\r\n4. Take the median fee rate as the confirmation target fee rate.\r\n\r\n### Sanity check\r\n* Whenever a new block is connected, we create a new block template which will give us the list of transactions we expect to be included in the new block. This can be used for comparison (as a sanity check) vs miner-generated blocks, to give us more confidence that our mempool somewhat-closely resembles miner mempools and can be somewhat relied upon for fee estimation:\r\n\r\n    * Tracking the number of times we expect a transaction to be mined and it's not.\r\n    * Track the number of times a high fee rate transaction is not confirmed. A transaction will be eligible to be high fee only if it's greater than e.g. the median fee rate of transactions in the newly connected block?\r\n\r\n* To determine whether node policy diverges from the network's aggregate policy we will:\r\n    1. Check that transactions we expect to be confirmed and are not (e.g. for up to three blocks) are below an as-yet undetermined threshold (10%?).\r\n    2. Check our mempool has seen another as-yet undetermined threshold % of the transactions in the last `n` (3?) blocks.\r\n\r\n    If both conditions are met, high fee-rate transactions in our mempool are getting confirmed, our mempool has likely not diverged from the global network aggregate policy.\r\n\r\n* Before generating any fee rate histogram we will:\r\n    1. exclude high fee rate transactions that failed to be included in block (e.g., three times) with all their descendants.\r\n\r\n\r\n## Implementation\r\n\r\n* Modify the `mini_miner` block-building algorithm to generate a fee rate histogram after building a block template (fee rate histogram is an array of fee rates along with their corresponding sizes, arranged in descending order, the higher fee rate listed first with their corresponding vsize)\r\n\r\n#### Naive approach of generating fee rate histogram\r\n\r\n* Manually generate mempool transactions `manual_entries` and their descendants `descendant_caches` from `CTxMempool`, this has the downside of locking and `mempool_cs` while we go through the whole mempool transactions and their descendant.\r\n\r\n* Use `manual_entries` and `descendant_caches` to get fee rate histogram with mini miner.\r\n\r\n### Improved approach of generating fee rate histogram\r\n\r\n* Implement a mempool-based fee estimator that will subscribe to the validation interface (similar to the one done in `CBlockPolicyEstimator` #28368)\r\n\r\n* Create a parallel (lightweight) \"mempool\" of unconfirmed transactions with their fee rates, and descendants.\r\n\r\n* Use the lightweight mempool to get fee rate histogram from mini miner.\r\n\r\n\r\n* Modify mini miner to build a block template with a target visize and return the transactions of the block template it built.\r\n\r\n* We can use either the [Naive](#naive-approach-of-generating-fee-rate-histogram) or [Improved](#improved-approach-of-generating-fee-rate-histogram)  appraoch to get the mempool transactions `manual_entries` and their descendants `descendant_caches` and generate a `DEFAULT_BLOCK_MAX_WEIGHT` block template.\r\n\r\n## Questions\r\n\r\n1. Whenever we estimate fees with the naive approach we generate a fee rate histogram with the whole mempool, we are locking mempool `cs` and creating `manual_entries` and `descendant_caches`, is that efficient?\r\n\r\n2. Every time a new block is connected we generate a block template to perform a sanity check with the naive approach this locks mempool `cs` to create `manual_entries` and `descendant_caches`, is that efficient? \r\n\r\nWe are building a normal block template with the default limit for this, the sanity checks execute in the background.\r\n\r\nIf this locking issue is a concern, to solve it I think the mempool-based fee estimator will have to implement the improved approach, which has the downside of creating another lightweight mempool, for a resource-constrained node, we can provide the option of turning it off?\r\n\r\nThe lightweight mempool DS might just be the cache of the mini miner constructor\r\n\r\n```\r\nconst std::vector<MiniMinerMempoolEntry>& manual_entries,\r\nconst std::map<Txid, std::set<Txid>>& descendant_caches\r\n```\r\n\r\nMiniMinerMempoolEntry DS https://github.com/bitcoin/bitcoin/blob/f2cc718e6920b8c45be107e2eb5ac84c4b839e50/src/node/mini_miner.h#L25\r\n\r\n\r\nThis work is the result of some discussions with @willcl-ark @glozow\r\n\r\nI would like to have feedback on the approaches before creating a PR.",
       "created_at" : "2023-10-02T09:26:07Z",
       "html_url" : "https://github.com/bitcoin/bitcoin/issues/27995#issuecomment-1742684817",
       "id" : 1742684817,
@@ -196,7 +196,7 @@
          "total_count" : 0,
          "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1742684817/reactions"
       },
-      "updated_at" : "2023-10-02T09:26:07Z",
+      "updated_at" : "2023-11-06T11:58:52Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1742684817",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/48946461?v=4",
@@ -217,6 +217,50 @@
          "subscriptions_url" : "https://api.github.com/users/ismaelsadeeq/subscriptions",
          "type" : "User",
          "url" : "https://api.github.com/users/ismaelsadeeq"
+      }
+   },
+   {
+      "author_association" : "NONE",
+      "body" : "A minimalist implementation of the second idea (\"look at the rate and feerate of transactions entering the mempool currently\"): https://code.samourai.io/oxt/one_dollar_fee_estimator\r\n\r\nFrom our observations, the estimator behaves rather well under current network conditions but as noted in the original post, no fee estimator should be used automatically without safeguards put in place. \r\n",
+      "created_at" : "2023-12-14T16:28:47Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/issues/27995#issuecomment-1856162406",
+      "id" : 1856162406,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/27995",
+      "node_id" : "IC_kwDOABII585uospm",
+      "performed_via_github_app" : null,
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1856162406/reactions"
+      },
+      "updated_at" : "2023-12-14T16:28:47Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/1856162406",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5204318?v=4",
+         "events_url" : "https://api.github.com/users/LaurentMT/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/LaurentMT/followers",
+         "following_url" : "https://api.github.com/users/LaurentMT/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/LaurentMT/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/LaurentMT",
+         "id" : 5204318,
+         "login" : "LaurentMT",
+         "node_id" : "MDQ6VXNlcjUyMDQzMTg=",
+         "organizations_url" : "https://api.github.com/users/LaurentMT/orgs",
+         "received_events_url" : "https://api.github.com/users/LaurentMT/received_events",
+         "repos_url" : "https://api.github.com/users/LaurentMT/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/LaurentMT/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/LaurentMT/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/LaurentMT"
       }
    }
 ]
