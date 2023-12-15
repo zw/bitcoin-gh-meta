@@ -991,5 +991,142 @@
          "type" : "User",
          "url" : "https://api.github.com/users/Ayush170-Future"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28236#discussion_r1417093434"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28236"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1417093434"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Seems like this should be a separate fuzz target?",
+      "commit_id" : "17a59053efb7ab2ec55ceb3aaa2288ecef016eb9",
+      "created_at" : "2023-12-06T10:50:27Z",
+      "diff_hunk" : "@@ -0,0 +1,259 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\r\n+// Distributed under the MIT software license, see the accompanying\r\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\r\n+\r\n+#include <key_io.h>\r\n+#include <outputtype.h>\r\n+#include <script/script.h>\r\n+#include <test/fuzz/FuzzedDataProvider.h>\r\n+#include <test/fuzz/fuzz.h>\r\n+#include <test/fuzz/util.h>\r\n+#include <test/util/setup_common.h>\r\n+#include <validation.h>\r\n+#include <wallet/coincontrol.h>\r\n+#include <wallet/spend.h>\r\n+#include <wallet/test/util.h>\r\n+#include <wallet/wallet.h>\r\n+\r\n+namespace wallet {\r\n+namespace {\r\n+\r\n+TestChain100Setup* g_setup;\r\n+\r\n+/**\r\n+ * Singleton wallet class ensures that only one\r\n+ * instance of CWallet is created and reused as required.\r\n+ * This increases Fuzzing efficiency by reducing the expense\r\n+ * of creating a new `Descriptor Wallet`Â each time and deletes\r\n+ * the pointer safely using the destructor.\r\n+ */\r\n+class WalletSingleton\r\n+{\r\n+public:\r\n+    static WalletSingleton& GetInstance()\r\n+    {\r\n+        static WalletSingleton instance;\r\n+        return instance;\r\n+    }\r\n+\r\n+    CWallet& GetWallet()\r\n+    {\r\n+        if (!wallet) {\r\n+            InitializeWallet();\r\n+        }\r\n+        return *wallet;\r\n+    }\r\n+    CoinsResult& GetCoins()\r\n+    {\r\n+        if (!wallet) {\r\n+            InitializeWallet();\r\n+        }\r\n+        return available_coins;\r\n+    }\r\n+\r\n+private:\r\n+    WalletSingleton()\r\n+    {\r\n+        InitializeWallet();\r\n+    }\r\n+\r\n+    ~WalletSingleton()\r\n+    {\r\n+        wallet.reset();\r\n+        available_coins.coins.clear();\r\n+    }\r\n+\r\n+    WalletSingleton(const WalletSingleton&) = delete;\r\n+    WalletSingleton& operator=(const WalletSingleton&) = delete;\r\n+\r\n+    void InitializeWallet()\r\n+    {\r\n+        auto& node{g_setup->m_node};\r\n+        wallet = CreateSyncedWallet(*node.chain, WITH_LOCK(Assert(node.chainman)->GetMutex(), return node.chainman->ActiveChain()), g_setup->coinbaseKey);\r\n+\r\n+        // This is placed here because Available Coins will never be updated while fuzzing.\r\n+        LOCK(wallet->cs_wallet);\r\n+        available_coins = AvailableCoins(*wallet);\r\n+    }\r\n+\r\n+    std::unique_ptr<CWallet> wallet;\r\n+    CoinsResult available_coins;\r\n+};\r\n+\r\n+CCoinControl GetNewCoinControl(FuzzedDataProvider& fuzzed_data_provider, CWallet& wallet, std::vector<COutput>& coins)\r\n+{\r\n+    CCoinControl new_coin_control;\r\n+    if (fuzzed_data_provider.ConsumeBool()) {\r\n+        const CTxDestination tx_destination{ConsumeTxDestination(fuzzed_data_provider)};\r\n+        new_coin_control.destChange = tx_destination;\r\n+    }\r\n+    if (fuzzed_data_provider.ConsumeBool()) {\r\n+        new_coin_control.m_change_type = fuzzed_data_provider.PickValueInArray(OUTPUT_TYPES);\r\n+    }\r\n+    new_coin_control.m_include_unsafe_inputs = fuzzed_data_provider.ConsumeBool();\r\n+    new_coin_control.m_allow_other_inputs = fuzzed_data_provider.ConsumeBool();\r\n+    if (fuzzed_data_provider.ConsumeBool()) {\r\n+        new_coin_control.m_feerate = CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/COIN)};\r\n+    }\r\n+    new_coin_control.m_signal_bip125_rbf = fuzzed_data_provider.ConsumeBool();\r\n+    new_coin_control.m_avoid_partial_spends = fuzzed_data_provider.ConsumeBool();\r\n+\r\n+    // Taking a random sub-sequence from available coins.\r\n+    for (const COutput& coin : coins) {\r\n+        if (fuzzed_data_provider.ConsumeBool()) {\r\n+            new_coin_control.Select(coin.outpoint);\r\n+        }\r\n+    }\r\n+\r\n+    // Occasionally, some random `CCoutPoint` are also selected.\r\n+    if (fuzzed_data_provider.ConsumeBool()) {\r\n+        for (int i = 0; i < 10; ++i) {\r\n+            std::optional<COutPoint> optional_out_point = ConsumeDeserializable<COutPoint>(fuzzed_data_provider);\r\n+            if (!optional_out_point) {\r\n+                continue;\r\n+            }\r\n+            new_coin_control.Select(*optional_out_point);\r\n+        }\r\n+    }\r\n+    return new_coin_control;\r\n+}\r\n+\r\n+void initialize_spend()\r\n+{\r\n+    static auto testing_setup = MakeNoLogFileContext<TestChain100Setup>();\r\n+    g_setup = testing_setup.get();\r\n+\r\n+    // Add 50 spendable UTXO, 50 BTC each, to the wallet (total balance 5000 BTC)\r\n+    // Because none of the UTXO will ever be used (marked as spent), mining this many should be sufficient.\r\n+    for (int i = 0; i < 50; ++i) {\r\n+        g_setup->CreateAndProcessBlock({}, GetScriptForRawPubKey(g_setup->coinbaseKey.GetPubKey()));\r\n+    }\r\n+}\r\n+\r\n+FUZZ_TARGET(spend, .init = initialize_spend)\r\n+{\r\n+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};\r\n+    CWallet& wallet = WalletSingleton::GetInstance().GetWallet();\r\n+    CoinsResult& available_coins = WalletSingleton::GetInstance().GetCoins();\r\n+\r\n+    // Asserting if the `wallet` has no funds.\r\n+    std::vector<COutput> coins = available_coins.All();\r\n+    assert(!coins.empty());\r\n+\r\n+    CCoinControl coin_control;\r\n+    CMutableTransaction mtx;\r\n+\r\n+    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 505)\r\n+    {\r\n+        CallOneOf(\r\n+            fuzzed_data_provider,\r\n+            [&] {\r\n+                // Creates a new `CoinControl`.\r\n+                coin_control = GetNewCoinControl(fuzzed_data_provider, wallet, coins);\r\n+            },\r\n+            [&] {\r\n+                // Creates a new Transaction using `CreateTransaction`.\r\n+                std::vector<CRecipient> recipients;\r\n+                unsigned int recipients_size = fuzzed_data_provider.ConsumeIntegralInRange<unsigned int>(0, 100);\r\n+                for (unsigned int i = 0; i < recipients_size; ++i) {\r\n+                    recipients.push_back({/*dest=*/ConsumeTxDestination(fuzzed_data_provider),\r\n+                                          /*nAmount=*/ConsumeMoney(fuzzed_data_provider),\r\n+                                          /*fSubtractFeeFromAmount=*/fuzzed_data_provider.ConsumeBool()});\r\n+                }\r\n+                // Equally likely to choose one of the three values.\r\n+                std::vector<int> random_positions = {-1, fuzzed_data_provider.ConsumeIntegralInRange<int>(0, recipients_size), fuzzed_data_provider.ConsumeIntegral<int>()};\r\n+                int change_pos = PickValue(fuzzed_data_provider, random_positions);\r\n+\r\n+                auto res = CreateTransaction(wallet, recipients, change_pos, coin_control, /*sign=*/fuzzed_data_provider.ConsumeBool());\r\n+                if (!res) return;\r\n+                mtx = CMutableTransaction(*(res->tx));\r\n+            },\r\n+            [&] {\r\n+                // Occasionally, creating a random Transaction for Fuzzing.\r\n+                auto new_mtx = ConsumeDeserializable<CMutableTransaction>(fuzzed_data_provider);\r\n+                if (!new_mtx) return;\r\n+                mtx = *new_mtx;\r\n+            },\r\n+            [&] {\r\n+                LOCK(wallet.cs_wallet);\r\n+                if (fuzzed_data_provider.ConsumeBool()) {\r\n+                    (void)CalculateMaximumSignedTxSize(CTransaction(mtx), &wallet);\r\n+                } else {\r\n+                    (void)CalculateMaximumSignedTxSize(CTransaction(mtx), &wallet, &coin_control);\r\n+                }\r\n+            },\r\n+            [&] {\r\n+                const CTxOut tx_out{ConsumeMoney(fuzzed_data_provider), ConsumeScript(fuzzed_data_provider)};\r\n+                CalculateMaximumSignedInputSize(tx_out, &wallet, &coin_control);\r\n+            },\r\n+            [&] {\r\n+                CAmount fee;\r\n+                std::vector<int> random_positions = {-1, fuzzed_data_provider.ConsumeIntegralInRange<int>(0, mtx.vout.size()), fuzzed_data_provider.ConsumeIntegral<int>()};\r\n+                int change_pos = PickValue(fuzzed_data_provider, random_positions);\r\n+                bilingual_str error;\r\n+                std::set<int> setSubtractFeeFromOutputs;\r\n+                for (size_t i = 0; i < mtx.vout.size(); ++i) {\r\n+                    if (fuzzed_data_provider.ConsumeBool()) {\r\n+                        setSubtractFeeFromOutputs.insert(i);\r\n+                    }\r\n+                }\r\n+                FundTransaction(wallet, mtx, fee, change_pos, error, false, setSubtractFeeFromOutputs, coin_control);\r\n+            });\r\n+    }\r\n+\r\n+    // Plays with the `CoinsResult`\r\n+    CoinsResult wallet_coins;\r\n+\r\n+    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 50)\r",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28236#discussion_r1417093434",
+      "id" : 1417093434,
+      "line" : 207,
+      "node_id" : "PRRC_kwDOABII585UdyE6",
+      "original_commit_id" : "17a59053efb7ab2ec55ceb3aaa2288ecef016eb9",
+      "original_line" : 207,
+      "original_position" : 207,
+      "original_start_line" : 205,
+      "path" : "src/wallet/test/fuzz/spend.cpp",
+      "position" : 207,
+      "pull_request_review_id" : 1767252938,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28236",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1417093434/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 205,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-12-06T10:51:07Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1417093434",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6399679?v=4",
+         "events_url" : "https://api.github.com/users/maflcko/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/maflcko/followers",
+         "following_url" : "https://api.github.com/users/maflcko/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/maflcko/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/maflcko",
+         "id" : 6399679,
+         "login" : "maflcko",
+         "node_id" : "MDQ6VXNlcjYzOTk2Nzk=",
+         "organizations_url" : "https://api.github.com/users/maflcko/orgs",
+         "received_events_url" : "https://api.github.com/users/maflcko/received_events",
+         "repos_url" : "https://api.github.com/users/maflcko/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/maflcko/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/maflcko/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/maflcko"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28236#discussion_r1427877760"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28236"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1427877760"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Yeah, I can create a separate PR for this immediately. Once it's ready, we can get it merged, and I can continue working on this. Thanks!",
+      "commit_id" : "17a59053efb7ab2ec55ceb3aaa2288ecef016eb9",
+      "created_at" : "2023-12-15T11:37:57Z",
+      "diff_hunk" : "@@ -0,0 +1,259 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\r\n+// Distributed under the MIT software license, see the accompanying\r\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\r\n+\r\n+#include <key_io.h>\r\n+#include <outputtype.h>\r\n+#include <script/script.h>\r\n+#include <test/fuzz/FuzzedDataProvider.h>\r\n+#include <test/fuzz/fuzz.h>\r\n+#include <test/fuzz/util.h>\r\n+#include <test/util/setup_common.h>\r\n+#include <validation.h>\r\n+#include <wallet/coincontrol.h>\r\n+#include <wallet/spend.h>\r\n+#include <wallet/test/util.h>\r\n+#include <wallet/wallet.h>\r\n+\r\n+namespace wallet {\r\n+namespace {\r\n+\r\n+TestChain100Setup* g_setup;\r\n+\r\n+/**\r\n+ * Singleton wallet class ensures that only one\r\n+ * instance of CWallet is created and reused as required.\r\n+ * This increases Fuzzing efficiency by reducing the expense\r\n+ * of creating a new `Descriptor Wallet`Â each time and deletes\r\n+ * the pointer safely using the destructor.\r\n+ */\r\n+class WalletSingleton\r\n+{\r\n+public:\r\n+    static WalletSingleton& GetInstance()\r\n+    {\r\n+        static WalletSingleton instance;\r\n+        return instance;\r\n+    }\r\n+\r\n+    CWallet& GetWallet()\r\n+    {\r\n+        if (!wallet) {\r\n+            InitializeWallet();\r\n+        }\r\n+        return *wallet;\r\n+    }\r\n+    CoinsResult& GetCoins()\r\n+    {\r\n+        if (!wallet) {\r\n+            InitializeWallet();\r\n+        }\r\n+        return available_coins;\r\n+    }\r\n+\r\n+private:\r\n+    WalletSingleton()\r\n+    {\r\n+        InitializeWallet();\r\n+    }\r\n+\r\n+    ~WalletSingleton()\r\n+    {\r\n+        wallet.reset();\r\n+        available_coins.coins.clear();\r\n+    }\r\n+\r\n+    WalletSingleton(const WalletSingleton&) = delete;\r\n+    WalletSingleton& operator=(const WalletSingleton&) = delete;\r\n+\r\n+    void InitializeWallet()\r\n+    {\r\n+        auto& node{g_setup->m_node};\r\n+        wallet = CreateSyncedWallet(*node.chain, WITH_LOCK(Assert(node.chainman)->GetMutex(), return node.chainman->ActiveChain()), g_setup->coinbaseKey);\r\n+\r\n+        // This is placed here because Available Coins will never be updated while fuzzing.\r\n+        LOCK(wallet->cs_wallet);\r\n+        available_coins = AvailableCoins(*wallet);\r\n+    }\r\n+\r\n+    std::unique_ptr<CWallet> wallet;\r\n+    CoinsResult available_coins;\r\n+};\r\n+\r\n+CCoinControl GetNewCoinControl(FuzzedDataProvider& fuzzed_data_provider, CWallet& wallet, std::vector<COutput>& coins)\r\n+{\r\n+    CCoinControl new_coin_control;\r\n+    if (fuzzed_data_provider.ConsumeBool()) {\r\n+        const CTxDestination tx_destination{ConsumeTxDestination(fuzzed_data_provider)};\r\n+        new_coin_control.destChange = tx_destination;\r\n+    }\r\n+    if (fuzzed_data_provider.ConsumeBool()) {\r\n+        new_coin_control.m_change_type = fuzzed_data_provider.PickValueInArray(OUTPUT_TYPES);\r\n+    }\r\n+    new_coin_control.m_include_unsafe_inputs = fuzzed_data_provider.ConsumeBool();\r\n+    new_coin_control.m_allow_other_inputs = fuzzed_data_provider.ConsumeBool();\r\n+    if (fuzzed_data_provider.ConsumeBool()) {\r\n+        new_coin_control.m_feerate = CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/COIN)};\r\n+    }\r\n+    new_coin_control.m_signal_bip125_rbf = fuzzed_data_provider.ConsumeBool();\r\n+    new_coin_control.m_avoid_partial_spends = fuzzed_data_provider.ConsumeBool();\r\n+\r\n+    // Taking a random sub-sequence from available coins.\r\n+    for (const COutput& coin : coins) {\r\n+        if (fuzzed_data_provider.ConsumeBool()) {\r\n+            new_coin_control.Select(coin.outpoint);\r\n+        }\r\n+    }\r\n+\r\n+    // Occasionally, some random `CCoutPoint` are also selected.\r\n+    if (fuzzed_data_provider.ConsumeBool()) {\r\n+        for (int i = 0; i < 10; ++i) {\r\n+            std::optional<COutPoint> optional_out_point = ConsumeDeserializable<COutPoint>(fuzzed_data_provider);\r\n+            if (!optional_out_point) {\r\n+                continue;\r\n+            }\r\n+            new_coin_control.Select(*optional_out_point);\r\n+        }\r\n+    }\r\n+    return new_coin_control;\r\n+}\r\n+\r\n+void initialize_spend()\r\n+{\r\n+    static auto testing_setup = MakeNoLogFileContext<TestChain100Setup>();\r\n+    g_setup = testing_setup.get();\r\n+\r\n+    // Add 50 spendable UTXO, 50 BTC each, to the wallet (total balance 5000 BTC)\r\n+    // Because none of the UTXO will ever be used (marked as spent), mining this many should be sufficient.\r\n+    for (int i = 0; i < 50; ++i) {\r\n+        g_setup->CreateAndProcessBlock({}, GetScriptForRawPubKey(g_setup->coinbaseKey.GetPubKey()));\r\n+    }\r\n+}\r\n+\r\n+FUZZ_TARGET(spend, .init = initialize_spend)\r\n+{\r\n+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};\r\n+    CWallet& wallet = WalletSingleton::GetInstance().GetWallet();\r\n+    CoinsResult& available_coins = WalletSingleton::GetInstance().GetCoins();\r\n+\r\n+    // Asserting if the `wallet` has no funds.\r\n+    std::vector<COutput> coins = available_coins.All();\r\n+    assert(!coins.empty());\r\n+\r\n+    CCoinControl coin_control;\r\n+    CMutableTransaction mtx;\r\n+\r\n+    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 505)\r\n+    {\r\n+        CallOneOf(\r\n+            fuzzed_data_provider,\r\n+            [&] {\r\n+                // Creates a new `CoinControl`.\r\n+                coin_control = GetNewCoinControl(fuzzed_data_provider, wallet, coins);\r\n+            },\r\n+            [&] {\r\n+                // Creates a new Transaction using `CreateTransaction`.\r\n+                std::vector<CRecipient> recipients;\r\n+                unsigned int recipients_size = fuzzed_data_provider.ConsumeIntegralInRange<unsigned int>(0, 100);\r\n+                for (unsigned int i = 0; i < recipients_size; ++i) {\r\n+                    recipients.push_back({/*dest=*/ConsumeTxDestination(fuzzed_data_provider),\r\n+                                          /*nAmount=*/ConsumeMoney(fuzzed_data_provider),\r\n+                                          /*fSubtractFeeFromAmount=*/fuzzed_data_provider.ConsumeBool()});\r\n+                }\r\n+                // Equally likely to choose one of the three values.\r\n+                std::vector<int> random_positions = {-1, fuzzed_data_provider.ConsumeIntegralInRange<int>(0, recipients_size), fuzzed_data_provider.ConsumeIntegral<int>()};\r\n+                int change_pos = PickValue(fuzzed_data_provider, random_positions);\r\n+\r\n+                auto res = CreateTransaction(wallet, recipients, change_pos, coin_control, /*sign=*/fuzzed_data_provider.ConsumeBool());\r\n+                if (!res) return;\r\n+                mtx = CMutableTransaction(*(res->tx));\r\n+            },\r\n+            [&] {\r\n+                // Occasionally, creating a random Transaction for Fuzzing.\r\n+                auto new_mtx = ConsumeDeserializable<CMutableTransaction>(fuzzed_data_provider);\r\n+                if (!new_mtx) return;\r\n+                mtx = *new_mtx;\r\n+            },\r\n+            [&] {\r\n+                LOCK(wallet.cs_wallet);\r\n+                if (fuzzed_data_provider.ConsumeBool()) {\r\n+                    (void)CalculateMaximumSignedTxSize(CTransaction(mtx), &wallet);\r\n+                } else {\r\n+                    (void)CalculateMaximumSignedTxSize(CTransaction(mtx), &wallet, &coin_control);\r\n+                }\r\n+            },\r\n+            [&] {\r\n+                const CTxOut tx_out{ConsumeMoney(fuzzed_data_provider), ConsumeScript(fuzzed_data_provider)};\r\n+                CalculateMaximumSignedInputSize(tx_out, &wallet, &coin_control);\r\n+            },\r\n+            [&] {\r\n+                CAmount fee;\r\n+                std::vector<int> random_positions = {-1, fuzzed_data_provider.ConsumeIntegralInRange<int>(0, mtx.vout.size()), fuzzed_data_provider.ConsumeIntegral<int>()};\r\n+                int change_pos = PickValue(fuzzed_data_provider, random_positions);\r\n+                bilingual_str error;\r\n+                std::set<int> setSubtractFeeFromOutputs;\r\n+                for (size_t i = 0; i < mtx.vout.size(); ++i) {\r\n+                    if (fuzzed_data_provider.ConsumeBool()) {\r\n+                        setSubtractFeeFromOutputs.insert(i);\r\n+                    }\r\n+                }\r\n+                FundTransaction(wallet, mtx, fee, change_pos, error, false, setSubtractFeeFromOutputs, coin_control);\r\n+            });\r\n+    }\r\n+\r\n+    // Plays with the `CoinsResult`\r\n+    CoinsResult wallet_coins;\r\n+\r\n+    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 50)\r",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28236#discussion_r1427877760",
+      "id" : 1427877760,
+      "in_reply_to_id" : 1417093434,
+      "line" : 207,
+      "node_id" : "PRRC_kwDOABII585VG6-A",
+      "original_commit_id" : "17a59053efb7ab2ec55ceb3aaa2288ecef016eb9",
+      "original_line" : 207,
+      "original_position" : 207,
+      "original_start_line" : 205,
+      "path" : "src/wallet/test/fuzz/spend.cpp",
+      "position" : 207,
+      "pull_request_review_id" : 1783688791,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28236",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1427877760/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 205,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2023-12-15T11:38:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1427877760",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/76209654?v=4",
+         "events_url" : "https://api.github.com/users/Ayush170-Future/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Ayush170-Future/followers",
+         "following_url" : "https://api.github.com/users/Ayush170-Future/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Ayush170-Future/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Ayush170-Future",
+         "id" : 76209654,
+         "login" : "Ayush170-Future",
+         "node_id" : "MDQ6VXNlcjc2MjA5NjU0",
+         "organizations_url" : "https://api.github.com/users/Ayush170-Future/orgs",
+         "received_events_url" : "https://api.github.com/users/Ayush170-Future/received_events",
+         "repos_url" : "https://api.github.com/users/Ayush170-Future/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Ayush170-Future/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Ayush170-Future/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Ayush170-Future"
+      }
    }
 ]
