@@ -1033,5 +1033,141 @@
          "type" : "User",
          "url" : "https://api.github.com/users/sdaftuar"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28984#discussion_r1428378451"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28984"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1428378451"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "too many zeroes on this, it's a 1/10 of a sat",
+      "commit_id" : "39c09efadeb5e23a8eee754b86ce4fbea2b0e30c",
+      "created_at" : "2023-12-15T19:07:51Z",
+      "diff_hunk" : "@@ -0,0 +1,590 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2021 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+from decimal import Decimal\n+\n+from test_framework.blocktools import COINBASE_MATURITY\n+from test_framework.messages import (\n+    COIN,\n+    MAX_BIP125_RBF_SEQUENCE,\n+)\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+    assert_greater_than_or_equal,\n+    assert_raises_rpc_error,\n+    assert_equal,\n+    assert_greater_than,\n+    create_lots_of_big_transactions,\n+    gen_return_txouts,\n+)\n+from test_framework.wallet import (\n+    DEFAULT_FEE,\n+    MiniWallet,\n+)\n+\n+class PackageRBFTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.setup_clean_chain = True\n+        # Required for fill_mempool()\n+        self.extra_args = [[\n+            \"-datacarriersize=100000\",\n+            \"-maxmempool=5\",\n+        ]]\n+\n+    def fill_mempool(self):\n+        \"\"\"Fill mempool until eviction.\"\"\"\n+        self.log.info(\"Fill the mempool until eviction is triggered and the mempoolminfee rises\")\n+        txouts = gen_return_txouts()\n+        node = self.nodes[0]\n+        miniwallet = self.wallet\n+        relayfee = node.getnetworkinfo()['relayfee']\n+\n+        tx_batch_size = 1\n+        num_of_batches = 75\n+        # Generate UTXOs to flood the mempool\n+        # 1 to create a tx initially that will be evicted from the mempool later\n+        # 75 transactions each with a fee rate higher than the previous one\n+        # And 1 more to verify that this tx does not get added to the mempool with a fee rate less than the mempoolminfee\n+        # And 2 more for the package cpfp test\n+        self.generate(miniwallet, 1 + (num_of_batches * tx_batch_size))\n+\n+        # Mine 99 blocks so that the UTXOs are allowed to be spent\n+        self.generate(node, COINBASE_MATURITY - 1)\n+\n+        self.log.debug(\"Create a mempool tx that will be evicted\")\n+        tx_to_be_evicted_id = miniwallet.send_self_transfer(from_node=node, fee_rate=relayfee)[\"txid\"]\n+\n+        # Increase the tx fee rate to give the subsequent transactions a higher priority in the mempool\n+        # The tx has an approx. vsize of 65k, i.e. multiplying the previous fee rate (in sats/kvB)\n+        # by 130 should result in a fee that corresponds to 2x of that fee rate\n+        base_fee = relayfee * 130\n+\n+        self.log.debug(\"Fill up the mempool with txs with higher fee rate\")\n+        with node.assert_debug_log([\"rolling minimum fee bumped\"]):\n+            for batch_of_txid in range(num_of_batches):\n+                fee = (batch_of_txid + 1) * base_fee\n+                create_lots_of_big_transactions(miniwallet, node, fee, tx_batch_size, txouts)\n+\n+        self.log.debug(\"The tx should be evicted by now\")\n+        # The number of transactions created should be greater than the ones present in the mempool\n+        assert_greater_than(tx_batch_size * num_of_batches, len(node.getrawmempool()))\n+        # Initial tx created should not be present in the mempool anymore as it had a lower fee rate\n+        assert tx_to_be_evicted_id not in node.getrawmempool()\n+\n+        self.log.debug(\"Check that mempoolminfee is larger than minrelaytxfee\")\n+        assert_equal(node.getmempoolinfo()['minrelaytxfee'], Decimal('0.00001000'))\n+        assert_greater_than(node.getmempoolinfo()['mempoolminfee'], Decimal('0.00001000'))\n+\n+    def assert_mempool_contents(self, expected=None, unexpected=None):\n+        \"\"\"Assert that all transactions in expected are in the mempool,\n+        and all transactions in unexpected are not in the mempool.\n+        \"\"\"\n+        if not expected:\n+            expected = []\n+        if not unexpected:\n+            unexpected = []\n+        assert set(unexpected).isdisjoint(expected)\n+        mempool = self.nodes[0].getrawmempool(verbose=False)\n+        for tx in expected:\n+            assert tx.rehash() in mempool\n+        for tx in unexpected:\n+            assert tx.rehash() not in mempool\n+\n+    def create_simple_package(self, parent_coin, parent_fee=DEFAULT_FEE, child_fee=DEFAULT_FEE, heavy_child=False):\n+        \"\"\"Create a 1 parent 1 child package using the coin passed in as the parent's input. The\n+        parent has 1 output, used to fund 1 child transaction.\n+        All transactions signal BIP125 replaceability, but nSequence changes based on self.ctr. This\n+        prevents identical txids between packages when the parents spend the same coin and have the\n+        same fee (i.e. 0sat).\n+\n+        returns tuple (hex serialized txns, CTransaction objects)\n+        \"\"\"\n+        self.ctr += 1\n+        # Use fee_rate=0 because create_self_transfer will use the default fee_rate value otherwise.\n+        # Passing in fee>0 overrides fee_rate, so this still works for non-zero parent_fee.\n+        parent_result = self.wallet.create_self_transfer(\n+            fee_rate=0,\n+            fee=parent_fee,\n+            utxo_to_spend=parent_coin,\n+            sequence=MAX_BIP125_RBF_SEQUENCE - self.ctr,\n+        )\n+\n+        num_child_outputs = 10 if heavy_child else 1\n+        child_result = self.wallet.create_self_transfer_multi(\n+            utxos_to_spend=[parent_result[\"new_utxo\"]],\n+            num_outputs=num_child_outputs,\n+            fee_per_output=int(child_fee * COIN // num_child_outputs),\n+            sequence=MAX_BIP125_RBF_SEQUENCE - self.ctr,\n+        )\n+        package_hex = [parent_result[\"hex\"], child_result[\"hex\"]]\n+        package_txns = [parent_result[\"tx\"], child_result[\"tx\"]]\n+        return package_hex, package_txns\n+\n+    def run_test(self):\n+        # Counter used to count the number of times we constructed packages. Since we're constructing parent transactions with the same\n+        # coins (to create conflicts), and giving them the same fee (i.e. 0, since their respective children are paying), we might\n+        # accidentally just create the exact same transaction again. To prevent this, set nSequences to MAX_BIP125_RBF_SEQUENCE - self.ctr.\n+        self.ctr = 0\n+\n+        self.log.info(\"Generate blocks to create UTXOs\")\n+        node = self.nodes[0]\n+        self.wallet = MiniWallet(node)\n+        self.generate(self.wallet, 160)\n+        self.coins = self.wallet.get_utxos(mark_as_spent=False)\n+        # Mature coinbase transactions\n+        self.generate(self.wallet, 100)\n+        self.address = self.wallet.get_address()\n+\n+        self.test_package_rbf_basic()\n+        self.test_package_rbf_additional_fees()\n+        self.test_package_rbf_max_conflicts()\n+        self.test_package_rbf_conflicting_conflicts()\n+        self.test_package_rbf_partial()\n+        self.test_too_numerous_ancestors()\n+        self.test_too_numerous_pkg()\n+        self.test_insufficient_feerate()\n+        self.test_wrong_conflict_cluster_size_linear()\n+        self.test_wrong_conflict_cluster_size_parents_child()\n+        self.test_wrong_conflict_cluster_size_parent_children()\n+        self.test_child_conflicts_parent_mempool_ancestor()\n+\n+    def test_package_rbf_basic(self):\n+        self.log.info(\"Test that a child can pay to replace its parents' conflicts\")\n+        node = self.nodes[0]\n+        # Reuse the same coins so that the transactions conflict with one another.\n+        parent_coin = self.coins.pop()\n+        package_hex1, package_txns1 = self.create_simple_package(parent_coin, DEFAULT_FEE, DEFAULT_FEE)\n+        package_hex2, package_txns2 = self.create_simple_package(parent_coin, DEFAULT_FEE, DEFAULT_FEE * 5)\n+        node.submitpackage(package_hex1)\n+        self.assert_mempool_contents(expected=package_txns1, unexpected=package_txns2)\n+\n+        submitres = node.submitpackage(package_hex2)\n+        submitres[\"replaced-transactions\"] == [tx.rehash() for tx in package_txns1]\n+        self.assert_mempool_contents(expected=package_txns2, unexpected=package_txns1)\n+        self.generate(node, 1)\n+\n+    def test_package_rbf_additional_fees(self):\n+        self.log.info(\"Check Package RBF must increase the absolute fee\")\n+        node = self.nodes[0]\n+        coin = self.coins.pop()\n+\n+        # avoid parent pays for child anti-DoS checks\n+        fee_delta = DEFAULT_FEE / 2\n+\n+        package_hex1, package_txns1 = self.create_simple_package(coin, parent_fee=DEFAULT_FEE - fee_delta, child_fee=DEFAULT_FEE + fee_delta, heavy_child=True)\n+        assert_greater_than_or_equal(1000, package_txns1[-1].get_vsize())\n+        node.submitpackage(package_hex1)\n+        self.assert_mempool_contents(expected=package_txns1)\n+\n+        # Package 2 has a higher feerate but lower absolute fee\n+        package_hex2, package_txns2 = self.create_simple_package(coin, parent_fee=DEFAULT_FEE - fee_delta, child_fee=DEFAULT_FEE + fee_delta - Decimal(\"0.000000001\"))",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28984#discussion_r1428378451",
+      "id" : 1428378451,
+      "line" : 183,
+      "node_id" : "PRRC_kwDOABII585VI1NT",
+      "original_commit_id" : "39c09efadeb5e23a8eee754b86ce4fbea2b0e30c",
+      "original_line" : 183,
+      "original_position" : 183,
+      "original_start_line" : null,
+      "path" : "test/functional/mempool_package_rbf.py",
+      "position" : 183,
+      "pull_request_review_id" : 1784767020,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28984",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1428378451/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-12-15T19:07:52Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1428378451",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28984#discussion_r1428379004"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28984"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1428379004"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "too many zeroes on this, it's a 1/10 of a sat",
+      "commit_id" : "39c09efadeb5e23a8eee754b86ce4fbea2b0e30c",
+      "created_at" : "2023-12-15T19:08:27Z",
+      "diff_hunk" : "@@ -0,0 +1,590 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2021 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+from decimal import Decimal\n+\n+from test_framework.blocktools import COINBASE_MATURITY\n+from test_framework.messages import (\n+    COIN,\n+    MAX_BIP125_RBF_SEQUENCE,\n+)\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+    assert_greater_than_or_equal,\n+    assert_raises_rpc_error,\n+    assert_equal,\n+    assert_greater_than,\n+    create_lots_of_big_transactions,\n+    gen_return_txouts,\n+)\n+from test_framework.wallet import (\n+    DEFAULT_FEE,\n+    MiniWallet,\n+)\n+\n+class PackageRBFTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.setup_clean_chain = True\n+        # Required for fill_mempool()\n+        self.extra_args = [[\n+            \"-datacarriersize=100000\",\n+            \"-maxmempool=5\",\n+        ]]\n+\n+    def fill_mempool(self):\n+        \"\"\"Fill mempool until eviction.\"\"\"\n+        self.log.info(\"Fill the mempool until eviction is triggered and the mempoolminfee rises\")\n+        txouts = gen_return_txouts()\n+        node = self.nodes[0]\n+        miniwallet = self.wallet\n+        relayfee = node.getnetworkinfo()['relayfee']\n+\n+        tx_batch_size = 1\n+        num_of_batches = 75\n+        # Generate UTXOs to flood the mempool\n+        # 1 to create a tx initially that will be evicted from the mempool later\n+        # 75 transactions each with a fee rate higher than the previous one\n+        # And 1 more to verify that this tx does not get added to the mempool with a fee rate less than the mempoolminfee\n+        # And 2 more for the package cpfp test\n+        self.generate(miniwallet, 1 + (num_of_batches * tx_batch_size))\n+\n+        # Mine 99 blocks so that the UTXOs are allowed to be spent\n+        self.generate(node, COINBASE_MATURITY - 1)\n+\n+        self.log.debug(\"Create a mempool tx that will be evicted\")\n+        tx_to_be_evicted_id = miniwallet.send_self_transfer(from_node=node, fee_rate=relayfee)[\"txid\"]\n+\n+        # Increase the tx fee rate to give the subsequent transactions a higher priority in the mempool\n+        # The tx has an approx. vsize of 65k, i.e. multiplying the previous fee rate (in sats/kvB)\n+        # by 130 should result in a fee that corresponds to 2x of that fee rate\n+        base_fee = relayfee * 130\n+\n+        self.log.debug(\"Fill up the mempool with txs with higher fee rate\")\n+        with node.assert_debug_log([\"rolling minimum fee bumped\"]):\n+            for batch_of_txid in range(num_of_batches):\n+                fee = (batch_of_txid + 1) * base_fee\n+                create_lots_of_big_transactions(miniwallet, node, fee, tx_batch_size, txouts)\n+\n+        self.log.debug(\"The tx should be evicted by now\")\n+        # The number of transactions created should be greater than the ones present in the mempool\n+        assert_greater_than(tx_batch_size * num_of_batches, len(node.getrawmempool()))\n+        # Initial tx created should not be present in the mempool anymore as it had a lower fee rate\n+        assert tx_to_be_evicted_id not in node.getrawmempool()\n+\n+        self.log.debug(\"Check that mempoolminfee is larger than minrelaytxfee\")\n+        assert_equal(node.getmempoolinfo()['minrelaytxfee'], Decimal('0.00001000'))\n+        assert_greater_than(node.getmempoolinfo()['mempoolminfee'], Decimal('0.00001000'))\n+\n+    def assert_mempool_contents(self, expected=None, unexpected=None):\n+        \"\"\"Assert that all transactions in expected are in the mempool,\n+        and all transactions in unexpected are not in the mempool.\n+        \"\"\"\n+        if not expected:\n+            expected = []\n+        if not unexpected:\n+            unexpected = []\n+        assert set(unexpected).isdisjoint(expected)\n+        mempool = self.nodes[0].getrawmempool(verbose=False)\n+        for tx in expected:\n+            assert tx.rehash() in mempool\n+        for tx in unexpected:\n+            assert tx.rehash() not in mempool\n+\n+    def create_simple_package(self, parent_coin, parent_fee=DEFAULT_FEE, child_fee=DEFAULT_FEE, heavy_child=False):\n+        \"\"\"Create a 1 parent 1 child package using the coin passed in as the parent's input. The\n+        parent has 1 output, used to fund 1 child transaction.\n+        All transactions signal BIP125 replaceability, but nSequence changes based on self.ctr. This\n+        prevents identical txids between packages when the parents spend the same coin and have the\n+        same fee (i.e. 0sat).\n+\n+        returns tuple (hex serialized txns, CTransaction objects)\n+        \"\"\"\n+        self.ctr += 1\n+        # Use fee_rate=0 because create_self_transfer will use the default fee_rate value otherwise.\n+        # Passing in fee>0 overrides fee_rate, so this still works for non-zero parent_fee.\n+        parent_result = self.wallet.create_self_transfer(\n+            fee_rate=0,\n+            fee=parent_fee,\n+            utxo_to_spend=parent_coin,\n+            sequence=MAX_BIP125_RBF_SEQUENCE - self.ctr,\n+        )\n+\n+        num_child_outputs = 10 if heavy_child else 1\n+        child_result = self.wallet.create_self_transfer_multi(\n+            utxos_to_spend=[parent_result[\"new_utxo\"]],\n+            num_outputs=num_child_outputs,\n+            fee_per_output=int(child_fee * COIN // num_child_outputs),\n+            sequence=MAX_BIP125_RBF_SEQUENCE - self.ctr,\n+        )\n+        package_hex = [parent_result[\"hex\"], child_result[\"hex\"]]\n+        package_txns = [parent_result[\"tx\"], child_result[\"tx\"]]\n+        return package_hex, package_txns\n+\n+    def run_test(self):\n+        # Counter used to count the number of times we constructed packages. Since we're constructing parent transactions with the same\n+        # coins (to create conflicts), and giving them the same fee (i.e. 0, since their respective children are paying), we might\n+        # accidentally just create the exact same transaction again. To prevent this, set nSequences to MAX_BIP125_RBF_SEQUENCE - self.ctr.\n+        self.ctr = 0\n+\n+        self.log.info(\"Generate blocks to create UTXOs\")\n+        node = self.nodes[0]\n+        self.wallet = MiniWallet(node)\n+        self.generate(self.wallet, 160)\n+        self.coins = self.wallet.get_utxos(mark_as_spent=False)\n+        # Mature coinbase transactions\n+        self.generate(self.wallet, 100)\n+        self.address = self.wallet.get_address()\n+\n+        self.test_package_rbf_basic()\n+        self.test_package_rbf_additional_fees()\n+        self.test_package_rbf_max_conflicts()\n+        self.test_package_rbf_conflicting_conflicts()\n+        self.test_package_rbf_partial()\n+        self.test_too_numerous_ancestors()\n+        self.test_too_numerous_pkg()\n+        self.test_insufficient_feerate()\n+        self.test_wrong_conflict_cluster_size_linear()\n+        self.test_wrong_conflict_cluster_size_parents_child()\n+        self.test_wrong_conflict_cluster_size_parent_children()\n+        self.test_child_conflicts_parent_mempool_ancestor()\n+\n+    def test_package_rbf_basic(self):\n+        self.log.info(\"Test that a child can pay to replace its parents' conflicts\")\n+        node = self.nodes[0]\n+        # Reuse the same coins so that the transactions conflict with one another.\n+        parent_coin = self.coins.pop()\n+        package_hex1, package_txns1 = self.create_simple_package(parent_coin, DEFAULT_FEE, DEFAULT_FEE)\n+        package_hex2, package_txns2 = self.create_simple_package(parent_coin, DEFAULT_FEE, DEFAULT_FEE * 5)\n+        node.submitpackage(package_hex1)\n+        self.assert_mempool_contents(expected=package_txns1, unexpected=package_txns2)\n+\n+        submitres = node.submitpackage(package_hex2)\n+        submitres[\"replaced-transactions\"] == [tx.rehash() for tx in package_txns1]\n+        self.assert_mempool_contents(expected=package_txns2, unexpected=package_txns1)\n+        self.generate(node, 1)\n+\n+    def test_package_rbf_additional_fees(self):\n+        self.log.info(\"Check Package RBF must increase the absolute fee\")\n+        node = self.nodes[0]\n+        coin = self.coins.pop()\n+\n+        # avoid parent pays for child anti-DoS checks\n+        fee_delta = DEFAULT_FEE / 2\n+\n+        package_hex1, package_txns1 = self.create_simple_package(coin, parent_fee=DEFAULT_FEE - fee_delta, child_fee=DEFAULT_FEE + fee_delta, heavy_child=True)\n+        assert_greater_than_or_equal(1000, package_txns1[-1].get_vsize())\n+        node.submitpackage(package_hex1)\n+        self.assert_mempool_contents(expected=package_txns1)\n+\n+        # Package 2 has a higher feerate but lower absolute fee\n+        package_hex2, package_txns2 = self.create_simple_package(coin, parent_fee=DEFAULT_FEE - fee_delta, child_fee=DEFAULT_FEE + fee_delta - Decimal(\"0.000000001\"))\n+        pkg_results2 = node.submitpackage(package_hex2)\n+        assert_equal(pkg_results2[\"package_msg\"], 'package RBF failed: insufficient anti-DoS fees')\n+        self.assert_mempool_contents(expected=package_txns1, unexpected=package_txns2)\n+        # Package 3 has a higher feerate and absolute fee\n+        package_hex3, package_txns3 = self.create_simple_package(coin, parent_fee=DEFAULT_FEE, child_fee=DEFAULT_FEE * 3)\n+        node.submitpackage(package_hex3)\n+        self.assert_mempool_contents(expected=package_txns3, unexpected=package_txns1 + package_txns2)\n+        self.generate(node, 1)\n+\n+        self.log.info(\"Check Package RBF must pay for the entire package's bandwidth\")\n+        coin = self.coins.pop()\n+        package_hex4, package_txns4 = self.create_simple_package(coin, parent_fee=DEFAULT_FEE, child_fee=DEFAULT_FEE)\n+        node.submitpackage(package_hex4)\n+        self.assert_mempool_contents(expected=package_txns4, unexpected=[])\n+        package_hex5, package_txns5 = self.create_simple_package(coin, parent_fee=DEFAULT_FEE - fee_delta, child_fee=DEFAULT_FEE + fee_delta + Decimal(\"0.000000001\"))",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28984#discussion_r1428379004",
+      "id" : 1428379004,
+      "line" : 198,
+      "node_id" : "PRRC_kwDOABII585VI1V8",
+      "original_commit_id" : "39c09efadeb5e23a8eee754b86ce4fbea2b0e30c",
+      "original_line" : 198,
+      "original_position" : 198,
+      "original_start_line" : null,
+      "path" : "test/functional/mempool_package_rbf.py",
+      "position" : 198,
+      "pull_request_review_id" : 1784767711,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28984",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1428379004/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-12-15T19:08:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1428379004",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
    }
 ]
