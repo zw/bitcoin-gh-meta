@@ -1086,5 +1086,350 @@
          "type" : "User",
          "url" : "https://api.github.com/users/instagibbs"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29242#discussion_r1455527026"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29242"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455527026"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I meant what is being returned by `err_string` and `CompareFeerateDiagram` was not used. why were you unable to compute mining score, same for `CompareFeerateDiagram` why is the fee rate insufficient.",
+      "commit_id" : "5da41e6f851b53d5639dc12aa3d6c308a8a8b403",
+      "created_at" : "2024-01-17T13:11:40Z",
+      "diff_hunk" : "@@ -181,3 +201,108 @@ std::optional<std::string> PaysForRBF(CAmount original_fees,\n     }\n     return std::nullopt;\n }\n+\n+// Compare two feerate points, where one of the points is interpolated from\n+// existing points in a feerate diagram.\n+// Return 1 if the interpolated point is greater than fee_compare; 0 if they\n+// are equal; -1 otherwise.\n+int InterpolateValueAndCompare(int64_t eval_size, const FeeFrac& p1, const FeeFrac& p2, CAmount fee_compare)\n+{\n+    // Interpolate between two points using the formula:\n+    // y = y1 + (x - x1) * (y2 - y1) / (x2 - x1)\n+    // i.e.\n+    // y = p1.fee + (eval_size - p1.size) * (p2.fee - p1.fee) / (p2.size - p2.size)\n+    // fee_compare = fee value we want to compare against the interpolated y\n+    //\n+    // Then evaluating y > fee_compare is equivalent to checking if y*(x2-x1) > fee_compare*(x2-x1),\n+    // or y1*(x2-x1) + (x - x1) * (y2 - y1) > fee_compare*(x2-x1).\n+    const auto fee_compare_scaled = Mul128(fee_compare, p2.size - p1.size);\n+    const auto y_scaled = Add128(Mul128(p1.fee, p2.size - p1.size), Mul128(eval_size - p1.size , p2.fee - p1.fee));\n+\n+    if (y_scaled > fee_compare_scaled) {\n+        return 1;\n+    } else if (y_scaled == fee_compare_scaled) {\n+        return 0;\n+    } else {\n+        return -1;\n+    }\n+}\n+\n+// returns true if the new_diagram is strictly better than the old one; false\n+// otherwise.\n+bool CompareFeerateDiagram(std::vector<FeeFrac>& old_diagram, std::vector<FeeFrac>& new_diagram)\n+{\n+    size_t old_index=0;\n+    size_t new_index=0;\n+\n+    // whether the new diagram has at least one point better than old_diagram\n+    bool new_better = false;\n+\n+    // whether the old diagram has at least one point better than new_diagram\n+    bool old_better = false;\n+\n+    // Diagrams should be non-empty, and first elements zero in size and fee\n+    Assert(!old_diagram.empty() && !new_diagram.empty());\n+    Assert(old_diagram[0].fee == 0 && old_diagram[0].size == 0);\n+    Assert(new_diagram[0].fee == 0 && new_diagram[0].size == 0);\n+\n+    // Start by padding the smaller diagram with a transaction that pays the\n+    // tail feerate up to the size of the larger diagram.\n+    // For now, use an implicit tail feerate of 0, but we can change this if\n+    // there's an argument to be made that the true tail feerate is higher.\n+    // Also, if we end up needing to transform the feerates (eg to avoid\n+    // negative numbers or overflow in the calculations?), then the tail\n+    // feerate would need to be transformed as well.\n+    if (old_diagram.back().size < new_diagram.back().size) {\n+        old_diagram.emplace_back(old_diagram.back().fee, new_diagram.back().size);\n+    } else if (old_diagram.back().size > new_diagram.back().size) {\n+        new_diagram.emplace_back(new_diagram.back().fee, old_diagram.back().size);\n+    }\n+\n+    while (old_index < old_diagram.size() && new_index < new_diagram.size()) {\n+        int cmp = 0;\n+        if (old_diagram[old_index].size < new_diagram[new_index].size) {\n+            cmp = InterpolateValueAndCompare(old_diagram[old_index].size, new_diagram[new_index-1], new_diagram[new_index], old_diagram[old_index].fee);\n+            old_better |= (cmp == -1);\n+            new_better |= (cmp == 1);\n+            old_index++;\n+        } else if (old_diagram[old_index].size > new_diagram[new_index].size) {\n+            cmp = InterpolateValueAndCompare(new_diagram[new_index].size, old_diagram[old_index-1], old_diagram[old_index], new_diagram[new_index].fee);\n+            old_better |= (cmp == 1);\n+            new_better |= (cmp == -1);\n+            new_index++;\n+        } else {\n+            if (old_diagram[old_index].fee > new_diagram[new_index].fee) {\n+                old_better = true;\n+            } else if (old_diagram[old_index].fee < new_diagram[new_index].fee) {\n+                new_better = true;\n+            }\n+            old_index++;\n+            new_index++;\n+        }\n+    }\n+\n+    // New is better at least one point, and at least as good on all points; we'll take it\n+    return new_better && !old_better;\n+}\n+\n+std::optional<std::string> ImprovesFeerateDiagram(CTxMemPool& pool,\n+                                                const CTxMemPool::setEntries& direct_conflicts,\n+                                                const CTxMemPool::setEntries& all_conflicts,\n+                                                int64_t replacement_vsize,\n+                                                CAmount replacement_fees)\n+{\n+    // Require that the replacement strictly improve the mempool's fee vs. size diagram.\n+    std::vector<FeeFrac> old_diagram, new_diagram;\n+\n+    const auto err_string{pool.CalculateFeerateDiagramsForRBF(replacement_fees, replacement_vsize, direct_conflicts, all_conflicts, old_diagram, new_diagram)};\n+\n+    if (err_string.has_value()) {\n+        return strprintf(\"unable to compute mining score\");\n+    }\n+\n+    if (!CompareFeerateDiagram(old_diagram, new_diagram)) {\n+        return strprintf(\"insufficient feerate\");\n+    }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29242#discussion_r1455527026",
+      "id" : 1455527026,
+      "in_reply_to_id" : 1453667765,
+      "line" : 306,
+      "node_id" : "PRRC_kwDOABII585WwZRy",
+      "original_commit_id" : "ab9a952bdd1406a4fc9fa71c63e6fbecb78d0a4b",
+      "original_line" : 306,
+      "original_position" : 133,
+      "original_start_line" : 300,
+      "path" : "src/policy/rbf.cpp",
+      "position" : 133,
+      "pull_request_review_id" : 1827266447,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29242",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455527026/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 300,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2024-01-17T13:11:40Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455527026",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48946461?v=4",
+         "events_url" : "https://api.github.com/users/ismaelsadeeq/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ismaelsadeeq/followers",
+         "following_url" : "https://api.github.com/users/ismaelsadeeq/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ismaelsadeeq/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ismaelsadeeq",
+         "id" : 48946461,
+         "login" : "ismaelsadeeq",
+         "node_id" : "MDQ6VXNlcjQ4OTQ2NDYx",
+         "organizations_url" : "https://api.github.com/users/ismaelsadeeq/orgs",
+         "received_events_url" : "https://api.github.com/users/ismaelsadeeq/received_events",
+         "repos_url" : "https://api.github.com/users/ismaelsadeeq/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ismaelsadeeq/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ismaelsadeeq/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ismaelsadeeq"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29242#discussion_r1455534078"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29242"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455534078"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "also, `Subtrack` isn't a word...",
+      "commit_id" : "5da41e6f851b53d5639dc12aa3d6c308a8a8b403",
+      "created_at" : "2024-01-17T13:14:53Z",
+      "diff_hunk" : "@@ -0,0 +1,158 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_FEEFRAC_H\n+#define BITCOIN_UTIL_FEEFRAC_H\n+\n+#include <assert.h>\n+#include <stdint.h>\n+#include <algorithm>\n+#include <compare>\n+#include <vector>\n+\n+namespace {\n+\n+inline std::pair<int64_t, uint64_t> Mul128(int64_t a, int64_t b)\n+{\n+#ifdef __SIZEOF_INT128__\n+    __int128 ret = (__int128)a * b;\n+    return {ret >> 64, ret};\n+#else\n+    uint64_t ll = (uint64_t)(uint32_t)a * (uint32_t)b;\n+    int64_t lh = (uint32_t)a * (b >> 32);\n+    int64_t hl = (a >> 32) * (uint32_t)b;\n+    int64_t hh = (a >> 32) * (b >> 32);\n+    uint64_t mid34 = (ll >> 32) + (uint32_t)lh + (uint32_t)hl;\n+    int64_t hi = hh + (lh >> 32) + (hl >> 32) + (mid34 >> 32);\n+    uint64_t lo = (mid34 << 32) + (uint32_t)ll;\n+    return {hi, lo};\n+#endif\n+}\n+\n+} // namespace\n+\n+/** Data structure storing a fee and size, ordered by increasing fee/size.\n+ *\n+ * The size of a FeeFrac cannot be zero unless the fee is also zero.\n+ *\n+ * FeeFracs have a total ordering, first by increasing feerate (ratio of fee over size), and then\n+ * by decreasing size. The empty FeeFrac (fee and size both 0) sorts last. So for example, the\n+ * following FeeFracs are in sorted order:\n+ *\n+ * - fee=0 size=1 (feerate 0)\n+ * - fee=1 size=2 (feerate 0.5)\n+ * - fee=2 size=3 (feerate 0.667...)\n+ * - fee=2 size=2 (feerate 1)\n+ * - fee=1 size=1 (feerate 1)\n+ * - fee=3 size=2 (feerate 1.5)\n+ * - fee=2 size=1 (feerate 2)\n+ * - fee=0 size=0 (undefined feerate)\n+ *\n+ * A FeeFrac is considered \"better\" if it sorts after another, by this ordering. All standard\n+ * comparison operators (==, !=, >, <, >=, <=, <=>) respect this ordering.\n+ *\n+ * The >> and << operators only compare feerate and treat equal feerate but different size as\n+ * equivalent. The empty FeeFrac is neither lower or higher in feerate than any other.\n+ * The FeeRateCompare function returns the three-way comparison for this order.\n+ */\n+struct FeeFrac\n+{\n+    /** Fee. */\n+    int64_t fee;\n+    /** Size. */\n+    int32_t size;\n+\n+    /** Construct an IsEmpty() FeeFrac. */\n+    inline FeeFrac() noexcept : fee{0}, size{0} {}\n+\n+    /** Construct a FeeFrac with specified fee and size. */\n+    inline FeeFrac(int64_t s, int32_t b) noexcept : fee{s}, size{b}\n+    {\n+        // If size==0, fee must be 0 as well.\n+        assert(size != 0 || fee == 0);\n+    }\n+\n+    inline FeeFrac(const FeeFrac&) noexcept = default;\n+    inline FeeFrac& operator=(const FeeFrac&) noexcept = default;\n+\n+    /** Check if this is empty (size and fee are 0). */\n+    bool inline IsEmpty() const noexcept {\n+        return size == 0;\n+    }\n+\n+    /** Add size and size of another FeeFrac to this one. */\n+    void inline operator+=(const FeeFrac& other) noexcept\n+    {\n+        fee += other.fee;\n+        size += other.size;\n+    }\n+\n+    /** Subtrack size and size of another FeeFrac from this one. */",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29242#discussion_r1455534078",
+      "id" : 1455534078,
+      "in_reply_to_id" : 1453480372,
+      "line" : 91,
+      "node_id" : "PRRC_kwDOABII585Wwa_-",
+      "original_commit_id" : "ec3cf62361912a85ccd8d93abc3606df695c69ef",
+      "original_line" : 91,
+      "original_position" : 91,
+      "original_start_line" : 84,
+      "path" : "src/util/feefrac.h",
+      "position" : 91,
+      "pull_request_review_id" : 1827272350,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29242",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455534078/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 84,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2024-01-17T13:14:54Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455534078",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29242#discussion_r1455539143"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29242"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455539143"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "\r\nYeah, maybe to be consistent define the labels and do the same in the  `OLD` `chunk` computation loop above.\r\nThough  the explicit comments in the `OLD`  `chunk` computation loop is more easier to parse for me :).",
+      "commit_id" : "5da41e6f851b53d5639dc12aa3d6c308a8a8b403",
+      "created_at" : "2024-01-17T13:17:06Z",
+      "diff_hunk" : "@@ -1248,3 +1249,121 @@ std::vector<CTxMemPool::txiter> CTxMemPool::GatherClusters(const std::vector<uin\n     }\n     return clustered_txs;\n }\n+\n+std::optional<std::string> CTxMemPool::CheckConflictTopology(const setEntries& direct_conflicts)\n+{\n+    for (const auto& direct_conflict : direct_conflicts) {\n+        // Ancestor and descendant counts are inclusive of the tx itself.\n+        const auto ancestor_count{direct_conflict->GetCountWithAncestors()};\n+        const auto descendant_count{direct_conflict->GetCountWithDescendants()};\n+        const bool has_ancestor{ancestor_count > 1};\n+        const bool has_descendant{descendant_count > 1};\n+        const auto& txid_string{direct_conflict->GetSharedTx()->GetHash().ToString()};\n+        // The only allowed configurations are:\n+        // 1 ancestor and 0 descendant\n+        // 0 ancestor and 1 descendant\n+        // 0 ancestor and 0 descendant\n+        if (ancestor_count > 2) {\n+            return strprintf(\"%s has %u ancestors, max 1 allowed\", ancestor_count, txid_string);\n+        } else if (descendant_count > 2) {\n+            return strprintf(\"%s has %u descendants, max 1 allowed\", ancestor_count, txid_string);\n+        } else if (has_ancestor && has_descendant) {\n+            return strprintf(\"%s has both ancestor and descendant\", txid_string);\n+        }\n+        // Additionally enforce that:\n+        // If we have a parent, we are its only child.\n+        // If we have a child,  we are its only parent.\n+        if (has_descendant) {\n+            const auto& our_child = direct_conflict->GetMemPoolChildrenConst().begin();\n+            if (our_child->get().GetCountWithAncestors() > 2) {\n+                return strprintf(\"%s is not the only parent of child %s\",\n+                                 txid_string, our_child->get().GetSharedTx()->GetHash().ToString());\n+            }\n+        } else if (has_ancestor) {\n+            const auto& our_parent = direct_conflict->GetMemPoolParentsConst().begin();\n+            if (our_parent->get().GetCountWithDescendants() > 2) {\n+                return strprintf(\"%s is not the only child of parent %s\",\n+                                 txid_string, our_parent->get().GetSharedTx()->GetHash().ToString());\n+            }\n+        }\n+    }\n+    return std::nullopt;\n+}\n+\n+std::optional<std::string> CTxMemPool::CalculateFeerateDiagramsForRBF(CAmount replacement_fees, int64_t replacement_vsize, const setEntries& direct_conflicts, const setEntries& all_conflicts, std::vector<FeeFrac>& old_diagram, std::vector<FeeFrac>& new_diagram)\n+{\n+    auto err_string{CheckConflictTopology(direct_conflicts)};\n+    if (err_string.has_value()) {\n+        // Unsupported topology for calculating a feerate diagram\n+        return err_string;\n+    }\n+\n+    // new_diagram will have chunks that consist of each ancestor of\n+    // direct_conflicts that is at its own fee/size, along with the replacement\n+    // tx/package at its own fee/size\n+\n+    // old diagram will consist of each element of direct_conflicts either at\n+    // its own feerate (followed by any descendant at its own feerate) or as a\n+    // single chunk at its descendant's ancestor feerate.\n+\n+    std::vector<FeeFrac> old_chunks;\n+    // Step 1: build the old diagram.\n+\n+    // The above clusters are all trivially linearized;\n+    // they have a strict topology of 1 or two connected transactions.\n+\n+    // Compute OLD chunks for all clusters\n+    for (auto txiter : all_conflicts) {\n+        // Does this transaction have descendants?\n+        if (txiter->GetCountWithDescendants() > 1) {\n+            // Consider this tx when we consider the descendant.\n+            continue;\n+        }\n+        // Does this transaction have ancestors?\n+        FeeFrac individual{txiter->GetModifiedFee(), txiter->GetTxSize()};\n+        if (txiter->GetCountWithAncestors() > 1) {\n+            // We'll add chunks for either the ancestor by itself and this tx\n+            // by itself, or for a combined package.\n+            FeeFrac package{txiter->GetModFeesWithAncestors(), int32_t(txiter->GetSizeWithAncestors())};\n+            if (individual > package) {\n+                // The individual feerate is higher than the package, and\n+                // therefore higher than the parent's fee. Chunk these\n+                // together.\n+                old_chunks.emplace_back(package);\n+            } else {\n+                // Add two points, one for the parent and one for this child.\n+                old_chunks.emplace_back(package-individual);\n+                old_chunks.emplace_back(individual);\n+            }\n+        } else {\n+            old_chunks.emplace_back(individual);\n+        }\n+    }\n+\n+    // No topology restrictions post-chunking; sort\n+    BuildDiagramFromUnsortedChunks(old_chunks, old_diagram);\n+\n+    std::vector<FeeFrac> new_chunks;\n+\n+    // Step 2: build the NEW = OLD - CON + CNK diagram\n+\n+    // OLD - CON: Any parents of direct conflicts that are not conflicted themselves\n+    for (auto direct_conflict : direct_conflicts) {\n+        // If a direct conflict has an ancestor that is not in all_conflicts,\n+        // it can be affected by the replacement of the child.\n+        if (direct_conflict->GetMemPoolParentsConst().size() > 0) {\n+            // Grab the parent.\n+            const CTxMemPoolEntry& parent = direct_conflict->GetMemPoolParentsConst().begin()->get();\n+            if (!all_conflicts.count(mapTx.iterator_to(parent))) {\n+                // This transaction would be left over, so add to the new\n+                // diagram.\n+                new_chunks.emplace_back(parent.GetModifiedFee(), parent.GetTxSize());\n+            }\n+        }\n+    }\n+    // + CNK\n+    new_chunks.emplace_back(replacement_fees, int32_t(replacement_vsize));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29242#discussion_r1455539143",
+      "id" : 1455539143,
+      "in_reply_to_id" : 1453626393,
+      "line" : 1365,
+      "node_id" : "PRRC_kwDOABII585WwcPH",
+      "original_commit_id" : "ab9a952bdd1406a4fc9fa71c63e6fbecb78d0a4b",
+      "original_line" : 1365,
+      "original_position" : 125,
+      "original_start_line" : 1348,
+      "path" : "src/txmempool.cpp",
+      "position" : 125,
+      "pull_request_review_id" : 1827276759,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29242",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455539143/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 1348,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2024-01-17T13:17:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455539143",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48946461?v=4",
+         "events_url" : "https://api.github.com/users/ismaelsadeeq/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ismaelsadeeq/followers",
+         "following_url" : "https://api.github.com/users/ismaelsadeeq/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ismaelsadeeq/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ismaelsadeeq",
+         "id" : 48946461,
+         "login" : "ismaelsadeeq",
+         "node_id" : "MDQ6VXNlcjQ4OTQ2NDYx",
+         "organizations_url" : "https://api.github.com/users/ismaelsadeeq/orgs",
+         "received_events_url" : "https://api.github.com/users/ismaelsadeeq/received_events",
+         "repos_url" : "https://api.github.com/users/ismaelsadeeq/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ismaelsadeeq/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ismaelsadeeq/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ismaelsadeeq"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29242#discussion_r1455544265"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29242"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455544265"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Yes, My question was... whats the rationale for `FeeFrac` to generally have negative size ?",
+      "commit_id" : "5da41e6f851b53d5639dc12aa3d6c308a8a8b403",
+      "created_at" : "2024-01-17T13:19:22Z",
+      "diff_hunk" : "@@ -0,0 +1,126 @@\n+// Copyright (c) 2016-2021 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <util/feefrac.h>\n+#include <random.h>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+BOOST_AUTO_TEST_SUITE(feefrac_tests)\n+\n+BOOST_AUTO_TEST_CASE(feefrac_operators)\n+{\n+    FeeFrac p1{1000, 100}, p2{500, 300};\n+    FeeFrac sum{1500, 400};\n+    FeeFrac diff{500, -200};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29242#discussion_r1455544265",
+      "id" : 1455544265,
+      "in_reply_to_id" : 1453502118,
+      "line" : 16,
+      "node_id" : "PRRC_kwDOABII585WwdfJ",
+      "original_commit_id" : "8d74a28a62083bbbee1fd6a2dee56994f293a61a",
+      "original_line" : 16,
+      "original_position" : 16,
+      "original_start_line" : null,
+      "path" : "src/test/feefrac_tests.cpp",
+      "position" : 16,
+      "pull_request_review_id" : 1827280890,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29242",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455544265/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-17T13:19:56Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455544265",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48946461?v=4",
+         "events_url" : "https://api.github.com/users/ismaelsadeeq/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ismaelsadeeq/followers",
+         "following_url" : "https://api.github.com/users/ismaelsadeeq/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ismaelsadeeq/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ismaelsadeeq",
+         "id" : 48946461,
+         "login" : "ismaelsadeeq",
+         "node_id" : "MDQ6VXNlcjQ4OTQ2NDYx",
+         "organizations_url" : "https://api.github.com/users/ismaelsadeeq/orgs",
+         "received_events_url" : "https://api.github.com/users/ismaelsadeeq/received_events",
+         "repos_url" : "https://api.github.com/users/ismaelsadeeq/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ismaelsadeeq/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ismaelsadeeq/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ismaelsadeeq"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29242#discussion_r1455658183"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29242"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455658183"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "CompareFeerateDiagram won't return much very interesting, but you're right for the `err_string`, will return it",
+      "commit_id" : "5da41e6f851b53d5639dc12aa3d6c308a8a8b403",
+      "created_at" : "2024-01-17T14:08:17Z",
+      "diff_hunk" : "@@ -181,3 +201,108 @@ std::optional<std::string> PaysForRBF(CAmount original_fees,\n     }\n     return std::nullopt;\n }\n+\n+// Compare two feerate points, where one of the points is interpolated from\n+// existing points in a feerate diagram.\n+// Return 1 if the interpolated point is greater than fee_compare; 0 if they\n+// are equal; -1 otherwise.\n+int InterpolateValueAndCompare(int64_t eval_size, const FeeFrac& p1, const FeeFrac& p2, CAmount fee_compare)\n+{\n+    // Interpolate between two points using the formula:\n+    // y = y1 + (x - x1) * (y2 - y1) / (x2 - x1)\n+    // i.e.\n+    // y = p1.fee + (eval_size - p1.size) * (p2.fee - p1.fee) / (p2.size - p2.size)\n+    // fee_compare = fee value we want to compare against the interpolated y\n+    //\n+    // Then evaluating y > fee_compare is equivalent to checking if y*(x2-x1) > fee_compare*(x2-x1),\n+    // or y1*(x2-x1) + (x - x1) * (y2 - y1) > fee_compare*(x2-x1).\n+    const auto fee_compare_scaled = Mul128(fee_compare, p2.size - p1.size);\n+    const auto y_scaled = Add128(Mul128(p1.fee, p2.size - p1.size), Mul128(eval_size - p1.size , p2.fee - p1.fee));\n+\n+    if (y_scaled > fee_compare_scaled) {\n+        return 1;\n+    } else if (y_scaled == fee_compare_scaled) {\n+        return 0;\n+    } else {\n+        return -1;\n+    }\n+}\n+\n+// returns true if the new_diagram is strictly better than the old one; false\n+// otherwise.\n+bool CompareFeerateDiagram(std::vector<FeeFrac>& old_diagram, std::vector<FeeFrac>& new_diagram)\n+{\n+    size_t old_index=0;\n+    size_t new_index=0;\n+\n+    // whether the new diagram has at least one point better than old_diagram\n+    bool new_better = false;\n+\n+    // whether the old diagram has at least one point better than new_diagram\n+    bool old_better = false;\n+\n+    // Diagrams should be non-empty, and first elements zero in size and fee\n+    Assert(!old_diagram.empty() && !new_diagram.empty());\n+    Assert(old_diagram[0].fee == 0 && old_diagram[0].size == 0);\n+    Assert(new_diagram[0].fee == 0 && new_diagram[0].size == 0);\n+\n+    // Start by padding the smaller diagram with a transaction that pays the\n+    // tail feerate up to the size of the larger diagram.\n+    // For now, use an implicit tail feerate of 0, but we can change this if\n+    // there's an argument to be made that the true tail feerate is higher.\n+    // Also, if we end up needing to transform the feerates (eg to avoid\n+    // negative numbers or overflow in the calculations?), then the tail\n+    // feerate would need to be transformed as well.\n+    if (old_diagram.back().size < new_diagram.back().size) {\n+        old_diagram.emplace_back(old_diagram.back().fee, new_diagram.back().size);\n+    } else if (old_diagram.back().size > new_diagram.back().size) {\n+        new_diagram.emplace_back(new_diagram.back().fee, old_diagram.back().size);\n+    }\n+\n+    while (old_index < old_diagram.size() && new_index < new_diagram.size()) {\n+        int cmp = 0;\n+        if (old_diagram[old_index].size < new_diagram[new_index].size) {\n+            cmp = InterpolateValueAndCompare(old_diagram[old_index].size, new_diagram[new_index-1], new_diagram[new_index], old_diagram[old_index].fee);\n+            old_better |= (cmp == -1);\n+            new_better |= (cmp == 1);\n+            old_index++;\n+        } else if (old_diagram[old_index].size > new_diagram[new_index].size) {\n+            cmp = InterpolateValueAndCompare(new_diagram[new_index].size, old_diagram[old_index-1], old_diagram[old_index], new_diagram[new_index].fee);\n+            old_better |= (cmp == 1);\n+            new_better |= (cmp == -1);\n+            new_index++;\n+        } else {\n+            if (old_diagram[old_index].fee > new_diagram[new_index].fee) {\n+                old_better = true;\n+            } else if (old_diagram[old_index].fee < new_diagram[new_index].fee) {\n+                new_better = true;\n+            }\n+            old_index++;\n+            new_index++;\n+        }\n+    }\n+\n+    // New is better at least one point, and at least as good on all points; we'll take it\n+    return new_better && !old_better;\n+}\n+\n+std::optional<std::string> ImprovesFeerateDiagram(CTxMemPool& pool,\n+                                                const CTxMemPool::setEntries& direct_conflicts,\n+                                                const CTxMemPool::setEntries& all_conflicts,\n+                                                int64_t replacement_vsize,\n+                                                CAmount replacement_fees)\n+{\n+    // Require that the replacement strictly improve the mempool's fee vs. size diagram.\n+    std::vector<FeeFrac> old_diagram, new_diagram;\n+\n+    const auto err_string{pool.CalculateFeerateDiagramsForRBF(replacement_fees, replacement_vsize, direct_conflicts, all_conflicts, old_diagram, new_diagram)};\n+\n+    if (err_string.has_value()) {\n+        return strprintf(\"unable to compute mining score\");\n+    }\n+\n+    if (!CompareFeerateDiagram(old_diagram, new_diagram)) {\n+        return strprintf(\"insufficient feerate\");\n+    }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29242#discussion_r1455658183",
+      "id" : 1455658183,
+      "in_reply_to_id" : 1453667765,
+      "line" : 306,
+      "node_id" : "PRRC_kwDOABII585Ww5TH",
+      "original_commit_id" : "ab9a952bdd1406a4fc9fa71c63e6fbecb78d0a4b",
+      "original_line" : 306,
+      "original_position" : 133,
+      "original_start_line" : 300,
+      "path" : "src/policy/rbf.cpp",
+      "position" : 133,
+      "pull_request_review_id" : 1827381635,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29242",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455658183/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 300,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2024-01-17T14:08:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1455658183",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/5767891?v=4",
+         "events_url" : "https://api.github.com/users/instagibbs/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/instagibbs/followers",
+         "following_url" : "https://api.github.com/users/instagibbs/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/instagibbs/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/instagibbs",
+         "id" : 5767891,
+         "login" : "instagibbs",
+         "node_id" : "MDQ6VXNlcjU3Njc4OTE=",
+         "organizations_url" : "https://api.github.com/users/instagibbs/orgs",
+         "received_events_url" : "https://api.github.com/users/instagibbs/received_events",
+         "repos_url" : "https://api.github.com/users/instagibbs/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/instagibbs/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/instagibbs/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/instagibbs"
+      }
    }
 ]
