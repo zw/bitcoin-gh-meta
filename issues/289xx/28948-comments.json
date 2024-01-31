@@ -17237,5 +17237,74 @@
          "type" : "User",
          "url" : "https://api.github.com/users/glozow"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28948#discussion_r1472680361"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28948"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472680361"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I think indeed we cannot hit this, but it's because we call `ApplyV3Rules` in a package.\r\n\r\nWhen `package` is a parent+child, `has_mempool_sibling` doesn't matter since having any mempool ancestor should cause this to fail immediately. In that way, this function kind of assumes that `package` is a connected component.\r\n\r\nIf `package` has unrelated transactions, we'd let a mempool sibling slip through in this function. However, since we are calling `ApplyV3Rules` within `PreChecks`, the mempool sibling is caught there. So I guess the \"not strictly necessary in package validation\" is not really correct for our \"testmempoolaccept is allowed to have unrelated transactions\" use case.",
+      "commit_id" : "815529917eb3f52166062eedadbc40fc1770a121",
+      "created_at" : "2024-01-31T11:19:38Z",
+      "diff_hunk" : "@@ -0,0 +1,197 @@\n+// Copyright (c) 2022 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <policy/v3_policy.h>\n+\n+#include <coins.h>\n+#include <consensus/amount.h>\n+#include <logging.h>\n+#include <tinyformat.h>\n+#include <util/check.h>\n+\n+#include <algorithm>\n+#include <numeric>\n+#include <vector>\n+\n+/** Helper for PackageV3Checks: Returns a vector containing the indices of transactions (within\n+ * package) that are direct parents of ptx. */\n+std::vector<int> FindInPackageParents(const PackageWithAncestorCounts& package_with_ancestors, const CTransactionRef& ptx)\n+{\n+    std::vector<int> in_package_parents;\n+\n+    std::set<Txid> possible_parents;\n+    for (auto &input : ptx->vin) {\n+        possible_parents.insert(input.prevout.hash);\n+    }\n+\n+    for (size_t i = 0; i < package_with_ancestors.package.size(); ++i) {\n+        const auto& tx = package_with_ancestors.package[i];\n+        // We assume the package is sorted, so that we don't need to continue\n+        // looking past the transaction itself.\n+        if (&(*tx) == &(*ptx)) break;\n+        if (possible_parents.count(tx->GetHash())) {\n+            in_package_parents.push_back(i);\n+        }\n+    }\n+    return in_package_parents;\n+}\n+\n+std::optional<std::string> PackageV3Checks(const CTransactionRef& ptx, int64_t vsize,\n+                                           const PackageWithAncestorCounts& package_with_ancestors,\n+                                           const CTxMemPool::setEntries& mempool_ancestors)\n+{\n+    // This function is specialized for these limits, and must be reimplemented if they ever change.\n+    static_assert(V3_ANCESTOR_LIMIT == 2);\n+    static_assert(V3_DESCENDANT_LIMIT == 2);\n+\n+    const auto in_package_parents{FindInPackageParents(package_with_ancestors, ptx)};\n+\n+    // Now we have all ancestors, so we can start checking v3 rules.\n+    if (ptx->nVersion == 3) {\n+        if (mempool_ancestors.size() + in_package_parents.size() + 1 > V3_ANCESTOR_LIMIT) {\n+            return strprintf(\"tx %s would have too many ancestors\", ptx->GetWitnessHash().ToString());\n+        }\n+\n+        const bool has_parent{mempool_ancestors.size() + in_package_parents.size() > 0};\n+        if (has_parent) {\n+            // A v3 child cannot be too large.\n+            if (vsize > V3_CHILD_MAX_VSIZE) {\n+                return strprintf(\"v3 child tx %s is too big: %u > %u virtual bytes\",\n+                                 ptx->GetWitnessHash().ToString(), vsize, V3_CHILD_MAX_VSIZE);\n+            }\n+\n+            // Find the parent and extract the information we need for v3 checks.\n+            int parent_version = 0;\n+            // Used to match parents by prevout\n+            Txid parent_hash = Txid::FromUint256(uint256(0));\n+            // Used for the error string.\n+            Wtxid parent_wtxid = Wtxid::FromUint256(uint256(0));\n+            bool has_mempool_sibling{false};\n+\n+            if (mempool_ancestors.size() > 0) {\n+                // There's a parent in the mempool.\n+                auto& parent = *mempool_ancestors.begin();\n+                parent_version = parent->GetTx().nVersion;\n+                has_mempool_sibling = parent->GetCountWithDescendants() > 1;\n+                parent_hash = parent->GetTx().GetHash();\n+                parent_wtxid = parent->GetTx().GetWitnessHash();\n+            } else {\n+                // Ancestor must be in the package. Find it.\n+                auto &parent_index = in_package_parents[0];\n+                // If the in-package parent has mempool ancestors, then this is\n+                // a v3 violation.\n+                if (package_with_ancestors.ancestor_counts[parent_index] > 0) {\n+                    return strprintf(\"tx %s would have too many ancestors\", ptx->GetWitnessHash().ToString());\n+                }\n+\n+                auto &parent = package_with_ancestors.package[parent_index];\n+                parent_version = parent->nVersion;\n+                parent_hash = parent->GetHash();\n+                parent_wtxid = parent->GetWitnessHash();\n+            }\n+\n+            // If there is a parent, it must have the right version.\n+            if (parent_version != 3) {\n+                return strprintf(\"v3 tx %s cannot spend from non-v3 tx %s\",\n+                                 ptx->GetWitnessHash().ToString(), parent_wtxid.ToString());\n+            }\n+\n+            // The mempool or in-package parent cannot have any other in-mempool children. We don't\n+            // check whether the sibling is to-be-replaced (done in ApplyV3Rules) because that\n+            // doesn't apply in a package.\n+            if (has_mempool_sibling) {\n+                return strprintf(\"tx %u would exceed descendant count limit\", parent_wtxid.ToString());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28948#discussion_r1472680361",
+      "id" : 1472680361,
+      "in_reply_to_id" : 1469920329,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Xx1Gp",
+      "original_commit_id" : "46eacf922b40b0e5edd03b8dfff8002e65a3ede5",
+      "original_line" : 104,
+      "original_position" : 104,
+      "original_start_line" : null,
+      "path" : "src/policy/v3_policy.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1853497963,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28948",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472680361/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T11:19:38Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472680361",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
    }
 ]
