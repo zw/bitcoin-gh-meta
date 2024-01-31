@@ -6574,5 +6574,759 @@
          "type" : "User",
          "url" : "https://api.github.com/users/murchandamus"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472836168"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472836168"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Sounds good.",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T13:39:08Z",
+      "diff_hunk" : "@@ -188,6 +188,168 @@ util::Result<SelectionResult> SelectCoinsBnB(std::vector<OutputGroup>& utxo_pool\n     return result;\n }\n \n+/*\n+ * Coin Grinder is a DFS-based algorithm that deterministically searches for the minimum-weight input set to fund the\n+ * transaction. The algorithm is similar to the Branch and Bound algorithm, but will produce a transaction _with_ a\n+ * change output instead of a changeless transaction.\n+ *\n+ * @param std::vector<OutputGroup>& utxo_pool The UTXOs that we are choosing from. These UTXOs will be sorted in\n+ *        descending order by effective value, with lower waste preferred as a tie-breaker. (We can think of an output\n+ *        group with multiple as a heavier UTXO with the combined amount here.)\n+ * @param const CAmount& selection_target This is the minimum amount that we need for the transaction without considering change.\n+ * @param const CAmount& change_target The minimum budget for creating a change output, by which we increase the selection_target.\n+ * @param int max_weight The maximum permitted weight for the input set.\n+ * @returns The result of this coin selection algorithm, or std::nullopt\n+ */\n+util::Result<SelectionResult> CoinGrinder(std::vector<OutputGroup>& utxo_pool, const CAmount& selection_target, CAmount change_target, int max_weight)\n+{\n+    std::sort(utxo_pool.begin(), utxo_pool.end(), descending);\n+\n+    // Check that there are sufficient funds\n+    CAmount total_available = 0;\n+    for (const OutputGroup& utxo : utxo_pool) {\n+        // Assert UTXOs with negative effective value have been filtered\n+        assert(utxo.GetSelectionAmount() > 0);\n+        total_available += utxo.GetSelectionAmount();\n+    }\n+    if (total_available < selection_target + change_target) {\n+        // Insufficient funds\n+        return util::Error();\n+    }\n+\n+    // CoinGrinder tracks selection via the indices of the currently selected UTXOs\n+    std::vector<size_t> best_selection;\n+    CAmount best_selection_amount = MAX_MONEY;\n+    int best_selection_weight = std::numeric_limits<int>::max();\n+    bool max_tx_weight_exceeded = false;\n+\n+    std::vector<size_t> curr_selection;\n+    CAmount curr_amount = 0;\n+    int curr_weight = 0;\n+    size_t next_utxo = 0; // Index of the next UTXO to consider\n+\n+    /*\n+     * You can think of the current selection as a vector of booleans that has decided inclusion or exclusion of all\n+     * UTXOs before `next_utxo`. When we consider the next UTXO, we extend this hypothetical boolean vector either with\n+     * a true value if the UTXO is included or a false value if it is omitted. The equivalent state is stored more\n+     * compactly as the list of indices of the included UTXOs and the `next_utxo` index.\n+     *\n+     * We can never find a new solution by deselecting a UTXO, because we then revisit a previously evaluated\n+     * selection. Therefore, we only need to check whether we found a new solution _after adding_ a new UTXO.\n+     *\n+     * Each iteration of CoinGrinder starts by selecting the `next_utxo` and evaluating the current selection. We\n+     * use three state transactions to progress from the current selection to the next promising selection:\n+     *\n+     * - EXPLORE inclusion branch: We do not have sufficient funds, yet. Add `next_utxo` to the current selection, then\n+     *                             nominate the direct successor of the just selected UTXO as our `next_utxo` for the\n+     *                             following iteration.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: EXPLORE, next_utxo: 8\n+     *                                 Next Selection: {0, 5, 7, 8}\n+     *\n+     * - SHIFT to omission branch: Adding more UTXOs to the current selection cannot produce a solution that is better\n+     *                             than the current best, e.g. the max weight is exceeded or the current selection has\n+     *                             exceeded reached the target.\n+     *                             We designate our `next_utxo` the one after the tail of our current selection, then\n+     *                             deselected the tail of our current selection.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: SHIFT, next_utxo: 8, omit last selected: {0, 5}\n+     *                                 Next Selection: {0, 5, 8}\n+     *\n+     * - CUT entire subtree:       We have exhausted the inclusion branch for the penultimately selected UTXO, both the\n+     *                             inclusion and the omission branch of the current prefix are barren. E.g. we have\n+     *                             reached the end of the UTXO pool, so neither further EXPLORING nor SHIFTING can find\n+     *                             any solutions. We designate our `next_utxo` the one after our penultimate selected,\n+     *                             then deselect both the last and penultimate selected.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: CUT, next_utxo: 6, omit two last selected: {0}\n+     *                                 Next Selection: {0, 6}\n+     */\n+    auto deselect_last = [&]() {\n+        OutputGroup& utxo = utxo_pool[curr_selection.back()];\n+        curr_amount -= utxo.GetSelectionAmount();\n+        curr_weight -= utxo.m_weight;\n+        curr_selection.pop_back();\n+    };\n+\n+    SelectionResult result(selection_target, SelectionAlgorithm::CG);\n+    size_t curr_try = 0;\n+    while (true) {\n+        bool should_shift{false}, should_cut{false};\n+        // Select `next_utxo`\n+        OutputGroup& utxo = utxo_pool[next_utxo];\n+        curr_amount += utxo.GetSelectionAmount();\n+        curr_weight += utxo.m_weight;\n+        curr_selection.push_back(next_utxo);\n+        ++next_utxo;\n+        ++curr_try;\n+\n+        // EVALUATE current selection: check for solutions and see whether we can CUT or SHIFT before EXPLORING further\n+        if (curr_weight > max_weight) {\n+            // max_weight exceeded: SHIFT\n+            max_tx_weight_exceeded = true;\n+            should_shift  = true;\n+        } else if (curr_amount >= selection_target + change_target) {\n+            // Success, adding more weight cannot be better: SHIFT\n+            should_shift  = true;\n+            if (curr_weight < best_selection_weight || (curr_weight == best_selection_weight && curr_amount < best_selection_amount)) {\n+                // New lowest weight, or same weight with fewer funds tied up\n+                best_selection = curr_selection;\n+                best_selection_weight = curr_weight;\n+                best_selection_amount = curr_amount;\n+            }\n+        }\n+\n+        if (curr_try >= TOTAL_TRIES) {\n+            // Solution is not guaranteed to be optimal if `curr_try` hit TOTAL_TRIES\n+            result.SetSelectionsEvaluated(curr_try);\n+            break;\n+        }\n+\n+        if (next_utxo == utxo_pool.size()) {\n+            // Last added UTXO was end of UTXO pool, nothing left to add on inclusion or omission branch: CUT\n+            should_cut = true;\n+        }\n+\n+        if (should_cut) {\n+            // Neither adding to the current selection nor exploring the omission branch of the last selected UTXO can\n+            // find any solutions. Redirect to exploring Omission branch of the penultimate selected UTXO (i.e. deselect\n+            // last selected UTXO, then SHIFT)\n+            should_cut = false;\n+            deselect_last();\n+            should_shift  = true;\n+        }\n+\n+        if (should_shift) {\n+            // Set `next_utxo` to one after last selected, then deselect last selected UTXO\n+            if (curr_selection.empty()) {\n+                // Exhausted search space before running into attempt limit\n+                result.SetSelectionsEvaluated(curr_try);\n+                break;\n+            }\n+            next_utxo = curr_selection.back() + 1;\n+            deselect_last();\n+            should_shift  = false;\n+        }\n+    }\n+\n+    if (best_selection.empty()) {\n+        return max_tx_weight_exceeded ? ErrorMaxWeightExceeded() : util::Error();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472836168",
+      "id" : 1472836168,
+      "in_reply_to_id" : 1468517854,
+      "line" : 410,
+      "node_id" : "PRRC_kwDOABII585XybJI",
+      "original_commit_id" : "180676ed7b20ccc7d51e6af6e63b8daac0c8495f",
+      "original_line" : 410,
+      "original_position" : 156,
+      "original_start_line" : null,
+      "path" : "src/wallet/coinselection.cpp",
+      "position" : 251,
+      "pull_request_review_id" : 1853755724,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472836168/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T13:39:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472836168",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472848173"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472848173"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I think you should set the number of tries to be at least some multiple of the utxo_pool size, because (a) without it, you can't guarantee even considering every UTXO, and (b) the runtime of coin selection overall already contains a component proportional to the size of utxo_pool (simply the cost of constructing the pool in the first place) anyway. So I would suggest something like `const auto total_tries = max(TOTAL_TRIES_CG, 10 * utxo_pool.size());` or so.\r\n\r\nIt may be worth doing this as a follow-up, as other algorithms may benefit from a similar treatment. Still, I'd suggest using a separate constant `TOTAL_TRIES_CG`, even if you also set it to 100000 for now, because there is no inherent reason why BNB and CG should have the same iteration count limit (their time per iteration, and certainly their \"solving power\" per iteration, is possibly quite different).",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T13:48:14Z",
+      "diff_hunk" : "@@ -188,6 +188,177 @@ util::Result<SelectionResult> SelectCoinsBnB(std::vector<OutputGroup>& utxo_pool\n     return result;\n }\n \n+/*\n+ * Coin Grinder is a DFS-based algorithm that deterministically searches for the minimum-weight input set to fund the\n+ * transaction. The algorithm is similar to the Branch and Bound algorithm, but will produce a transaction _with_ a\n+ * change output instead of a changeless transaction.\n+ *\n+ * @param std::vector<OutputGroup>& utxo_pool The UTXOs that we are choosing from. These UTXOs will be sorted in\n+ *        descending order by effective value, with lower waste preferred as a tie-breaker. (We can think of an output\n+ *        group with multiple as a heavier UTXO with the combined amount here.)\n+ * @param const CAmount& selection_target This is the minimum amount that we need for the transaction without considering change.\n+ * @param const CAmount& change_target The minimum budget for creating a change output, by which we increase the selection_target.\n+ * @param int max_weight The maximum permitted weight for the input set.\n+ * @returns The result of this coin selection algorithm, or std::nullopt\n+ */\n+util::Result<SelectionResult> CoinGrinder(std::vector<OutputGroup>& utxo_pool, const CAmount& selection_target, CAmount change_target, int max_weight)\n+{\n+    std::sort(utxo_pool.begin(), utxo_pool.end(), descending);\n+\n+    // Check that there are sufficient funds\n+    CAmount total_available = 0;\n+    for (const OutputGroup& utxo : utxo_pool) {\n+        // Assert UTXOs with non-positive effective value have been filtered\n+        Assume(utxo.GetSelectionAmount() > 0);\n+        total_available += utxo.GetSelectionAmount();\n+    }\n+\n+    const CAmount total_target = selection_target + change_target;\n+    if (total_available < total_target) {\n+        // Insufficient funds\n+        return util::Error();\n+    }\n+\n+    // The current selection and the best input set found so far, stored as the utxo_pool indices of the UTXOs forming them\n+    std::vector<size_t> curr_selection;\n+    std::vector<size_t> best_selection;\n+\n+    // The currently selected effective amount, and the effective amount of the best selection so far\n+    CAmount curr_amount = 0;\n+    CAmount best_selection_amount = MAX_MONEY;\n+\n+    // The weight of the currently selected input set, and the weight of the best selection\n+    int curr_weight = 0;\n+    int best_selection_weight = std::numeric_limits<int>::max();\n+\n+    // Whether the input sets generated during this search have exceeded the maximum transaction weight at any point\n+    bool max_tx_weight_exceeded = false;\n+\n+    // Index of the next UTXO to consider in utxo_pool\n+    size_t next_utxo = 0;\n+\n+    /*\n+     * You can think of the current selection as a vector of booleans that has decided inclusion or exclusion of all\n+     * UTXOs before `next_utxo`. When we consider the next UTXO, we extend this hypothetical boolean vector either with\n+     * a true value if the UTXO is included or a false value if it is omitted. The equivalent state is stored more\n+     * compactly as the list of indices of the included UTXOs and the `next_utxo` index.\n+     *\n+     * We can never find a new solution by deselecting a UTXO, because we then revisit a previously evaluated\n+     * selection. Therefore, we only need to check whether we found a new solution _after adding_ a new UTXO.\n+     *\n+     * Each iteration of CoinGrinder starts by selecting the `next_utxo` and evaluating the current selection. We\n+     * use three state transitions to progress from the current selection to the next promising selection:\n+     *\n+     * - EXPLORE inclusion branch: We do not have sufficient funds, yet. Add `next_utxo` to the current selection, then\n+     *                             nominate the direct successor of the just selected UTXO as our `next_utxo` for the\n+     *                             following iteration.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: EXPLORE, next_utxo: 8\n+     *                                 Next Selection: {0, 5, 7, 8}\n+     *\n+     * - SHIFT to omission branch: Adding more UTXOs to the current selection cannot produce a solution that is better\n+     *                             than the current best, e.g. the current selection weight exceeds the max weight or\n+     *                             the current selection amount is equal to or greater than the target.\n+     *                             We designate our `next_utxo` the one after the tail of our current selection, then\n+     *                             deselect the tail of our current selection.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: SHIFT, next_utxo: 8, omit last selected: {0, 5}\n+     *                                 Next Selection: {0, 5, 8}\n+     *\n+     * - CUT entire subtree:       We have exhausted the inclusion branch for the penultimately selected UTXO, both the\n+     *                             inclusion and the omission branch of the current prefix are barren. E.g. we have\n+     *                             reached the end of the UTXO pool, so neither further EXPLORING nor SHIFTING can find\n+     *                             any solutions. We designate our `next_utxo` the one after our penultimate selected,\n+     *                             then deselect both the last and penultimate selected.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: CUT, next_utxo: 6, omit two last selected: {0}\n+     *                                 Next Selection: {0, 6}\n+     */\n+    auto deselect_last = [&]() {\n+        OutputGroup& utxo = utxo_pool[curr_selection.back()];\n+        curr_amount -= utxo.GetSelectionAmount();\n+        curr_weight -= utxo.m_weight;\n+        curr_selection.pop_back();\n+    };\n+\n+    SelectionResult result(selection_target, SelectionAlgorithm::CG);\n+    size_t curr_try = 0;\n+    while (true) {\n+        bool should_shift{false}, should_cut{false};\n+        // Select `next_utxo`\n+        OutputGroup& utxo = utxo_pool[next_utxo];\n+        curr_amount += utxo.GetSelectionAmount();\n+        curr_weight += utxo.m_weight;\n+        curr_selection.push_back(next_utxo);\n+        ++next_utxo;\n+        ++curr_try;\n+\n+        // EVALUATE current selection: check for solutions and see whether we can CUT or SHIFT before EXPLORING further\n+        if (curr_weight > max_weight) {\n+            // max_weight exceeded: SHIFT\n+            max_tx_weight_exceeded = true;\n+            should_shift  = true;\n+        } else if (curr_amount >= total_target) {\n+            // Success, adding more weight cannot be better: SHIFT\n+            should_shift  = true;\n+            if (curr_weight < best_selection_weight || (curr_weight == best_selection_weight && curr_amount < best_selection_amount)) {\n+                // New lowest weight, or same weight with fewer funds tied up\n+                best_selection = curr_selection;\n+                best_selection_weight = curr_weight;\n+                best_selection_amount = curr_amount;\n+            }\n+        }\n+\n+        if (curr_try >= TOTAL_TRIES) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472848173",
+      "id" : 1472848173,
+      "line" : 358,
+      "node_id" : "PRRC_kwDOABII585XyeEt",
+      "original_commit_id" : "9ccbef5d481f7e6d42887f4230a2443e44405094",
+      "original_line" : 318,
+      "original_position" : 131,
+      "original_start_line" : null,
+      "path" : "src/wallet/coinselection.cpp",
+      "position" : 199,
+      "pull_request_review_id" : 1853774778,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472848173/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T15:25:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472848173",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472849582"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472849582"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Did you mean \"then EXPLORE\" here?",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T13:49:11Z",
+      "diff_hunk" : "@@ -188,6 +188,177 @@ util::Result<SelectionResult> SelectCoinsBnB(std::vector<OutputGroup>& utxo_pool\n     return result;\n }\n \n+/*\n+ * Coin Grinder is a DFS-based algorithm that deterministically searches for the minimum-weight input set to fund the\n+ * transaction. The algorithm is similar to the Branch and Bound algorithm, but will produce a transaction _with_ a\n+ * change output instead of a changeless transaction.\n+ *\n+ * @param std::vector<OutputGroup>& utxo_pool The UTXOs that we are choosing from. These UTXOs will be sorted in\n+ *        descending order by effective value, with lower waste preferred as a tie-breaker. (We can think of an output\n+ *        group with multiple as a heavier UTXO with the combined amount here.)\n+ * @param const CAmount& selection_target This is the minimum amount that we need for the transaction without considering change.\n+ * @param const CAmount& change_target The minimum budget for creating a change output, by which we increase the selection_target.\n+ * @param int max_weight The maximum permitted weight for the input set.\n+ * @returns The result of this coin selection algorithm, or std::nullopt\n+ */\n+util::Result<SelectionResult> CoinGrinder(std::vector<OutputGroup>& utxo_pool, const CAmount& selection_target, CAmount change_target, int max_weight)\n+{\n+    std::sort(utxo_pool.begin(), utxo_pool.end(), descending);\n+\n+    // Check that there are sufficient funds\n+    CAmount total_available = 0;\n+    for (const OutputGroup& utxo : utxo_pool) {\n+        // Assert UTXOs with non-positive effective value have been filtered\n+        Assume(utxo.GetSelectionAmount() > 0);\n+        total_available += utxo.GetSelectionAmount();\n+    }\n+\n+    const CAmount total_target = selection_target + change_target;\n+    if (total_available < total_target) {\n+        // Insufficient funds\n+        return util::Error();\n+    }\n+\n+    // The current selection and the best input set found so far, stored as the utxo_pool indices of the UTXOs forming them\n+    std::vector<size_t> curr_selection;\n+    std::vector<size_t> best_selection;\n+\n+    // The currently selected effective amount, and the effective amount of the best selection so far\n+    CAmount curr_amount = 0;\n+    CAmount best_selection_amount = MAX_MONEY;\n+\n+    // The weight of the currently selected input set, and the weight of the best selection\n+    int curr_weight = 0;\n+    int best_selection_weight = std::numeric_limits<int>::max();\n+\n+    // Whether the input sets generated during this search have exceeded the maximum transaction weight at any point\n+    bool max_tx_weight_exceeded = false;\n+\n+    // Index of the next UTXO to consider in utxo_pool\n+    size_t next_utxo = 0;\n+\n+    /*\n+     * You can think of the current selection as a vector of booleans that has decided inclusion or exclusion of all\n+     * UTXOs before `next_utxo`. When we consider the next UTXO, we extend this hypothetical boolean vector either with\n+     * a true value if the UTXO is included or a false value if it is omitted. The equivalent state is stored more\n+     * compactly as the list of indices of the included UTXOs and the `next_utxo` index.\n+     *\n+     * We can never find a new solution by deselecting a UTXO, because we then revisit a previously evaluated\n+     * selection. Therefore, we only need to check whether we found a new solution _after adding_ a new UTXO.\n+     *\n+     * Each iteration of CoinGrinder starts by selecting the `next_utxo` and evaluating the current selection. We\n+     * use three state transitions to progress from the current selection to the next promising selection:\n+     *\n+     * - EXPLORE inclusion branch: We do not have sufficient funds, yet. Add `next_utxo` to the current selection, then\n+     *                             nominate the direct successor of the just selected UTXO as our `next_utxo` for the\n+     *                             following iteration.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: EXPLORE, next_utxo: 8\n+     *                                 Next Selection: {0, 5, 7, 8}\n+     *\n+     * - SHIFT to omission branch: Adding more UTXOs to the current selection cannot produce a solution that is better\n+     *                             than the current best, e.g. the current selection weight exceeds the max weight or\n+     *                             the current selection amount is equal to or greater than the target.\n+     *                             We designate our `next_utxo` the one after the tail of our current selection, then\n+     *                             deselect the tail of our current selection.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: SHIFT, next_utxo: 8, omit last selected: {0, 5}\n+     *                                 Next Selection: {0, 5, 8}\n+     *\n+     * - CUT entire subtree:       We have exhausted the inclusion branch for the penultimately selected UTXO, both the\n+     *                             inclusion and the omission branch of the current prefix are barren. E.g. we have\n+     *                             reached the end of the UTXO pool, so neither further EXPLORING nor SHIFTING can find\n+     *                             any solutions. We designate our `next_utxo` the one after our penultimate selected,\n+     *                             then deselect both the last and penultimate selected.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: CUT, next_utxo: 6, omit two last selected: {0}\n+     *                                 Next Selection: {0, 6}\n+     */\n+    auto deselect_last = [&]() {\n+        OutputGroup& utxo = utxo_pool[curr_selection.back()];\n+        curr_amount -= utxo.GetSelectionAmount();\n+        curr_weight -= utxo.m_weight;\n+        curr_selection.pop_back();\n+    };\n+\n+    SelectionResult result(selection_target, SelectionAlgorithm::CG);\n+    size_t curr_try = 0;\n+    while (true) {\n+        bool should_shift{false}, should_cut{false};\n+        // Select `next_utxo`\n+        OutputGroup& utxo = utxo_pool[next_utxo];\n+        curr_amount += utxo.GetSelectionAmount();\n+        curr_weight += utxo.m_weight;\n+        curr_selection.push_back(next_utxo);\n+        ++next_utxo;\n+        ++curr_try;\n+\n+        // EVALUATE current selection: check for solutions and see whether we can CUT or SHIFT before EXPLORING further\n+        if (curr_weight > max_weight) {\n+            // max_weight exceeded: SHIFT\n+            max_tx_weight_exceeded = true;\n+            should_shift  = true;\n+        } else if (curr_amount >= total_target) {\n+            // Success, adding more weight cannot be better: SHIFT\n+            should_shift  = true;\n+            if (curr_weight < best_selection_weight || (curr_weight == best_selection_weight && curr_amount < best_selection_amount)) {\n+                // New lowest weight, or same weight with fewer funds tied up\n+                best_selection = curr_selection;\n+                best_selection_weight = curr_weight;\n+                best_selection_amount = curr_amount;\n+            }\n+        }\n+\n+        if (curr_try >= TOTAL_TRIES) {\n+            // Solution is not guaranteed to be optimal if `curr_try` hit TOTAL_TRIES\n+            result.SetSelectionsEvaluated(curr_try);\n+            break;\n+        }\n+\n+        if (next_utxo == utxo_pool.size()) {\n+            // Last added UTXO was end of UTXO pool, nothing left to add on inclusion or omission branch: CUT\n+            should_cut = true;\n+        }\n+\n+        if (should_cut) {\n+            // Neither adding to the current selection nor exploring the omission branch of the last selected UTXO can\n+            // find any solutions. Redirect to exploring Omission branch of the penultimate selected UTXO (i.e. deselect\n+            // last selected UTXO, then SHIFT)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472849582",
+      "id" : 1472849582,
+      "line" : 373,
+      "node_id" : "PRRC_kwDOABII585Xyeau",
+      "original_commit_id" : "9ccbef5d481f7e6d42887f4230a2443e44405094",
+      "original_line" : 332,
+      "original_position" : 145,
+      "original_start_line" : null,
+      "path" : "src/wallet/coinselection.cpp",
+      "position" : 214,
+      "pull_request_review_id" : 1853774778,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472849582/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T15:25:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472849582",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472864023"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472864023"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "This `result.SetSelectionsEvaluated(curr_try); break;` is repeated in both exit conditions. The `result.SetSelectionsEvaluated(curr_try);` can be moved outside of the loop I believe.",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T13:59:52Z",
+      "diff_hunk" : "@@ -188,6 +188,177 @@ util::Result<SelectionResult> SelectCoinsBnB(std::vector<OutputGroup>& utxo_pool\n     return result;\n }\n \n+/*\n+ * Coin Grinder is a DFS-based algorithm that deterministically searches for the minimum-weight input set to fund the\n+ * transaction. The algorithm is similar to the Branch and Bound algorithm, but will produce a transaction _with_ a\n+ * change output instead of a changeless transaction.\n+ *\n+ * @param std::vector<OutputGroup>& utxo_pool The UTXOs that we are choosing from. These UTXOs will be sorted in\n+ *        descending order by effective value, with lower waste preferred as a tie-breaker. (We can think of an output\n+ *        group with multiple as a heavier UTXO with the combined amount here.)\n+ * @param const CAmount& selection_target This is the minimum amount that we need for the transaction without considering change.\n+ * @param const CAmount& change_target The minimum budget for creating a change output, by which we increase the selection_target.\n+ * @param int max_weight The maximum permitted weight for the input set.\n+ * @returns The result of this coin selection algorithm, or std::nullopt\n+ */\n+util::Result<SelectionResult> CoinGrinder(std::vector<OutputGroup>& utxo_pool, const CAmount& selection_target, CAmount change_target, int max_weight)\n+{\n+    std::sort(utxo_pool.begin(), utxo_pool.end(), descending);\n+\n+    // Check that there are sufficient funds\n+    CAmount total_available = 0;\n+    for (const OutputGroup& utxo : utxo_pool) {\n+        // Assert UTXOs with non-positive effective value have been filtered\n+        Assume(utxo.GetSelectionAmount() > 0);\n+        total_available += utxo.GetSelectionAmount();\n+    }\n+\n+    const CAmount total_target = selection_target + change_target;\n+    if (total_available < total_target) {\n+        // Insufficient funds\n+        return util::Error();\n+    }\n+\n+    // The current selection and the best input set found so far, stored as the utxo_pool indices of the UTXOs forming them\n+    std::vector<size_t> curr_selection;\n+    std::vector<size_t> best_selection;\n+\n+    // The currently selected effective amount, and the effective amount of the best selection so far\n+    CAmount curr_amount = 0;\n+    CAmount best_selection_amount = MAX_MONEY;\n+\n+    // The weight of the currently selected input set, and the weight of the best selection\n+    int curr_weight = 0;\n+    int best_selection_weight = std::numeric_limits<int>::max();\n+\n+    // Whether the input sets generated during this search have exceeded the maximum transaction weight at any point\n+    bool max_tx_weight_exceeded = false;\n+\n+    // Index of the next UTXO to consider in utxo_pool\n+    size_t next_utxo = 0;\n+\n+    /*\n+     * You can think of the current selection as a vector of booleans that has decided inclusion or exclusion of all\n+     * UTXOs before `next_utxo`. When we consider the next UTXO, we extend this hypothetical boolean vector either with\n+     * a true value if the UTXO is included or a false value if it is omitted. The equivalent state is stored more\n+     * compactly as the list of indices of the included UTXOs and the `next_utxo` index.\n+     *\n+     * We can never find a new solution by deselecting a UTXO, because we then revisit a previously evaluated\n+     * selection. Therefore, we only need to check whether we found a new solution _after adding_ a new UTXO.\n+     *\n+     * Each iteration of CoinGrinder starts by selecting the `next_utxo` and evaluating the current selection. We\n+     * use three state transitions to progress from the current selection to the next promising selection:\n+     *\n+     * - EXPLORE inclusion branch: We do not have sufficient funds, yet. Add `next_utxo` to the current selection, then\n+     *                             nominate the direct successor of the just selected UTXO as our `next_utxo` for the\n+     *                             following iteration.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: EXPLORE, next_utxo: 8\n+     *                                 Next Selection: {0, 5, 7, 8}\n+     *\n+     * - SHIFT to omission branch: Adding more UTXOs to the current selection cannot produce a solution that is better\n+     *                             than the current best, e.g. the current selection weight exceeds the max weight or\n+     *                             the current selection amount is equal to or greater than the target.\n+     *                             We designate our `next_utxo` the one after the tail of our current selection, then\n+     *                             deselect the tail of our current selection.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: SHIFT, next_utxo: 8, omit last selected: {0, 5}\n+     *                                 Next Selection: {0, 5, 8}\n+     *\n+     * - CUT entire subtree:       We have exhausted the inclusion branch for the penultimately selected UTXO, both the\n+     *                             inclusion and the omission branch of the current prefix are barren. E.g. we have\n+     *                             reached the end of the UTXO pool, so neither further EXPLORING nor SHIFTING can find\n+     *                             any solutions. We designate our `next_utxo` the one after our penultimate selected,\n+     *                             then deselect both the last and penultimate selected.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: CUT, next_utxo: 6, omit two last selected: {0}\n+     *                                 Next Selection: {0, 6}\n+     */\n+    auto deselect_last = [&]() {\n+        OutputGroup& utxo = utxo_pool[curr_selection.back()];\n+        curr_amount -= utxo.GetSelectionAmount();\n+        curr_weight -= utxo.m_weight;\n+        curr_selection.pop_back();\n+    };\n+\n+    SelectionResult result(selection_target, SelectionAlgorithm::CG);\n+    size_t curr_try = 0;\n+    while (true) {\n+        bool should_shift{false}, should_cut{false};\n+        // Select `next_utxo`\n+        OutputGroup& utxo = utxo_pool[next_utxo];\n+        curr_amount += utxo.GetSelectionAmount();\n+        curr_weight += utxo.m_weight;\n+        curr_selection.push_back(next_utxo);\n+        ++next_utxo;\n+        ++curr_try;\n+\n+        // EVALUATE current selection: check for solutions and see whether we can CUT or SHIFT before EXPLORING further\n+        if (curr_weight > max_weight) {\n+            // max_weight exceeded: SHIFT\n+            max_tx_weight_exceeded = true;\n+            should_shift  = true;\n+        } else if (curr_amount >= total_target) {\n+            // Success, adding more weight cannot be better: SHIFT\n+            should_shift  = true;\n+            if (curr_weight < best_selection_weight || (curr_weight == best_selection_weight && curr_amount < best_selection_amount)) {\n+                // New lowest weight, or same weight with fewer funds tied up\n+                best_selection = curr_selection;\n+                best_selection_weight = curr_weight;\n+                best_selection_amount = curr_amount;\n+            }\n+        }\n+\n+        if (curr_try >= TOTAL_TRIES) {\n+            // Solution is not guaranteed to be optimal if `curr_try` hit TOTAL_TRIES\n+            result.SetSelectionsEvaluated(curr_try);\n+            break;\n+        }\n+\n+        if (next_utxo == utxo_pool.size()) {\n+            // Last added UTXO was end of UTXO pool, nothing left to add on inclusion or omission branch: CUT\n+            should_cut = true;\n+        }\n+\n+        if (should_cut) {\n+            // Neither adding to the current selection nor exploring the omission branch of the last selected UTXO can\n+            // find any solutions. Redirect to exploring Omission branch of the penultimate selected UTXO (i.e. deselect\n+            // last selected UTXO, then SHIFT)\n+            should_cut = false;\n+            deselect_last();\n+            should_shift  = true;\n+        }\n+\n+        if (should_shift) {\n+            // Set `next_utxo` to one after last selected, then deselect last selected UTXO\n+            if (curr_selection.empty()) {\n+                // Exhausted search space before running into attempt limit\n+                result.SetSelectionsEvaluated(curr_try);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472864023",
+      "id" : 1472864023,
+      "line" : 384,
+      "node_id" : "PRRC_kwDOABII585Xyh8X",
+      "original_commit_id" : "9ccbef5d481f7e6d42887f4230a2443e44405094",
+      "original_line" : 342,
+      "original_position" : 155,
+      "original_start_line" : null,
+      "path" : "src/wallet/coinselection.cpp",
+      "position" : 225,
+      "pull_request_review_id" : 1853774778,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472864023/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T15:25:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472864023",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472865513"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472865513"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Coding style nit:\r\n\r\n```c++\r\n} else {\r\n    append_error(cg_result);\r\n}\r\n```\r\n\r\n(single-line conditional only allowed if it's of the `if (condition) statement;` form)",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T14:01:01Z",
+      "diff_hunk" : "@@ -709,6 +709,13 @@ util::Result<SelectionResult> ChooseSelectionResult(interfaces::Chain& chain, co\n         results.push_back(*knapsack_result);\n     } else append_error(knapsack_result);\n \n+    if (coin_selection_params.m_effective_feerate > CFeeRate{3 * coin_selection_params.m_long_term_feerate}) { // Minimize input set for feerates of at least 3ÃLTFRE (default: 30â¯á¹©/vB+)\n+        if (auto cg_result{CoinGrinder(groups.positive_group, nTargetValue, coin_selection_params.m_min_change_target, max_inputs_weight)}) {\n+            cg_result->ComputeAndSetWaste(coin_selection_params.min_viable_change, coin_selection_params.m_cost_of_change, coin_selection_params.m_change_fee);\n+            results.push_back(*cg_result);\n+        } else append_error(cg_result);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472865513",
+      "id" : 1472865513,
+      "line" : 716,
+      "node_id" : "PRRC_kwDOABII585XyiTp",
+      "original_commit_id" : "9ccbef5d481f7e6d42887f4230a2443e44405094",
+      "original_line" : 716,
+      "original_position" : 8,
+      "original_start_line" : null,
+      "path" : "src/wallet/spend.cpp",
+      "position" : 8,
+      "pull_request_review_id" : 1853774778,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472865513/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T15:25:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472865513",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472986777"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472986777"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "I've experimented a bit with how far the range of inputs can be extended to cover extreme values (not because those extreme values are ones we care about in practice, but because they're more likely to expose bugs that do affect practical inputs):\r\n\r\n```diff\r\n--- a/src/wallet/test/fuzz/coinselection.cpp\r\n+++ b/src/wallet/test/fuzz/coinselection.cpp\r\n@@ -142,29 +142,25 @@ FUZZ_TARGET(coin_grinder_is_optimal)\r\n     FastRandomContext fast_random_context{ConsumeUInt256(fuzzed_data_provider)};\r\n     CoinSelectionParams coin_params{fast_random_context};\r\n     coin_params.m_subtract_fee_outputs = false;\r\n-    coin_params.m_effective_feerate = CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/COIN)};\r\n-    coin_params.m_min_change_target = fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(0, MAX_MONEY);\r\n+    // Set effective feerate up to MAX_MONEY sats per 1000000 vB (21000 BTC per kvB).\r\n+    coin_params.m_effective_feerate = CFeeRate{ConsumeMoney(fuzzed_data_provider, MAX_MONEY)};\r\n+    coin_params.m_min_change_target = ConsumeMoney(fuzzed_data_provider);\r\n \r\n     // Create some coins\r\n-    CAmount total_balance{0};\r\n     CAmount max_spendable{0};\r\n     int next_locktime{0};\r\n     unsigned max_output_groups = 16;\r\n     std::vector<OutputGroup> group_pos;\r\n     LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), max_output_groups)\r\n     {\r\n-        const int n_input_bytes{fuzzed_data_provider.ConsumeIntegralInRange<int>(41, 10000)};\r\n+        // With maximum m_effective_feerate and n_input_bytes = 1000000, input_fee <= MAX_MONEY.\r\n+        const int n_input_bytes{fuzzed_data_provider.ConsumeIntegralInRange<int>(1, 1000000)};\r\n         // Only make UTXOs with positive effective value\r\n         const CAmount input_fee = coin_params.m_effective_feerate.GetFee(n_input_bytes);\r\n-        const CAmount amount{fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(input_fee + 1, MAX_MONEY)};\r\n-        if (total_balance + amount >= MAX_MONEY) {\r\n-            break;\r\n-        }\r\n-\r\n+        const CAmount eff_value{fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(0, MAX_MONEY - max_spendable)};\r\n+        const CAmount amount{eff_value + input_fee};\r\n         std::vector<COutput> temp_utxo_pool;\r\n         AddCoin(amount, /*n_input=*/0, n_input_bytes, ++next_locktime, temp_utxo_pool, coin_params.m_effective_feerate);\r\n-        total_balance += amount;\r\n-        CAmount eff_value = amount - input_fee;\r\n         max_spendable += eff_value;\r\n \r\n         auto output_group = OutputGroup(coin_params);\r\n@@ -195,9 +191,9 @@ FUZZ_TARGET(coin_grinder_is_optimal)\r\n         }\r\n     }\r\n \r\n-    if (best_weight <= MAX_STANDARD_TX_WEIGHT) {\r\n+    if (best_weight < std::numeric_limits<int>::max()) {\r\n         // Sufficient funds and acceptable weight: CoinGrinder should find at least one solution\r\n-        int high_max_weight = fuzzed_data_provider.ConsumeIntegralInRange<int>(best_weight, MAX_STANDARD_TX_WEIGHT);\r\n+        int high_max_weight = fuzzed_data_provider.ConsumeIntegralInRange<int>(best_weight, std::numeric_limits<int>::max());\r\n \r\n         auto result_cg = CoinGrinder(group_pos, target, coin_params.m_min_change_target, high_max_weight);\r\n         assert(result_cg);\r\n@@ -209,7 +205,7 @@ FUZZ_TARGET(coin_grinder_is_optimal)\r\n     }\r\n \r\n     // CoinGrinder cannot ever find a better solution than the brute-forced best, or there is none in the first place\r\n-    int low_max_weight = fuzzed_data_provider.ConsumeIntegralInRange<int>(0, std::min(best_weight - 1, MAX_STANDARD_TX_WEIGHT));\r\n+    int low_max_weight = fuzzed_data_provider.ConsumeIntegralInRange<int>(0, best_weight - 1);\r\n     auto result_cg = CoinGrinder(group_pos, target, coin_params.m_min_change_target, low_max_weight);\r\n     // Max_weight should have been exceeded, or there were insufficient funds\r\n     assert(!result_cg);\r\n```",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T15:18:26Z",
+      "diff_hunk" : "@@ -134,6 +135,86 @@ FUZZ_TARGET(coin_grinder)\n     }\n }\n \n+FUZZ_TARGET(coin_grinder_is_optimal)\n+{\n+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};\n+\n+    FastRandomContext fast_random_context{ConsumeUInt256(fuzzed_data_provider)};\n+    CoinSelectionParams coin_params{fast_random_context};\n+    coin_params.m_subtract_fee_outputs = false;\n+    coin_params.m_effective_feerate = CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/COIN)};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1472986777",
+      "id" : 1472986777,
+      "line" : 145,
+      "node_id" : "PRRC_kwDOABII585Xy_6Z",
+      "original_commit_id" : "e8115ac3402a1722f89f2a4e1907a7fe151622dc",
+      "original_line" : 145,
+      "original_position" : 19,
+      "original_start_line" : null,
+      "path" : "src/wallet/test/fuzz/coinselection.cpp",
+      "position" : 76,
+      "pull_request_review_id" : 1853774778,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472986777/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T15:25:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1472986777",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1473374021"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473374021"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "While I agree that CoinGrinder already does work that scales with the size of the UTXO pool, I would argue that CoinGrinder should never need more than 100'000 tries to find _a_ solution. We can only use up to ~1740 inputs in a standard transaction, so if a wallet canât scrounge up enough funds after traversing 100'000 candidate input sets, Iâd say it has other issues.\r\n\r\nHappy to change both of these in a follow-up, but wouldnât consider it necessary for this PR to land.",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T19:38:05Z",
+      "diff_hunk" : "@@ -188,6 +188,177 @@ util::Result<SelectionResult> SelectCoinsBnB(std::vector<OutputGroup>& utxo_pool\n     return result;\n }\n \n+/*\n+ * Coin Grinder is a DFS-based algorithm that deterministically searches for the minimum-weight input set to fund the\n+ * transaction. The algorithm is similar to the Branch and Bound algorithm, but will produce a transaction _with_ a\n+ * change output instead of a changeless transaction.\n+ *\n+ * @param std::vector<OutputGroup>& utxo_pool The UTXOs that we are choosing from. These UTXOs will be sorted in\n+ *        descending order by effective value, with lower waste preferred as a tie-breaker. (We can think of an output\n+ *        group with multiple as a heavier UTXO with the combined amount here.)\n+ * @param const CAmount& selection_target This is the minimum amount that we need for the transaction without considering change.\n+ * @param const CAmount& change_target The minimum budget for creating a change output, by which we increase the selection_target.\n+ * @param int max_weight The maximum permitted weight for the input set.\n+ * @returns The result of this coin selection algorithm, or std::nullopt\n+ */\n+util::Result<SelectionResult> CoinGrinder(std::vector<OutputGroup>& utxo_pool, const CAmount& selection_target, CAmount change_target, int max_weight)\n+{\n+    std::sort(utxo_pool.begin(), utxo_pool.end(), descending);\n+\n+    // Check that there are sufficient funds\n+    CAmount total_available = 0;\n+    for (const OutputGroup& utxo : utxo_pool) {\n+        // Assert UTXOs with non-positive effective value have been filtered\n+        Assume(utxo.GetSelectionAmount() > 0);\n+        total_available += utxo.GetSelectionAmount();\n+    }\n+\n+    const CAmount total_target = selection_target + change_target;\n+    if (total_available < total_target) {\n+        // Insufficient funds\n+        return util::Error();\n+    }\n+\n+    // The current selection and the best input set found so far, stored as the utxo_pool indices of the UTXOs forming them\n+    std::vector<size_t> curr_selection;\n+    std::vector<size_t> best_selection;\n+\n+    // The currently selected effective amount, and the effective amount of the best selection so far\n+    CAmount curr_amount = 0;\n+    CAmount best_selection_amount = MAX_MONEY;\n+\n+    // The weight of the currently selected input set, and the weight of the best selection\n+    int curr_weight = 0;\n+    int best_selection_weight = std::numeric_limits<int>::max();\n+\n+    // Whether the input sets generated during this search have exceeded the maximum transaction weight at any point\n+    bool max_tx_weight_exceeded = false;\n+\n+    // Index of the next UTXO to consider in utxo_pool\n+    size_t next_utxo = 0;\n+\n+    /*\n+     * You can think of the current selection as a vector of booleans that has decided inclusion or exclusion of all\n+     * UTXOs before `next_utxo`. When we consider the next UTXO, we extend this hypothetical boolean vector either with\n+     * a true value if the UTXO is included or a false value if it is omitted. The equivalent state is stored more\n+     * compactly as the list of indices of the included UTXOs and the `next_utxo` index.\n+     *\n+     * We can never find a new solution by deselecting a UTXO, because we then revisit a previously evaluated\n+     * selection. Therefore, we only need to check whether we found a new solution _after adding_ a new UTXO.\n+     *\n+     * Each iteration of CoinGrinder starts by selecting the `next_utxo` and evaluating the current selection. We\n+     * use three state transitions to progress from the current selection to the next promising selection:\n+     *\n+     * - EXPLORE inclusion branch: We do not have sufficient funds, yet. Add `next_utxo` to the current selection, then\n+     *                             nominate the direct successor of the just selected UTXO as our `next_utxo` for the\n+     *                             following iteration.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: EXPLORE, next_utxo: 8\n+     *                                 Next Selection: {0, 5, 7, 8}\n+     *\n+     * - SHIFT to omission branch: Adding more UTXOs to the current selection cannot produce a solution that is better\n+     *                             than the current best, e.g. the current selection weight exceeds the max weight or\n+     *                             the current selection amount is equal to or greater than the target.\n+     *                             We designate our `next_utxo` the one after the tail of our current selection, then\n+     *                             deselect the tail of our current selection.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: SHIFT, next_utxo: 8, omit last selected: {0, 5}\n+     *                                 Next Selection: {0, 5, 8}\n+     *\n+     * - CUT entire subtree:       We have exhausted the inclusion branch for the penultimately selected UTXO, both the\n+     *                             inclusion and the omission branch of the current prefix are barren. E.g. we have\n+     *                             reached the end of the UTXO pool, so neither further EXPLORING nor SHIFTING can find\n+     *                             any solutions. We designate our `next_utxo` the one after our penultimate selected,\n+     *                             then deselect both the last and penultimate selected.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: CUT, next_utxo: 6, omit two last selected: {0}\n+     *                                 Next Selection: {0, 6}\n+     */\n+    auto deselect_last = [&]() {\n+        OutputGroup& utxo = utxo_pool[curr_selection.back()];\n+        curr_amount -= utxo.GetSelectionAmount();\n+        curr_weight -= utxo.m_weight;\n+        curr_selection.pop_back();\n+    };\n+\n+    SelectionResult result(selection_target, SelectionAlgorithm::CG);\n+    size_t curr_try = 0;\n+    while (true) {\n+        bool should_shift{false}, should_cut{false};\n+        // Select `next_utxo`\n+        OutputGroup& utxo = utxo_pool[next_utxo];\n+        curr_amount += utxo.GetSelectionAmount();\n+        curr_weight += utxo.m_weight;\n+        curr_selection.push_back(next_utxo);\n+        ++next_utxo;\n+        ++curr_try;\n+\n+        // EVALUATE current selection: check for solutions and see whether we can CUT or SHIFT before EXPLORING further\n+        if (curr_weight > max_weight) {\n+            // max_weight exceeded: SHIFT\n+            max_tx_weight_exceeded = true;\n+            should_shift  = true;\n+        } else if (curr_amount >= total_target) {\n+            // Success, adding more weight cannot be better: SHIFT\n+            should_shift  = true;\n+            if (curr_weight < best_selection_weight || (curr_weight == best_selection_weight && curr_amount < best_selection_amount)) {\n+                // New lowest weight, or same weight with fewer funds tied up\n+                best_selection = curr_selection;\n+                best_selection_weight = curr_weight;\n+                best_selection_amount = curr_amount;\n+            }\n+        }\n+\n+        if (curr_try >= TOTAL_TRIES) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1473374021",
+      "id" : 1473374021,
+      "in_reply_to_id" : 1472848173,
+      "line" : 358,
+      "node_id" : "PRRC_kwDOABII585X0edF",
+      "original_commit_id" : "9ccbef5d481f7e6d42887f4230a2443e44405094",
+      "original_line" : 318,
+      "original_position" : 131,
+      "original_start_line" : null,
+      "path" : "src/wallet/coinselection.cpp",
+      "position" : 199,
+      "pull_request_review_id" : 1854679982,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473374021/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T19:56:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473374021",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/4060799?v=4",
+         "events_url" : "https://api.github.com/users/murchandamus/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/murchandamus/followers",
+         "following_url" : "https://api.github.com/users/murchandamus/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/murchandamus/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/murchandamus",
+         "id" : 4060799,
+         "login" : "murchandamus",
+         "node_id" : "MDQ6VXNlcjQwNjA3OTk=",
+         "organizations_url" : "https://api.github.com/users/murchandamus/orgs",
+         "received_events_url" : "https://api.github.com/users/murchandamus/received_events",
+         "repos_url" : "https://api.github.com/users/murchandamus/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/murchandamus/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/murchandamus/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/murchandamus"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1473374818"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473374818"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "No, SHIFT is _deselect + explore_ and CUT is _deselect + deselect + explore_, so CUT is _deselect + SHIFT_.",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T19:38:52Z",
+      "diff_hunk" : "@@ -188,6 +188,177 @@ util::Result<SelectionResult> SelectCoinsBnB(std::vector<OutputGroup>& utxo_pool\n     return result;\n }\n \n+/*\n+ * Coin Grinder is a DFS-based algorithm that deterministically searches for the minimum-weight input set to fund the\n+ * transaction. The algorithm is similar to the Branch and Bound algorithm, but will produce a transaction _with_ a\n+ * change output instead of a changeless transaction.\n+ *\n+ * @param std::vector<OutputGroup>& utxo_pool The UTXOs that we are choosing from. These UTXOs will be sorted in\n+ *        descending order by effective value, with lower waste preferred as a tie-breaker. (We can think of an output\n+ *        group with multiple as a heavier UTXO with the combined amount here.)\n+ * @param const CAmount& selection_target This is the minimum amount that we need for the transaction without considering change.\n+ * @param const CAmount& change_target The minimum budget for creating a change output, by which we increase the selection_target.\n+ * @param int max_weight The maximum permitted weight for the input set.\n+ * @returns The result of this coin selection algorithm, or std::nullopt\n+ */\n+util::Result<SelectionResult> CoinGrinder(std::vector<OutputGroup>& utxo_pool, const CAmount& selection_target, CAmount change_target, int max_weight)\n+{\n+    std::sort(utxo_pool.begin(), utxo_pool.end(), descending);\n+\n+    // Check that there are sufficient funds\n+    CAmount total_available = 0;\n+    for (const OutputGroup& utxo : utxo_pool) {\n+        // Assert UTXOs with non-positive effective value have been filtered\n+        Assume(utxo.GetSelectionAmount() > 0);\n+        total_available += utxo.GetSelectionAmount();\n+    }\n+\n+    const CAmount total_target = selection_target + change_target;\n+    if (total_available < total_target) {\n+        // Insufficient funds\n+        return util::Error();\n+    }\n+\n+    // The current selection and the best input set found so far, stored as the utxo_pool indices of the UTXOs forming them\n+    std::vector<size_t> curr_selection;\n+    std::vector<size_t> best_selection;\n+\n+    // The currently selected effective amount, and the effective amount of the best selection so far\n+    CAmount curr_amount = 0;\n+    CAmount best_selection_amount = MAX_MONEY;\n+\n+    // The weight of the currently selected input set, and the weight of the best selection\n+    int curr_weight = 0;\n+    int best_selection_weight = std::numeric_limits<int>::max();\n+\n+    // Whether the input sets generated during this search have exceeded the maximum transaction weight at any point\n+    bool max_tx_weight_exceeded = false;\n+\n+    // Index of the next UTXO to consider in utxo_pool\n+    size_t next_utxo = 0;\n+\n+    /*\n+     * You can think of the current selection as a vector of booleans that has decided inclusion or exclusion of all\n+     * UTXOs before `next_utxo`. When we consider the next UTXO, we extend this hypothetical boolean vector either with\n+     * a true value if the UTXO is included or a false value if it is omitted. The equivalent state is stored more\n+     * compactly as the list of indices of the included UTXOs and the `next_utxo` index.\n+     *\n+     * We can never find a new solution by deselecting a UTXO, because we then revisit a previously evaluated\n+     * selection. Therefore, we only need to check whether we found a new solution _after adding_ a new UTXO.\n+     *\n+     * Each iteration of CoinGrinder starts by selecting the `next_utxo` and evaluating the current selection. We\n+     * use three state transitions to progress from the current selection to the next promising selection:\n+     *\n+     * - EXPLORE inclusion branch: We do not have sufficient funds, yet. Add `next_utxo` to the current selection, then\n+     *                             nominate the direct successor of the just selected UTXO as our `next_utxo` for the\n+     *                             following iteration.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: EXPLORE, next_utxo: 8\n+     *                                 Next Selection: {0, 5, 7, 8}\n+     *\n+     * - SHIFT to omission branch: Adding more UTXOs to the current selection cannot produce a solution that is better\n+     *                             than the current best, e.g. the current selection weight exceeds the max weight or\n+     *                             the current selection amount is equal to or greater than the target.\n+     *                             We designate our `next_utxo` the one after the tail of our current selection, then\n+     *                             deselect the tail of our current selection.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: SHIFT, next_utxo: 8, omit last selected: {0, 5}\n+     *                                 Next Selection: {0, 5, 8}\n+     *\n+     * - CUT entire subtree:       We have exhausted the inclusion branch for the penultimately selected UTXO, both the\n+     *                             inclusion and the omission branch of the current prefix are barren. E.g. we have\n+     *                             reached the end of the UTXO pool, so neither further EXPLORING nor SHIFTING can find\n+     *                             any solutions. We designate our `next_utxo` the one after our penultimate selected,\n+     *                             then deselect both the last and penultimate selected.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: CUT, next_utxo: 6, omit two last selected: {0}\n+     *                                 Next Selection: {0, 6}\n+     */\n+    auto deselect_last = [&]() {\n+        OutputGroup& utxo = utxo_pool[curr_selection.back()];\n+        curr_amount -= utxo.GetSelectionAmount();\n+        curr_weight -= utxo.m_weight;\n+        curr_selection.pop_back();\n+    };\n+\n+    SelectionResult result(selection_target, SelectionAlgorithm::CG);\n+    size_t curr_try = 0;\n+    while (true) {\n+        bool should_shift{false}, should_cut{false};\n+        // Select `next_utxo`\n+        OutputGroup& utxo = utxo_pool[next_utxo];\n+        curr_amount += utxo.GetSelectionAmount();\n+        curr_weight += utxo.m_weight;\n+        curr_selection.push_back(next_utxo);\n+        ++next_utxo;\n+        ++curr_try;\n+\n+        // EVALUATE current selection: check for solutions and see whether we can CUT or SHIFT before EXPLORING further\n+        if (curr_weight > max_weight) {\n+            // max_weight exceeded: SHIFT\n+            max_tx_weight_exceeded = true;\n+            should_shift  = true;\n+        } else if (curr_amount >= total_target) {\n+            // Success, adding more weight cannot be better: SHIFT\n+            should_shift  = true;\n+            if (curr_weight < best_selection_weight || (curr_weight == best_selection_weight && curr_amount < best_selection_amount)) {\n+                // New lowest weight, or same weight with fewer funds tied up\n+                best_selection = curr_selection;\n+                best_selection_weight = curr_weight;\n+                best_selection_amount = curr_amount;\n+            }\n+        }\n+\n+        if (curr_try >= TOTAL_TRIES) {\n+            // Solution is not guaranteed to be optimal if `curr_try` hit TOTAL_TRIES\n+            result.SetSelectionsEvaluated(curr_try);\n+            break;\n+        }\n+\n+        if (next_utxo == utxo_pool.size()) {\n+            // Last added UTXO was end of UTXO pool, nothing left to add on inclusion or omission branch: CUT\n+            should_cut = true;\n+        }\n+\n+        if (should_cut) {\n+            // Neither adding to the current selection nor exploring the omission branch of the last selected UTXO can\n+            // find any solutions. Redirect to exploring Omission branch of the penultimate selected UTXO (i.e. deselect\n+            // last selected UTXO, then SHIFT)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1473374818",
+      "id" : 1473374818,
+      "in_reply_to_id" : 1472849582,
+      "line" : 373,
+      "node_id" : "PRRC_kwDOABII585X0epi",
+      "original_commit_id" : "9ccbef5d481f7e6d42887f4230a2443e44405094",
+      "original_line" : 332,
+      "original_position" : 145,
+      "original_start_line" : null,
+      "path" : "src/wallet/coinselection.cpp",
+      "position" : 214,
+      "pull_request_review_id" : 1854679982,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473374818/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T19:56:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473374818",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/4060799?v=4",
+         "events_url" : "https://api.github.com/users/murchandamus/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/murchandamus/followers",
+         "following_url" : "https://api.github.com/users/murchandamus/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/murchandamus/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/murchandamus",
+         "id" : 4060799,
+         "login" : "murchandamus",
+         "node_id" : "MDQ6VXNlcjQwNjA3OTk=",
+         "organizations_url" : "https://api.github.com/users/murchandamus/orgs",
+         "received_events_url" : "https://api.github.com/users/murchandamus/received_events",
+         "repos_url" : "https://api.github.com/users/murchandamus/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/murchandamus/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/murchandamus/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/murchandamus"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1473376740"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473376740"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Yeah, looks correct. I will move `result.SetSelectionsEvaluated(curr_try)` out of the loop next time Iâll push. I know there are some other reviews in flight right now.",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T19:40:35Z",
+      "diff_hunk" : "@@ -188,6 +188,177 @@ util::Result<SelectionResult> SelectCoinsBnB(std::vector<OutputGroup>& utxo_pool\n     return result;\n }\n \n+/*\n+ * Coin Grinder is a DFS-based algorithm that deterministically searches for the minimum-weight input set to fund the\n+ * transaction. The algorithm is similar to the Branch and Bound algorithm, but will produce a transaction _with_ a\n+ * change output instead of a changeless transaction.\n+ *\n+ * @param std::vector<OutputGroup>& utxo_pool The UTXOs that we are choosing from. These UTXOs will be sorted in\n+ *        descending order by effective value, with lower waste preferred as a tie-breaker. (We can think of an output\n+ *        group with multiple as a heavier UTXO with the combined amount here.)\n+ * @param const CAmount& selection_target This is the minimum amount that we need for the transaction without considering change.\n+ * @param const CAmount& change_target The minimum budget for creating a change output, by which we increase the selection_target.\n+ * @param int max_weight The maximum permitted weight for the input set.\n+ * @returns The result of this coin selection algorithm, or std::nullopt\n+ */\n+util::Result<SelectionResult> CoinGrinder(std::vector<OutputGroup>& utxo_pool, const CAmount& selection_target, CAmount change_target, int max_weight)\n+{\n+    std::sort(utxo_pool.begin(), utxo_pool.end(), descending);\n+\n+    // Check that there are sufficient funds\n+    CAmount total_available = 0;\n+    for (const OutputGroup& utxo : utxo_pool) {\n+        // Assert UTXOs with non-positive effective value have been filtered\n+        Assume(utxo.GetSelectionAmount() > 0);\n+        total_available += utxo.GetSelectionAmount();\n+    }\n+\n+    const CAmount total_target = selection_target + change_target;\n+    if (total_available < total_target) {\n+        // Insufficient funds\n+        return util::Error();\n+    }\n+\n+    // The current selection and the best input set found so far, stored as the utxo_pool indices of the UTXOs forming them\n+    std::vector<size_t> curr_selection;\n+    std::vector<size_t> best_selection;\n+\n+    // The currently selected effective amount, and the effective amount of the best selection so far\n+    CAmount curr_amount = 0;\n+    CAmount best_selection_amount = MAX_MONEY;\n+\n+    // The weight of the currently selected input set, and the weight of the best selection\n+    int curr_weight = 0;\n+    int best_selection_weight = std::numeric_limits<int>::max();\n+\n+    // Whether the input sets generated during this search have exceeded the maximum transaction weight at any point\n+    bool max_tx_weight_exceeded = false;\n+\n+    // Index of the next UTXO to consider in utxo_pool\n+    size_t next_utxo = 0;\n+\n+    /*\n+     * You can think of the current selection as a vector of booleans that has decided inclusion or exclusion of all\n+     * UTXOs before `next_utxo`. When we consider the next UTXO, we extend this hypothetical boolean vector either with\n+     * a true value if the UTXO is included or a false value if it is omitted. The equivalent state is stored more\n+     * compactly as the list of indices of the included UTXOs and the `next_utxo` index.\n+     *\n+     * We can never find a new solution by deselecting a UTXO, because we then revisit a previously evaluated\n+     * selection. Therefore, we only need to check whether we found a new solution _after adding_ a new UTXO.\n+     *\n+     * Each iteration of CoinGrinder starts by selecting the `next_utxo` and evaluating the current selection. We\n+     * use three state transitions to progress from the current selection to the next promising selection:\n+     *\n+     * - EXPLORE inclusion branch: We do not have sufficient funds, yet. Add `next_utxo` to the current selection, then\n+     *                             nominate the direct successor of the just selected UTXO as our `next_utxo` for the\n+     *                             following iteration.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: EXPLORE, next_utxo: 8\n+     *                                 Next Selection: {0, 5, 7, 8}\n+     *\n+     * - SHIFT to omission branch: Adding more UTXOs to the current selection cannot produce a solution that is better\n+     *                             than the current best, e.g. the current selection weight exceeds the max weight or\n+     *                             the current selection amount is equal to or greater than the target.\n+     *                             We designate our `next_utxo` the one after the tail of our current selection, then\n+     *                             deselect the tail of our current selection.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: SHIFT, next_utxo: 8, omit last selected: {0, 5}\n+     *                                 Next Selection: {0, 5, 8}\n+     *\n+     * - CUT entire subtree:       We have exhausted the inclusion branch for the penultimately selected UTXO, both the\n+     *                             inclusion and the omission branch of the current prefix are barren. E.g. we have\n+     *                             reached the end of the UTXO pool, so neither further EXPLORING nor SHIFTING can find\n+     *                             any solutions. We designate our `next_utxo` the one after our penultimate selected,\n+     *                             then deselect both the last and penultimate selected.\n+     *\n+     *                             Example:\n+     *                                 Current Selection: {0, 5, 7}\n+     *                                 Evaluation: CUT, next_utxo: 6, omit two last selected: {0}\n+     *                                 Next Selection: {0, 6}\n+     */\n+    auto deselect_last = [&]() {\n+        OutputGroup& utxo = utxo_pool[curr_selection.back()];\n+        curr_amount -= utxo.GetSelectionAmount();\n+        curr_weight -= utxo.m_weight;\n+        curr_selection.pop_back();\n+    };\n+\n+    SelectionResult result(selection_target, SelectionAlgorithm::CG);\n+    size_t curr_try = 0;\n+    while (true) {\n+        bool should_shift{false}, should_cut{false};\n+        // Select `next_utxo`\n+        OutputGroup& utxo = utxo_pool[next_utxo];\n+        curr_amount += utxo.GetSelectionAmount();\n+        curr_weight += utxo.m_weight;\n+        curr_selection.push_back(next_utxo);\n+        ++next_utxo;\n+        ++curr_try;\n+\n+        // EVALUATE current selection: check for solutions and see whether we can CUT or SHIFT before EXPLORING further\n+        if (curr_weight > max_weight) {\n+            // max_weight exceeded: SHIFT\n+            max_tx_weight_exceeded = true;\n+            should_shift  = true;\n+        } else if (curr_amount >= total_target) {\n+            // Success, adding more weight cannot be better: SHIFT\n+            should_shift  = true;\n+            if (curr_weight < best_selection_weight || (curr_weight == best_selection_weight && curr_amount < best_selection_amount)) {\n+                // New lowest weight, or same weight with fewer funds tied up\n+                best_selection = curr_selection;\n+                best_selection_weight = curr_weight;\n+                best_selection_amount = curr_amount;\n+            }\n+        }\n+\n+        if (curr_try >= TOTAL_TRIES) {\n+            // Solution is not guaranteed to be optimal if `curr_try` hit TOTAL_TRIES\n+            result.SetSelectionsEvaluated(curr_try);\n+            break;\n+        }\n+\n+        if (next_utxo == utxo_pool.size()) {\n+            // Last added UTXO was end of UTXO pool, nothing left to add on inclusion or omission branch: CUT\n+            should_cut = true;\n+        }\n+\n+        if (should_cut) {\n+            // Neither adding to the current selection nor exploring the omission branch of the last selected UTXO can\n+            // find any solutions. Redirect to exploring Omission branch of the penultimate selected UTXO (i.e. deselect\n+            // last selected UTXO, then SHIFT)\n+            should_cut = false;\n+            deselect_last();\n+            should_shift  = true;\n+        }\n+\n+        if (should_shift) {\n+            // Set `next_utxo` to one after last selected, then deselect last selected UTXO\n+            if (curr_selection.empty()) {\n+                // Exhausted search space before running into attempt limit\n+                result.SetSelectionsEvaluated(curr_try);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1473376740",
+      "id" : 1473376740,
+      "in_reply_to_id" : 1472864023,
+      "line" : 384,
+      "node_id" : "PRRC_kwDOABII585X0fHk",
+      "original_commit_id" : "9ccbef5d481f7e6d42887f4230a2443e44405094",
+      "original_line" : 342,
+      "original_position" : 155,
+      "original_start_line" : null,
+      "path" : "src/wallet/coinselection.cpp",
+      "position" : 225,
+      "pull_request_review_id" : 1854679982,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473376740/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T19:56:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473376740",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/4060799?v=4",
+         "events_url" : "https://api.github.com/users/murchandamus/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/murchandamus/followers",
+         "following_url" : "https://api.github.com/users/murchandamus/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/murchandamus/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/murchandamus",
+         "id" : 4060799,
+         "login" : "murchandamus",
+         "node_id" : "MDQ6VXNlcjQwNjA3OTk=",
+         "organizations_url" : "https://api.github.com/users/murchandamus/orgs",
+         "received_events_url" : "https://api.github.com/users/murchandamus/received_events",
+         "repos_url" : "https://api.github.com/users/murchandamus/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/murchandamus/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/murchandamus/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/murchandamus"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1473377599"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473377599"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Okay, will fix when I push next time.",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T19:41:25Z",
+      "diff_hunk" : "@@ -709,6 +709,13 @@ util::Result<SelectionResult> ChooseSelectionResult(interfaces::Chain& chain, co\n         results.push_back(*knapsack_result);\n     } else append_error(knapsack_result);\n \n+    if (coin_selection_params.m_effective_feerate > CFeeRate{3 * coin_selection_params.m_long_term_feerate}) { // Minimize input set for feerates of at least 3ÃLTFRE (default: 30â¯á¹©/vB+)\n+        if (auto cg_result{CoinGrinder(groups.positive_group, nTargetValue, coin_selection_params.m_min_change_target, max_inputs_weight)}) {\n+            cg_result->ComputeAndSetWaste(coin_selection_params.min_viable_change, coin_selection_params.m_cost_of_change, coin_selection_params.m_change_fee);\n+            results.push_back(*cg_result);\n+        } else append_error(cg_result);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1473377599",
+      "id" : 1473377599,
+      "in_reply_to_id" : 1472865513,
+      "line" : 716,
+      "node_id" : "PRRC_kwDOABII585X0fU_",
+      "original_commit_id" : "9ccbef5d481f7e6d42887f4230a2443e44405094",
+      "original_line" : 716,
+      "original_position" : 8,
+      "original_start_line" : null,
+      "path" : "src/wallet/spend.cpp",
+      "position" : 8,
+      "pull_request_review_id" : 1854679982,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473377599/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T19:56:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473377599",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/4060799?v=4",
+         "events_url" : "https://api.github.com/users/murchandamus/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/murchandamus/followers",
+         "following_url" : "https://api.github.com/users/murchandamus/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/murchandamus/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/murchandamus",
+         "id" : 4060799,
+         "login" : "murchandamus",
+         "node_id" : "MDQ6VXNlcjQwNjA3OTk=",
+         "organizations_url" : "https://api.github.com/users/murchandamus/orgs",
+         "received_events_url" : "https://api.github.com/users/murchandamus/received_events",
+         "repos_url" : "https://api.github.com/users/murchandamus/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/murchandamus/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/murchandamus/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/murchandamus"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1473380373"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473380373"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Okay cool, sound great. Will adopt with the next push.",
+      "commit_id" : "ab7eaaa98bc29bafb96cda2d391e9a7ab16ccac7",
+      "created_at" : "2024-01-31T19:44:24Z",
+      "diff_hunk" : "@@ -134,6 +135,86 @@ FUZZ_TARGET(coin_grinder)\n     }\n }\n \n+FUZZ_TARGET(coin_grinder_is_optimal)\n+{\n+    FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};\n+\n+    FastRandomContext fast_random_context{ConsumeUInt256(fuzzed_data_provider)};\n+    CoinSelectionParams coin_params{fast_random_context};\n+    coin_params.m_subtract_fee_outputs = false;\n+    coin_params.m_effective_feerate = CFeeRate{ConsumeMoney(fuzzed_data_provider, /*max=*/COIN)};",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/27877#discussion_r1473380373",
+      "id" : 1473380373,
+      "in_reply_to_id" : 1472986777,
+      "line" : 145,
+      "node_id" : "PRRC_kwDOABII585X0gAV",
+      "original_commit_id" : "e8115ac3402a1722f89f2a4e1907a7fe151622dc",
+      "original_line" : 145,
+      "original_position" : 19,
+      "original_start_line" : null,
+      "path" : "src/wallet/test/fuzz/coinselection.cpp",
+      "position" : 76,
+      "pull_request_review_id" : 1854679982,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/27877",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473380373/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-01-31T19:56:35Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1473380373",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/4060799?v=4",
+         "events_url" : "https://api.github.com/users/murchandamus/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/murchandamus/followers",
+         "following_url" : "https://api.github.com/users/murchandamus/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/murchandamus/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/murchandamus",
+         "id" : 4060799,
+         "login" : "murchandamus",
+         "node_id" : "MDQ6VXNlcjQwNjA3OTk=",
+         "organizations_url" : "https://api.github.com/users/murchandamus/orgs",
+         "received_events_url" : "https://api.github.com/users/murchandamus/received_events",
+         "repos_url" : "https://api.github.com/users/murchandamus/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/murchandamus/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/murchandamus/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/murchandamus"
+      }
    }
 ]
