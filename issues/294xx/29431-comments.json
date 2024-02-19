@@ -227,6 +227,142 @@
    {
       "_links" : {
          "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29431#discussion_r1491848110"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29431"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491848110"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "do you think it would make sense to use `test_earlykeyresponse` here and then make `test_v2disconnection` into `run_test`",
+      "commit_id" : "ec9005ca4be088dfa2d247bbfe964a9c98e4f29d",
+      "created_at" : "2024-02-16T01:15:28Z",
+      "diff_hunk" : "@@ -0,0 +1,201 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2022 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+import random\n+from enum import Enum\n+\n+from test_framework.crypto.ellswift import ellswift_create\n+from test_framework.p2p import P2PInterface\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import random_bitflip\n+from test_framework.v2_p2p import (\n+    logger,\n+    EncryptedP2PState,\n+    MAX_GARBAGE_LEN,\n+    TRANSPORT_VERSION,\n+)\n+\n+\n+class TestType(Enum):\n+    \"\"\" Scenarios to be tested:\n+\n+    1. EARLY_KEY_RESPONSE - The responder needs to wait until one byte is received which does not match the 16 bytes\n+    consisting of network magic followed by \"version\\x00\\x00\\x00\\x00\\x00\" before sending out it's ellswift + garbage bytes\n+    2. EXCESS_GARBAGE - Disconnection happens when > MAX_GARBAGE_LEN bytes garbage is sent\n+    3. WRONG_GARBAGE_TERMINATOR - Disconnection happens when incorrect garbage terminator is sent\n+    4. WRONG_GARBAGE - Disconnection happens when garbage bytes that is sent is different from what the peer receives\n+    5. SEND_NO_AAD - Disconnection happens when AAD of first encrypted packet after the garbage terminator is not filled\n+    6. SEND_NON_EMPTY_VERSION_PACKET - non-empty version packet is simply ignored\n+    \"\"\"\n+    EARLY_KEY_RESPONSE = 0\n+    EXCESS_GARBAGE = 1\n+    WRONG_GARBAGE_TERMINATOR = 2\n+    WRONG_GARBAGE = 3\n+    SEND_NO_AAD = 4\n+    SEND_NON_EMPTY_VERSION_PACKET = 5\n+\n+\n+class TestEncryptedP2PState(EncryptedP2PState):\n+    \"\"\" Modify v2 P2P protocol functions for testing scenarios listed in `TestType`\"\"\"\n+    def __init__(self, test_type):\n+        super().__init__(initiating=True, net='regtest')\n+        self.test_type = test_type\n+        if test_type == TestType.EARLY_KEY_RESPONSE:\n+            self.magic_sent = False  # set to True after first 4 bytes of ellswift which match network magic is sent.\n+            self.can_data_be_received = False  # variable used to assert if data is received on recvbuf.\n+\n+    def generate_keypair_and_garbage(self):\n+        \"\"\"Generate > MAX_GARBAGE_LEN garbage bytes, MAX_GARBAGE_LEN//2 garbage bytes, tampered garbage bytes\n+        when TestType = (EXCESS_GARBAGE, WRONG_GARBAGE_TERMINATOR, WRONG_GARBAGE)\"\"\"\n+        self.privkey_ours, self.ellswift_ours = ellswift_create()\n+\n+        if self.test_type == TestType.EXCESS_GARBAGE:\n+            # send > 4095 bytes garbage\n+            garbage_len = MAX_GARBAGE_LEN + random.randrange(1, 10)\n+        elif self.test_type == TestType.WRONG_GARBAGE_TERMINATOR:\n+            garbage_len = random.randrange(MAX_GARBAGE_LEN//2)\n+        else:\n+            garbage_len = random.randrange(MAX_GARBAGE_LEN + 1)\n+\n+        self.sent_garbage = random.randbytes(garbage_len)\n+        logger.debug(f\"sending {garbage_len} bytes of garbage data\")\n+\n+        if self.test_type == TestType.WRONG_GARBAGE:\n+            # assume that garbage bytes sent to TestNode were tampered with\n+            return self.ellswift_ours + random_bitflip(self.sent_garbage)\n+        else:\n+            return self.ellswift_ours + self.sent_garbage\n+\n+    def initiate_v2_handshake(self):\n+        \"\"\"Send ellswift and garbage bytes in 2 parts when TestType = (EARLY_KEY_RESPONSE)\"\"\"\n+        if self.test_type == TestType.EARLY_KEY_RESPONSE:\n+            # Here, the 64 bytes ellswift is assumed to have it's first 4 bytes match network magic bytes.\n+            # It is sent in 2 phases:\n+            # 1. when `magic_sent` = False, send first 4 bytes of ellswift (matches network magic bytes)\n+            # 2. when `magic_sent` = True, send remaining 60 bytes of ellswift\n+            if not self.magic_sent:\n+                self.generate_keypair_and_garbage()\n+                self.magic_sent = True\n+                return b\"\\xfa\\xbf\\xb5\\xda\"\n+            else:\n+                # `can_data_be_received` is a variable used to assert if data is received on recvbuf.\n+                # 1. v2 TestNode shouldn't respond back if we send V1_PREFIX and data shouldn't be received on recvbuf.\n+                # This state is represented using `can_data_be_received` = False.\n+                # 2. v2 TestNode responds back when mismatch from V1_PREFIX happens and data can be received on recvbuf.\n+                # This state is represented using `can_data_be_received` = True.\n+                self.can_data_be_received = True\n+                return self.ellswift_ours[4:] + self.sent_garbage\n+        else:\n+            return super().initiate_v2_handshake()\n+\n+    def complete_handshake(self, response):\n+        \"\"\"Add option for sending wrong garbage terminator, not filling first encrypted packet after garbage terminator\n+        with AAD, sending non-empty transport version packet.\n+        when TestType = (WRONG_GARBAGE_TERMINATOR, SEND_NO_AAD, SEND_NON_EMPTY_VERSION_PACKET)\"\"\"\n+        ellswift_theirs = self.received_prefix + response.read(64 - len(self.received_prefix))\n+        # return b\"\" if we need to receive more bytes\n+        if len(ellswift_theirs) != 64:\n+            return 0, b\"\"\n+        ecdh_secret = self.v2_ecdh(self.privkey_ours, ellswift_theirs, self.ellswift_ours, self.initiating)\n+        self.initialize_v2_transport(ecdh_secret)\n+        # Send garbage terminator\n+        msg_to_send = self.peer['send_garbage_terminator']\n+        aad = self.sent_garbage\n+\n+        if self.test_type == TestType.WRONG_GARBAGE_TERMINATOR:\n+            msg_to_send = random_bitflip(msg_to_send)\n+        elif self.test_type == TestType.SEND_NO_AAD:\n+            aad = b''\n+\n+        # Optionally send decoy packets after garbage terminator.\n+        for decoy_content_len in [random.randint(1, 100) for _ in range(random.randint(0, 10))]:\n+            msg_to_send += self.v2_enc_packet(decoy_content_len * b'\\x00', aad=aad, ignore=True)\n+            aad = b''\n+\n+        # Send version packet.\n+        if self.test_type == TestType.SEND_NON_EMPTY_VERSION_PACKET:\n+            msg_to_send += self.v2_enc_packet(random.randbytes(5), aad=aad)\n+        else:\n+            msg_to_send += self.v2_enc_packet(TRANSPORT_VERSION, aad=aad)\n+\n+        return 64 - len(self.received_prefix), msg_to_send\n+\n+\n+class MisbehavingV2Peer(P2PInterface):\n+    \"\"\"Custom implementation of P2PInterface which uses modified v2 P2P protocol functions for testing purposes.\"\"\"\n+    def __init__(self, test_type):\n+        super().__init__()\n+        self.v2_state = None\n+        self.connection_opened = False\n+        self.test_type = test_type\n+\n+    def connection_made(self, transport):\n+        \"\"\"Only first 4 ellswift bytes which match network magic bytes is sent using `initial_v2_handshake()` in\n+        `connection_made()` when TestType = (EARLY_KEY_RESPONSE)\"\"\"\n+        self.v2_state = TestEncryptedP2PState(self.test_type)\n+        super().connection_made(transport)\n+\n+    def data_received(self, t):\n+        if self.test_type == TestType.EARLY_KEY_RESPONSE:\n+            # check that data can be received on recvbuf only when mismatch from V1_PREFIX happens (magic_sent = True)\n+            assert self.v2_state.can_data_be_received and self.v2_state.magic_sent\n+        else:\n+            super().data_received(t)\n+\n+    def on_open(self):\n+        self.connection_opened = True\n+\n+\n+class EncryptedP2PMisbehaving(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.extra_args = [[\"-v2transport=1\", \"-peertimeout=3\"]]\n+\n+    def run_test(self):\n+        self.test_earlykeyresponse()\n+        self.test_v2disconnection()\n+\n+    def test_earlykeyresponse(self):\n+        self.log.info('Sending ellswift bytes in parts to ensure that response from responder is received only when')\n+        self.log.info('ellswift bytes have a mismatch from the 16 bytes(network magic followed by \"version\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\")')\n+        node0 = self.nodes[0]\n+        self.log.info('Sending first 4 bytes of ellswift which match network magic')\n+        self.log.info('If a response is received, assertion failure would happen in our custom data_received() function')\n+        # send happens in `initiate_v2_handshake()` in `connection_made()`\n+        peer1 = node0.add_p2p_connection(MisbehavingV2Peer(TestType.EARLY_KEY_RESPONSE), wait_for_verack=False, send_version=False, supports_v2_p2p=True)\n+        self.wait_until(lambda: peer1.connection_opened)\n+        self.log.info('Sending remaining ellswift and garbage which are different from V1_PREFIX. Since a response is')\n+        self.log.info('expected now, our custom data_received() function wouldn\\'t result in assertion failure')\n+        ellswift_and_garbage_data = peer1.v2_state.initiate_v2_handshake()\n+        peer1.send_raw_message(ellswift_and_garbage_data)\n+        with self.nodes[0].assert_debug_log(['version handshake timeout peer=0']):\n+            peer1.wait_for_disconnect(timeout=5)\n+        self.log.info('successful disconnection since modified ellswift was sent as response')\n+\n+    def test_v2disconnection(self):\n+        # test v2 disconnection scenarios\n+        node0 = self.nodes[0]\n+        expected_debug_message = [\n+            [],  # EARLY_KEY_RESPONSE\n+            [\"V2 transport error: missing garbage terminator, peer=1\"],  # EXCESS_GARBAGE\n+            [\"version handshake timeout peer=2\"],  # WRONG_GARBAGE_TERMINATOR\n+            [\"V2 transport error: packet decryption failure\"],  # WRONG_GARBAGE\n+            [\"V2 transport error: packet decryption failure\"],  # SEND_NO_AAD\n+            [],  # SEND_NON_EMPTY_VERSION_PACKET\n+        ]\n+        for test_type in TestType:\n+            if test_type == TestType.EARLY_KEY_RESPONSE:\n+                continue",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29431#discussion_r1491848110",
+      "id" : 1491848110,
+      "line" : 190,
+      "node_id" : "PRRC_kwDOABII585Y68uu",
+      "original_commit_id" : "ec9005ca4be088dfa2d247bbfe964a9c98e4f29d",
+      "original_line" : 190,
+      "original_position" : 190,
+      "original_start_line" : null,
+      "path" : "test/functional/p2p_v2_misbehaving.py",
+      "position" : 190,
+      "pull_request_review_id" : 1884162177,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29431",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491848110/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-16T15:12:09Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491848110",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/15950706?v=4",
+         "events_url" : "https://api.github.com/users/kevkevinpal/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/kevkevinpal/followers",
+         "following_url" : "https://api.github.com/users/kevkevinpal/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/kevkevinpal/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/kevkevinpal",
+         "id" : 15950706,
+         "login" : "kevkevinpal",
+         "node_id" : "MDQ6VXNlcjE1OTUwNzA2",
+         "organizations_url" : "https://api.github.com/users/kevkevinpal/orgs",
+         "received_events_url" : "https://api.github.com/users/kevkevinpal/received_events",
+         "repos_url" : "https://api.github.com/users/kevkevinpal/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/kevkevinpal/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/kevkevinpal/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/kevkevinpal"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29431#discussion_r1491897558"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29431"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491897558"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Are the `test_type`'s in `test_v2disconnection` dependent on `test_earlykeyresponse` to run first?\r\n\r\nI tried running the tests individually for each `test_type` but I ran into this error, using this diff a74f4ddcc50eeba04977d8eeb96ffee2a94dbbf9 \r\n```\r\n2024-02-16T02:38:17.055000Z TestFramework (INFO): PRNG seed is: 8074818075718275852\r\n2024-02-16T02:38:17.056000Z TestFramework (INFO): Initializing test directory /var/folders/9g/cvx014yx4dq5lwl_x5zvn_j80000gn/T/bitcoin_func_test_dmwxb4ar\r\n2024-02-16T02:38:22.936000Z TestFramework (ERROR): Assertion failed\r\nTraceback (most recent call last):\r\n  File \"/Users/kevkevin/DEVDIR/bitcoin/test/functional/test_framework/test_framework.py\", line 131, in main\r\n    self.run_test()\r\n  File \"/Users/kevkevin/DEVDIR/bitcoin/./test/functional/p2p_v2_misbehaving.py\", line 176, in run_test\r\n    with self.nodes[0].assert_debug_log(expected_debug_message[test_type.value], timeout=5):\r\n  File \"/usr/local/Cellar/python@3.11/3.11.6_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/contextlib.py\", line 144, in __exit__\r\n    next(self.gen)\r\n  File \"/Users/kevkevin/DEVDIR/bitcoin/test/functional/test_framework/test_node.py\", line 492, in assert_debug_log\r\n    self._raise_assertion_error('Expected messages \"{}\" does not partially match log:\\n\\n{}\\n\\n'.format(str(expected_msgs), print_log))\r\n  File \"/Users/kevkevin/DEVDIR/bitcoin/test/functional/test_framework/test_node.py\", line 190, in _raise_assertion_error\r\n    raise AssertionError(self._node_msg(msg))\r\nAssertionError: [node 0] Expected messages \"['version handshake timeout peer=2']\" does not partially match log:\r\n\r\n - 2024-02-16T02:38:17.908176Z [net] [net.cpp:3712] [CNode] [net] Added connection peer=0\r\n - 2024-02-16T02:38:17.908650Z [net] [net.cpp:1820] [CreateNodeFromAcceptedSocket] [net] connection from 127.0.0.1:63849 accepted\r\n - 2024-02-16T02:38:21.015546Z [net] [net.cpp:1992] [InactivityCheck] [net] version handshake timeout peer=0\r\n - 2024-02-16T02:38:21.015844Z [net] [net.cpp:555] [CloseSocketDisconnect] [net] disconnecting peer=0\r\n - 2024-02-16T02:38:21.016463Z [net] [net_processing.cpp:1672] [FinalizeNode] [net] Cleared nodestate for peer=0\r\n\r\n\r\n2024-02-16T02:38:22.999000Z TestFramework (INFO): Stopping nodes\r\n2024-02-16T02:38:23.270000Z TestFramework (WARNING): Not cleaning up dir /var/folders/9g/cvx014yx4dq5lwl_x5zvn_j80000gn/T/bitcoin_func_test_dmwxb4ar\r\n2024-02-16T02:38:23.270000Z TestFramework (ERROR): Test failed. Test logging available at /var/folders/9g/cvx014yx4dq5lwl_x5zvn_j80000gn/T/bitcoin_func_test_dmwxb4ar/test_framework.log\r\n2024-02-16T02:38:23.271000Z TestFramework (ERROR):\r\n2024-02-16T02:38:23.271000Z TestFramework (ERROR): Hint: Call /Users/kevkevin/DEVDIR/bitcoin/test/functional/combine_logs.py '/var/folders/9g/cvx014yx4dq5lwl_x5zvn_j80000gn/T/bitcoin_func_test_dmwxb4ar' to consolidate all logs\r\n2024-02-16T02:38:23.271000Z TestFramework (ERROR):\r\n2024-02-16T02:38:23.271000Z TestFramework (ERROR): If this failure happened unexpectedly or intermittently, please file a bug and provide a link or upload of the combined log.\r\n2024-02-16T02:38:23.272000Z TestFramework (ERROR): https://github.com/bitcoin/bitcoin/issues\r\n2024-02-16T02:38:23.272000Z TestFramework (ERROR):\r\n```",
+      "commit_id" : "ec9005ca4be088dfa2d247bbfe964a9c98e4f29d",
+      "created_at" : "2024-02-16T02:43:16Z",
+      "diff_hunk" : "@@ -0,0 +1,201 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2022 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+import random\n+from enum import Enum\n+\n+from test_framework.crypto.ellswift import ellswift_create\n+from test_framework.p2p import P2PInterface\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import random_bitflip\n+from test_framework.v2_p2p import (\n+    logger,\n+    EncryptedP2PState,\n+    MAX_GARBAGE_LEN,\n+    TRANSPORT_VERSION,\n+)\n+\n+\n+class TestType(Enum):\n+    \"\"\" Scenarios to be tested:\n+\n+    1. EARLY_KEY_RESPONSE - The responder needs to wait until one byte is received which does not match the 16 bytes\n+    consisting of network magic followed by \"version\\x00\\x00\\x00\\x00\\x00\" before sending out it's ellswift + garbage bytes\n+    2. EXCESS_GARBAGE - Disconnection happens when > MAX_GARBAGE_LEN bytes garbage is sent\n+    3. WRONG_GARBAGE_TERMINATOR - Disconnection happens when incorrect garbage terminator is sent\n+    4. WRONG_GARBAGE - Disconnection happens when garbage bytes that is sent is different from what the peer receives\n+    5. SEND_NO_AAD - Disconnection happens when AAD of first encrypted packet after the garbage terminator is not filled\n+    6. SEND_NON_EMPTY_VERSION_PACKET - non-empty version packet is simply ignored\n+    \"\"\"\n+    EARLY_KEY_RESPONSE = 0\n+    EXCESS_GARBAGE = 1\n+    WRONG_GARBAGE_TERMINATOR = 2\n+    WRONG_GARBAGE = 3\n+    SEND_NO_AAD = 4\n+    SEND_NON_EMPTY_VERSION_PACKET = 5\n+\n+\n+class TestEncryptedP2PState(EncryptedP2PState):\n+    \"\"\" Modify v2 P2P protocol functions for testing scenarios listed in `TestType`\"\"\"\n+    def __init__(self, test_type):\n+        super().__init__(initiating=True, net='regtest')\n+        self.test_type = test_type\n+        if test_type == TestType.EARLY_KEY_RESPONSE:\n+            self.magic_sent = False  # set to True after first 4 bytes of ellswift which match network magic is sent.\n+            self.can_data_be_received = False  # variable used to assert if data is received on recvbuf.\n+\n+    def generate_keypair_and_garbage(self):\n+        \"\"\"Generate > MAX_GARBAGE_LEN garbage bytes, MAX_GARBAGE_LEN//2 garbage bytes, tampered garbage bytes\n+        when TestType = (EXCESS_GARBAGE, WRONG_GARBAGE_TERMINATOR, WRONG_GARBAGE)\"\"\"\n+        self.privkey_ours, self.ellswift_ours = ellswift_create()\n+\n+        if self.test_type == TestType.EXCESS_GARBAGE:\n+            # send > 4095 bytes garbage\n+            garbage_len = MAX_GARBAGE_LEN + random.randrange(1, 10)\n+        elif self.test_type == TestType.WRONG_GARBAGE_TERMINATOR:\n+            garbage_len = random.randrange(MAX_GARBAGE_LEN//2)\n+        else:\n+            garbage_len = random.randrange(MAX_GARBAGE_LEN + 1)\n+\n+        self.sent_garbage = random.randbytes(garbage_len)\n+        logger.debug(f\"sending {garbage_len} bytes of garbage data\")\n+\n+        if self.test_type == TestType.WRONG_GARBAGE:\n+            # assume that garbage bytes sent to TestNode were tampered with\n+            return self.ellswift_ours + random_bitflip(self.sent_garbage)\n+        else:\n+            return self.ellswift_ours + self.sent_garbage\n+\n+    def initiate_v2_handshake(self):\n+        \"\"\"Send ellswift and garbage bytes in 2 parts when TestType = (EARLY_KEY_RESPONSE)\"\"\"\n+        if self.test_type == TestType.EARLY_KEY_RESPONSE:\n+            # Here, the 64 bytes ellswift is assumed to have it's first 4 bytes match network magic bytes.\n+            # It is sent in 2 phases:\n+            # 1. when `magic_sent` = False, send first 4 bytes of ellswift (matches network magic bytes)\n+            # 2. when `magic_sent` = True, send remaining 60 bytes of ellswift\n+            if not self.magic_sent:\n+                self.generate_keypair_and_garbage()\n+                self.magic_sent = True\n+                return b\"\\xfa\\xbf\\xb5\\xda\"\n+            else:\n+                # `can_data_be_received` is a variable used to assert if data is received on recvbuf.\n+                # 1. v2 TestNode shouldn't respond back if we send V1_PREFIX and data shouldn't be received on recvbuf.\n+                # This state is represented using `can_data_be_received` = False.\n+                # 2. v2 TestNode responds back when mismatch from V1_PREFIX happens and data can be received on recvbuf.\n+                # This state is represented using `can_data_be_received` = True.\n+                self.can_data_be_received = True\n+                return self.ellswift_ours[4:] + self.sent_garbage\n+        else:\n+            return super().initiate_v2_handshake()\n+\n+    def complete_handshake(self, response):\n+        \"\"\"Add option for sending wrong garbage terminator, not filling first encrypted packet after garbage terminator\n+        with AAD, sending non-empty transport version packet.\n+        when TestType = (WRONG_GARBAGE_TERMINATOR, SEND_NO_AAD, SEND_NON_EMPTY_VERSION_PACKET)\"\"\"\n+        ellswift_theirs = self.received_prefix + response.read(64 - len(self.received_prefix))\n+        # return b\"\" if we need to receive more bytes\n+        if len(ellswift_theirs) != 64:\n+            return 0, b\"\"\n+        ecdh_secret = self.v2_ecdh(self.privkey_ours, ellswift_theirs, self.ellswift_ours, self.initiating)\n+        self.initialize_v2_transport(ecdh_secret)\n+        # Send garbage terminator\n+        msg_to_send = self.peer['send_garbage_terminator']\n+        aad = self.sent_garbage\n+\n+        if self.test_type == TestType.WRONG_GARBAGE_TERMINATOR:\n+            msg_to_send = random_bitflip(msg_to_send)\n+        elif self.test_type == TestType.SEND_NO_AAD:\n+            aad = b''\n+\n+        # Optionally send decoy packets after garbage terminator.\n+        for decoy_content_len in [random.randint(1, 100) for _ in range(random.randint(0, 10))]:\n+            msg_to_send += self.v2_enc_packet(decoy_content_len * b'\\x00', aad=aad, ignore=True)\n+            aad = b''\n+\n+        # Send version packet.\n+        if self.test_type == TestType.SEND_NON_EMPTY_VERSION_PACKET:\n+            msg_to_send += self.v2_enc_packet(random.randbytes(5), aad=aad)\n+        else:\n+            msg_to_send += self.v2_enc_packet(TRANSPORT_VERSION, aad=aad)\n+\n+        return 64 - len(self.received_prefix), msg_to_send\n+\n+\n+class MisbehavingV2Peer(P2PInterface):\n+    \"\"\"Custom implementation of P2PInterface which uses modified v2 P2P protocol functions for testing purposes.\"\"\"\n+    def __init__(self, test_type):\n+        super().__init__()\n+        self.v2_state = None\n+        self.connection_opened = False\n+        self.test_type = test_type\n+\n+    def connection_made(self, transport):\n+        \"\"\"Only first 4 ellswift bytes which match network magic bytes is sent using `initial_v2_handshake()` in\n+        `connection_made()` when TestType = (EARLY_KEY_RESPONSE)\"\"\"\n+        self.v2_state = TestEncryptedP2PState(self.test_type)\n+        super().connection_made(transport)\n+\n+    def data_received(self, t):\n+        if self.test_type == TestType.EARLY_KEY_RESPONSE:\n+            # check that data can be received on recvbuf only when mismatch from V1_PREFIX happens (magic_sent = True)\n+            assert self.v2_state.can_data_be_received and self.v2_state.magic_sent\n+        else:\n+            super().data_received(t)\n+\n+    def on_open(self):\n+        self.connection_opened = True\n+\n+\n+class EncryptedP2PMisbehaving(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.extra_args = [[\"-v2transport=1\", \"-peertimeout=3\"]]\n+\n+    def run_test(self):\n+        self.test_earlykeyresponse()\n+        self.test_v2disconnection()",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29431#discussion_r1491897558",
+      "id" : 1491897558,
+      "line" : 158,
+      "node_id" : "PRRC_kwDOABII585Y7IzW",
+      "original_commit_id" : "ec9005ca4be088dfa2d247bbfe964a9c98e4f29d",
+      "original_line" : 158,
+      "original_position" : 158,
+      "original_start_line" : 157,
+      "path" : "test/functional/p2p_v2_misbehaving.py",
+      "position" : 158,
+      "pull_request_review_id" : 1884162177,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29431",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491897558/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 157,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2024-02-16T15:12:09Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491897558",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/15950706?v=4",
+         "events_url" : "https://api.github.com/users/kevkevinpal/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/kevkevinpal/followers",
+         "following_url" : "https://api.github.com/users/kevkevinpal/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/kevkevinpal/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/kevkevinpal",
+         "id" : 15950706,
+         "login" : "kevkevinpal",
+         "node_id" : "MDQ6VXNlcjE1OTUwNzA2",
+         "organizations_url" : "https://api.github.com/users/kevkevinpal/orgs",
+         "received_events_url" : "https://api.github.com/users/kevkevinpal/received_events",
+         "repos_url" : "https://api.github.com/users/kevkevinpal/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/kevkevinpal/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/kevkevinpal/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/kevkevinpal"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
             "href" : "https://github.com/bitcoin/bitcoin/pull/29431#discussion_r1491901555"
          },
          "pull_request" : {
@@ -272,6 +408,144 @@
       "subject_type" : "line",
       "updated_at" : "2024-02-16T02:51:30Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491901555",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/44024636?v=4",
+         "events_url" : "https://api.github.com/users/stratospher/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/stratospher/followers",
+         "following_url" : "https://api.github.com/users/stratospher/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/stratospher/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/stratospher",
+         "id" : 44024636,
+         "login" : "stratospher",
+         "node_id" : "MDQ6VXNlcjQ0MDI0NjM2",
+         "organizations_url" : "https://api.github.com/users/stratospher/orgs",
+         "received_events_url" : "https://api.github.com/users/stratospher/received_events",
+         "repos_url" : "https://api.github.com/users/stratospher/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/stratospher/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/stratospher/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/stratospher"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29431#discussion_r1494116658"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29431"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1494116658"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "`test_earlykeyresponse` sends handshake bytes etc.. in the `MainThread` and I feel it's better to isolate that behaviour in a different test.\r\n\r\nalso, if you grep for `def test_` in `test/functional`, you'll see many [examples](https://github.com/bitcoin/bitcoin/blob/3cbc8cbc71d3d6ecfaf41164ce59c24ac94bae99/test/functional/feature_asmap.py#L128) of different tests listed in `run_test()` using the pattern which is currently used.",
+      "commit_id" : "ec9005ca4be088dfa2d247bbfe964a9c98e4f29d",
+      "created_at" : "2024-02-19T07:35:13Z",
+      "diff_hunk" : "@@ -0,0 +1,201 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2022 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+import random\n+from enum import Enum\n+\n+from test_framework.crypto.ellswift import ellswift_create\n+from test_framework.p2p import P2PInterface\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import random_bitflip\n+from test_framework.v2_p2p import (\n+    logger,\n+    EncryptedP2PState,\n+    MAX_GARBAGE_LEN,\n+    TRANSPORT_VERSION,\n+)\n+\n+\n+class TestType(Enum):\n+    \"\"\" Scenarios to be tested:\n+\n+    1. EARLY_KEY_RESPONSE - The responder needs to wait until one byte is received which does not match the 16 bytes\n+    consisting of network magic followed by \"version\\x00\\x00\\x00\\x00\\x00\" before sending out it's ellswift + garbage bytes\n+    2. EXCESS_GARBAGE - Disconnection happens when > MAX_GARBAGE_LEN bytes garbage is sent\n+    3. WRONG_GARBAGE_TERMINATOR - Disconnection happens when incorrect garbage terminator is sent\n+    4. WRONG_GARBAGE - Disconnection happens when garbage bytes that is sent is different from what the peer receives\n+    5. SEND_NO_AAD - Disconnection happens when AAD of first encrypted packet after the garbage terminator is not filled\n+    6. SEND_NON_EMPTY_VERSION_PACKET - non-empty version packet is simply ignored\n+    \"\"\"\n+    EARLY_KEY_RESPONSE = 0\n+    EXCESS_GARBAGE = 1\n+    WRONG_GARBAGE_TERMINATOR = 2\n+    WRONG_GARBAGE = 3\n+    SEND_NO_AAD = 4\n+    SEND_NON_EMPTY_VERSION_PACKET = 5\n+\n+\n+class TestEncryptedP2PState(EncryptedP2PState):\n+    \"\"\" Modify v2 P2P protocol functions for testing scenarios listed in `TestType`\"\"\"\n+    def __init__(self, test_type):\n+        super().__init__(initiating=True, net='regtest')\n+        self.test_type = test_type\n+        if test_type == TestType.EARLY_KEY_RESPONSE:\n+            self.magic_sent = False  # set to True after first 4 bytes of ellswift which match network magic is sent.\n+            self.can_data_be_received = False  # variable used to assert if data is received on recvbuf.\n+\n+    def generate_keypair_and_garbage(self):\n+        \"\"\"Generate > MAX_GARBAGE_LEN garbage bytes, MAX_GARBAGE_LEN//2 garbage bytes, tampered garbage bytes\n+        when TestType = (EXCESS_GARBAGE, WRONG_GARBAGE_TERMINATOR, WRONG_GARBAGE)\"\"\"\n+        self.privkey_ours, self.ellswift_ours = ellswift_create()\n+\n+        if self.test_type == TestType.EXCESS_GARBAGE:\n+            # send > 4095 bytes garbage\n+            garbage_len = MAX_GARBAGE_LEN + random.randrange(1, 10)\n+        elif self.test_type == TestType.WRONG_GARBAGE_TERMINATOR:\n+            garbage_len = random.randrange(MAX_GARBAGE_LEN//2)\n+        else:\n+            garbage_len = random.randrange(MAX_GARBAGE_LEN + 1)\n+\n+        self.sent_garbage = random.randbytes(garbage_len)\n+        logger.debug(f\"sending {garbage_len} bytes of garbage data\")\n+\n+        if self.test_type == TestType.WRONG_GARBAGE:\n+            # assume that garbage bytes sent to TestNode were tampered with\n+            return self.ellswift_ours + random_bitflip(self.sent_garbage)\n+        else:\n+            return self.ellswift_ours + self.sent_garbage\n+\n+    def initiate_v2_handshake(self):\n+        \"\"\"Send ellswift and garbage bytes in 2 parts when TestType = (EARLY_KEY_RESPONSE)\"\"\"\n+        if self.test_type == TestType.EARLY_KEY_RESPONSE:\n+            # Here, the 64 bytes ellswift is assumed to have it's first 4 bytes match network magic bytes.\n+            # It is sent in 2 phases:\n+            # 1. when `magic_sent` = False, send first 4 bytes of ellswift (matches network magic bytes)\n+            # 2. when `magic_sent` = True, send remaining 60 bytes of ellswift\n+            if not self.magic_sent:\n+                self.generate_keypair_and_garbage()\n+                self.magic_sent = True\n+                return b\"\\xfa\\xbf\\xb5\\xda\"\n+            else:\n+                # `can_data_be_received` is a variable used to assert if data is received on recvbuf.\n+                # 1. v2 TestNode shouldn't respond back if we send V1_PREFIX and data shouldn't be received on recvbuf.\n+                # This state is represented using `can_data_be_received` = False.\n+                # 2. v2 TestNode responds back when mismatch from V1_PREFIX happens and data can be received on recvbuf.\n+                # This state is represented using `can_data_be_received` = True.\n+                self.can_data_be_received = True\n+                return self.ellswift_ours[4:] + self.sent_garbage\n+        else:\n+            return super().initiate_v2_handshake()\n+\n+    def complete_handshake(self, response):\n+        \"\"\"Add option for sending wrong garbage terminator, not filling first encrypted packet after garbage terminator\n+        with AAD, sending non-empty transport version packet.\n+        when TestType = (WRONG_GARBAGE_TERMINATOR, SEND_NO_AAD, SEND_NON_EMPTY_VERSION_PACKET)\"\"\"\n+        ellswift_theirs = self.received_prefix + response.read(64 - len(self.received_prefix))\n+        # return b\"\" if we need to receive more bytes\n+        if len(ellswift_theirs) != 64:\n+            return 0, b\"\"\n+        ecdh_secret = self.v2_ecdh(self.privkey_ours, ellswift_theirs, self.ellswift_ours, self.initiating)\n+        self.initialize_v2_transport(ecdh_secret)\n+        # Send garbage terminator\n+        msg_to_send = self.peer['send_garbage_terminator']\n+        aad = self.sent_garbage\n+\n+        if self.test_type == TestType.WRONG_GARBAGE_TERMINATOR:\n+            msg_to_send = random_bitflip(msg_to_send)\n+        elif self.test_type == TestType.SEND_NO_AAD:\n+            aad = b''\n+\n+        # Optionally send decoy packets after garbage terminator.\n+        for decoy_content_len in [random.randint(1, 100) for _ in range(random.randint(0, 10))]:\n+            msg_to_send += self.v2_enc_packet(decoy_content_len * b'\\x00', aad=aad, ignore=True)\n+            aad = b''\n+\n+        # Send version packet.\n+        if self.test_type == TestType.SEND_NON_EMPTY_VERSION_PACKET:\n+            msg_to_send += self.v2_enc_packet(random.randbytes(5), aad=aad)\n+        else:\n+            msg_to_send += self.v2_enc_packet(TRANSPORT_VERSION, aad=aad)\n+\n+        return 64 - len(self.received_prefix), msg_to_send\n+\n+\n+class MisbehavingV2Peer(P2PInterface):\n+    \"\"\"Custom implementation of P2PInterface which uses modified v2 P2P protocol functions for testing purposes.\"\"\"\n+    def __init__(self, test_type):\n+        super().__init__()\n+        self.v2_state = None\n+        self.connection_opened = False\n+        self.test_type = test_type\n+\n+    def connection_made(self, transport):\n+        \"\"\"Only first 4 ellswift bytes which match network magic bytes is sent using `initial_v2_handshake()` in\n+        `connection_made()` when TestType = (EARLY_KEY_RESPONSE)\"\"\"\n+        self.v2_state = TestEncryptedP2PState(self.test_type)\n+        super().connection_made(transport)\n+\n+    def data_received(self, t):\n+        if self.test_type == TestType.EARLY_KEY_RESPONSE:\n+            # check that data can be received on recvbuf only when mismatch from V1_PREFIX happens (magic_sent = True)\n+            assert self.v2_state.can_data_be_received and self.v2_state.magic_sent\n+        else:\n+            super().data_received(t)\n+\n+    def on_open(self):\n+        self.connection_opened = True\n+\n+\n+class EncryptedP2PMisbehaving(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.extra_args = [[\"-v2transport=1\", \"-peertimeout=3\"]]\n+\n+    def run_test(self):\n+        self.test_earlykeyresponse()\n+        self.test_v2disconnection()\n+\n+    def test_earlykeyresponse(self):\n+        self.log.info('Sending ellswift bytes in parts to ensure that response from responder is received only when')\n+        self.log.info('ellswift bytes have a mismatch from the 16 bytes(network magic followed by \"version\\\\x00\\\\x00\\\\x00\\\\x00\\\\x00\")')\n+        node0 = self.nodes[0]\n+        self.log.info('Sending first 4 bytes of ellswift which match network magic')\n+        self.log.info('If a response is received, assertion failure would happen in our custom data_received() function')\n+        # send happens in `initiate_v2_handshake()` in `connection_made()`\n+        peer1 = node0.add_p2p_connection(MisbehavingV2Peer(TestType.EARLY_KEY_RESPONSE), wait_for_verack=False, send_version=False, supports_v2_p2p=True)\n+        self.wait_until(lambda: peer1.connection_opened)\n+        self.log.info('Sending remaining ellswift and garbage which are different from V1_PREFIX. Since a response is')\n+        self.log.info('expected now, our custom data_received() function wouldn\\'t result in assertion failure')\n+        ellswift_and_garbage_data = peer1.v2_state.initiate_v2_handshake()\n+        peer1.send_raw_message(ellswift_and_garbage_data)\n+        with self.nodes[0].assert_debug_log(['version handshake timeout peer=0']):\n+            peer1.wait_for_disconnect(timeout=5)\n+        self.log.info('successful disconnection since modified ellswift was sent as response')\n+\n+    def test_v2disconnection(self):\n+        # test v2 disconnection scenarios\n+        node0 = self.nodes[0]\n+        expected_debug_message = [\n+            [],  # EARLY_KEY_RESPONSE\n+            [\"V2 transport error: missing garbage terminator, peer=1\"],  # EXCESS_GARBAGE\n+            [\"version handshake timeout peer=2\"],  # WRONG_GARBAGE_TERMINATOR\n+            [\"V2 transport error: packet decryption failure\"],  # WRONG_GARBAGE\n+            [\"V2 transport error: packet decryption failure\"],  # SEND_NO_AAD\n+            [],  # SEND_NON_EMPTY_VERSION_PACKET\n+        ]\n+        for test_type in TestType:\n+            if test_type == TestType.EARLY_KEY_RESPONSE:\n+                continue",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29431#discussion_r1494116658",
+      "id" : 1494116658,
+      "in_reply_to_id" : 1491848110,
+      "line" : 190,
+      "node_id" : "PRRC_kwDOABII585ZDmky",
+      "original_commit_id" : "ec9005ca4be088dfa2d247bbfe964a9c98e4f29d",
+      "original_line" : 190,
+      "original_position" : 190,
+      "original_start_line" : null,
+      "path" : "test/functional/p2p_v2_misbehaving.py",
+      "position" : 190,
+      "pull_request_review_id" : 1887729403,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29431",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1494116658/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-19T07:51:51Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1494116658",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/44024636?v=4",
+         "events_url" : "https://api.github.com/users/stratospher/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/stratospher/followers",
+         "following_url" : "https://api.github.com/users/stratospher/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/stratospher/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/stratospher",
+         "id" : 44024636,
+         "login" : "stratospher",
+         "node_id" : "MDQ6VXNlcjQ0MDI0NjM2",
+         "organizations_url" : "https://api.github.com/users/stratospher/orgs",
+         "received_events_url" : "https://api.github.com/users/stratospher/received_events",
+         "repos_url" : "https://api.github.com/users/stratospher/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/stratospher/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/stratospher/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/stratospher"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29431#discussion_r1494131410"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29431"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1494131410"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "yeah! `expected_debug_message` on [L180](https://github.com/bitcoin/bitcoin/blob/ec9005ca4be088dfa2d247bbfe964a9c98e4f29d/test/functional/p2p_v2_misbehaving.py#L180) was written with the assumption that `test_v2disconnection` is run after `test_earlykeyresponse`. so peer=0 happens in `test_earlykeyresponse` and peer=1,2,3,4,5 happens in  `test_v2disconnection`.",
+      "commit_id" : "ec9005ca4be088dfa2d247bbfe964a9c98e4f29d",
+      "created_at" : "2024-02-19T07:50:51Z",
+      "diff_hunk" : "@@ -0,0 +1,201 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2022 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+import random\n+from enum import Enum\n+\n+from test_framework.crypto.ellswift import ellswift_create\n+from test_framework.p2p import P2PInterface\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import random_bitflip\n+from test_framework.v2_p2p import (\n+    logger,\n+    EncryptedP2PState,\n+    MAX_GARBAGE_LEN,\n+    TRANSPORT_VERSION,\n+)\n+\n+\n+class TestType(Enum):\n+    \"\"\" Scenarios to be tested:\n+\n+    1. EARLY_KEY_RESPONSE - The responder needs to wait until one byte is received which does not match the 16 bytes\n+    consisting of network magic followed by \"version\\x00\\x00\\x00\\x00\\x00\" before sending out it's ellswift + garbage bytes\n+    2. EXCESS_GARBAGE - Disconnection happens when > MAX_GARBAGE_LEN bytes garbage is sent\n+    3. WRONG_GARBAGE_TERMINATOR - Disconnection happens when incorrect garbage terminator is sent\n+    4. WRONG_GARBAGE - Disconnection happens when garbage bytes that is sent is different from what the peer receives\n+    5. SEND_NO_AAD - Disconnection happens when AAD of first encrypted packet after the garbage terminator is not filled\n+    6. SEND_NON_EMPTY_VERSION_PACKET - non-empty version packet is simply ignored\n+    \"\"\"\n+    EARLY_KEY_RESPONSE = 0\n+    EXCESS_GARBAGE = 1\n+    WRONG_GARBAGE_TERMINATOR = 2\n+    WRONG_GARBAGE = 3\n+    SEND_NO_AAD = 4\n+    SEND_NON_EMPTY_VERSION_PACKET = 5\n+\n+\n+class TestEncryptedP2PState(EncryptedP2PState):\n+    \"\"\" Modify v2 P2P protocol functions for testing scenarios listed in `TestType`\"\"\"\n+    def __init__(self, test_type):\n+        super().__init__(initiating=True, net='regtest')\n+        self.test_type = test_type\n+        if test_type == TestType.EARLY_KEY_RESPONSE:\n+            self.magic_sent = False  # set to True after first 4 bytes of ellswift which match network magic is sent.\n+            self.can_data_be_received = False  # variable used to assert if data is received on recvbuf.\n+\n+    def generate_keypair_and_garbage(self):\n+        \"\"\"Generate > MAX_GARBAGE_LEN garbage bytes, MAX_GARBAGE_LEN//2 garbage bytes, tampered garbage bytes\n+        when TestType = (EXCESS_GARBAGE, WRONG_GARBAGE_TERMINATOR, WRONG_GARBAGE)\"\"\"\n+        self.privkey_ours, self.ellswift_ours = ellswift_create()\n+\n+        if self.test_type == TestType.EXCESS_GARBAGE:\n+            # send > 4095 bytes garbage\n+            garbage_len = MAX_GARBAGE_LEN + random.randrange(1, 10)\n+        elif self.test_type == TestType.WRONG_GARBAGE_TERMINATOR:\n+            garbage_len = random.randrange(MAX_GARBAGE_LEN//2)\n+        else:\n+            garbage_len = random.randrange(MAX_GARBAGE_LEN + 1)\n+\n+        self.sent_garbage = random.randbytes(garbage_len)\n+        logger.debug(f\"sending {garbage_len} bytes of garbage data\")\n+\n+        if self.test_type == TestType.WRONG_GARBAGE:\n+            # assume that garbage bytes sent to TestNode were tampered with\n+            return self.ellswift_ours + random_bitflip(self.sent_garbage)\n+        else:\n+            return self.ellswift_ours + self.sent_garbage\n+\n+    def initiate_v2_handshake(self):\n+        \"\"\"Send ellswift and garbage bytes in 2 parts when TestType = (EARLY_KEY_RESPONSE)\"\"\"\n+        if self.test_type == TestType.EARLY_KEY_RESPONSE:\n+            # Here, the 64 bytes ellswift is assumed to have it's first 4 bytes match network magic bytes.\n+            # It is sent in 2 phases:\n+            # 1. when `magic_sent` = False, send first 4 bytes of ellswift (matches network magic bytes)\n+            # 2. when `magic_sent` = True, send remaining 60 bytes of ellswift\n+            if not self.magic_sent:\n+                self.generate_keypair_and_garbage()\n+                self.magic_sent = True\n+                return b\"\\xfa\\xbf\\xb5\\xda\"\n+            else:\n+                # `can_data_be_received` is a variable used to assert if data is received on recvbuf.\n+                # 1. v2 TestNode shouldn't respond back if we send V1_PREFIX and data shouldn't be received on recvbuf.\n+                # This state is represented using `can_data_be_received` = False.\n+                # 2. v2 TestNode responds back when mismatch from V1_PREFIX happens and data can be received on recvbuf.\n+                # This state is represented using `can_data_be_received` = True.\n+                self.can_data_be_received = True\n+                return self.ellswift_ours[4:] + self.sent_garbage\n+        else:\n+            return super().initiate_v2_handshake()\n+\n+    def complete_handshake(self, response):\n+        \"\"\"Add option for sending wrong garbage terminator, not filling first encrypted packet after garbage terminator\n+        with AAD, sending non-empty transport version packet.\n+        when TestType = (WRONG_GARBAGE_TERMINATOR, SEND_NO_AAD, SEND_NON_EMPTY_VERSION_PACKET)\"\"\"\n+        ellswift_theirs = self.received_prefix + response.read(64 - len(self.received_prefix))\n+        # return b\"\" if we need to receive more bytes\n+        if len(ellswift_theirs) != 64:\n+            return 0, b\"\"\n+        ecdh_secret = self.v2_ecdh(self.privkey_ours, ellswift_theirs, self.ellswift_ours, self.initiating)\n+        self.initialize_v2_transport(ecdh_secret)\n+        # Send garbage terminator\n+        msg_to_send = self.peer['send_garbage_terminator']\n+        aad = self.sent_garbage\n+\n+        if self.test_type == TestType.WRONG_GARBAGE_TERMINATOR:\n+            msg_to_send = random_bitflip(msg_to_send)\n+        elif self.test_type == TestType.SEND_NO_AAD:\n+            aad = b''\n+\n+        # Optionally send decoy packets after garbage terminator.\n+        for decoy_content_len in [random.randint(1, 100) for _ in range(random.randint(0, 10))]:\n+            msg_to_send += self.v2_enc_packet(decoy_content_len * b'\\x00', aad=aad, ignore=True)\n+            aad = b''\n+\n+        # Send version packet.\n+        if self.test_type == TestType.SEND_NON_EMPTY_VERSION_PACKET:\n+            msg_to_send += self.v2_enc_packet(random.randbytes(5), aad=aad)\n+        else:\n+            msg_to_send += self.v2_enc_packet(TRANSPORT_VERSION, aad=aad)\n+\n+        return 64 - len(self.received_prefix), msg_to_send\n+\n+\n+class MisbehavingV2Peer(P2PInterface):\n+    \"\"\"Custom implementation of P2PInterface which uses modified v2 P2P protocol functions for testing purposes.\"\"\"\n+    def __init__(self, test_type):\n+        super().__init__()\n+        self.v2_state = None\n+        self.connection_opened = False\n+        self.test_type = test_type\n+\n+    def connection_made(self, transport):\n+        \"\"\"Only first 4 ellswift bytes which match network magic bytes is sent using `initial_v2_handshake()` in\n+        `connection_made()` when TestType = (EARLY_KEY_RESPONSE)\"\"\"\n+        self.v2_state = TestEncryptedP2PState(self.test_type)\n+        super().connection_made(transport)\n+\n+    def data_received(self, t):\n+        if self.test_type == TestType.EARLY_KEY_RESPONSE:\n+            # check that data can be received on recvbuf only when mismatch from V1_PREFIX happens (magic_sent = True)\n+            assert self.v2_state.can_data_be_received and self.v2_state.magic_sent\n+        else:\n+            super().data_received(t)\n+\n+    def on_open(self):\n+        self.connection_opened = True\n+\n+\n+class EncryptedP2PMisbehaving(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.extra_args = [[\"-v2transport=1\", \"-peertimeout=3\"]]\n+\n+    def run_test(self):\n+        self.test_earlykeyresponse()\n+        self.test_v2disconnection()",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29431#discussion_r1494131410",
+      "id" : 1494131410,
+      "in_reply_to_id" : 1491897558,
+      "line" : 158,
+      "node_id" : "PRRC_kwDOABII585ZDqLS",
+      "original_commit_id" : "ec9005ca4be088dfa2d247bbfe964a9c98e4f29d",
+      "original_line" : 158,
+      "original_position" : 158,
+      "original_start_line" : 157,
+      "path" : "test/functional/p2p_v2_misbehaving.py",
+      "position" : 158,
+      "pull_request_review_id" : 1887729403,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29431",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1494131410/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 157,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2024-02-19T07:51:51Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1494131410",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/44024636?v=4",
          "events_url" : "https://api.github.com/users/stratospher/events{/privacy}",
