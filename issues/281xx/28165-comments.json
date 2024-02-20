@@ -8401,5 +8401,486 @@
          "type" : "User",
          "url" : "https://api.github.com/users/sipa"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1303035946"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303035946"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: named arguments at some places in the simulation test would be nice for improved readability\r\n```suggestion\r\n        if (send_fn(0, /*everything=*/true)) any = true;\r\n```\r\n(also for the boolean arguments of other `send_fn`, `recv_fn` and `make_msg_fn` calls).",
+      "commit_id" : "8a3b6f33873a1075f932f5d9feb6d82e50d83c0c",
+      "created_at" : "2023-08-23T13:37:21Z",
+      "diff_hunk" : "@@ -92,3 +102,231 @@ FUZZ_TARGET(p2p_transport_serialization, .init = initialize_p2p_transport_serial\n         }\n     }\n }\n+\n+namespace {\n+\n+template<typename R>\n+void SimulationTest(Transport& initiator, Transport& responder, R& rng, FuzzedDataProvider& provider)\n+{\n+    // Simulation test with two Transport objects, which send messages to each other, with\n+    // sending and receiving fragmented into multiple pieces that may be interleaved. It primarily\n+    // verifies that the sending and receiving side are compatible with each other, plus a few\n+    // sanity checks. It does not attempt to introduce errors in the communicated data.\n+\n+    // Put the transports in an array for by-index access.\n+    const std::array<Transport*, 2> transports = {&initiator, &responder};\n+\n+    // Two vectors representing in-flight bytes. inflight[i] is from transport[i] to transport[!i].\n+    std::array<std::vector<uint8_t>, 2> in_flight;\n+\n+    // Two deques with expected messages. expected[i] is expected to arrive in transport[!i].\n+    std::array<std::deque<CSerializedNetMsg>, 2> expected;\n+\n+    // Vectors with bytes last returned by GetBytesToSend() on transport[i].\n+    std::array<std::vector<uint8_t>, 2> to_send;\n+\n+    // Last returned 'more' values (if still relevant) by transport[i]->GetBytesToSend().\n+    std::array<std::optional<bool>, 2> last_more;\n+\n+    // Whether more bytes to be sent are expected on transport[i].\n+    std::array<std::optional<bool>, 2> expect_more;\n+\n+    // Function to consume a message type.\n+    auto msg_type_fn = [&]() {\n+        uint8_t v = provider.ConsumeIntegral<uint8_t>();\n+        if (v == 0xFF) {\n+            // If v is 0xFF, construct a valid (but possibly unknown) message type from the fuzz\n+            // data.\n+            std::string ret;\n+            while (ret.size() < CMessageHeader::COMMAND_SIZE) {\n+                char c = provider.ConsumeIntegral<char>();\n+                // Match the allowed characters in CMessageHeader::IsCommandValid(). Any other\n+                // character is interpreted as end.\n+                if (c < ' ' || c > 0x7E) break;\n+                ret += c;\n+            }\n+            return ret;\n+        } else {\n+            // Otherwise, use it as index into the list of known messages.\n+            return g_all_messages[v % g_all_messages.size()];\n+        }\n+    };\n+\n+    // Function to construct a CSerializedNetMsg to send.\n+    auto make_msg_fn = [&](bool first) {\n+        CSerializedNetMsg msg;\n+        if (first) {\n+            // Always send a \"version\" message as first one.\n+            msg.m_type = \"version\";\n+        } else {\n+            msg.m_type = msg_type_fn();\n+        }\n+        // Determine size of message to send (limited to 75 kB for performance reasons).\n+        size_t size = provider.ConsumeIntegralInRange<uint32_t>(0, 75000);\n+        // Get payload of message from RNG.\n+        msg.data.resize(size);\n+        for (auto& v : msg.data) v = uint8_t(rng());\n+        // Return.\n+        return msg;\n+    };\n+\n+    // The next message to be sent (initially version messages, but will be replaced once sent).\n+    std::array<CSerializedNetMsg, 2> next_msg = {make_msg_fn(true), make_msg_fn(true)};\n+\n+    // Wrapper around transport[i]->GetBytesToSend() that performs sanity checks.\n+    auto bytes_to_send_fn = [&](int side) -> Transport::BytesToSend {\n+        const auto& [bytes, more, msg_type] = transports[side]->GetBytesToSend();\n+        // Compare with expected more.\n+        if (expect_more[side].has_value()) assert(!bytes.empty() == *expect_more[side]);\n+        // Compare with previously reported output.\n+        assert(to_send[side].size() <= bytes.size());\n+        assert(to_send[side] == Span{bytes}.first(to_send[side].size()));\n+        to_send[side].resize(bytes.size());\n+        std::copy(bytes.begin(), bytes.end(), to_send[side].begin());\n+        // Remember 'more' result.\n+        last_more[side] = {more};\n+        // Return.\n+        return {bytes, more, msg_type};\n+    };\n+\n+    // Function to make side send a new message.\n+    auto new_msg_fn = [&](int side) {\n+        // Don't do anything if there are too many unreceived messages already.\n+        if (expected[side].size() >= 16) return;\n+        // Try to send (a copy of) the message in next_msg[side].\n+        CSerializedNetMsg msg = next_msg[side].Copy();\n+        bool queued = transports[side]->SetMessageToSend(msg);\n+        // Update expected more data.\n+        expect_more[side] = std::nullopt;\n+        // Verify consistency of GetBytesToSend after SetMessageToSend\n+        bytes_to_send_fn(side);\n+        if (queued) {\n+            // Remember that this message is now expected by the receiver.\n+            expected[side].emplace_back(std::move(next_msg[side]));\n+            // Construct a new next message to send.\n+            next_msg[side] = make_msg_fn(false);\n+        }\n+    };\n+\n+    // Function to make side send out bytes (if any).\n+    auto send_fn = [&](int side, bool everything = false) {\n+        const auto& [bytes, more, msg_type] = bytes_to_send_fn(side);\n+        // Don't do anything if no bytes to send.\n+        if (bytes.empty()) return false;\n+        size_t send_now = everything ? bytes.size() : provider.ConsumeIntegralInRange<size_t>(0, bytes.size());\n+        if (send_now == 0) return false;\n+        // Add bytes to the in-flight queue, and mark those bytes as consumed.\n+        in_flight[side].insert(in_flight[side].end(), bytes.begin(), bytes.begin() + send_now);\n+        transports[side]->MarkBytesSent(send_now);\n+        // If all to-be-sent bytes were sent, move last_more data to expect_more data.\n+        if (send_now == bytes.size()) {\n+            expect_more[side] = last_more[side];\n+        }\n+        // Remove the bytes from the last reported to-be-sent vector.\n+        assert(to_send[side].size() >= send_now);\n+        to_send[side].erase(to_send[side].begin(), to_send[side].begin() + send_now);\n+        // Verify that GetBytesToSend gives a result consistent with earlier.\n+        bytes_to_send_fn(side);\n+        // Return whether anything was sent.\n+        return send_now > 0;\n+    };\n+\n+    // Function to make !side receive bytes (if any).\n+    auto recv_fn = [&](int side, bool everything = false) {\n+        // Don't do anything if no bytes in flight.\n+        if (in_flight[side].empty()) return false;\n+        // Decide span to receive\n+        size_t to_recv_len = in_flight[side].size();\n+        if (!everything) to_recv_len = provider.ConsumeIntegralInRange<size_t>(0, to_recv_len);\n+        Span<const uint8_t> to_recv = Span{in_flight[side]}.first(to_recv_len);\n+        // Process those bytes\n+        while (!to_recv.empty()) {\n+            size_t old_len = to_recv.size();\n+            bool ret = transports[!side]->ReceivedBytes(to_recv);\n+            // Bytes must always be accepted, as this test does not introduce any errors in\n+            // communication.\n+            assert(ret);\n+            // Clear cached expected 'more' information: if certainly no more data was to be sent\n+            // before, receiving bytes makes this uncertain.\n+            if (expect_more[!side] == false) expect_more[!side] = std::nullopt;\n+            // Verify consistency of GetBytesToSend after ReceivedBytes\n+            bytes_to_send_fn(!side);\n+            bool progress = to_recv.size() < old_len;\n+            if (transports[!side]->ReceivedMessageComplete()) {\n+                bool reject{false};\n+                auto received = transports[!side]->GetReceivedMessage({}, reject);\n+                // Receiving must succeed.\n+                assert(!reject);\n+                // There must be a corresponding expected message.\n+                assert(!expected[side].empty());\n+                // The m_message_size field must be correct.\n+                assert(received.m_message_size == received.m_recv.size());\n+                // The m_type must match what is expected.\n+                assert(received.m_type == expected[side].front().m_type);\n+                // The data must match what is expected.\n+                assert(MakeByteSpan(received.m_recv) == MakeByteSpan(expected[side].front().data));\n+                expected[side].pop_front();\n+                progress = true;\n+            }\n+            // Progress must be made (by processing incoming bytes and/or returning complete\n+            // messages) until all received bytes are processed.\n+            assert(progress);\n+        }\n+        // Remove the processed bytes from the in_flight buffer.\n+        in_flight[side].erase(in_flight[side].begin(), in_flight[side].begin() + to_recv_len);\n+        // Return whether anything was received.\n+        return to_recv_len > 0;\n+    };\n+\n+    // Main loop, interleaving new messages, sends, and receives.\n+    LIMITED_WHILE(provider.remaining_bytes(), 1000) {\n+        CallOneOf(provider,\n+            // (Try to) give the next message to the transport.\n+            [&] { new_msg_fn(0); },\n+            [&] { new_msg_fn(1); },\n+            // (Try to) send some bytes from the transport to the network.\n+            [&] { send_fn(0); },\n+            [&] { send_fn(1); },\n+            // (Try to) receive bytes from the network, converting to messages.\n+            [&] { recv_fn(0); },\n+            [&] { recv_fn(1); }\n+        );\n+    }\n+\n+    // When we're done, perform sends and receives of existing messages to flush anything already\n+    // in flight.\n+    while (true) {\n+        bool any = false;\n+        if (send_fn(0, true)) any = true;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1303035946",
+      "id" : 1303035946,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585NqsAq",
+      "original_commit_id" : "89b220d44bca232a3dd7f25d839b2075b5a5d642",
+      "original_line" : 300,
+      "original_position" : 228,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/p2p_transport_serialization.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1591626400,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303035946/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-23T14:03:53Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303035946",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/91535?v=4",
+         "events_url" : "https://api.github.com/users/theStack/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theStack/followers",
+         "following_url" : "https://api.github.com/users/theStack/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theStack/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theStack",
+         "id" : 91535,
+         "login" : "theStack",
+         "node_id" : "MDQ6VXNlcjkxNTM1",
+         "organizations_url" : "https://api.github.com/users/theStack/orgs",
+         "received_events_url" : "https://api.github.com/users/theStack/received_events",
+         "repos_url" : "https://api.github.com/users/theStack/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theStack/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theStack/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theStack"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1303077167"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303077167"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Will do when I retouch.",
+      "commit_id" : "8a3b6f33873a1075f932f5d9feb6d82e50d83c0c",
+      "created_at" : "2023-08-23T14:05:27Z",
+      "diff_hunk" : "@@ -92,3 +102,231 @@ FUZZ_TARGET(p2p_transport_serialization, .init = initialize_p2p_transport_serial\n         }\n     }\n }\n+\n+namespace {\n+\n+template<typename R>\n+void SimulationTest(Transport& initiator, Transport& responder, R& rng, FuzzedDataProvider& provider)\n+{\n+    // Simulation test with two Transport objects, which send messages to each other, with\n+    // sending and receiving fragmented into multiple pieces that may be interleaved. It primarily\n+    // verifies that the sending and receiving side are compatible with each other, plus a few\n+    // sanity checks. It does not attempt to introduce errors in the communicated data.\n+\n+    // Put the transports in an array for by-index access.\n+    const std::array<Transport*, 2> transports = {&initiator, &responder};\n+\n+    // Two vectors representing in-flight bytes. inflight[i] is from transport[i] to transport[!i].\n+    std::array<std::vector<uint8_t>, 2> in_flight;\n+\n+    // Two deques with expected messages. expected[i] is expected to arrive in transport[!i].\n+    std::array<std::deque<CSerializedNetMsg>, 2> expected;\n+\n+    // Vectors with bytes last returned by GetBytesToSend() on transport[i].\n+    std::array<std::vector<uint8_t>, 2> to_send;\n+\n+    // Last returned 'more' values (if still relevant) by transport[i]->GetBytesToSend().\n+    std::array<std::optional<bool>, 2> last_more;\n+\n+    // Whether more bytes to be sent are expected on transport[i].\n+    std::array<std::optional<bool>, 2> expect_more;\n+\n+    // Function to consume a message type.\n+    auto msg_type_fn = [&]() {\n+        uint8_t v = provider.ConsumeIntegral<uint8_t>();\n+        if (v == 0xFF) {\n+            // If v is 0xFF, construct a valid (but possibly unknown) message type from the fuzz\n+            // data.\n+            std::string ret;\n+            while (ret.size() < CMessageHeader::COMMAND_SIZE) {\n+                char c = provider.ConsumeIntegral<char>();\n+                // Match the allowed characters in CMessageHeader::IsCommandValid(). Any other\n+                // character is interpreted as end.\n+                if (c < ' ' || c > 0x7E) break;\n+                ret += c;\n+            }\n+            return ret;\n+        } else {\n+            // Otherwise, use it as index into the list of known messages.\n+            return g_all_messages[v % g_all_messages.size()];\n+        }\n+    };\n+\n+    // Function to construct a CSerializedNetMsg to send.\n+    auto make_msg_fn = [&](bool first) {\n+        CSerializedNetMsg msg;\n+        if (first) {\n+            // Always send a \"version\" message as first one.\n+            msg.m_type = \"version\";\n+        } else {\n+            msg.m_type = msg_type_fn();\n+        }\n+        // Determine size of message to send (limited to 75 kB for performance reasons).\n+        size_t size = provider.ConsumeIntegralInRange<uint32_t>(0, 75000);\n+        // Get payload of message from RNG.\n+        msg.data.resize(size);\n+        for (auto& v : msg.data) v = uint8_t(rng());\n+        // Return.\n+        return msg;\n+    };\n+\n+    // The next message to be sent (initially version messages, but will be replaced once sent).\n+    std::array<CSerializedNetMsg, 2> next_msg = {make_msg_fn(true), make_msg_fn(true)};\n+\n+    // Wrapper around transport[i]->GetBytesToSend() that performs sanity checks.\n+    auto bytes_to_send_fn = [&](int side) -> Transport::BytesToSend {\n+        const auto& [bytes, more, msg_type] = transports[side]->GetBytesToSend();\n+        // Compare with expected more.\n+        if (expect_more[side].has_value()) assert(!bytes.empty() == *expect_more[side]);\n+        // Compare with previously reported output.\n+        assert(to_send[side].size() <= bytes.size());\n+        assert(to_send[side] == Span{bytes}.first(to_send[side].size()));\n+        to_send[side].resize(bytes.size());\n+        std::copy(bytes.begin(), bytes.end(), to_send[side].begin());\n+        // Remember 'more' result.\n+        last_more[side] = {more};\n+        // Return.\n+        return {bytes, more, msg_type};\n+    };\n+\n+    // Function to make side send a new message.\n+    auto new_msg_fn = [&](int side) {\n+        // Don't do anything if there are too many unreceived messages already.\n+        if (expected[side].size() >= 16) return;\n+        // Try to send (a copy of) the message in next_msg[side].\n+        CSerializedNetMsg msg = next_msg[side].Copy();\n+        bool queued = transports[side]->SetMessageToSend(msg);\n+        // Update expected more data.\n+        expect_more[side] = std::nullopt;\n+        // Verify consistency of GetBytesToSend after SetMessageToSend\n+        bytes_to_send_fn(side);\n+        if (queued) {\n+            // Remember that this message is now expected by the receiver.\n+            expected[side].emplace_back(std::move(next_msg[side]));\n+            // Construct a new next message to send.\n+            next_msg[side] = make_msg_fn(false);\n+        }\n+    };\n+\n+    // Function to make side send out bytes (if any).\n+    auto send_fn = [&](int side, bool everything = false) {\n+        const auto& [bytes, more, msg_type] = bytes_to_send_fn(side);\n+        // Don't do anything if no bytes to send.\n+        if (bytes.empty()) return false;\n+        size_t send_now = everything ? bytes.size() : provider.ConsumeIntegralInRange<size_t>(0, bytes.size());\n+        if (send_now == 0) return false;\n+        // Add bytes to the in-flight queue, and mark those bytes as consumed.\n+        in_flight[side].insert(in_flight[side].end(), bytes.begin(), bytes.begin() + send_now);\n+        transports[side]->MarkBytesSent(send_now);\n+        // If all to-be-sent bytes were sent, move last_more data to expect_more data.\n+        if (send_now == bytes.size()) {\n+            expect_more[side] = last_more[side];\n+        }\n+        // Remove the bytes from the last reported to-be-sent vector.\n+        assert(to_send[side].size() >= send_now);\n+        to_send[side].erase(to_send[side].begin(), to_send[side].begin() + send_now);\n+        // Verify that GetBytesToSend gives a result consistent with earlier.\n+        bytes_to_send_fn(side);\n+        // Return whether anything was sent.\n+        return send_now > 0;\n+    };\n+\n+    // Function to make !side receive bytes (if any).\n+    auto recv_fn = [&](int side, bool everything = false) {\n+        // Don't do anything if no bytes in flight.\n+        if (in_flight[side].empty()) return false;\n+        // Decide span to receive\n+        size_t to_recv_len = in_flight[side].size();\n+        if (!everything) to_recv_len = provider.ConsumeIntegralInRange<size_t>(0, to_recv_len);\n+        Span<const uint8_t> to_recv = Span{in_flight[side]}.first(to_recv_len);\n+        // Process those bytes\n+        while (!to_recv.empty()) {\n+            size_t old_len = to_recv.size();\n+            bool ret = transports[!side]->ReceivedBytes(to_recv);\n+            // Bytes must always be accepted, as this test does not introduce any errors in\n+            // communication.\n+            assert(ret);\n+            // Clear cached expected 'more' information: if certainly no more data was to be sent\n+            // before, receiving bytes makes this uncertain.\n+            if (expect_more[!side] == false) expect_more[!side] = std::nullopt;\n+            // Verify consistency of GetBytesToSend after ReceivedBytes\n+            bytes_to_send_fn(!side);\n+            bool progress = to_recv.size() < old_len;\n+            if (transports[!side]->ReceivedMessageComplete()) {\n+                bool reject{false};\n+                auto received = transports[!side]->GetReceivedMessage({}, reject);\n+                // Receiving must succeed.\n+                assert(!reject);\n+                // There must be a corresponding expected message.\n+                assert(!expected[side].empty());\n+                // The m_message_size field must be correct.\n+                assert(received.m_message_size == received.m_recv.size());\n+                // The m_type must match what is expected.\n+                assert(received.m_type == expected[side].front().m_type);\n+                // The data must match what is expected.\n+                assert(MakeByteSpan(received.m_recv) == MakeByteSpan(expected[side].front().data));\n+                expected[side].pop_front();\n+                progress = true;\n+            }\n+            // Progress must be made (by processing incoming bytes and/or returning complete\n+            // messages) until all received bytes are processed.\n+            assert(progress);\n+        }\n+        // Remove the processed bytes from the in_flight buffer.\n+        in_flight[side].erase(in_flight[side].begin(), in_flight[side].begin() + to_recv_len);\n+        // Return whether anything was received.\n+        return to_recv_len > 0;\n+    };\n+\n+    // Main loop, interleaving new messages, sends, and receives.\n+    LIMITED_WHILE(provider.remaining_bytes(), 1000) {\n+        CallOneOf(provider,\n+            // (Try to) give the next message to the transport.\n+            [&] { new_msg_fn(0); },\n+            [&] { new_msg_fn(1); },\n+            // (Try to) send some bytes from the transport to the network.\n+            [&] { send_fn(0); },\n+            [&] { send_fn(1); },\n+            // (Try to) receive bytes from the network, converting to messages.\n+            [&] { recv_fn(0); },\n+            [&] { recv_fn(1); }\n+        );\n+    }\n+\n+    // When we're done, perform sends and receives of existing messages to flush anything already\n+    // in flight.\n+    while (true) {\n+        bool any = false;\n+        if (send_fn(0, true)) any = true;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1303077167",
+      "id" : 1303077167,
+      "in_reply_to_id" : 1303035946,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Nq2Ev",
+      "original_commit_id" : "89b220d44bca232a3dd7f25d839b2075b5a5d642",
+      "original_line" : 300,
+      "original_position" : 228,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/p2p_transport_serialization.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1591690863,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303077167/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-23T14:05:27Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303077167",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1303300470"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303300470"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "It's fine by me but the spellcheck linter trips over it.",
+      "commit_id" : "8a3b6f33873a1075f932f5d9feb6d82e50d83c0c",
+      "created_at" : "2023-08-23T16:55:13Z",
+      "diff_hunk" : "@@ -92,3 +102,231 @@ FUZZ_TARGET(p2p_transport_serialization, .init = initialize_p2p_transport_serial\n         }\n     }\n }\n+\n+namespace {\n+\n+template<typename R>\n+void SimulationTest(Transport& initiator, Transport& responder, R& rng, FuzzedDataProvider& provider)\n+{\n+    // Simulation test with two Transport objects, which send messages to each other, with\n+    // sending and receiving fragmented into multiple pieces that may be interleaved. It primarily\n+    // verifies that the sending and receiving side are compatible with each other, plus a few\n+    // sanity checks. It does not attempt to introduce errors in the communicated data.\n+\n+    // Put the transports in an array for by-index access.\n+    const std::array<Transport*, 2> transports = {&initiator, &responder};\n+\n+    // Two vectors representing in-flight bytes. inflight[i] is from transport[i] to transport[!i].\n+    std::array<std::vector<uint8_t>, 2> in_flight;\n+\n+    // Two deques with expected messages. expected[i] is expected to arrive in transport[!i].",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1303300470",
+      "id" : 1303300470,
+      "in_reply_to_id" : 1302858154,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585Nrsl2",
+      "original_commit_id" : "89b220d44bca232a3dd7f25d839b2075b5a5d642",
+      "original_line" : 122,
+      "original_position" : 50,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/p2p_transport_serialization.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1592035713,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303300470/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-23T16:55:13Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303300470",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1303658001"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303658001"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done.",
+      "commit_id" : "8a3b6f33873a1075f932f5d9feb6d82e50d83c0c",
+      "created_at" : "2023-08-24T00:15:09Z",
+      "diff_hunk" : "@@ -92,3 +102,231 @@ FUZZ_TARGET(p2p_transport_serialization, .init = initialize_p2p_transport_serial\n         }\n     }\n }\n+\n+namespace {\n+\n+template<typename R>\n+void SimulationTest(Transport& initiator, Transport& responder, R& rng, FuzzedDataProvider& provider)\n+{\n+    // Simulation test with two Transport objects, which send messages to each other, with\n+    // sending and receiving fragmented into multiple pieces that may be interleaved. It primarily\n+    // verifies that the sending and receiving side are compatible with each other, plus a few\n+    // sanity checks. It does not attempt to introduce errors in the communicated data.\n+\n+    // Put the transports in an array for by-index access.\n+    const std::array<Transport*, 2> transports = {&initiator, &responder};\n+\n+    // Two vectors representing in-flight bytes. inflight[i] is from transport[i] to transport[!i].\n+    std::array<std::vector<uint8_t>, 2> in_flight;\n+\n+    // Two deques with expected messages. expected[i] is expected to arrive in transport[!i].\n+    std::array<std::deque<CSerializedNetMsg>, 2> expected;\n+\n+    // Vectors with bytes last returned by GetBytesToSend() on transport[i].\n+    std::array<std::vector<uint8_t>, 2> to_send;\n+\n+    // Last returned 'more' values (if still relevant) by transport[i]->GetBytesToSend().\n+    std::array<std::optional<bool>, 2> last_more;\n+\n+    // Whether more bytes to be sent are expected on transport[i].\n+    std::array<std::optional<bool>, 2> expect_more;\n+\n+    // Function to consume a message type.\n+    auto msg_type_fn = [&]() {\n+        uint8_t v = provider.ConsumeIntegral<uint8_t>();\n+        if (v == 0xFF) {\n+            // If v is 0xFF, construct a valid (but possibly unknown) message type from the fuzz\n+            // data.\n+            std::string ret;\n+            while (ret.size() < CMessageHeader::COMMAND_SIZE) {\n+                char c = provider.ConsumeIntegral<char>();\n+                // Match the allowed characters in CMessageHeader::IsCommandValid(). Any other\n+                // character is interpreted as end.\n+                if (c < ' ' || c > 0x7E) break;\n+                ret += c;\n+            }\n+            return ret;\n+        } else {\n+            // Otherwise, use it as index into the list of known messages.\n+            return g_all_messages[v % g_all_messages.size()];\n+        }\n+    };\n+\n+    // Function to construct a CSerializedNetMsg to send.\n+    auto make_msg_fn = [&](bool first) {\n+        CSerializedNetMsg msg;\n+        if (first) {\n+            // Always send a \"version\" message as first one.\n+            msg.m_type = \"version\";\n+        } else {\n+            msg.m_type = msg_type_fn();\n+        }\n+        // Determine size of message to send (limited to 75 kB for performance reasons).\n+        size_t size = provider.ConsumeIntegralInRange<uint32_t>(0, 75000);\n+        // Get payload of message from RNG.\n+        msg.data.resize(size);\n+        for (auto& v : msg.data) v = uint8_t(rng());\n+        // Return.\n+        return msg;\n+    };\n+\n+    // The next message to be sent (initially version messages, but will be replaced once sent).\n+    std::array<CSerializedNetMsg, 2> next_msg = {make_msg_fn(true), make_msg_fn(true)};\n+\n+    // Wrapper around transport[i]->GetBytesToSend() that performs sanity checks.\n+    auto bytes_to_send_fn = [&](int side) -> Transport::BytesToSend {\n+        const auto& [bytes, more, msg_type] = transports[side]->GetBytesToSend();\n+        // Compare with expected more.\n+        if (expect_more[side].has_value()) assert(!bytes.empty() == *expect_more[side]);\n+        // Compare with previously reported output.\n+        assert(to_send[side].size() <= bytes.size());\n+        assert(to_send[side] == Span{bytes}.first(to_send[side].size()));\n+        to_send[side].resize(bytes.size());\n+        std::copy(bytes.begin(), bytes.end(), to_send[side].begin());\n+        // Remember 'more' result.\n+        last_more[side] = {more};\n+        // Return.\n+        return {bytes, more, msg_type};\n+    };\n+\n+    // Function to make side send a new message.\n+    auto new_msg_fn = [&](int side) {\n+        // Don't do anything if there are too many unreceived messages already.\n+        if (expected[side].size() >= 16) return;\n+        // Try to send (a copy of) the message in next_msg[side].\n+        CSerializedNetMsg msg = next_msg[side].Copy();\n+        bool queued = transports[side]->SetMessageToSend(msg);\n+        // Update expected more data.\n+        expect_more[side] = std::nullopt;\n+        // Verify consistency of GetBytesToSend after SetMessageToSend\n+        bytes_to_send_fn(side);\n+        if (queued) {\n+            // Remember that this message is now expected by the receiver.\n+            expected[side].emplace_back(std::move(next_msg[side]));\n+            // Construct a new next message to send.\n+            next_msg[side] = make_msg_fn(false);\n+        }\n+    };\n+\n+    // Function to make side send out bytes (if any).\n+    auto send_fn = [&](int side, bool everything = false) {\n+        const auto& [bytes, more, msg_type] = bytes_to_send_fn(side);\n+        // Don't do anything if no bytes to send.\n+        if (bytes.empty()) return false;\n+        size_t send_now = everything ? bytes.size() : provider.ConsumeIntegralInRange<size_t>(0, bytes.size());\n+        if (send_now == 0) return false;\n+        // Add bytes to the in-flight queue, and mark those bytes as consumed.\n+        in_flight[side].insert(in_flight[side].end(), bytes.begin(), bytes.begin() + send_now);\n+        transports[side]->MarkBytesSent(send_now);\n+        // If all to-be-sent bytes were sent, move last_more data to expect_more data.\n+        if (send_now == bytes.size()) {\n+            expect_more[side] = last_more[side];\n+        }\n+        // Remove the bytes from the last reported to-be-sent vector.\n+        assert(to_send[side].size() >= send_now);\n+        to_send[side].erase(to_send[side].begin(), to_send[side].begin() + send_now);\n+        // Verify that GetBytesToSend gives a result consistent with earlier.\n+        bytes_to_send_fn(side);\n+        // Return whether anything was sent.\n+        return send_now > 0;\n+    };\n+\n+    // Function to make !side receive bytes (if any).\n+    auto recv_fn = [&](int side, bool everything = false) {\n+        // Don't do anything if no bytes in flight.\n+        if (in_flight[side].empty()) return false;\n+        // Decide span to receive\n+        size_t to_recv_len = in_flight[side].size();\n+        if (!everything) to_recv_len = provider.ConsumeIntegralInRange<size_t>(0, to_recv_len);\n+        Span<const uint8_t> to_recv = Span{in_flight[side]}.first(to_recv_len);\n+        // Process those bytes\n+        while (!to_recv.empty()) {\n+            size_t old_len = to_recv.size();\n+            bool ret = transports[!side]->ReceivedBytes(to_recv);\n+            // Bytes must always be accepted, as this test does not introduce any errors in\n+            // communication.\n+            assert(ret);\n+            // Clear cached expected 'more' information: if certainly no more data was to be sent\n+            // before, receiving bytes makes this uncertain.\n+            if (expect_more[!side] == false) expect_more[!side] = std::nullopt;\n+            // Verify consistency of GetBytesToSend after ReceivedBytes\n+            bytes_to_send_fn(!side);\n+            bool progress = to_recv.size() < old_len;\n+            if (transports[!side]->ReceivedMessageComplete()) {\n+                bool reject{false};\n+                auto received = transports[!side]->GetReceivedMessage({}, reject);\n+                // Receiving must succeed.\n+                assert(!reject);\n+                // There must be a corresponding expected message.\n+                assert(!expected[side].empty());\n+                // The m_message_size field must be correct.\n+                assert(received.m_message_size == received.m_recv.size());\n+                // The m_type must match what is expected.\n+                assert(received.m_type == expected[side].front().m_type);\n+                // The data must match what is expected.\n+                assert(MakeByteSpan(received.m_recv) == MakeByteSpan(expected[side].front().data));\n+                expected[side].pop_front();\n+                progress = true;\n+            }\n+            // Progress must be made (by processing incoming bytes and/or returning complete\n+            // messages) until all received bytes are processed.\n+            assert(progress);\n+        }\n+        // Remove the processed bytes from the in_flight buffer.\n+        in_flight[side].erase(in_flight[side].begin(), in_flight[side].begin() + to_recv_len);\n+        // Return whether anything was received.\n+        return to_recv_len > 0;\n+    };\n+\n+    // Main loop, interleaving new messages, sends, and receives.\n+    LIMITED_WHILE(provider.remaining_bytes(), 1000) {\n+        CallOneOf(provider,\n+            // (Try to) give the next message to the transport.\n+            [&] { new_msg_fn(0); },\n+            [&] { new_msg_fn(1); },\n+            // (Try to) send some bytes from the transport to the network.\n+            [&] { send_fn(0); },\n+            [&] { send_fn(1); },\n+            // (Try to) receive bytes from the network, converting to messages.\n+            [&] { recv_fn(0); },\n+            [&] { recv_fn(1); }\n+        );\n+    }\n+\n+    // When we're done, perform sends and receives of existing messages to flush anything already\n+    // in flight.\n+    while (true) {\n+        bool any = false;\n+        if (send_fn(0, true)) any = true;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1303658001",
+      "id" : 1303658001,
+      "in_reply_to_id" : 1303035946,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585NtD4R",
+      "original_commit_id" : "89b220d44bca232a3dd7f25d839b2075b5a5d642",
+      "original_line" : 300,
+      "original_position" : 228,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/p2p_transport_serialization.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1592573938,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303658001/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-24T00:15:09Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303658001",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1303658085"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303658085"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Fixed (replaced by `queues`).",
+      "commit_id" : "8a3b6f33873a1075f932f5d9feb6d82e50d83c0c",
+      "created_at" : "2023-08-24T00:15:20Z",
+      "diff_hunk" : "@@ -92,3 +102,231 @@ FUZZ_TARGET(p2p_transport_serialization, .init = initialize_p2p_transport_serial\n         }\n     }\n }\n+\n+namespace {\n+\n+template<typename R>\n+void SimulationTest(Transport& initiator, Transport& responder, R& rng, FuzzedDataProvider& provider)\n+{\n+    // Simulation test with two Transport objects, which send messages to each other, with\n+    // sending and receiving fragmented into multiple pieces that may be interleaved. It primarily\n+    // verifies that the sending and receiving side are compatible with each other, plus a few\n+    // sanity checks. It does not attempt to introduce errors in the communicated data.\n+\n+    // Put the transports in an array for by-index access.\n+    const std::array<Transport*, 2> transports = {&initiator, &responder};\n+\n+    // Two vectors representing in-flight bytes. inflight[i] is from transport[i] to transport[!i].\n+    std::array<std::vector<uint8_t>, 2> in_flight;\n+\n+    // Two deques with expected messages. expected[i] is expected to arrive in transport[!i].",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1303658085",
+      "id" : 1303658085,
+      "in_reply_to_id" : 1302858154,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585NtD5l",
+      "original_commit_id" : "89b220d44bca232a3dd7f25d839b2075b5a5d642",
+      "original_line" : 122,
+      "original_position" : 50,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/p2p_transport_serialization.cpp",
+      "position" : null,
+      "pull_request_review_id" : 1592574046,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303658085/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2023-08-24T00:15:21Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1303658085",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1491029750"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491029750"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Why this sort here? Anybody remembers? It is only used like:\r\n\r\n```cpp\r\ng_all_messages[v % g_all_messages.size()]\r\n```\r\n\r\nwhere `v` is a random number. The sort seems unnecessary?\r\n\r\nThe question arised in: https://github.com/bitcoin/bitcoin/pull/29421#discussion_r1490653235",
+      "commit_id" : "8a3b6f33873a1075f932f5d9feb6d82e50d83c0c",
+      "created_at" : "2024-02-15T13:43:16Z",
+      "diff_hunk" : "@@ -17,16 +19,25 @@\n #include <optional>\n #include <vector>\n \n+namespace {\n+\n+std::vector<std::string> g_all_messages;\n+\n void initialize_p2p_transport_serialization()\n {\n     SelectParams(ChainType::REGTEST);\n+    g_all_messages = getAllNetMessageTypes();\n+    std::sort(g_all_messages.begin(), g_all_messages.end());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1491029750",
+      "id" : 1491029750,
+      "line" : 30,
+      "node_id" : "PRRC_kwDOABII585Y3072",
+      "original_commit_id" : "8a3b6f33873a1075f932f5d9feb6d82e50d83c0c",
+      "original_line" : 30,
+      "original_position" : 21,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/p2p_transport_serialization.cpp",
+      "position" : 21,
+      "pull_request_review_id" : 1882796958,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491029750/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-15T13:43:17Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491029750",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1491051732"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491051732"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Well it's not random, it's a fuzzer input. They're random in a way, but definitely not uniformly random.\n\nI think the sorting is there to make sure that just reorderings in the list don't affect fuzzer behavior.",
+      "commit_id" : "8a3b6f33873a1075f932f5d9feb6d82e50d83c0c",
+      "created_at" : "2024-02-15T13:59:00Z",
+      "diff_hunk" : "@@ -17,16 +19,25 @@\n #include <optional>\n #include <vector>\n \n+namespace {\n+\n+std::vector<std::string> g_all_messages;\n+\n void initialize_p2p_transport_serialization()\n {\n     SelectParams(ChainType::REGTEST);\n+    g_all_messages = getAllNetMessageTypes();\n+    std::sort(g_all_messages.begin(), g_all_messages.end());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28165#discussion_r1491051732",
+      "id" : 1491051732,
+      "in_reply_to_id" : 1491029750,
+      "line" : 30,
+      "node_id" : "PRRC_kwDOABII585Y36TU",
+      "original_commit_id" : "8a3b6f33873a1075f932f5d9feb6d82e50d83c0c",
+      "original_line" : 30,
+      "original_position" : 21,
+      "original_start_line" : null,
+      "path" : "src/test/fuzz/p2p_transport_serialization.cpp",
+      "position" : 21,
+      "pull_request_review_id" : 1882843069,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28165",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491051732/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-15T13:59:00Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1491051732",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
    }
 ]
