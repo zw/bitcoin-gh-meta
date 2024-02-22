@@ -6747,5 +6747,142 @@
          "type" : "User",
          "url" : "https://api.github.com/users/naumenkogs"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28765#discussion_r1499802603"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28765"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1499802603"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "okay will read back the txrelayism issue on const selection.",
+      "commit_id" : "b3db2bcd011c70292079f1f95c72e744678d2299",
+      "created_at" : "2024-02-22T19:24:18Z",
+      "diff_hunk" : "@@ -142,9 +250,104 @@ class TxReconciliationTracker::Impl\n         return (recon_state != m_states.end() &&\n                 std::holds_alternative<TxReconciliationState>(recon_state->second));\n     }\n+\n+    // Not const because of caching.\n+    bool IsFanoutTarget(const Wtxid& wtxid, NodeId peer_id, bool we_initiate, double limit) EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n+    {\n+        auto fanout_candidates = m_tx_fanout_targets_cache_data.find(wtxid);\n+        if (fanout_candidates != m_tx_fanout_targets_cache_data.end()) {\n+            return std::binary_search(fanout_candidates->second.begin(), fanout_candidates->second.end(), peer_id);\n+        }\n+\n+        // We use the pre-determined randomness to give a consistent result per transaction,\n+        // thus making sure that no transaction gets \"unlucky\" if every per-peer roll fails.\n+        CSipHasher deterministic_randomizer{m_deterministic_randomizer};\n+        deterministic_randomizer.Write(wtxid.ToUint256());\n+\n+        // The algorithm works as follows. We iterate through the peers (of a given direction)\n+        // hashing them with the given wtxid, and sort them by this hash.\n+        // We then consider top `limit` peers to be low-fanout flood targets.\n+        // The randomness should be seeded with wtxid to return consistent results for every call.\n+\n+        // The integral part of `limit` is accounted in the higher 32 bits of the second element.\n+        // The fractional part of `limit` is stored in the lower 32 bits, and then we check\n+        // whether adding a random lower 32-bit value (first element) would end up modifying\n+        // the higher bits.\n+        const size_t targets_size = ((deterministic_randomizer.Finalize() & 0xFFFFFFFF) + uint64_t(limit * 0x100000000)) >> 32;\n+\n+        std::vector<std::pair<uint64_t, NodeId>> best_peers;\n+        best_peers.reserve(m_states.size());\n+\n+        for (const auto& indexed_state : m_states) {\n+            const auto cur_state = std::get_if<TxReconciliationState>(&indexed_state.second);\n+            if (cur_state && cur_state->m_we_initiate == we_initiate) {\n+                uint64_t hash_key = CSipHasher(deterministic_randomizer).Write(cur_state->m_k0).Finalize();\n+                best_peers.emplace_back(hash_key, indexed_state.first);\n+            }\n+        }\n+\n+        // Sort by the assigned key.\n+        std::sort(best_peers.begin(), best_peers.end());\n+        best_peers.resize(targets_size);\n+\n+        std::vector<NodeId> new_fanout_candidates;\n+        new_fanout_candidates.reserve(targets_size);\n+        for_each(best_peers.begin(), best_peers.end(),\n+                 [&new_fanout_candidates](auto& keyed_peer) { new_fanout_candidates.push_back(keyed_peer.second); });\n+\n+        // Sort by NodeId.\n+        std::sort(new_fanout_candidates.begin(), new_fanout_candidates.end());\n+        bool found = std::binary_search(new_fanout_candidates.begin(), new_fanout_candidates.end(), peer_id);\n+\n+        // If the cache is full, make room for the new entry.\n+        if (m_tx_fanout_targets_cache_order.size() == FANOUT_TARGETS_PER_TX_CACHE_SIZE) {\n+            auto expired_tx = m_tx_fanout_targets_cache_order.front();\n+            m_tx_fanout_targets_cache_data.erase(expired_tx);\n+            m_tx_fanout_targets_cache_order.pop_front();\n+        }\n+        m_tx_fanout_targets_cache_data.emplace(wtxid, std::move(new_fanout_candidates));\n+        m_tx_fanout_targets_cache_order.push_back(wtxid);\n+\n+        return found;\n+    }\n+\n+    bool ShouldFanoutTo(const Wtxid& wtxid, NodeId peer_id,\n+                        size_t inbounds_nonrcncl_tx_relay, size_t outbounds_nonrcncl_tx_relay)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        auto peer_state = GetRegisteredPeerState(peer_id);\n+        if (!peer_state) return true;\n+        // We decide whether a particular peer is a low-fanout flood target differently\n+        // based on its connection direction:\n+        // - for outbounds we have a fixed number of flood destinations;\n+        // - for inbounds we use a fraction of all inbound peers supporting tx relay.\n+        //\n+        // We first decide how many reconciling peers of a given direction we want to flood to,\n+        // and then generate a list of peers of that size for a given transaction. We then see\n+        // whether the given peer falls into this list.\n+        double destinations;\n+        if (peer_state->m_we_initiate) {\n+            destinations = OUTBOUND_FANOUT_DESTINATIONS - outbounds_nonrcncl_tx_relay;\n+        } else {\n+            // Since we use the fraction for inbound peers, we first need to compute the total\n+            // number of inbound targets.\n+            const double inbound_targets = (inbounds_nonrcncl_tx_relay + m_inbounds_count) * INBOUND_FANOUT_DESTINATIONS_FRACTION;\n+            destinations = inbound_targets - inbounds_nonrcncl_tx_relay;\n+        }\n+\n+        // Pure optimization to avoid going through the peers when the odds of picking one are\n+        // too low.\n+        if (destinations < 0.001) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28765#discussion_r1499802603",
+      "id" : 1499802603,
+      "in_reply_to_id" : 1498025796,
+      "line" : 342,
+      "node_id" : "PRRC_kwDOABII585ZZSvr",
+      "original_commit_id" : "82126d3ca527e5c06606a50ee8d8baf792193ef4",
+      "original_line" : 342,
+      "original_position" : 281,
+      "original_start_line" : null,
+      "path" : "src/node/txreconciliation.cpp",
+      "position" : 281,
+      "pull_request_review_id" : 1896771509,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28765",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1499802603/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-22T19:24:18Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1499802603",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28765#discussion_r1499825828"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28765"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1499825828"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "In the eventuality of an influx of inbound transactions, faster than we can flush out them to low-fanout flooding peers, my understanding of dropping the upfront wtxid candidate, we would keep propagating this transaction only according to tx-relay policy and connection state of other peers (not this `NodeId` anymore).\r\n\r\nI understand weâre fanning out only to outbound peers (`m_tx_fanout_targets_cache_data` doc), though here itâs more a dependency on the perfomance capabilities of the full-node itself (i.e how fast you process `vInv(MSG_WTX`) and how fast you-reannounce them to downstream peers if valid). To interferes with a transaction propagation, assuming a non-listening node, an attacker would have to be puppet or compromise all our low-fanout outbound peers, I think ? Obviously more outbound peers would make things better on this front, which should be allowed by Erlay tx-relay bandwidth savings.",
+      "commit_id" : "b3db2bcd011c70292079f1f95c72e744678d2299",
+      "created_at" : "2024-02-22T19:37:19Z",
+      "diff_hunk" : "@@ -142,9 +250,104 @@ class TxReconciliationTracker::Impl\n         return (recon_state != m_states.end() &&\n                 std::holds_alternative<TxReconciliationState>(recon_state->second));\n     }\n+\n+    // Not const because of caching.\n+    bool IsFanoutTarget(const Wtxid& wtxid, NodeId peer_id, bool we_initiate, double limit) EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n+    {\n+        auto fanout_candidates = m_tx_fanout_targets_cache_data.find(wtxid);\n+        if (fanout_candidates != m_tx_fanout_targets_cache_data.end()) {\n+            return std::binary_search(fanout_candidates->second.begin(), fanout_candidates->second.end(), peer_id);\n+        }\n+\n+        // We use the pre-determined randomness to give a consistent result per transaction,\n+        // thus making sure that no transaction gets \"unlucky\" if every per-peer roll fails.\n+        CSipHasher deterministic_randomizer{m_deterministic_randomizer};\n+        deterministic_randomizer.Write(wtxid.ToUint256());\n+\n+        // The algorithm works as follows. We iterate through the peers (of a given direction)\n+        // hashing them with the given wtxid, and sort them by this hash.\n+        // We then consider top `limit` peers to be low-fanout flood targets.\n+        // The randomness should be seeded with wtxid to return consistent results for every call.\n+\n+        // The integral part of `limit` is accounted in the higher 32 bits of the second element.\n+        // The fractional part of `limit` is stored in the lower 32 bits, and then we check\n+        // whether adding a random lower 32-bit value (first element) would end up modifying\n+        // the higher bits.\n+        const size_t targets_size = ((deterministic_randomizer.Finalize() & 0xFFFFFFFF) + uint64_t(limit * 0x100000000)) >> 32;\n+\n+        std::vector<std::pair<uint64_t, NodeId>> best_peers;\n+        best_peers.reserve(m_states.size());\n+\n+        for (const auto& indexed_state : m_states) {\n+            const auto cur_state = std::get_if<TxReconciliationState>(&indexed_state.second);\n+            if (cur_state && cur_state->m_we_initiate == we_initiate) {\n+                uint64_t hash_key = CSipHasher(deterministic_randomizer).Write(cur_state->m_k0).Finalize();\n+                best_peers.emplace_back(hash_key, indexed_state.first);\n+            }\n+        }\n+\n+        // Sort by the assigned key.\n+        std::sort(best_peers.begin(), best_peers.end());\n+        best_peers.resize(targets_size);\n+\n+        std::vector<NodeId> new_fanout_candidates;\n+        new_fanout_candidates.reserve(targets_size);\n+        for_each(best_peers.begin(), best_peers.end(),\n+                 [&new_fanout_candidates](auto& keyed_peer) { new_fanout_candidates.push_back(keyed_peer.second); });\n+\n+        // Sort by NodeId.\n+        std::sort(new_fanout_candidates.begin(), new_fanout_candidates.end());\n+        bool found = std::binary_search(new_fanout_candidates.begin(), new_fanout_candidates.end(), peer_id);\n+\n+        // If the cache is full, make room for the new entry.\n+        if (m_tx_fanout_targets_cache_order.size() == FANOUT_TARGETS_PER_TX_CACHE_SIZE) {\n+            auto expired_tx = m_tx_fanout_targets_cache_order.front();\n+            m_tx_fanout_targets_cache_data.erase(expired_tx);\n+            m_tx_fanout_targets_cache_order.pop_front();",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28765#discussion_r1499825828",
+      "id" : 1499825828,
+      "line" : 306,
+      "node_id" : "PRRC_kwDOABII585ZZYak",
+      "original_commit_id" : "b3db2bcd011c70292079f1f95c72e744678d2299",
+      "original_line" : 306,
+      "original_position" : 245,
+      "original_start_line" : null,
+      "path" : "src/node/txreconciliation.cpp",
+      "position" : 245,
+      "pull_request_review_id" : 1896793349,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28765",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1499825828/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-22T19:39:10Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1499825828",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/23310655?v=4",
+         "events_url" : "https://api.github.com/users/ariard/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/ariard/followers",
+         "following_url" : "https://api.github.com/users/ariard/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/ariard/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/ariard",
+         "id" : 23310655,
+         "login" : "ariard",
+         "node_id" : "MDQ6VXNlcjIzMzEwNjU1",
+         "organizations_url" : "https://api.github.com/users/ariard/orgs",
+         "received_events_url" : "https://api.github.com/users/ariard/received_events",
+         "repos_url" : "https://api.github.com/users/ariard/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/ariard/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/ariard/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/ariard"
+      }
    }
 ]
