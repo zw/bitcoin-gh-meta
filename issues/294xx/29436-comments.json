@@ -3085,5 +3085,142 @@
          "type" : "User",
          "url" : "https://api.github.com/users/vasild"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29436#discussion_r1510609846"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29436"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1510609846"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I am trying to understand better the performance of this. Posting here to avoid cluttering the PR's main discussion thread.\r\n\r\nhttps://github.com/bitcoin/bitcoin/pull/29436#pullrequestreview-1891096814:\r\n> I tried to test the performance impact on the \"normal\" case of an addrman that only has addrs for reachable nets:\r\nIf I change the AddrManSelect benchmark to use addrman.Select(false, g_reachable_nets.All()); the performance goes down by a factor of ~5 for me\r\n\r\nOne thing to note here is that the benchmark fills addrman solely with IPv6 addresses. That's not representative. So I borrowed the `peers.dat` from my mainnet node and ran the tests below.\r\n\r\nAs a start I began from 7edb07ca80 (this PR before the performance related tweaks). My aim was to 1. confirm that there is indeed a performance issue and 2. to understand where exactly it comes from so it can be addressed in the best way. Then I compared with the PR and then I compared with the PR + a change to make the last argument of `Select()` const ref.\r\n\r\naddrman size:\r\n```\r\nIPV4: 49123\r\nIPV6: 11071\r\nONION:15096\r\nI2P:   1863\r\nCJDNS:    2\r\n```\r\n\r\nNumbers in ns/op (bigger number => slower).\r\n\r\n\\ | Baseline (master @ `7edb07ca80~3`) | PR (`7edb07ca80`) | PR (`7edb07ca80`) + const ref argument\r\n --- | ---: | ---: | ---:\r\nany (empty optional or empty map) | 130  | 140 <sup>A</sup> | 135\r\nIPV4 or {IPV4} | 190 | 320 | 200\r\nIPV6 or {IPV6} | 490 | 640 | 510\r\nONION or {ONION} | 1200 | 1370 | 1270\r\nI2P or {I2P} | 2500 | 2650 | 2550\r\nCJDNS or {CJDNS} | 1500000 | 1700000 | 1600000\r\n{IPV4, IPV6, ONION, I2P, CJDNS} | - | 550 <sup>B</sup> | 150 <sup>C</sup>\r\n\r\n<sup>A</sup> vs <sup>B</sup> is probably what @mzumsande observed in https://github.com/bitcoin/bitcoin/pull/29436#pullrequestreview-1891096814. But fixing the arg changes that to <sup>A</sup> vs <sup>C</sup>.\r\n\r\nBased on the above, I think that it is best to go back to `7edb07ca80` and only fix the `Select()` argument.\r\n\r\n<details>\r\n<summary>benchmark for Select() to read real peers.dat</summary>\r\n\r\n```diff\r\ndiff --git a/src/bench/addrman.cpp b/src/bench/addrman.cpp\r\nindex f044feebba..dd45b9e69b 100644\r\n--- a/src/bench/addrman.cpp\r\n+++ b/src/bench/addrman.cpp\r\n@@ -1,12 +1,15 @@\r\n // Copyright (c) 2020-2022 The Bitcoin Core developers\r\n // Distributed under the MIT software license, see the accompanying\r\n // file COPYING or http://www.opensource.org/licenses/mit-license.php.\r\n \r\n+#include <addrdb.h>\r\n #include <addrman.h>\r\n #include <bench/bench.h>\r\n+#include <chainparams.h>\r\n+#include <common/args.h>\r\n #include <netbase.h>\r\n #include <netgroup.h>\r\n #include <random.h>\r\n #include <util/check.h>\r\n #include <util/time.h>\r\n \r\n@@ -81,12 +84,37 @@ static void AddrManAdd(benchmark::Bench& bench)\r\n     bench.run([&] {\r\n         AddrMan addrman{EMPTY_NETGROUPMAN, /*deterministic=*/false, ADDRMAN_CONSISTENCY_CHECK_RATIO};\r\n         AddAddressesToAddrMan(addrman);\r\n     });\r\n }\r\n \r\n+static void AddrManSelectMain(benchmark::Bench& bench)\r\n+{\r\n+    SelectParams(ChainType::MAIN);\r\n+    gArgs.ForceSetArg(\"checkaddrman\", \"0\");\r\n+    gArgs.ForceSetArg(\"datadir\", \"/tmp\");\r\n+    auto result = LoadAddrman(EMPTY_NETGROUPMAN, gArgs);\r\n+    AddrMan& addrman = *(*result).get();\r\n+\r\n+    std::cout << \"addrman size:\\n\";\r\n+    std::cout << \"IPv4: \" << addrman.Size(NET_IPV4) << \"\\n\";\r\n+    std::cout << \"IPv6: \" << addrman.Size(NET_IPV6) << \"\\n\";\r\n+    std::cout << \"Tor:  \" << addrman.Size(NET_ONION) << \"\\n\";\r\n+    std::cout << \"I2P:  \" << addrman.Size(NET_I2P) << \"\\n\";\r\n+    std::cout << \"CJDNS:\" << addrman.Size(NET_CJDNS) << \"\\n\";\r\n+\r\n+    //const std::optional<Network> n{NET_CJDNS};\r\n+    //const std::unordered_set<Network> n{NET_IPV4, NET_IPV6, NET_ONION, NET_I2P, NET_CJDNS};\r\n+    //const std::unordered_set<Network> n{};\r\n+    //const std::unordered_set<Network> n{g_reachable_nets.All()};\r\n+    bench.run([&] {\r\n+        const auto& address = addrman.Select(/*new_only=*/false, n);\r\n+        assert(address.first.IsValid());\r\n+    });\r\n+}\r\n+\r\n static void AddrManSelect(benchmark::Bench& bench)\r\n {\r\n     AddrMan addrman{EMPTY_NETGROUPMAN, /*deterministic=*/false, ADDRMAN_CONSISTENCY_CHECK_RATIO};\r\n \r\n     FillAddrMan(addrman);\r\n \r\n@@ -167,11 +195,12 @@ static void AddrManAddThenGood(benchmark::Bench& bench)\r\n \r\n         markSomeAsGood(addrman);\r\n     });\r\n }\r\n \r\n BENCHMARK(AddrManAdd, benchmark::PriorityLevel::HIGH);\r\n+BENCHMARK(AddrManSelectMain, benchmark::PriorityLevel::HIGH);\r\n BENCHMARK(AddrManSelect, benchmark::PriorityLevel::HIGH);\r\n BENCHMARK(AddrManSelectFromAlmostEmpty, benchmark::PriorityLevel::HIGH);\r\n BENCHMARK(AddrManSelectByNetwork, benchmark::PriorityLevel::HIGH);\r\n BENCHMARK(AddrManGetAddr, benchmark::PriorityLevel::HIGH);\r\n BENCHMARK(AddrManAddThenGood, benchmark::PriorityLevel::HIGH);\r\n```\r\n</details>\r\n\r\n<details>\r\n<summary>Fix Select() argument</summary>\r\n\r\n```diff\r\ndiff --git i/src/addrman.cpp w/src/addrman.cpp\r\nindex 4e551e81c3..bde2d90ef2 100644\r\n--- i/src/addrman.cpp\r\n+++ w/src/addrman.cpp\r\n@@ -705,13 +705,13 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\r\n     if (fCountFailure && info.m_last_count_attempt < m_last_good) {\r\n         info.m_last_count_attempt = time;\r\n         info.nAttempts++;\r\n     }\r\n }\r\n \r\n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::unordered_set<Network> networks) const\r\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, const std::unordered_set<Network>& networks) const\r\n {\r\n     AssertLockHeld(cs);\r\n \r\n     if (vRandom.empty()) return {};\r\n \r\n     size_t new_count = nNew;\r\n@@ -1208,13 +1208,13 @@ std::pair<CAddress, NodeSeconds> AddrManImpl::SelectTriedCollision()\r\n     Check();\r\n     auto ret = SelectTriedCollision_();\r\n     Check();\r\n     return ret;\r\n }\r\n \r\n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select(bool new_only, std::unordered_set<Network> networks) const\r\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select(bool new_only, const std::unordered_set<Network>& networks) const\r\n {\r\n     LOCK(cs);\r\n     Check();\r\n     auto addrRet = Select_(new_only, networks);\r\n     Check();\r\n     return addrRet;\r\n@@ -1315,13 +1315,13 @@ void AddrMan::ResolveCollisions()\r\n \r\n std::pair<CAddress, NodeSeconds> AddrMan::SelectTriedCollision()\r\n {\r\n     return m_impl->SelectTriedCollision();\r\n }\r\n \r\n-std::pair<CAddress, NodeSeconds> AddrMan::Select(bool new_only, std::unordered_set<Network> networks) const\r\n+std::pair<CAddress, NodeSeconds> AddrMan::Select(bool new_only, const std::unordered_set<Network>& networks) const\r\n {\r\n     return m_impl->Select(new_only, networks);\r\n }\r\n \r\n std::vector<CAddress> AddrMan::GetAddr(size_t max_addresses, size_t max_pct, std::optional<Network> network, const bool filtered) const\r\n {\r\ndiff --git i/src/addrman.h w/src/addrman.h\r\nindex 2d2846993a..b6fdb07f82 100644\r\n--- i/src/addrman.h\r\n+++ w/src/addrman.h\r\n@@ -157,13 +157,13 @@ public:\r\n      *                     guarantee a tried entry).\r\n      * @param[in] networks Select only addresses of these networks (empty = all). Passing networks may\r\n      *                     slow down the search.\r\n      * @return    CAddress The record for the selected peer.\r\n      *            seconds  The last time we attempted to connect to that peer.\r\n      */\r\n-    std::pair<CAddress, NodeSeconds> Select(bool new_only = false, std::unordered_set<Network> networks = {}) const;\r\n+    std::pair<CAddress, NodeSeconds> Select(bool new_only = false, const std::unordered_set<Network>& networks = {}) const;\r\n \r\n     /**\r\n      * Return all or many randomly selected addresses, optionally by network.\r\n      *\r\n      * @param[in] max_addresses  Maximum number of addresses to return (0 = all).\r\n      * @param[in] max_pct        Maximum percentage of addresses to return (0 = all).\r\ndiff --git i/src/addrman_impl.h w/src/addrman_impl.h\r\nindex bb89213bb7..2a4596e81f 100644\r\n--- i/src/addrman_impl.h\r\n+++ w/src/addrman_impl.h\r\n@@ -123,13 +123,13 @@ public:\r\n         EXCLUSIVE_LOCKS_REQUIRED(!cs);\r\n \r\n     void ResolveCollisions() EXCLUSIVE_LOCKS_REQUIRED(!cs);\r\n \r\n     std::pair<CAddress, NodeSeconds> SelectTriedCollision() EXCLUSIVE_LOCKS_REQUIRED(!cs);\r\n \r\n-    std::pair<CAddress, NodeSeconds> Select(bool new_only, std::unordered_set<Network> networks) const\r\n+    std::pair<CAddress, NodeSeconds> Select(bool new_only, const std::unordered_set<Network>& networks) const\r\n         EXCLUSIVE_LOCKS_REQUIRED(!cs);\r\n \r\n     std::vector<CAddress> GetAddr(size_t max_addresses, size_t max_pct, std::optional<Network> network, const bool filtered = true) const\r\n         EXCLUSIVE_LOCKS_REQUIRED(!cs);\r\n \r\n     std::vector<std::pair<AddrInfo, AddressPosition>> GetEntries(bool from_tried) const\r\n@@ -250,13 +250,13 @@ private:\r\n     bool Good_(const CService& addr, bool test_before_evict, NodeSeconds time) EXCLUSIVE_LOCKS_REQUIRED(cs);\r\n \r\n     bool Add_(const std::vector<CAddress>& vAddr, const CNetAddr& source, std::chrono::seconds time_penalty) EXCLUSIVE_LOCKS_REQUIRED(cs);\r\n \r\n     void Attempt_(const CService& addr, bool fCountFailure, NodeSeconds time) EXCLUSIVE_LOCKS_REQUIRED(cs);\r\n \r\n-    std::pair<CAddress, NodeSeconds> Select_(bool new_only, std::unordered_set<Network> networks) const EXCLUSIVE_LOCKS_REQUIRED(cs);\r\n+    std::pair<CAddress, NodeSeconds> Select_(bool new_only, const std::unordered_set<Network>& networks) const EXCLUSIVE_LOCKS_REQUIRED(cs);\r\n \r\n     /** Helper to generalize looking up an addrman entry from either table.\r\n      *\r\n      *  @return  int The nid of the entry. If the addrman position is empty or not found, returns -1.\r\n      * */\r\n     int GetEntry(bool use_tried, size_t bucket, size_t position) const EXCLUSIVE_LOCKS_REQUIRED(cs);\r\n```\r\n</details>",
+      "commit_id" : "b85893ca02c9a7f872f2f0428e0f709a6d45906c",
+      "created_at" : "2024-03-04T05:36:32Z",
+      "diff_hunk" : "@@ -721,13 +721,18 @@ std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::option\n     size_t new_count = nNew;\n     size_t tried_count = nTried;\n \n-    if (network.has_value()) {\n-        auto it = m_network_counts.find(*network);\n-        if (it == m_network_counts.end()) return {};\n-\n-        auto counts = it->second;\n-        new_count = counts.n_new;\n-        tried_count = counts.n_tried;\n+    if (!networks.empty()) {",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29436#discussion_r1510609846",
+      "id" : 1510609846,
+      "line" : 724,
+      "node_id" : "PRRC_kwDOABII585aChO2",
+      "original_commit_id" : "b85893ca02c9a7f872f2f0428e0f709a6d45906c",
+      "original_line" : 724,
+      "original_position" : 20,
+      "original_start_line" : null,
+      "path" : "src/addrman.cpp",
+      "position" : 20,
+      "pull_request_review_id" : 1913404137,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29436",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1510609846/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-03-04T10:09:32Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1510609846",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29436#discussion_r1511064348"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29436"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1511064348"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I'll leave as it for now, but free to change if other reviewers agree.",
+      "commit_id" : "b85893ca02c9a7f872f2f0428e0f709a6d45906c",
+      "created_at" : "2024-03-04T12:13:42Z",
+      "diff_hunk" : "@@ -712,7 +712,7 @@ void AddrManImpl::Attempt_(const CService& addr, bool fCountFailure, NodeSeconds\n     }\n }\n \n-std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, std::optional<Network> network) const\n+std::pair<CAddress, NodeSeconds> AddrManImpl::Select_(bool new_only, const std::unordered_set<Network>& networks) const",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29436#discussion_r1511064348",
+      "id" : 1511064348,
+      "in_reply_to_id" : 1506916729,
+      "line" : 715,
+      "node_id" : "PRRC_kwDOABII585aEQMc",
+      "original_commit_id" : "b85893ca02c9a7f872f2f0428e0f709a6d45906c",
+      "original_line" : 715,
+      "original_position" : 5,
+      "original_start_line" : null,
+      "path" : "src/addrman.cpp",
+      "position" : 5,
+      "pull_request_review_id" : 1914158512,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29436",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1511064348/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-03-04T12:13:42Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1511064348",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/19480819?v=4",
+         "events_url" : "https://api.github.com/users/brunoerg/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/brunoerg/followers",
+         "following_url" : "https://api.github.com/users/brunoerg/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/brunoerg/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/brunoerg",
+         "id" : 19480819,
+         "login" : "brunoerg",
+         "node_id" : "MDQ6VXNlcjE5NDgwODE5",
+         "organizations_url" : "https://api.github.com/users/brunoerg/orgs",
+         "received_events_url" : "https://api.github.com/users/brunoerg/received_events",
+         "repos_url" : "https://api.github.com/users/brunoerg/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/brunoerg/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/brunoerg/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/brunoerg"
+      }
    }
 ]
