@@ -6746,5 +6746,350 @@
          "type" : "User",
          "url" : "https://api.github.com/users/Sjors"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1504500723"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504500723"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Like this?\r\n\r\n<details>\r\n<summary>Add GetBytesWait()</summary>\r\n\r\n```diff\r\ncommit 2e8674478813e2e672e5eb7dbb87f28ee11a7268\r\nParent: ad806a0969226806bb33a890356b89e39904c1a8\r\nAuthor:     Vasil Dimov <vd@FreeBSD.org>\r\nAuthorDate: Tue Feb 27 14:59:04 2024 +0100\r\nCommit:     Vasil Dimov <vd@FreeBSD.org>\r\nCommitDate: Tue Feb 27 15:48:18 2024 +0100\r\ngpg: Signature made Tue Feb 27 15:48:19 2024 CET\r\ngpg:                using RSA key E64D8D45614DB07545D9CCC154DF06F64B55CBBF\r\ngpg: Good signature from \"Vasil Dimov <vd@myforest.net>\" [ultimate]\r\ngpg:                 aka \"Vasil Dimov <vd@FreeBSD.org>\" [ultimate]\r\ngpg:                 aka \"Vasil Dimov <vasild@gmail.com>\" [ultimate]\r\n\r\n\r\n    test: add blocking \"get bytes\" method to DynSock\r\n\r\ndiff --git a/src/test/util/net.h b/src/test/util/net.h\r\nindex 368c84d622..d03674cb23 100644\r\n--- a/src/test/util/net.h\r\n+++ b/src/test/util/net.h\r\n@@ -224,12 +224,20 @@ public:\r\n          * @param[in] flags Same as the flags of `recv(2)`. Just `MSG_PEEK` is honored.\r\n          * @return The number of bytes written to `buf`. `0` if `Eof()` has been called.\r\n          * If no bytes are available then `-1` is returned and `errno` is set to `EAGAIN`.\r\n          */\r\n         ssize_t GetBytes(void* buf, size_t len, int flags = 0) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);\r\n \r\n+        /**\r\n+         * Wait for `len` bytes and remove them from the pipe.\r\n+         * @param[in] buf Destination to write bytes to.\r\n+         * @param[in] len Write this number of bytes to `buf` or less if EOF is signaled.\r\n+         * @return The number of bytes written to `buf`. Less than `len` means EOF was signaled.\r\n+         */\r\n+        size_t GetBytesWait(void* buf, size_t len) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);\r\n+\r\n         /**\r\n          * Deserialize a `CNetMessage` and remove it from the pipe.\r\n          * If not enough bytes are available then the function will wait. If parsing fails\r\n          * or EOF is signaled to the pipe, then `std::nullopt` is returned.\r\n          */\r\n         std::optional<CNetMessage> GetNetMsg() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);\r\n@@ -243,13 +251,13 @@ public:\r\n          * Construct and push CNetMessage to the pipe.\r\n          */\r\n         template <typename... Args>\r\n         void PushNetMsg(const std::string& type, Args&&... payload) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);\r\n \r\n         /**\r\n-         * Signal end-of-file on the receiving end (`GetBytes()` or `GetNetMsg()`).\r\n+         * Signal end-of-file on the receiving end (`GetBytes()`, `GetBytesWait()` or `GetNetMsg()`).\r\n          */\r\n         void Eof() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);\r\n \r\n     private:\r\n         /**\r\n          * Return when there is some data to read or EOF has been signaled.\r\ndiff --git a/src/test/util/net.cpp b/src/test/util/net.cpp\r\nindex 0fee2041f0..2bd4815e89 100644\r\n--- a/src/test/util/net.cpp\r\n+++ b/src/test/util/net.cpp\r\n@@ -256,12 +256,31 @@ ssize_t DynSock::Pipe::GetBytes(void* buf, size_t len, int flags)\r\n         m_data.erase(m_data.begin(), m_data.begin() + read_bytes);\r\n     }\r\n \r\n     return read_bytes;\r\n }\r\n \r\n+size_t DynSock::Pipe::GetBytesWait(void* buf, size_t len)\r\n+{\r\n+    WAIT_LOCK(m_mutex, lock);\r\n+\r\n+    size_t total_read_bytes{0};\r\n+\r\n+    do {\r\n+        WaitForDataOrEof(lock);\r\n+        if (!m_data.empty()) {\r\n+            const size_t read_bytes{std::min(len - total_read_bytes, m_data.size())};\r\n+            std::memcpy(reinterpret_cast<uint8_t*>(buf) + total_read_bytes, m_data.data(), read_bytes);\r\n+            m_data.erase(m_data.begin(), m_data.begin() + read_bytes);\r\n+            total_read_bytes += read_bytes;\r\n+        }\r\n+    } while (total_read_bytes < len && !m_eof);\r\n+\r\n+    return total_read_bytes;\r\n+}\r\n+\r\n std::optional<CNetMessage> DynSock::Pipe::GetNetMsg()\r\n {\r\n     V1Transport transport{NodeId{0}};\r\n \r\n     {\r\n         WAIT_LOCK(m_mutex, lock);\r\n@@ -309,12 +328,22 @@ void DynSock::Pipe::Eof()\r\n {\r\n     LOCK(m_mutex);\r\n     m_eof = true;\r\n     m_cond.notify_all();\r\n }\r\n \r\n+void DynSock::Pipe::WaitForDataOrEof(UniqueLock<Mutex>& lock)\r\n+{\r\n+    Assert(lock.mutex() == &m_mutex);\r\n+\r\n+    m_cond.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {\r\n+        AssertLockHeld(m_mutex);\r\n+        return !m_data.empty() || m_eof;\r\n+    });\r\n+}\r\n+\r\n DynSock::DynSock(std::shared_ptr<Pipes> pipes) : m_pipes{pipes} {}\r\n \r\n DynSock::~DynSock()\r\n {\r\n     m_pipes->send.Eof();\r\n }\r\n```\r\n\r\nI did not add that method in this PR because it would be unused. Can be added any time later as part of a PR that needs it.",
+      "commit_id" : "c54a458cb981ac72258aac5c8c1e6a8f881e3b4e",
+      "created_at" : "2024-02-27T15:53:32Z",
+      "diff_hunk" : "@@ -198,4 +201,105 @@ class StaticContentsSock : public ZeroSock\n     mutable size_t m_consumed{0};\n };\n \n+/**\n+ * A mocked Sock alternative that allows providing the data to be returned by Recv()\n+ * and inspecting the data that has been supplied to Send().\n+ */\n+class DynSock : public ZeroSock\n+{\n+public:\n+    /**\n+     * Unidirectional bytes or CNetMessage queue (FIFO).\n+     */\n+    class Pipe\n+    {\n+    public:\n+        /**\n+         * Get bytes and remove them from the pipe.\n+         * @param[in] buf Destination to write bytes to.\n+         * @param[in] len Write up to this number of bytes.\n+         * @param[in] flags Same as the flags of `recv(2)`. Just `MSG_PEEK` is honored.\n+         * @return The number of bytes written to `buf`. `0` if `Eof()` has been called.\n+         * If no bytes are available then `-1` is returned and `errno` is set to `EAGAIN`.\n+         */\n+        ssize_t GetBytes(void* buf, size_t len, int flags = 0) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);\n+\n+        /**\n+         * Deserialize a `CNetMessage` and remove it from the pipe.\n+         * If not enough bytes are available then the function will wait. If parsing fails\n+         * or EOF is signaled to the pipe, then `std::nullopt` is returned.\n+         */\n+        std::optional<CNetMessage> GetNetMsg() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1504500723",
+      "id" : 1504500723,
+      "in_reply_to_id" : 1494319538,
+      "line" : 235,
+      "node_id" : "PRRC_kwDOABII585ZrNvz",
+      "original_commit_id" : "f42e4f3b3b4b3ca1945d1ea298b443f1cecaf2ea",
+      "original_line" : 235,
+      "original_position" : 52,
+      "original_start_line" : null,
+      "path" : "src/test/util/net.h",
+      "position" : 199,
+      "pull_request_review_id" : 1903958786,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504500723/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-27T15:53:33Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504500723",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1504531521"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504531521"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Something like that yes. Maybe it can be included and used a helper function by `GetNetMsg`? ",
+      "commit_id" : "c54a458cb981ac72258aac5c8c1e6a8f881e3b4e",
+      "created_at" : "2024-02-27T16:09:06Z",
+      "diff_hunk" : "@@ -198,4 +201,105 @@ class StaticContentsSock : public ZeroSock\n     mutable size_t m_consumed{0};\n };\n \n+/**\n+ * A mocked Sock alternative that allows providing the data to be returned by Recv()\n+ * and inspecting the data that has been supplied to Send().\n+ */\n+class DynSock : public ZeroSock\n+{\n+public:\n+    /**\n+     * Unidirectional bytes or CNetMessage queue (FIFO).\n+     */\n+    class Pipe\n+    {\n+    public:\n+        /**\n+         * Get bytes and remove them from the pipe.\n+         * @param[in] buf Destination to write bytes to.\n+         * @param[in] len Write up to this number of bytes.\n+         * @param[in] flags Same as the flags of `recv(2)`. Just `MSG_PEEK` is honored.\n+         * @return The number of bytes written to `buf`. `0` if `Eof()` has been called.\n+         * If no bytes are available then `-1` is returned and `errno` is set to `EAGAIN`.\n+         */\n+        ssize_t GetBytes(void* buf, size_t len, int flags = 0) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);\n+\n+        /**\n+         * Deserialize a `CNetMessage` and remove it from the pipe.\n+         * If not enough bytes are available then the function will wait. If parsing fails\n+         * or EOF is signaled to the pipe, then `std::nullopt` is returned.\n+         */\n+        std::optional<CNetMessage> GetNetMsg() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1504531521",
+      "id" : 1504531521,
+      "in_reply_to_id" : 1494319538,
+      "line" : 235,
+      "node_id" : "PRRC_kwDOABII585ZrVRB",
+      "original_commit_id" : "f42e4f3b3b4b3ca1945d1ea298b443f1cecaf2ea",
+      "original_line" : 235,
+      "original_position" : 52,
+      "original_start_line" : null,
+      "path" : "src/test/util/net.h",
+      "position" : 199,
+      "pull_request_review_id" : 1904009575,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504531521/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-27T16:09:06Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504531521",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1504541717"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504541717"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I do not think so (or maybe I just don't see it). Inside `GetNetMsg()` we don't know how many bytes are needed. We throw something at `transport.ReceivedBytes()` and it tells us how much of that it consumed.",
+      "commit_id" : "c54a458cb981ac72258aac5c8c1e6a8f881e3b4e",
+      "created_at" : "2024-02-27T16:15:34Z",
+      "diff_hunk" : "@@ -198,4 +201,105 @@ class StaticContentsSock : public ZeroSock\n     mutable size_t m_consumed{0};\n };\n \n+/**\n+ * A mocked Sock alternative that allows providing the data to be returned by Recv()\n+ * and inspecting the data that has been supplied to Send().\n+ */\n+class DynSock : public ZeroSock\n+{\n+public:\n+    /**\n+     * Unidirectional bytes or CNetMessage queue (FIFO).\n+     */\n+    class Pipe\n+    {\n+    public:\n+        /**\n+         * Get bytes and remove them from the pipe.\n+         * @param[in] buf Destination to write bytes to.\n+         * @param[in] len Write up to this number of bytes.\n+         * @param[in] flags Same as the flags of `recv(2)`. Just `MSG_PEEK` is honored.\n+         * @return The number of bytes written to `buf`. `0` if `Eof()` has been called.\n+         * If no bytes are available then `-1` is returned and `errno` is set to `EAGAIN`.\n+         */\n+        ssize_t GetBytes(void* buf, size_t len, int flags = 0) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);\n+\n+        /**\n+         * Deserialize a `CNetMessage` and remove it from the pipe.\n+         * If not enough bytes are available then the function will wait. If parsing fails\n+         * or EOF is signaled to the pipe, then `std::nullopt` is returned.\n+         */\n+        std::optional<CNetMessage> GetNetMsg() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1504541717",
+      "id" : 1504541717,
+      "in_reply_to_id" : 1494319538,
+      "line" : 235,
+      "node_id" : "PRRC_kwDOABII585ZrXwV",
+      "original_commit_id" : "f42e4f3b3b4b3ca1945d1ea298b443f1cecaf2ea",
+      "original_line" : 235,
+      "original_position" : 52,
+      "original_start_line" : null,
+      "path" : "src/test/util/net.h",
+      "position" : 199,
+      "pull_request_review_id" : 1904027167,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504541717/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-27T16:15:34Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504541717",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1504561565"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504561565"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "`size_t len` could be an optional argument. Not sure if that otherwise creates a mess though.",
+      "commit_id" : "c54a458cb981ac72258aac5c8c1e6a8f881e3b4e",
+      "created_at" : "2024-02-27T16:25:40Z",
+      "diff_hunk" : "@@ -198,4 +201,105 @@ class StaticContentsSock : public ZeroSock\n     mutable size_t m_consumed{0};\n };\n \n+/**\n+ * A mocked Sock alternative that allows providing the data to be returned by Recv()\n+ * and inspecting the data that has been supplied to Send().\n+ */\n+class DynSock : public ZeroSock\n+{\n+public:\n+    /**\n+     * Unidirectional bytes or CNetMessage queue (FIFO).\n+     */\n+    class Pipe\n+    {\n+    public:\n+        /**\n+         * Get bytes and remove them from the pipe.\n+         * @param[in] buf Destination to write bytes to.\n+         * @param[in] len Write up to this number of bytes.\n+         * @param[in] flags Same as the flags of `recv(2)`. Just `MSG_PEEK` is honored.\n+         * @return The number of bytes written to `buf`. `0` if `Eof()` has been called.\n+         * If no bytes are available then `-1` is returned and `errno` is set to `EAGAIN`.\n+         */\n+        ssize_t GetBytes(void* buf, size_t len, int flags = 0) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);\n+\n+        /**\n+         * Deserialize a `CNetMessage` and remove it from the pipe.\n+         * If not enough bytes are available then the function will wait. If parsing fails\n+         * or EOF is signaled to the pipe, then `std::nullopt` is returned.\n+         */\n+        std::optional<CNetMessage> GetNetMsg() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1504561565",
+      "id" : 1504561565,
+      "in_reply_to_id" : 1494319538,
+      "line" : 235,
+      "node_id" : "PRRC_kwDOABII585Zrcmd",
+      "original_commit_id" : "f42e4f3b3b4b3ca1945d1ea298b443f1cecaf2ea",
+      "original_line" : 235,
+      "original_position" : 52,
+      "original_start_line" : null,
+      "path" : "src/test/util/net.h",
+      "position" : 199,
+      "pull_request_review_id" : 1904059239,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504561565/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-27T16:25:40Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504561565",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1504633691"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504633691"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "You mean to combine the two methods `GetBytes()` and `GetBytesWait()`? I considered this but ditched the idea. The bodies of the methods are too different and the `len` argument cannot be omitted as it tells the size of the buffer.",
+      "commit_id" : "c54a458cb981ac72258aac5c8c1e6a8f881e3b4e",
+      "created_at" : "2024-02-27T17:00:44Z",
+      "diff_hunk" : "@@ -198,4 +201,105 @@ class StaticContentsSock : public ZeroSock\n     mutable size_t m_consumed{0};\n };\n \n+/**\n+ * A mocked Sock alternative that allows providing the data to be returned by Recv()\n+ * and inspecting the data that has been supplied to Send().\n+ */\n+class DynSock : public ZeroSock\n+{\n+public:\n+    /**\n+     * Unidirectional bytes or CNetMessage queue (FIFO).\n+     */\n+    class Pipe\n+    {\n+    public:\n+        /**\n+         * Get bytes and remove them from the pipe.\n+         * @param[in] buf Destination to write bytes to.\n+         * @param[in] len Write up to this number of bytes.\n+         * @param[in] flags Same as the flags of `recv(2)`. Just `MSG_PEEK` is honored.\n+         * @return The number of bytes written to `buf`. `0` if `Eof()` has been called.\n+         * If no bytes are available then `-1` is returned and `errno` is set to `EAGAIN`.\n+         */\n+        ssize_t GetBytes(void* buf, size_t len, int flags = 0) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);\n+\n+        /**\n+         * Deserialize a `CNetMessage` and remove it from the pipe.\n+         * If not enough bytes are available then the function will wait. If parsing fails\n+         * or EOF is signaled to the pipe, then `std::nullopt` is returned.\n+         */\n+        std::optional<CNetMessage> GetNetMsg() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26812#discussion_r1504633691",
+      "id" : 1504633691,
+      "in_reply_to_id" : 1494319538,
+      "line" : 235,
+      "node_id" : "PRRC_kwDOABII585ZruNb",
+      "original_commit_id" : "f42e4f3b3b4b3ca1945d1ea298b443f1cecaf2ea",
+      "original_line" : 235,
+      "original_position" : 52,
+      "original_start_line" : null,
+      "path" : "src/test/util/net.h",
+      "position" : 199,
+      "pull_request_review_id" : 1904189317,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26812",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504633691/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-02-27T17:00:44Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1504633691",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/266751?v=4",
+         "events_url" : "https://api.github.com/users/vasild/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/vasild/followers",
+         "following_url" : "https://api.github.com/users/vasild/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/vasild/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/vasild",
+         "id" : 266751,
+         "login" : "vasild",
+         "node_id" : "MDQ6VXNlcjI2Njc1MQ==",
+         "organizations_url" : "https://api.github.com/users/vasild/orgs",
+         "received_events_url" : "https://api.github.com/users/vasild/received_events",
+         "repos_url" : "https://api.github.com/users/vasild/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/vasild/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/vasild/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/vasild"
+      }
    }
 ]
