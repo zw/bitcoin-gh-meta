@@ -1,0 +1,46 @@
+[
+   {
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Hi @domZippilli.\r\n\r\nWhilst I think having more control over leveldb compaction would be nice, it seems to me that the changes would be pretty invasive to our leveldb subtree, which we don't particularly want to touch.\r\n\r\nI tried some minimal changes, such as skipping the scheduled compaction on startup, however it's clear to me on testing this that these compaction jobs are scheduled very regularly by the DB implementation (and see below), as this made almost no difference to when I observed compaction running. It would also be possible to increase the leveldb cache size to trigger compactions less frequently (in combination with the previous change).\r\n\r\nHaving read the leveldb documentation compaction is run:\r\n\r\n1. when the DB is opened (which I tested changes to)\r\n2. when the log gets full (unavoidable) or \r\n3. when manual compaction is called.\r\n\r\nYou might be able to get some different performance characteristics by changing the database cache size in the source code manually, but I think it's unlikely that these changes/options will see implementation in main branch here.\r\n\r\nIf you are in IBD compactions will be unavoidable as you sync and the cache fills, but it sounds like you are either restarting or recovering from failure?\r\n\r\nThe startup compactions I saw are mostly coming from initial chainstate verifcation -- we verify the first 6 blocks at startup which triggers a few of these. Without disabling this (highly not recommended) I don't see any way to avoid them either. Disabling these check did see fewer startup compactions. You could probably therefore see improved performance by setting `-checkblocks=1`, which would be preferable to the below (crude, untested, don't run these!) changes which skips block checks altogether.\r\n\r\n<details>\r\n<summary>diff</summary>\r\n\r\n```diff\r\ndiff --git a/src/init.cpp b/src/init.cpp\r\nindex 1a4fce4678..f55aadc9de 100644\r\n--- a/src/init.cpp\r\n+++ b/src/init.cpp\r\n@@ -614,6 +614,7 @@ void SetupServerArgs(ArgsManager& argsman)\r\n     argsman.AddArg(\"-checkblocks=<n>\", strprintf(\"How many blocks to check at startup (default: %u, 0 = all)\", DEFAULT_CHECKBLOCKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);\r\n     argsman.AddArg(\"-checklevel=<n>\", strprintf(\"How thorough the block verification of -checkblocks is: %s (0-4, default: %u)\", Join(CHECKLEVEL_DOC, \", \"), DEFAULT_CHECKLEVEL), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);\r\n     argsman.AddArg(\"-checkblockindex\", strprintf(\"Do a consistency check for the block tree, chainstate, and other validation data structures occasionally. (default: %u, regtest: %u)\", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);\r\n+    argsman.AddArg(\"-skipverify\", strprintf(\"Skip chain verification at startup (default %b)\", DEFAULT_SKIP_VERIFY), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);\r\n     argsman.AddArg(\"-checkaddrman=<n>\", strprintf(\"Run addrman consistency checks every <n> operations. Use 0 to disable. (default: %u)\", DEFAULT_ADDRMAN_CONSISTENCY_CHECKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);\r\n     argsman.AddArg(\"-checkmempool=<n>\", strprintf(\"Run mempool consistency checks every <n> transactions. Use 0 to disable. (default: %u, regtest: %u)\", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);\r\n     argsman.AddArg(\"-checkpoints\", strprintf(\"Enable rejection of any forks from the known historical chain until block %s (default: %u)\", defaultChainParams->Checkpoints().GetHeight(), DEFAULT_CHECKPOINTS_ENABLED), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);\r\n@@ -1573,6 +1574,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)\r\n         options.mempool = Assert(node.mempool.get());\r\n         options.reindex = node::fReindex;\r\n         options.reindex_chainstate = fReindexChainState;\r\n+        options.skip_verify = args.GetIntArg(\"-skipverify\", DEFAULT_SKIP_VERIFY);\r\n         options.prune = chainman.m_blockman.IsPruneMode();\r\n         options.check_blocks = args.GetIntArg(\"-checkblocks\", DEFAULT_CHECKBLOCKS);\r\n         options.check_level = args.GetIntArg(\"-checklevel\", DEFAULT_CHECKLEVEL);\r\ndiff --git a/src/node/chainstate.cpp b/src/node/chainstate.cpp\r\nindex bf1fc06b0b..d241b580e6 100644\r\n--- a/src/node/chainstate.cpp\r\n+++ b/src/node/chainstate.cpp\r\n@@ -249,6 +249,10 @@ ChainstateLoadResult VerifyLoadedChainstate(ChainstateManager& chainman, const C\r\n     auto is_coinsview_empty = [&](Chainstate* chainstate) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {\r\n         return options.reindex || options.reindex_chainstate || chainstate->CoinsTip().GetBestBlock().IsNull();\r\n     };\r\n+    if (options.skip_verify) {\r\n+        LogPrintf(\"[chainstate] WARNING: skipping chain verification due to --skipverify flag\\n\");\r\n+        return {ChainstateLoadStatus::SUCCESS, {}};\r\n+    };\r\n \r\n     LOCK(cs_main);\r\n \r\ndiff --git a/src/node/chainstate.h b/src/node/chainstate.h\r\nindex a6e9a0331b..36321dbebd 100644\r\n--- a/src/node/chainstate.h\r\n+++ b/src/node/chainstate.h\r\n@@ -24,6 +24,7 @@ struct ChainstateLoadOptions {\r\n     bool coins_db_in_memory{false};\r\n     bool reindex{false};\r\n     bool reindex_chainstate{false};\r\n+    bool skip_verify{false};\r\n     bool prune{false};\r\n     //! Setting require_full_verification to true will require all checks at\r\n     //! check_level (below) to succeed for loading to succeed. Setting it to\r\ndiff --git a/src/validation.h b/src/validation.h\r\nindex b64ba4dcbc..147fd13ed9 100644\r\n--- a/src/validation.h\r\n+++ b/src/validation.h\r\n@@ -65,6 +65,7 @@ class SignalInterrupt;\r\n /** Block files containing a block-height within MIN_BLOCKS_TO_KEEP of ActiveChain().Tip() will not be pruned. */\r\n static const unsigned int MIN_BLOCKS_TO_KEEP = 288;\r\n static const signed int DEFAULT_CHECKBLOCKS = 6;\r\n+static const bool DEFAULT_SKIP_VERIFY{false};\r\n static constexpr int DEFAULT_CHECKLEVEL{3};\r\n // Require that user allocate at least 550 MiB for block & undo files (blk???.dat and rev???.dat)\r\n // At 1MB per block, 288 blocks = 288MB.\r\n```\r\n\r\n</details>\r\n\r\nApart from that startup option, your only other solution as I see it is to speed up your storage backend/replication somehow. These compactions are barely noticable for me on a local SSD...\r\n\r\nI hope this helps in some way.",
+      "created_at" : "2024-03-19T11:39:19Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/issues/29662#issuecomment-2006956184",
+      "id" : 2006956184,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/29662",
+      "node_id" : "IC_kwDOABII5853n7iY",
+      "performed_via_github_app" : null,
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2006956184/reactions"
+      },
+      "updated_at" : "2024-03-19T11:39:19Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2006956184",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/6606587?v=4",
+         "events_url" : "https://api.github.com/users/willcl-ark/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/willcl-ark/followers",
+         "following_url" : "https://api.github.com/users/willcl-ark/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/willcl-ark/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/willcl-ark",
+         "id" : 6606587,
+         "login" : "willcl-ark",
+         "node_id" : "MDQ6VXNlcjY2MDY1ODc=",
+         "organizations_url" : "https://api.github.com/users/willcl-ark/orgs",
+         "received_events_url" : "https://api.github.com/users/willcl-ark/received_events",
+         "repos_url" : "https://api.github.com/users/willcl-ark/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/willcl-ark/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/willcl-ark/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/willcl-ark"
+      }
+   }
+]
