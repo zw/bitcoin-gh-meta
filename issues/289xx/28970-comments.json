@@ -12230,5 +12230,187 @@
          "type" : "User",
          "url" : "https://api.github.com/users/glozow"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28970#discussion_r1572288041"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28970"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1572288041"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Added this test and tweaked a bit to check that orphan stays + can still be resolved.",
+      "commit_id" : "a053911cb9957797faff7f68dbd6deb6b6080578",
+      "created_at" : "2024-04-19T12:24:02Z",
+      "diff_hunk" : "@@ -0,0 +1,241 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2024-present The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"\n+Test opportunistic 1p1c package submission logic.\n+\"\"\"\n+\n+from decimal import Decimal\n+from test_framework.messages import (\n+    CInv,\n+    CTxInWitness,\n+    MSG_WTX,\n+    msg_inv,\n+    msg_tx,\n+    tx_from_hex,\n+)\n+from test_framework.p2p import (\n+    P2PInterface,\n+)\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+    fill_mempool,\n+)\n+from test_framework.wallet import (\n+    MiniWallet,\n+    MiniWalletMode,\n+)\n+\n+# 1sat/vB feerate denominated in BTC/KvB\n+FEERATE_1SAT_VB = Decimal(\"0.00001000\")\n+\n+class PackageRelayTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.setup_clean_chain = True\n+        self.num_nodes = 1\n+        self.extra_args = [[\n+            \"-datacarriersize=100000\",\n+            \"-maxmempool=5\",\n+        ]]\n+        self.supports_cli = False\n+\n+    def test_basic_child_then_parent(self):\n+        node = self.nodes[0]\n+        self.log.info(\"Check that opportunistic 1p1c logic works when child is received before parent\")\n+\n+        low_fee_parent = self.wallet.create_self_transfer(fee_rate=FEERATE_1SAT_VB, confirmed_only=True)\n+        high_fee_child = self.wallet.create_self_transfer(utxo_to_spend=low_fee_parent[\"new_utxo\"], fee_rate=20*FEERATE_1SAT_VB)\n+\n+        peer_sender = node.add_p2p_connection(P2PInterface())\n+\n+        # 1. Child is received first (perhaps the low feerate parent didn't meet feefilter or the requests were sent to different nodes). It is missing an input.\n+        high_child_wtxid_int = int(high_fee_child[\"tx\"].getwtxid(), 16)\n+        peer_sender.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=high_child_wtxid_int)]))\n+        peer_sender.wait_for_getdata([high_child_wtxid_int])\n+        peer_sender.send_and_ping(msg_tx(high_fee_child[\"tx\"]))\n+\n+        # 2. Node requests the missing parent by txid.\n+        parent_txid_int = int(low_fee_parent[\"txid\"], 16)\n+        peer_sender.wait_for_getdata([parent_txid_int])\n+\n+        # 3. Sender relays the parent. Parent+Child are evaluated as a package and accepted.\n+        peer_sender.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+\n+        # 4. Both transactions should now be in mempool.\n+        node_mempool = node.getrawmempool()\n+        assert low_fee_parent[\"txid\"] in node_mempool\n+        assert high_fee_child[\"txid\"] in node_mempool\n+\n+        node.disconnect_p2ps()\n+\n+    def test_basic_parent_then_child(self, wallet):\n+        node = self.nodes[0]\n+        low_fee_parent = wallet.create_self_transfer(fee_rate=FEERATE_1SAT_VB, confirmed_only=True)\n+        high_fee_child = wallet.create_self_transfer(utxo_to_spend=low_fee_parent[\"new_utxo\"], fee_rate=20*FEERATE_1SAT_VB)\n+\n+        peer_sender = node.add_outbound_p2p_connection(P2PInterface(), p2p_idx=1, connection_type=\"outbound-full-relay\")\n+        peer_ignored = node.add_outbound_p2p_connection(P2PInterface(), p2p_idx=2, connection_type=\"outbound-full-relay\")\n+\n+        # 1. Parent is relayed first. It is too low feerate.\n+        parent_wtxid_int = int(low_fee_parent[\"tx\"].getwtxid(), 16)\n+        peer_sender.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=parent_wtxid_int)]))\n+        peer_sender.wait_for_getdata([parent_wtxid_int])\n+        peer_sender.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+        assert low_fee_parent[\"txid\"] not in node.getrawmempool()\n+\n+        # Send again from peer_ignored, check that it is ignored\n+        peer_ignored.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=parent_wtxid_int)]))\n+        assert \"getdata\" not in peer_ignored.last_message\n+\n+        # 2. Child is relayed next. It is missing an input.\n+        high_child_wtxid_int = int(high_fee_child[\"tx\"].getwtxid(), 16)\n+        peer_sender.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=high_child_wtxid_int)]))\n+        peer_sender.wait_for_getdata([high_child_wtxid_int])\n+        peer_sender.send_and_ping(msg_tx(high_fee_child[\"tx\"]))\n+\n+        # 3. Node requests the missing parent by txid.\n+        # It should do so even if it has previously rejected that parent for being too low feerate.\n+        parent_txid_int = int(low_fee_parent[\"txid\"], 16)\n+        peer_sender.wait_for_getdata([parent_txid_int])\n+\n+        # 4. Sender re-relays the parent. Parent+Child are evaluated as a package and accepted.\n+        peer_sender.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+\n+        # 5. Both transactions should now be in mempool.\n+        node_mempool = node.getrawmempool()\n+        assert low_fee_parent[\"txid\"] in node_mempool\n+        assert high_fee_child[\"txid\"] in node_mempool\n+\n+        node.disconnect_p2ps()\n+\n+    def test_low_and_high_child(self, wallet):\n+        node = self.nodes[0]\n+        low_fee_parent = wallet.create_self_transfer(fee_rate=FEERATE_1SAT_VB, confirmed_only=True)\n+        low_fee_child = wallet.create_self_transfer(utxo_to_spend=low_fee_parent[\"new_utxo\"], fee_rate=2*FEERATE_1SAT_VB)\n+        high_fee_child = wallet.create_self_transfer(utxo_to_spend=low_fee_parent[\"new_utxo\"], fee_rate=999*FEERATE_1SAT_VB)\n+\n+        peer_sender = node.add_outbound_p2p_connection(P2PInterface(), p2p_idx=3, connection_type=\"outbound-full-relay\")\n+        peer_ignored = node.add_outbound_p2p_connection(P2PInterface(), p2p_idx=4, connection_type=\"outbound-full-relay\")\n+\n+        self.log.info(\"Check that tx caches low fee parent + low fee child package rejections\")\n+\n+        # 1. Send parent, rejected for being low feerate.\n+        parent_wtxid_int = int(low_fee_parent[\"tx\"].getwtxid(), 16)\n+        peer_sender.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=parent_wtxid_int)]))\n+        peer_sender.wait_for_getdata([parent_wtxid_int])\n+        peer_sender.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+        assert low_fee_parent[\"txid\"] not in node.getrawmempool()\n+\n+        # Send again from peer_ignored, check that it is ignored\n+        peer_ignored.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=parent_wtxid_int)]))\n+        assert \"getdata\" not in peer_ignored.last_message\n+\n+        # 2. Send an (orphan) child that has a higher feerate, but not enough to bump the parent.\n+        low_child_wtxid_int = int(low_fee_child[\"tx\"].getwtxid(), 16)\n+        peer_sender.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=low_child_wtxid_int)]))\n+        peer_sender.wait_for_getdata([low_child_wtxid_int])\n+        peer_sender.send_and_ping(msg_tx(low_fee_child[\"tx\"]))\n+\n+        # 3. Node requests the orphan's missing parent.\n+        parent_txid_int = int(low_fee_parent[\"txid\"], 16)\n+        peer_sender.wait_for_getdata([parent_txid_int])\n+\n+        # 4. The low parent + low child are submitted as a package. They are not accepted due to low package feerate.\n+        peer_sender.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+\n+        assert low_fee_parent[\"txid\"] not in node.getrawmempool()\n+        assert low_fee_child[\"txid\"] not in node.getrawmempool()\n+\n+        # If peer_ignored announces the low feerate child, it should be ignored\n+        peer_ignored.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=low_child_wtxid_int)]))\n+        assert \"getdata\" not in peer_ignored.last_message\n+        # If either peer sends the parent again, package evaluation should not be attempted\n+        peer_sender.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+        peer_ignored.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+\n+        # 5. Send the high feerate (orphan) child\n+        high_child_wtxid_int = int(high_fee_child[\"tx\"].getwtxid(), 16)\n+        peer_sender.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=high_child_wtxid_int)]))\n+        peer_sender.wait_for_getdata([high_child_wtxid_int])\n+        peer_sender.send_and_ping(msg_tx(high_fee_child[\"tx\"]))\n+\n+        # 6. Node requests the orphan's parent, even though it has already been rejected, both by\n+        # itself and with a child. This is necessary, otherwise high_fee_child can be censored.\n+        parent_txid_int = int(low_fee_parent[\"txid\"], 16)\n+        peer_sender.wait_for_getdata([parent_txid_int])\n+\n+        # 7. The low feerate parent + high feerate child are submitted as a package.\n+        peer_sender.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+\n+        # 8. Both transactions should now be in mempool\n+        node_mempool = node.getrawmempool()\n+        assert low_fee_parent[\"txid\"] in node_mempool\n+        assert high_fee_child[\"txid\"] in node_mempool\n+\n+        node.disconnect_p2ps()\n+\n+    def test_orphan_consensus_failure(self):\n+        node = self.nodes[0]\n+        low_fee_parent = self.wallet.create_self_transfer(fee_rate=FEERATE_1SAT_VB, confirmed_only=True)\n+        coin = low_fee_parent[\"new_utxo\"]\n+        address = node.get_deterministic_priv_key().address\n+        # Create raw transaction spending the parent, but with no signature (a consensus error).\n+        hex_orphan_no_sig = node.createrawtransaction([{\"txid\": coin[\"txid\"], \"vout\": coin[\"vout\"]}], {address : coin[\"value\"] - Decimal(\"0.0001\")})\n+        tx_orphan_bad_wit = tx_from_hex(hex_orphan_no_sig)\n+        tx_orphan_bad_wit.wit.vtxinwit.append(CTxInWitness())\n+        tx_orphan_bad_wit.wit.vtxinwit[0].scriptWitness.stack = [b'garbage']\n+\n+        peer_sender = node.add_p2p_connection(P2PInterface())",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28970#discussion_r1572288041",
+      "id" : 1572288041,
+      "in_reply_to_id" : 1567724841,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585dtzYp",
+      "original_commit_id" : "142d584dab3725081344520bec0a092d6b58d996",
+      "original_line" : 189,
+      "original_position" : 189,
+      "original_start_line" : null,
+      "path" : "test/functional/p2p_opportunistic_1p1c.py",
+      "position" : null,
+      "pull_request_review_id" : 2011282364,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28970",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1572288041/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-04-19T12:24:03Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1572288041",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/28970#discussion_r1572288118"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28970"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1572288118"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "done",
+      "commit_id" : "a053911cb9957797faff7f68dbd6deb6b6080578",
+      "created_at" : "2024-04-19T12:24:07Z",
+      "diff_hunk" : "@@ -0,0 +1,241 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2024-present The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"\n+Test opportunistic 1p1c package submission logic.\n+\"\"\"\n+\n+from decimal import Decimal\n+from test_framework.messages import (\n+    CInv,\n+    CTxInWitness,\n+    MSG_WTX,\n+    msg_inv,\n+    msg_tx,\n+    tx_from_hex,\n+)\n+from test_framework.p2p import (\n+    P2PInterface,\n+)\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+    fill_mempool,\n+)\n+from test_framework.wallet import (\n+    MiniWallet,\n+    MiniWalletMode,\n+)\n+\n+# 1sat/vB feerate denominated in BTC/KvB\n+FEERATE_1SAT_VB = Decimal(\"0.00001000\")\n+\n+class PackageRelayTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.setup_clean_chain = True\n+        self.num_nodes = 1\n+        self.extra_args = [[\n+            \"-datacarriersize=100000\",\n+            \"-maxmempool=5\",\n+        ]]\n+        self.supports_cli = False\n+\n+    def test_basic_child_then_parent(self):\n+        node = self.nodes[0]\n+        self.log.info(\"Check that opportunistic 1p1c logic works when child is received before parent\")\n+\n+        low_fee_parent = self.wallet.create_self_transfer(fee_rate=FEERATE_1SAT_VB, confirmed_only=True)\n+        high_fee_child = self.wallet.create_self_transfer(utxo_to_spend=low_fee_parent[\"new_utxo\"], fee_rate=20*FEERATE_1SAT_VB)\n+\n+        peer_sender = node.add_p2p_connection(P2PInterface())\n+\n+        # 1. Child is received first (perhaps the low feerate parent didn't meet feefilter or the requests were sent to different nodes). It is missing an input.\n+        high_child_wtxid_int = int(high_fee_child[\"tx\"].getwtxid(), 16)\n+        peer_sender.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=high_child_wtxid_int)]))\n+        peer_sender.wait_for_getdata([high_child_wtxid_int])\n+        peer_sender.send_and_ping(msg_tx(high_fee_child[\"tx\"]))\n+\n+        # 2. Node requests the missing parent by txid.\n+        parent_txid_int = int(low_fee_parent[\"txid\"], 16)\n+        peer_sender.wait_for_getdata([parent_txid_int])\n+\n+        # 3. Sender relays the parent. Parent+Child are evaluated as a package and accepted.\n+        peer_sender.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+\n+        # 4. Both transactions should now be in mempool.\n+        node_mempool = node.getrawmempool()\n+        assert low_fee_parent[\"txid\"] in node_mempool\n+        assert high_fee_child[\"txid\"] in node_mempool\n+\n+        node.disconnect_p2ps()\n+\n+    def test_basic_parent_then_child(self, wallet):\n+        node = self.nodes[0]\n+        low_fee_parent = wallet.create_self_transfer(fee_rate=FEERATE_1SAT_VB, confirmed_only=True)\n+        high_fee_child = wallet.create_self_transfer(utxo_to_spend=low_fee_parent[\"new_utxo\"], fee_rate=20*FEERATE_1SAT_VB)\n+\n+        peer_sender = node.add_outbound_p2p_connection(P2PInterface(), p2p_idx=1, connection_type=\"outbound-full-relay\")\n+        peer_ignored = node.add_outbound_p2p_connection(P2PInterface(), p2p_idx=2, connection_type=\"outbound-full-relay\")\n+\n+        # 1. Parent is relayed first. It is too low feerate.\n+        parent_wtxid_int = int(low_fee_parent[\"tx\"].getwtxid(), 16)\n+        peer_sender.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=parent_wtxid_int)]))\n+        peer_sender.wait_for_getdata([parent_wtxid_int])\n+        peer_sender.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+        assert low_fee_parent[\"txid\"] not in node.getrawmempool()\n+\n+        # Send again from peer_ignored, check that it is ignored\n+        peer_ignored.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=parent_wtxid_int)]))\n+        assert \"getdata\" not in peer_ignored.last_message\n+\n+        # 2. Child is relayed next. It is missing an input.\n+        high_child_wtxid_int = int(high_fee_child[\"tx\"].getwtxid(), 16)\n+        peer_sender.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=high_child_wtxid_int)]))\n+        peer_sender.wait_for_getdata([high_child_wtxid_int])\n+        peer_sender.send_and_ping(msg_tx(high_fee_child[\"tx\"]))\n+\n+        # 3. Node requests the missing parent by txid.\n+        # It should do so even if it has previously rejected that parent for being too low feerate.\n+        parent_txid_int = int(low_fee_parent[\"txid\"], 16)\n+        peer_sender.wait_for_getdata([parent_txid_int])\n+\n+        # 4. Sender re-relays the parent. Parent+Child are evaluated as a package and accepted.\n+        peer_sender.send_and_ping(msg_tx(low_fee_parent[\"tx\"]))\n+\n+        # 5. Both transactions should now be in mempool.\n+        node_mempool = node.getrawmempool()\n+        assert low_fee_parent[\"txid\"] in node_mempool\n+        assert high_fee_child[\"txid\"] in node_mempool\n+\n+        node.disconnect_p2ps()\n+\n+    def test_low_and_high_child(self, wallet):\n+        node = self.nodes[0]\n+        low_fee_parent = wallet.create_self_transfer(fee_rate=FEERATE_1SAT_VB, confirmed_only=True)\n+        low_fee_child = wallet.create_self_transfer(utxo_to_spend=low_fee_parent[\"new_utxo\"], fee_rate=2*FEERATE_1SAT_VB)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28970#discussion_r1572288118",
+      "id" : 1572288118,
+      "in_reply_to_id" : 1567763258,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585dtzZ2",
+      "original_commit_id" : "142d584dab3725081344520bec0a092d6b58d996",
+      "original_line" : 115,
+      "original_position" : 115,
+      "original_start_line" : null,
+      "path" : "test/functional/p2p_opportunistic_1p1c.py",
+      "position" : null,
+      "pull_request_review_id" : 2011282515,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/28970",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1572288118/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-04-19T12:24:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1572288118",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
+   },
+   {
+      "author_association" : "MEMBER",
+      "body" : "Ok ready for review again.",
+      "created_at" : "2024-04-19T12:32:21Z",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/28970#issuecomment-2066473350",
+      "id" : 2066473350,
+      "issue_url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/28970",
+      "node_id" : "IC_kwDOABII5857K-GG",
+      "performed_via_github_app" : null,
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2066473350/reactions"
+      },
+      "updated_at" : "2024-04-19T12:32:21Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2066473350",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/25183001?v=4",
+         "events_url" : "https://api.github.com/users/glozow/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/glozow/followers",
+         "following_url" : "https://api.github.com/users/glozow/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/glozow/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/glozow",
+         "id" : 25183001,
+         "login" : "glozow",
+         "node_id" : "MDQ6VXNlcjI1MTgzMDAx",
+         "organizations_url" : "https://api.github.com/users/glozow/orgs",
+         "received_events_url" : "https://api.github.com/users/glozow/received_events",
+         "repos_url" : "https://api.github.com/users/glozow/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/glozow/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/glozow/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/glozow"
+      }
    }
 ]
