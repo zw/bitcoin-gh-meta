@@ -1502,5 +1502,74 @@
          "type" : "User",
          "url" : "https://api.github.com/users/mjdietzx"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/29156#discussion_r1582257401"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29156"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1582257401"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "I don't think it was ever necessary for me to demonstrate this alternative signing flow as part of this test. So I simplified and removed this code. Now all sends are tested in the single loop",
+      "commit_id" : "7ddfc6d53cedbbf539dcd4bb6289b65b581c01c9",
+      "created_at" : "2024-04-28T17:50:26Z",
+      "diff_hunk" : "@@ -0,0 +1,176 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2023 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test a miniscript multisig that starts as 4-of-4 and \"decays\" to 3-of-4, 2-of-4, and finally 1-of-4 at each future halvening block height.\n+\n+Spending policy: `thresh(4,pk(key_1),pk(key_2),pk(key_3),pk(key_4),after(t1),after(t2),after(t3))`\n+This is based off of `test/functional/wallet_multisig_descriptor_psbt.py` and most code is the same.\n+\"\"\"\n+\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+    assert_approx,\n+    assert_equal,\n+    assert_raises_rpc_error,\n+)\n+\n+\n+class WalletMiniscriptDecayingMultisigDescriptorPSBTTest(BitcoinTestFramework):\n+    def add_options(self, parser):\n+        self.add_wallet_options(parser, legacy=False)\n+\n+    def set_test_params(self):\n+        self.num_nodes = 4\n+        self.setup_clean_chain = True\n+        self.wallet_names = []\n+        self.extra_args = [[\"-keypool=100\"]] * self.num_nodes\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+        self.skip_if_no_sqlite()\n+\n+    @staticmethod\n+    def _get_xpub(wallet, internal):\n+        \"\"\"Extract the wallet's xpubs using `listdescriptors` and pick the one from the `pkh` descriptor since it's least likely to be accidentally reused (legacy addresses).\"\"\"\n+        pkh_descriptor = next(filter(lambda d: d[\"desc\"].startswith(\"pkh(\") and d[\"internal\"] == internal, wallet.listdescriptors()[\"descriptors\"]))\n+        # Keep all key origin information (master key fingerprint and all derivation steps) for proper support of hardware devices\n+        # See section 'Key origin identification' in 'doc/descriptors.md' for more details...\n+        return pkh_descriptor[\"desc\"].split(\"pkh(\")[1].split(\")\")[0]\n+\n+    @staticmethod\n+    def _check_psbt(psbt, to, value, multisig):\n+        \"\"\"Helper function for any of the N participants to check the psbt with decodepsbt and verify it is OK before signing.\"\"\"\n+        tx = multisig.decodepsbt(psbt)[\"tx\"]\n+        amount = 0\n+        for vout in tx[\"vout\"]:\n+            address = vout[\"scriptPubKey\"][\"address\"]\n+            assert_equal(multisig.getaddressinfo(address)[\"ischange\"], address != to)\n+            if address == to:\n+                amount += vout[\"value\"]\n+        assert_approx(amount, float(value), vspan=0.001)\n+\n+    def participants_create_multisigs(self, external_xpubs, internal_xpubs):\n+        \"\"\"The multisig is created by importing the following descriptors. The resulting wallet is watch-only and every participant can do this.\"\"\"\n+        for i, node in enumerate(self.nodes):\n+            node.createwallet(wallet_name=f\"{self.name}_{i}\", blank=True, descriptors=True, disable_private_keys=True)\n+            multisig = node.get_wallet_rpc(f\"{self.name}_{i}\")\n+            # Spending policy: `thresh(4,pk(key_1),pk(key_2),pk(key_3),pk(key_4),after(t1),after(t2),after(t3))`\n+            external = multisig.getdescriptorinfo(f\"wsh(thresh({self.N},pk({f'),s:pk('.join(external_xpubs)}),sln:after({f'),sln:after('.join(map(str, self.locktimes))})))\")\n+            internal = multisig.getdescriptorinfo(f\"wsh(thresh({self.N},pk({f'),s:pk('.join(internal_xpubs)}),sln:after({f'),sln:after('.join(map(str, self.locktimes))})))\")\n+            result = multisig.importdescriptors([\n+                {  # receiving addresses (internal: False)\n+                    \"desc\": external[\"descriptor\"],\n+                    \"active\": True,\n+                    \"internal\": False,\n+                    \"timestamp\": \"now\",\n+                },\n+                {  # change addresses (internal: True)\n+                    \"desc\": internal[\"descriptor\"],\n+                    \"active\": True,\n+                    \"internal\": True,\n+                    \"timestamp\": \"now\",\n+                },\n+            ])\n+            assert all(r[\"success\"] for r in result)\n+            yield multisig\n+\n+    def run_test(self):\n+        self.M = self.num_nodes\n+        self.N = self.num_nodes\n+        self.locktimes = [128, 256, 512]  # in real-world align with future halvenings: [840000, 1050000, 1260000]\n+        assert_equal(len(self.locktimes), self.N - 1)\n+\n+        self.name = f\"{self.M}_of_{self.N}_decaying_multisig\"\n+        self.log.info(f\"Testing {self.name}...\")\n+\n+        participants = {\n+            # Every participant generates an xpub. The most straightforward way is to create a new descriptor wallet.\n+            # This wallet will be the participant's `signer` for the resulting multisig. Avoid reusing this wallet for any other purpose (for privacy reasons).\n+            \"signers\": [node.get_wallet_rpc(node.createwallet(wallet_name=f\"participant_{self.nodes.index(node)}\", descriptors=True)[\"name\"]) for node in self.nodes],\n+            # After participants generate and exchange their xpubs they will each create their own watch-only multisig.\n+            # Note: these multisigs are all the same, this just highlights that each participant can independently verify everything on their own node.\n+            \"multisigs\": []\n+        }\n+\n+        self.log.info(\"Generate and exchange xpubs...\")\n+        external_xpubs, internal_xpubs = [[self._get_xpub(signer, internal) for signer in participants[\"signers\"]] for internal in [False, True]]\n+\n+        self.log.info(\"Every participant imports the following descriptors to create the watch-only multisig...\")\n+        participants[\"multisigs\"] = list(self.participants_create_multisigs(external_xpubs, internal_xpubs))\n+\n+        self.log.info(\"Check that every participant's multisig generates the same addresses...\")\n+        for _ in range(10):  # we check that the first 10 generated addresses are the same for all participant's multisigs\n+            receive_addresses = [multisig.getnewaddress() for multisig in participants[\"multisigs\"]]\n+            all(address == receive_addresses[0] for address in receive_addresses)\n+            change_addresses = [multisig.getrawchangeaddress() for multisig in participants[\"multisigs\"]]\n+            all(address == change_addresses[0] for address in change_addresses)\n+\n+        self.log.info(\"Get a mature utxo to send to the multisig...\")\n+        coordinator_wallet = participants[\"signers\"][0]\n+        self.generatetoaddress(self.nodes[0], 101, coordinator_wallet.getnewaddress())\n+\n+        deposit_amount = 6.15\n+        multisig_receiving_address = participants[\"multisigs\"][0].getnewaddress()\n+        self.log.info(\"Send funds to the resulting multisig receiving address...\")\n+        coordinator_wallet.sendtoaddress(multisig_receiving_address, deposit_amount)\n+        self.generate(self.nodes[0], 1)\n+        for participant in participants[\"multisigs\"]:\n+            assert_approx(participant.getbalance(), deposit_amount, vspan=0.001)\n+\n+        self.log.info(\"Send a transaction from the multisig! We can always spend with all signers!\")\n+        to = participants[\"signers\"][self.N - 1].getnewaddress()\n+        value = 1.5\n+        self.log.info(\"First, make a sending transaction, created using `walletcreatefundedpsbt` (anyone can initiate this)...\")\n+        psbt = participants[\"multisigs\"][0].walletcreatefundedpsbt(inputs=[], outputs={to: value}, feeRate=0.00010)\n+\n+        psbts = []\n+        self.log.info(\"Now at least M users check the psbt with decodepsbt and (if OK) signs it with walletprocesspsbt...\")\n+        for m in range(self.M):\n+            signers_multisig = participants[\"multisigs\"][m]\n+            self._check_psbt(psbt[\"psbt\"], to, value, signers_multisig)\n+            signing_wallet = participants[\"signers\"][m]\n+            partially_signed_psbt = signing_wallet.walletprocesspsbt(psbt[\"psbt\"])\n+            psbts.append(partially_signed_psbt[\"psbt\"])\n+\n+        self.log.info(\"Finally, collect the signed PSBTs with combinepsbt, finalizepsbt, then broadcast the resulting transaction...\")\n+        combined = coordinator_wallet.combinepsbt(psbts)\n+        finalized = coordinator_wallet.finalizepsbt(combined)\n+        coordinator_wallet.sendrawtransaction(finalized[\"hex\"])\n+\n+        self.log.info(\"Check that balances are correct after the transaction has been included in a block.\")\n+        self.generate(self.nodes[0], 1)\n+        assert_approx(participants[\"multisigs\"][0].getbalance(), deposit_amount - value, vspan=0.001)\n+        assert_equal(participants[\"signers\"][self.N - 1].getbalance(), value)",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/29156#discussion_r1582257401",
+      "id" : 1582257401,
+      "in_reply_to_id" : 1567842740,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585eT1T5",
+      "original_commit_id" : "de93b863583921929bc16feb7a0bf5decfbc7ac5",
+      "original_line" : 144,
+      "original_position" : 144,
+      "original_start_line" : 129,
+      "path" : "test/functional/wallet_miniscript_decaying_multisig_descriptor_psbt.py",
+      "position" : null,
+      "pull_request_review_id" : 2027204045,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/29156",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1582257401/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2024-04-28T17:50:26Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1582257401",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/7217256?v=4",
+         "events_url" : "https://api.github.com/users/mjdietzx/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/mjdietzx/followers",
+         "following_url" : "https://api.github.com/users/mjdietzx/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/mjdietzx/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/mjdietzx",
+         "id" : 7217256,
+         "login" : "mjdietzx",
+         "node_id" : "MDQ6VXNlcjcyMTcyNTY=",
+         "organizations_url" : "https://api.github.com/users/mjdietzx/orgs",
+         "received_events_url" : "https://api.github.com/users/mjdietzx/received_events",
+         "repos_url" : "https://api.github.com/users/mjdietzx/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/mjdietzx/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/mjdietzx/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/mjdietzx"
+      }
    }
 ]
