@@ -3030,5 +3030,73 @@
          "type" : "User",
          "url" : "https://api.github.com/users/andrewtoth"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/26326#discussion_r1592887228"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26326"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1592887228"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: maybe mentioning the block hash and/or height in the unconditional logs here and below could be helpful so in case of a disk failure, users could reproduce the failure easier (e.g. with getblock RPC).",
+      "commit_id" : "75d27fefc7a04ebdda7be5724a014b6a896e7325",
+      "created_at" : "2024-05-07T18:14:41Z",
+      "diff_hunk" : "@@ -2421,55 +2421,77 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv&\n         }\n     }\n \n-    LOCK(cs_main);\n-    const CBlockIndex* pindex = m_chainman.m_blockman.LookupBlockIndex(inv.hash);\n-    if (!pindex) {\n-        return;\n-    }\n-    if (!BlockRequestAllowed(pindex)) {\n-        LogPrint(BCLog::NET, \"%s: ignoring request from peer=%i for old block that isn't in the main chain\\n\", __func__, pfrom.GetId());\n-        return;\n-    }\n-    // disconnect node in case we have reached the outbound limit for serving historical blocks\n-    if (m_connman.OutboundTargetReached(true) &&\n-        (((m_chainman.m_best_header != nullptr) && (m_chainman.m_best_header->GetBlockTime() - pindex->GetBlockTime() > HISTORICAL_BLOCK_AGE)) || inv.IsMsgFilteredBlk()) &&\n-        !pfrom.HasPermission(NetPermissionFlags::Download) // nodes with the download permission may exceed target\n-    ) {\n-        LogPrint(BCLog::NET, \"historical block serving limit reached, disconnect peer=%d\\n\", pfrom.GetId());\n-        pfrom.fDisconnect = true;\n-        return;\n-    }\n-    // Avoid leaking prune-height by never sending blocks below the NODE_NETWORK_LIMITED threshold\n-    if (!pfrom.HasPermission(NetPermissionFlags::NoBan) && (\n-            (((peer.m_our_services & NODE_NETWORK_LIMITED) == NODE_NETWORK_LIMITED) && ((peer.m_our_services & NODE_NETWORK) != NODE_NETWORK) && (m_chainman.ActiveChain().Tip()->nHeight - pindex->nHeight > (int)NODE_NETWORK_LIMITED_MIN_BLOCKS + 2 /* add two blocks buffer extension for possible races */) )\n-       )) {\n-        LogPrint(BCLog::NET, \"Ignore block request below NODE_NETWORK_LIMITED threshold, disconnect peer=%d\\n\", pfrom.GetId());\n-        //disconnect node and prevent it from stalling (would otherwise wait for the missing block)\n-        pfrom.fDisconnect = true;\n-        return;\n-    }\n-    // Pruned nodes may have deleted the block, so check whether\n-    // it's available before trying to send.\n-    if (!(pindex->nStatus & BLOCK_HAVE_DATA)) {\n-        return;\n+    const CBlockIndex* pindex{nullptr};\n+    const CBlockIndex* tip{nullptr};\n+    bool can_direct_fetch{false};\n+    FlatFilePos block_pos{};\n+    {\n+        LOCK(cs_main);\n+        pindex = m_chainman.m_blockman.LookupBlockIndex(inv.hash);\n+        if (!pindex) {\n+            return;\n+        }\n+        if (!BlockRequestAllowed(pindex)) {\n+            LogPrint(BCLog::NET, \"%s: ignoring request from peer=%i for old block that isn't in the main chain\\n\", __func__, pfrom.GetId());\n+            return;\n+        }\n+        // disconnect node in case we have reached the outbound limit for serving historical blocks\n+        if (m_connman.OutboundTargetReached(true) &&\n+            (((m_chainman.m_best_header != nullptr) && (m_chainman.m_best_header->GetBlockTime() - pindex->GetBlockTime() > HISTORICAL_BLOCK_AGE)) || inv.IsMsgFilteredBlk()) &&\n+            !pfrom.HasPermission(NetPermissionFlags::Download) // nodes with the download permission may exceed target\n+        ) {\n+            LogPrint(BCLog::NET, \"historical block serving limit reached, disconnect peer=%d\\n\", pfrom.GetId());\n+            pfrom.fDisconnect = true;\n+            return;\n+        }\n+        tip = m_chainman.ActiveChain().Tip();\n+        // Avoid leaking prune-height by never sending blocks below the NODE_NETWORK_LIMITED threshold\n+        if (!pfrom.HasPermission(NetPermissionFlags::NoBan) && (\n+                (((peer.m_our_services & NODE_NETWORK_LIMITED) == NODE_NETWORK_LIMITED) && ((peer.m_our_services & NODE_NETWORK) != NODE_NETWORK) && (tip->nHeight - pindex->nHeight > (int)NODE_NETWORK_LIMITED_MIN_BLOCKS + 2 /* add two blocks buffer extension for possible races */) )\n+           )) {\n+            LogPrint(BCLog::NET, \"Ignore block request below NODE_NETWORK_LIMITED threshold, disconnect peer=%d\\n\", pfrom.GetId());\n+            //disconnect node and prevent it from stalling (would otherwise wait for the missing block)\n+            pfrom.fDisconnect = true;\n+            return;\n+        }\n+        // Pruned nodes may have deleted the block, so check whether\n+        // it's available before trying to send.\n+        if (!(pindex->nStatus & BLOCK_HAVE_DATA)) {\n+            return;\n+        }\n+        can_direct_fetch = CanDirectFetch();\n+        block_pos = pindex->GetBlockPos();\n     }\n+\n     std::shared_ptr<const CBlock> pblock;\n     if (a_recent_block && a_recent_block->GetHash() == pindex->GetBlockHash()) {\n         pblock = a_recent_block;\n     } else if (inv.IsMsgWitnessBlk()) {\n         // Fast-path: in this case it is possible to serve the block directly from disk,\n         // as the network format matches the format on disk\n         std::vector<uint8_t> block_data;\n-        if (!m_chainman.m_blockman.ReadRawBlockFromDisk(block_data, pindex->GetBlockPos())) {\n-            assert(!\"cannot load block from disk\");\n+        if (!m_chainman.m_blockman.ReadRawBlockFromDisk(block_data, block_pos)) {\n+            if (WITH_LOCK(m_chainman.GetMutex(), return m_chainman.m_blockman.IsBlockPruned(*pindex))) {\n+                LogPrint(BCLog::NET, \"Block was pruned before it could be read, disconnect peer=%s\\n\", pfrom.GetId());\n+            } else {\n+                LogError(\"Cannot load block from disk, disconnect peer=%d\\n\", pfrom.GetId());",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/26326#discussion_r1592887228",
+      "id" : 1592887228,
+      "line" : 2477,
+      "node_id" : "PRRC_kwDOABII585e8Ye8",
+      "original_commit_id" : "75d27fefc7a04ebdda7be5724a014b6a896e7325",
+      "original_line" : 2477,
+      "original_position" : 90,
+      "original_start_line" : null,
+      "path" : "src/net_processing.cpp",
+      "position" : 90,
+      "pull_request_review_id" : 2043866221,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/26326",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1592887228/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-07T18:18:56Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1592887228",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48763452?v=4",
+         "events_url" : "https://api.github.com/users/mzumsande/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/mzumsande/followers",
+         "following_url" : "https://api.github.com/users/mzumsande/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/mzumsande/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/mzumsande",
+         "id" : 48763452,
+         "login" : "mzumsande",
+         "node_id" : "MDQ6VXNlcjQ4NzYzNDUy",
+         "organizations_url" : "https://api.github.com/users/mzumsande/orgs",
+         "received_events_url" : "https://api.github.com/users/mzumsande/received_events",
+         "repos_url" : "https://api.github.com/users/mzumsande/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/mzumsande/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/mzumsande/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/mzumsande"
+      }
    }
 ]
