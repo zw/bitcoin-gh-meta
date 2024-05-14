@@ -4284,5 +4284,277 @@
          "type" : "User",
          "url" : "https://api.github.com/users/instagibbs"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30000#discussion_r1599064530"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30000"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599064530"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "i don't think that's a problem, just mentioning that whether we disconnect the  bad peer for misbehavior depends on the order in which the `ProcessOrphanTx` is called, so it could be random:\r\nIf the valid pair of txns is processed first, the invalid tx is removed with \"txn-same-nonwitness-data-in-mempool\" and no punishment. If the invalid pair is processed first, the bad peer is disconnected.",
+      "commit_id" : "16483fee7c6d93722bfb79fce9efbe841ec13d6a",
+      "created_at" : "2024-05-13T20:48:50Z",
+      "diff_hunk" : "@@ -398,6 +427,154 @@ def test_orphan_inherit_rejection(self):\n         self.nodes[0].bumpmocktime(TXREQUEST_TIME_SKIP)\n         peer3.assert_never_requested(child[\"txid\"])\n \n+    @cleanup\n+    def test_same_txid_orphan(self):\n+        self.log.info(\"Check what happens when orphan with same txid is already in orphanage\")\n+        node = self.nodes[0]\n+\n+        tx_parent = self.wallet.create_self_transfer()\n+\n+        # Create the real child\n+        tx_child = self.wallet.create_self_transfer(utxo_to_spend=tx_parent[\"new_utxo\"])\n+\n+        # Create a fake version of the child\n+        tx_orphan_bad_wit = self.create_malleated_version(tx_child)\n+\n+        bad_peer = node.add_p2p_connection(P2PInterface())\n+        honest_peer = node.add_p2p_connection(P2PInterface())\n+\n+        # 1. Fake orphan is received first. It is missing an input.\n+        bad_peer.send_and_ping(msg_tx(tx_orphan_bad_wit))\n+\n+        # 2. Node requests the missing parent by txid.\n+        parent_txid_int = int(tx_parent[\"txid\"], 16)\n+        node.bumpmocktime(NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY)\n+        bad_peer.wait_for_getdata([parent_txid_int])\n+\n+        # 3. Honest peer relays the real child, which is also missing parents and should be placed\n+        # in the orphanage.\n+        with node.assert_debug_log([\"missingorspent\", \"stored orphan tx\"]):\n+            honest_peer.send_and_ping(msg_tx(tx_child[\"tx\"]))\n+\n+        # Time out the previous request for the parent (node will not request the same transaction\n+        # from multiple nodes at the same time)\n+        node.bumpmocktime(GETDATA_TX_INTERVAL)\n+\n+        # 4. The parent is requested. Honest peer sends it.\n+        honest_peer.wait_for_getdata([parent_txid_int])\n+        honest_peer.send_message(msg_tx(tx_parent[\"tx\"]))\n+        # This ensures the peer's orphans were reconsidered.\n+        honest_peer.sync_with_ping()\n+\n+        # 5. After parent is accepted, orphans should be reconsidered.\n+        # The real child should be accepted and the fake one rejected.\n+        node_mempool = node.getrawmempool()\n+        assert tx_parent[\"txid\"] in node_mempool\n+        assert tx_child[\"txid\"] in node_mempool\n+        assert_equal(node.getmempoolentry(tx_child[\"txid\"])[\"wtxid\"], tx_child[\"wtxid\"])\n+\n+    @cleanup\n+    def test_same_txid_orphan_of_orphan(self):\n+        self.log.info(\"Check what happens when orphan's parent with same txid is already in orphanage\")\n+        node = self.nodes[0]\n+\n+        tx_grandparent = self.wallet.create_self_transfer()\n+\n+        # Create middle tx (both parent and child) which will be in orphanage.\n+        tx_middle = self.wallet.create_self_transfer(utxo_to_spend=tx_grandparent[\"new_utxo\"])\n+\n+        # Create a fake version of the middle tx\n+        tx_orphan_bad_wit = self.create_malleated_version(tx_middle)\n+\n+        # Create grandchild spending from tx_middle (and spending from tx_orphan_bad_wit since they\n+        # have the same txid).\n+        tx_grandchild = self.wallet.create_self_transfer(utxo_to_spend=tx_middle[\"new_utxo\"])\n+\n+        bad_peer = node.add_p2p_connection(P2PInterface())\n+        honest_peer = node.add_p2p_connection(P2PInterface())\n+\n+        # 1. Fake orphan is received first. It is missing an input.\n+        bad_peer.send_and_ping(msg_tx(tx_orphan_bad_wit))\n+\n+        # 2. Node requests missing tx_grandparent by txid.\n+        grandparent_txid_int = int(tx_grandparent[\"txid\"], 16)\n+        node.bumpmocktime(NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY)\n+        bad_peer.wait_for_getdata([grandparent_txid_int])\n+\n+        # 3. Honest peer relays the granchild, which is missing a parent. The parent by txid already\n+        # exists in orphanage, but should be re-requested because the node shouldn't assume that the\n+        # witness data is the same. In this case, a same-txid-different-witness transaction exists!\n+        with node.assert_debug_log([\"stored orphan tx\"]):\n+            honest_peer.send_and_ping(msg_tx(tx_grandchild[\"tx\"]))\n+        middle_txid_int = int(tx_middle[\"txid\"], 16)\n+        node.bumpmocktime(NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY)\n+        honest_peer.wait_for_getdata([middle_txid_int])\n+\n+        # 4. Honest peer relays the real child, which is also missing parents and should be placed\n+        # in the orphanage.\n+        with node.assert_debug_log([\"stored orphan tx\"]):\n+            honest_peer.send_and_ping(msg_tx(tx_middle[\"tx\"]))\n+        assert_equal(len(node.getrawmempool()), 0)\n+\n+        # 5. Hondest peer sends tx_grandparent\n+        honest_peer.send_and_ping(msg_tx(tx_grandparent[\"tx\"]))\n+\n+        # 6. After parent is accepted, orphans should be reconsidered.\n+        # The real child should be accepted and the fake one rejected.\n+        node_mempool = node.getrawmempool()\n+        assert tx_grandparent[\"txid\"] in node_mempool\n+        assert tx_middle[\"txid\"] in node_mempool\n+        assert tx_grandchild[\"txid\"] in node_mempool\n+        assert_equal(node.getmempoolentry(tx_middle[\"txid\"])[\"wtxid\"], tx_middle[\"wtxid\"])\n+\n+    @cleanup\n+    def test_orphan_txid_inv(self):\n+        self.log.info(\"Check node does not ignore announcement with same txid as tx in orphanage\")\n+        node = self.nodes[0]\n+\n+        tx_parent = self.wallet.create_self_transfer()\n+\n+        # Create the real child and fake version\n+        tx_child = self.wallet.create_self_transfer(utxo_to_spend=tx_parent[\"new_utxo\"])\n+        tx_orphan_bad_wit = self.create_malleated_version(tx_child)\n+\n+        bad_peer = node.add_p2p_connection(PeerTxRelayer())\n+        # Must not send wtxidrelay because otherwise the inv(TX) will be ignored later\n+        honest_peer = node.add_p2p_connection(PeerTxRelayer(wtxidrelay=False))\n+\n+        # 1. Fake orphan is received first. It is missing an input.\n+        bad_peer.send_and_ping(msg_tx(tx_orphan_bad_wit))\n+\n+        # 2. Node requests the missing parent by txid.\n+        parent_txid_int = int(tx_parent[\"txid\"], 16)\n+        node.bumpmocktime(NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY)\n+        bad_peer.wait_for_getdata([parent_txid_int])\n+\n+        # 3. Honest peer announces the real child, by txid (this isn't common but the node should\n+        # still keep track of it).\n+        child_txid_int = int(tx_child[\"txid\"], 16)\n+        honest_peer.send_and_ping(msg_inv([CInv(t=MSG_TX, h=child_txid_int)]))\n+\n+        # 4. The child is requested. Honest peer sends it.\n+        node.bumpmocktime(TXREQUEST_TIME_SKIP)\n+        honest_peer.wait_for_getdata([child_txid_int])\n+        with node.assert_debug_log([\"stored orphan tx\"]):\n+            honest_peer.send_message(msg_tx(tx_child[\"tx\"]))\n+\n+        # 5. After first parent request times out, the node sends another one for the missing parent\n+        # of the real orphan child.\n+        node.bumpmocktime(GETDATA_TX_INTERVAL)\n+        honest_peer.wait_for_getdata([parent_txid_int])\n+        honest_peer.send_and_ping(msg_tx(tx_parent[\"tx\"]))\n+\n+        # 6. After parent is accepted, orphans should be reconsidered.\n+        # The real child should be accepted and the fake one rejected.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30000#discussion_r1599064530",
+      "id" : 1599064530,
+      "line" : 571,
+      "node_id" : "PRRC_kwDOABII585fT8nS",
+      "original_commit_id" : "1aea9f21571470a37cc0a776bc16b9c2855a81d9",
+      "original_line" : 571,
+      "original_position" : 214,
+      "original_start_line" : null,
+      "path" : "test/functional/p2p_orphan_handling.py",
+      "position" : 214,
+      "pull_request_review_id" : 2053800837,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30000",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599064530/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-13T23:17:04Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599064530",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48763452?v=4",
+         "events_url" : "https://api.github.com/users/mzumsande/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/mzumsande/followers",
+         "following_url" : "https://api.github.com/users/mzumsande/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/mzumsande/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/mzumsande",
+         "id" : 48763452,
+         "login" : "mzumsande",
+         "node_id" : "MDQ6VXNlcjQ4NzYzNDUy",
+         "organizations_url" : "https://api.github.com/users/mzumsande/orgs",
+         "received_events_url" : "https://api.github.com/users/mzumsande/received_events",
+         "repos_url" : "https://api.github.com/users/mzumsande/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/mzumsande/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/mzumsande/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/mzumsande"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30000#discussion_r1599118360"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30000"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599118360"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "Nit: given the discussion in the PR, you could extend this with a note on why we might still want to keep multiple same-txid-diff-witness transactions in the orphanage\r\n\r\n```suggestion\r\n    // It is possible that the transaction in the orphanage has the same txid but a different\r\n    // witness (e.g. malleated by an attacker) and we don't want to return false positives,\r\n    // nor can we tell which of the same-txid-different-witness transactions in the orphanage\r\n    // could be evicted without seeing their parent transactions.\r\n```",
+      "commit_id" : "16483fee7c6d93722bfb79fce9efbe841ec13d6a",
+      "created_at" : "2024-05-13T21:40:39Z",
+      "diff_hunk" : "@@ -2295,7 +2295,12 @@ bool PeerManagerImpl::AlreadyHaveTx(const GenTxid& gtxid, bool include_reconside\n \n     const uint256& hash = gtxid.GetHash();\n \n-    if (m_orphanage.HaveTx(gtxid)) return true;\n+    // Always query by wtxid, even if gtxid has a Txid type.\n+    // It is possible that the transaction in the orphanage has the same txid but a different\n+    // witness (e.g. malleated by an attacker) and we don't want to return false positives.",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30000#discussion_r1599118360",
+      "id" : 1599118360,
+      "line" : 2300,
+      "node_id" : "PRRC_kwDOABII585fUJwY",
+      "original_commit_id" : "16483fee7c6d93722bfb79fce9efbe841ec13d6a",
+      "original_line" : 2300,
+      "original_position" : 7,
+      "original_start_line" : 2299,
+      "path" : "src/net_processing.cpp",
+      "position" : 7,
+      "pull_request_review_id" : 2053871488,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30000",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599118360/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : 2299,
+      "start_side" : "RIGHT",
+      "subject_type" : "line",
+      "updated_at" : "2024-05-13T22:04:32Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599118360",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1328814?v=4",
+         "events_url" : "https://api.github.com/users/AngusP/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/AngusP/followers",
+         "following_url" : "https://api.github.com/users/AngusP/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/AngusP/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/AngusP",
+         "id" : 1328814,
+         "login" : "AngusP",
+         "node_id" : "MDQ6VXNlcjEzMjg4MTQ=",
+         "organizations_url" : "https://api.github.com/users/AngusP/orgs",
+         "received_events_url" : "https://api.github.com/users/AngusP/received_events",
+         "repos_url" : "https://api.github.com/users/AngusP/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/AngusP/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/AngusP/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/AngusP"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30000#discussion_r1599138412"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30000"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599138412"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "```suggestion\r\n        # 3. Honest peer relays the grandchild, which is missing a parent. The parent by txid already\r\n```",
+      "commit_id" : "16483fee7c6d93722bfb79fce9efbe841ec13d6a",
+      "created_at" : "2024-05-13T22:02:02Z",
+      "diff_hunk" : "@@ -398,6 +427,154 @@ def test_orphan_inherit_rejection(self):\n         self.nodes[0].bumpmocktime(TXREQUEST_TIME_SKIP)\n         peer3.assert_never_requested(child[\"txid\"])\n \n+    @cleanup\n+    def test_same_txid_orphan(self):\n+        self.log.info(\"Check what happens when orphan with same txid is already in orphanage\")\n+        node = self.nodes[0]\n+\n+        tx_parent = self.wallet.create_self_transfer()\n+\n+        # Create the real child\n+        tx_child = self.wallet.create_self_transfer(utxo_to_spend=tx_parent[\"new_utxo\"])\n+\n+        # Create a fake version of the child\n+        tx_orphan_bad_wit = self.create_malleated_version(tx_child)\n+\n+        bad_peer = node.add_p2p_connection(P2PInterface())\n+        honest_peer = node.add_p2p_connection(P2PInterface())\n+\n+        # 1. Fake orphan is received first. It is missing an input.\n+        bad_peer.send_and_ping(msg_tx(tx_orphan_bad_wit))\n+\n+        # 2. Node requests the missing parent by txid.\n+        parent_txid_int = int(tx_parent[\"txid\"], 16)\n+        node.bumpmocktime(NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY)\n+        bad_peer.wait_for_getdata([parent_txid_int])\n+\n+        # 3. Honest peer relays the real child, which is also missing parents and should be placed\n+        # in the orphanage.\n+        with node.assert_debug_log([\"missingorspent\", \"stored orphan tx\"]):\n+            honest_peer.send_and_ping(msg_tx(tx_child[\"tx\"]))\n+\n+        # Time out the previous request for the parent (node will not request the same transaction\n+        # from multiple nodes at the same time)\n+        node.bumpmocktime(GETDATA_TX_INTERVAL)\n+\n+        # 4. The parent is requested. Honest peer sends it.\n+        honest_peer.wait_for_getdata([parent_txid_int])\n+        honest_peer.send_message(msg_tx(tx_parent[\"tx\"]))\n+        # This ensures the peer's orphans were reconsidered.\n+        honest_peer.sync_with_ping()\n+\n+        # 5. After parent is accepted, orphans should be reconsidered.\n+        # The real child should be accepted and the fake one rejected.\n+        node_mempool = node.getrawmempool()\n+        assert tx_parent[\"txid\"] in node_mempool\n+        assert tx_child[\"txid\"] in node_mempool\n+        assert_equal(node.getmempoolentry(tx_child[\"txid\"])[\"wtxid\"], tx_child[\"wtxid\"])\n+\n+    @cleanup\n+    def test_same_txid_orphan_of_orphan(self):\n+        self.log.info(\"Check what happens when orphan's parent with same txid is already in orphanage\")\n+        node = self.nodes[0]\n+\n+        tx_grandparent = self.wallet.create_self_transfer()\n+\n+        # Create middle tx (both parent and child) which will be in orphanage.\n+        tx_middle = self.wallet.create_self_transfer(utxo_to_spend=tx_grandparent[\"new_utxo\"])\n+\n+        # Create a fake version of the middle tx\n+        tx_orphan_bad_wit = self.create_malleated_version(tx_middle)\n+\n+        # Create grandchild spending from tx_middle (and spending from tx_orphan_bad_wit since they\n+        # have the same txid).\n+        tx_grandchild = self.wallet.create_self_transfer(utxo_to_spend=tx_middle[\"new_utxo\"])\n+\n+        bad_peer = node.add_p2p_connection(P2PInterface())\n+        honest_peer = node.add_p2p_connection(P2PInterface())\n+\n+        # 1. Fake orphan is received first. It is missing an input.\n+        bad_peer.send_and_ping(msg_tx(tx_orphan_bad_wit))\n+\n+        # 2. Node requests missing tx_grandparent by txid.\n+        grandparent_txid_int = int(tx_grandparent[\"txid\"], 16)\n+        node.bumpmocktime(NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY)\n+        bad_peer.wait_for_getdata([grandparent_txid_int])\n+\n+        # 3. Honest peer relays the granchild, which is missing a parent. The parent by txid already",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30000#discussion_r1599138412",
+      "id" : 1599138412,
+      "line" : 504,
+      "node_id" : "PRRC_kwDOABII585fUOps",
+      "original_commit_id" : "16483fee7c6d93722bfb79fce9efbe841ec13d6a",
+      "original_line" : 504,
+      "original_position" : 147,
+      "original_start_line" : null,
+      "path" : "test/functional/p2p_orphan_handling.py",
+      "position" : 147,
+      "pull_request_review_id" : 2053871488,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30000",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599138412/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-13T22:04:32Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599138412",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/1328814?v=4",
+         "events_url" : "https://api.github.com/users/AngusP/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/AngusP/followers",
+         "following_url" : "https://api.github.com/users/AngusP/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/AngusP/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/AngusP",
+         "id" : 1328814,
+         "login" : "AngusP",
+         "node_id" : "MDQ6VXNlcjEzMjg4MTQ=",
+         "organizations_url" : "https://api.github.com/users/AngusP/orgs",
+         "received_events_url" : "https://api.github.com/users/AngusP/received_events",
+         "repos_url" : "https://api.github.com/users/AngusP/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/AngusP/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/AngusP/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/AngusP"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30000#discussion_r1599193199"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30000"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599193199"
+         }
+      },
+      "author_association" : "CONTRIBUTOR",
+      "body" : "nit: could use `send_and_ping` here too (as in the other subtests).",
+      "commit_id" : "16483fee7c6d93722bfb79fce9efbe841ec13d6a",
+      "created_at" : "2024-05-13T23:07:37Z",
+      "diff_hunk" : "@@ -398,6 +427,154 @@ def test_orphan_inherit_rejection(self):\n         self.nodes[0].bumpmocktime(TXREQUEST_TIME_SKIP)\n         peer3.assert_never_requested(child[\"txid\"])\n \n+    @cleanup\n+    def test_same_txid_orphan(self):\n+        self.log.info(\"Check what happens when orphan with same txid is already in orphanage\")\n+        node = self.nodes[0]\n+\n+        tx_parent = self.wallet.create_self_transfer()\n+\n+        # Create the real child\n+        tx_child = self.wallet.create_self_transfer(utxo_to_spend=tx_parent[\"new_utxo\"])\n+\n+        # Create a fake version of the child\n+        tx_orphan_bad_wit = self.create_malleated_version(tx_child)\n+\n+        bad_peer = node.add_p2p_connection(P2PInterface())\n+        honest_peer = node.add_p2p_connection(P2PInterface())\n+\n+        # 1. Fake orphan is received first. It is missing an input.\n+        bad_peer.send_and_ping(msg_tx(tx_orphan_bad_wit))\n+\n+        # 2. Node requests the missing parent by txid.\n+        parent_txid_int = int(tx_parent[\"txid\"], 16)\n+        node.bumpmocktime(NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY)\n+        bad_peer.wait_for_getdata([parent_txid_int])\n+\n+        # 3. Honest peer relays the real child, which is also missing parents and should be placed\n+        # in the orphanage.\n+        with node.assert_debug_log([\"missingorspent\", \"stored orphan tx\"]):\n+            honest_peer.send_and_ping(msg_tx(tx_child[\"tx\"]))\n+\n+        # Time out the previous request for the parent (node will not request the same transaction\n+        # from multiple nodes at the same time)\n+        node.bumpmocktime(GETDATA_TX_INTERVAL)\n+\n+        # 4. The parent is requested. Honest peer sends it.\n+        honest_peer.wait_for_getdata([parent_txid_int])\n+        honest_peer.send_message(msg_tx(tx_parent[\"tx\"]))",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30000#discussion_r1599193199",
+      "id" : 1599193199,
+      "line" : 465,
+      "node_id" : "PRRC_kwDOABII585fUcBv",
+      "original_commit_id" : "1aea9f21571470a37cc0a776bc16b9c2855a81d9",
+      "original_line" : 465,
+      "original_position" : 108,
+      "original_start_line" : null,
+      "path" : "test/functional/p2p_orphan_handling.py",
+      "position" : 108,
+      "pull_request_review_id" : 2053800837,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30000",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599193199/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-13T23:17:04Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1599193199",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/48763452?v=4",
+         "events_url" : "https://api.github.com/users/mzumsande/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/mzumsande/followers",
+         "following_url" : "https://api.github.com/users/mzumsande/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/mzumsande/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/mzumsande",
+         "id" : 48763452,
+         "login" : "mzumsande",
+         "node_id" : "MDQ6VXNlcjQ4NzYzNDUy",
+         "organizations_url" : "https://api.github.com/users/mzumsande/orgs",
+         "received_events_url" : "https://api.github.com/users/mzumsande/received_events",
+         "repos_url" : "https://api.github.com/users/mzumsande/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/mzumsande/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/mzumsande/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/mzumsande"
+      }
    }
 ]
