@@ -6356,5 +6356,419 @@
          "type" : "User",
          "url" : "https://api.github.com/users/Sjors"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611968560"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611968560"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "How about:\r\n\r\n```cpp\r\n// rt_msghdr is followed by zero or more sockaddrs, as indicated by rtm_addrs\r\nauto sa = (const struct sockaddr*)(p + sizeof(rt_msghdr));\r\n```",
+      "commit_id" : "82b1c25b9ca61f5b0382a5196e0ff7016b4d1429",
+      "created_at" : "2024-05-23T16:10:25Z",
+      "diff_hunk" : "@@ -0,0 +1,287 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+\n+// Linux and FreeBSD 13.2+\n+#if defined(__linux__) || (defined(__FreeBSD__) && __FreeBSD_version >= 1302000)\n+\n+#if defined(__linux__)\n+#include <linux/rtnetlink.h>\n+#elif defined(__FreeBSD__)\n+#include <netlink/netlink.h>\n+#include <netlink/netlink_route.h>\n+#endif\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    // Create a netlink socket.\n+    const int s{socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)};\n+    if (s < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"socket(AF_NETLINK): %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+    Sock sock{static_cast<SOCKET>(s)};\n+\n+    // Send request.\n+    struct {\n+        nlmsghdr hdr; ///< Request header.\n+        rtmsg data; ///< Request data, a \"route message\".\n+        nlattr dst_hdr; ///< One attribute, conveying the route destination address.\n+        char dst_data[16]; ///< Route destination address. To query the default route we use 0.0.0.0/0 or [::]/0. For IPv4 the first 4 bytes are used.\n+    } request{};\n+\n+    // Whether to use the first 4 or 16 bytes from request.attr_dst_data.\n+    const size_t dst_data_len = family == AF_INET ? 4 : 16;\n+\n+    request.hdr.nlmsg_type = RTM_GETROUTE;\n+    request.hdr.nlmsg_flags = NLM_F_REQUEST;\n+#ifdef __linux__\n+    // Linux IPv4 / IPv6 - this must be present, otherwise no gateway is found\n+    // FreeBSD IPv4 - does not matter, the gateway is found with or without this\n+    // FreeBSD IPv6 - this must be absent, otherwise no gateway is found\n+    request.hdr.nlmsg_flags |= NLM_F_DUMP;\n+#endif\n+    request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg) + sizeof(nlattr) + dst_data_len);\n+    request.hdr.nlmsg_seq = 0; // Sequence number, used to match which reply is to which request. Irrelevant for us because we send just one request.\n+    request.data.rtm_family = family;\n+    request.data.rtm_dst_len = 0; // Prefix length.\n+#ifdef __FreeBSD__\n+    // Linux IPv4 / IPv6 this must be absent, otherwise no gateway is found\n+    // FreeBSD IPv4 - does not matter, the gateway is found with or without this\n+    // FreeBSD IPv6 - this must be present, otherwise no gateway is found\n+    request.data.rtm_flags = RTM_F_PREFIX;\n+#endif\n+    request.dst_hdr.nla_type = RTA_DST;\n+    request.dst_hdr.nla_len = sizeof(nlattr) + dst_data_len;\n+\n+    if (sock.Send(&request, request.hdr.nlmsg_len, 0) != static_cast<ssize_t>(request.hdr.nlmsg_len)) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"send() to netlink socket: %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    // Receive response.\n+    char response[4096];\n+    ssize_t recv_result;\n+    do {\n+        recv_result = sock.Recv(response, sizeof(response), 0);\n+    } while (recv_result < 0 && (errno == EINTR || errno == EAGAIN));\n+    if (recv_result < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"recv() from netlink socket: %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    size_t response_len = static_cast<size_t>(recv_result);\n+    for (nlmsghdr* hdr = (nlmsghdr*)response; NLMSG_OK(hdr, response_len); hdr = NLMSG_NEXT(hdr, response_len)) {\n+        rtmsg* r = (rtmsg*)NLMSG_DATA(hdr);\n+        int remaining_len = RTM_PAYLOAD(hdr);\n+\n+        // Iterate over the attributes.\n+        rtattr *rta_gateway = nullptr;\n+        int scope_id = 0;\n+        for (rtattr* attr = RTM_RTA(r); RTA_OK(attr, remaining_len); attr = RTA_NEXT(attr, remaining_len)) {\n+            if (attr->rta_type == RTA_GATEWAY) {\n+                rta_gateway = attr;\n+            } else if (attr->rta_type == RTA_OIF) {\n+                Assume(sizeof(int) == RTA_PAYLOAD(attr));\n+                std::memcpy(&scope_id, RTA_DATA(attr), sizeof(scope_id));\n+            }\n+        }\n+\n+        // Found gateway?\n+        if (rta_gateway != nullptr) {\n+            if (family == AF_INET) {\n+                Assume(sizeof(in_addr) == RTA_PAYLOAD(rta_gateway));\n+                in_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw);\n+            } else if (family == AF_INET6) {\n+                Assume(sizeof(in6_addr) == RTA_PAYLOAD(rta_gateway));\n+                in6_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw, scope_id);\n+            }\n+        }\n+    }\n+\n+    return std::nullopt;\n+}\n+\n+#elif defined(WIN32)\n+\n+#include <iphlpapi.h>\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    NET_LUID interface_luid = {};\n+    SOCKADDR_INET destination_address = {};\n+    MIB_IPFORWARD_ROW2 best_route = {};\n+    SOCKADDR_INET best_source_address = {};\n+    DWORD best_if_idx = 0;\n+    DWORD status = 0;\n+\n+    // Pass empty destination address of the requested type (:: or 0.0.0.0) to get interface of default route.\n+    destination_address.si_family = family;\n+    status = GetBestInterfaceEx((sockaddr*)&destination_address, &best_if_idx);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best interface for default route: %s\\n\", NetworkErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    // Get best route to default gateway.\n+    // Leave interface_luid at all-zeros to use interface index instead.\n+    status = GetBestRoute2(&interface_luid, best_if_idx, nullptr, &destination_address, 0, &best_route, &best_source_address);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best route for default route for interface index %d: %s\\n\",\n+                best_if_idx, NetworkErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    Assume(best_route.NextHop.si_family == family);\n+    if (family == AF_INET) {\n+        return CNetAddr(best_route.NextHop.Ipv4.sin_addr);\n+    } else if(family == AF_INET6) {\n+        return CNetAddr(best_route.NextHop.Ipv6.sin6_addr, best_route.InterfaceIndex);\n+    }\n+    return std::nullopt;\n+}\n+\n+#elif defined(__APPLE__)\n+\n+#include <net/route.h>\n+#include <sys/sysctl.h>\n+\n+// Ensure correct alignment for sockaddrs.\n+#define ROUNDUP(a) \\\n+    ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))\n+\n+static std::optional<CNetAddr> FromSockAddr(const struct sockaddr* addr)\n+{\n+    // Fill in a CService from the sockaddr, then drop the port part.\n+    CService service;\n+    if (service.SetSockAddr(addr)) {\n+        return (CNetAddr)service;\n+    }\n+    return std::nullopt;\n+}\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    // MacOS: Get default gateway from route table.\n+    // See man page for route(4) for the format.\n+\n+    // net.route.0.inet[6].flags.gateway\n+    int mib[] = {CTL_NET, PF_ROUTE, 0, family, NET_RT_FLAGS, RTF_GATEWAY};\n+    size_t l = 0;\n+    if (sysctl(mib, sizeof(mib) / sizeof(int), 0, &l, 0, 0) < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get sysctl length of routing table: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    std::vector<std::byte> buf(l);\n+    if (sysctl(mib, sizeof(mib) / sizeof(int), buf.data(), &l, 0, 0) < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get sysctl data of routing table: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    const struct rt_msghdr* rt = nullptr;\n+    for (const std::byte* p = buf.data(); p < buf.data() + buf.size(); p += rt->rtm_msglen) {\n+        // Iterate over routing entry addresses, get destination and gateway (if present).\n+        rt = (const struct rt_msghdr*)p;\n+        const struct sockaddr* sa = (const struct sockaddr*)(rt + 1);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611968560",
+      "id" : 1611968560,
+      "in_reply_to_id" : 1611691990,
+      "line" : 194,
+      "node_id" : "PRRC_kwDOABII585gFLAw",
+      "original_commit_id" : "89ac09777d4d60a331fe1c482d87ecdd1aeb01a0",
+      "original_line" : 198,
+      "original_position" : 198,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : 194,
+      "pull_request_review_id" : 2074432764,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611968560/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T16:10:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611968560",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1612003469"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612003469"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Right, let's add `sizeof(rt_msghdr)` manually instead of doing the +1 trick.\r\n\r\n> That makes sense. Whereas rt_msghdr is fixed length I guess, so you're able to use rt + 1 above (I'm still a bit terified that compilers don't care). \r\n\r\nIf we can hardcode the assumption that `sa_len` is the first byte (which it is) then we can avoid casting and dereferencing sockaddr, anywhere. E.g. when we know the length we can memcpy it into a `sockaddr_storage` first.\r\n",
+      "commit_id" : "82b1c25b9ca61f5b0382a5196e0ff7016b4d1429",
+      "created_at" : "2024-05-23T16:29:53Z",
+      "diff_hunk" : "@@ -0,0 +1,287 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+\n+// Linux and FreeBSD 13.2+\n+#if defined(__linux__) || (defined(__FreeBSD__) && __FreeBSD_version >= 1302000)\n+\n+#if defined(__linux__)\n+#include <linux/rtnetlink.h>\n+#elif defined(__FreeBSD__)\n+#include <netlink/netlink.h>\n+#include <netlink/netlink_route.h>\n+#endif\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    // Create a netlink socket.\n+    const int s{socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)};\n+    if (s < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"socket(AF_NETLINK): %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+    Sock sock{static_cast<SOCKET>(s)};\n+\n+    // Send request.\n+    struct {\n+        nlmsghdr hdr; ///< Request header.\n+        rtmsg data; ///< Request data, a \"route message\".\n+        nlattr dst_hdr; ///< One attribute, conveying the route destination address.\n+        char dst_data[16]; ///< Route destination address. To query the default route we use 0.0.0.0/0 or [::]/0. For IPv4 the first 4 bytes are used.\n+    } request{};\n+\n+    // Whether to use the first 4 or 16 bytes from request.attr_dst_data.\n+    const size_t dst_data_len = family == AF_INET ? 4 : 16;\n+\n+    request.hdr.nlmsg_type = RTM_GETROUTE;\n+    request.hdr.nlmsg_flags = NLM_F_REQUEST;\n+#ifdef __linux__\n+    // Linux IPv4 / IPv6 - this must be present, otherwise no gateway is found\n+    // FreeBSD IPv4 - does not matter, the gateway is found with or without this\n+    // FreeBSD IPv6 - this must be absent, otherwise no gateway is found\n+    request.hdr.nlmsg_flags |= NLM_F_DUMP;\n+#endif\n+    request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg) + sizeof(nlattr) + dst_data_len);\n+    request.hdr.nlmsg_seq = 0; // Sequence number, used to match which reply is to which request. Irrelevant for us because we send just one request.\n+    request.data.rtm_family = family;\n+    request.data.rtm_dst_len = 0; // Prefix length.\n+#ifdef __FreeBSD__\n+    // Linux IPv4 / IPv6 this must be absent, otherwise no gateway is found\n+    // FreeBSD IPv4 - does not matter, the gateway is found with or without this\n+    // FreeBSD IPv6 - this must be present, otherwise no gateway is found\n+    request.data.rtm_flags = RTM_F_PREFIX;\n+#endif\n+    request.dst_hdr.nla_type = RTA_DST;\n+    request.dst_hdr.nla_len = sizeof(nlattr) + dst_data_len;\n+\n+    if (sock.Send(&request, request.hdr.nlmsg_len, 0) != static_cast<ssize_t>(request.hdr.nlmsg_len)) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"send() to netlink socket: %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    // Receive response.\n+    char response[4096];\n+    ssize_t recv_result;\n+    do {\n+        recv_result = sock.Recv(response, sizeof(response), 0);\n+    } while (recv_result < 0 && (errno == EINTR || errno == EAGAIN));\n+    if (recv_result < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"recv() from netlink socket: %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    size_t response_len = static_cast<size_t>(recv_result);\n+    for (nlmsghdr* hdr = (nlmsghdr*)response; NLMSG_OK(hdr, response_len); hdr = NLMSG_NEXT(hdr, response_len)) {\n+        rtmsg* r = (rtmsg*)NLMSG_DATA(hdr);\n+        int remaining_len = RTM_PAYLOAD(hdr);\n+\n+        // Iterate over the attributes.\n+        rtattr *rta_gateway = nullptr;\n+        int scope_id = 0;\n+        for (rtattr* attr = RTM_RTA(r); RTA_OK(attr, remaining_len); attr = RTA_NEXT(attr, remaining_len)) {\n+            if (attr->rta_type == RTA_GATEWAY) {\n+                rta_gateway = attr;\n+            } else if (attr->rta_type == RTA_OIF) {\n+                Assume(sizeof(int) == RTA_PAYLOAD(attr));\n+                std::memcpy(&scope_id, RTA_DATA(attr), sizeof(scope_id));\n+            }\n+        }\n+\n+        // Found gateway?\n+        if (rta_gateway != nullptr) {\n+            if (family == AF_INET) {\n+                Assume(sizeof(in_addr) == RTA_PAYLOAD(rta_gateway));\n+                in_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw);\n+            } else if (family == AF_INET6) {\n+                Assume(sizeof(in6_addr) == RTA_PAYLOAD(rta_gateway));\n+                in6_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw, scope_id);\n+            }\n+        }\n+    }\n+\n+    return std::nullopt;\n+}\n+\n+#elif defined(WIN32)\n+\n+#include <iphlpapi.h>\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    NET_LUID interface_luid = {};\n+    SOCKADDR_INET destination_address = {};\n+    MIB_IPFORWARD_ROW2 best_route = {};\n+    SOCKADDR_INET best_source_address = {};\n+    DWORD best_if_idx = 0;\n+    DWORD status = 0;\n+\n+    // Pass empty destination address of the requested type (:: or 0.0.0.0) to get interface of default route.\n+    destination_address.si_family = family;\n+    status = GetBestInterfaceEx((sockaddr*)&destination_address, &best_if_idx);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best interface for default route: %s\\n\", NetworkErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    // Get best route to default gateway.\n+    // Leave interface_luid at all-zeros to use interface index instead.\n+    status = GetBestRoute2(&interface_luid, best_if_idx, nullptr, &destination_address, 0, &best_route, &best_source_address);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best route for default route for interface index %d: %s\\n\",\n+                best_if_idx, NetworkErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    Assume(best_route.NextHop.si_family == family);\n+    if (family == AF_INET) {\n+        return CNetAddr(best_route.NextHop.Ipv4.sin_addr);\n+    } else if(family == AF_INET6) {\n+        return CNetAddr(best_route.NextHop.Ipv6.sin6_addr, best_route.InterfaceIndex);\n+    }\n+    return std::nullopt;\n+}\n+\n+#elif defined(__APPLE__)\n+\n+#include <net/route.h>\n+#include <sys/sysctl.h>\n+\n+// Ensure correct alignment for sockaddrs.\n+#define ROUNDUP(a) \\\n+    ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))\n+\n+static std::optional<CNetAddr> FromSockAddr(const struct sockaddr* addr)\n+{\n+    // Fill in a CService from the sockaddr, then drop the port part.\n+    CService service;\n+    if (service.SetSockAddr(addr)) {\n+        return (CNetAddr)service;\n+    }\n+    return std::nullopt;\n+}\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    // MacOS: Get default gateway from route table.\n+    // See man page for route(4) for the format.\n+\n+    // net.route.0.inet[6].flags.gateway\n+    int mib[] = {CTL_NET, PF_ROUTE, 0, family, NET_RT_FLAGS, RTF_GATEWAY};\n+    size_t l = 0;\n+    if (sysctl(mib, sizeof(mib) / sizeof(int), 0, &l, 0, 0) < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get sysctl length of routing table: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    std::vector<std::byte> buf(l);\n+    if (sysctl(mib, sizeof(mib) / sizeof(int), buf.data(), &l, 0, 0) < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get sysctl data of routing table: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    const struct rt_msghdr* rt = nullptr;\n+    for (const std::byte* p = buf.data(); p < buf.data() + buf.size(); p += rt->rtm_msglen) {\n+        // Iterate over routing entry addresses, get destination and gateway (if present).\n+        rt = (const struct rt_msghdr*)p;\n+        const struct sockaddr* sa = (const struct sockaddr*)(rt + 1);\n+        std::optional<CNetAddr> dst;\n+        std::optional<CNetAddr> gateway;\n+        for (int i = 0; i < RTAX_MAX; i++) {\n+            if (rt->rtm_addrs & (1 << i)) {\n+                if (i == RTAX_DST) {\n+                    dst = FromSockAddr(sa);\n+                } else if (i == RTAX_GATEWAY) {\n+                    gateway = FromSockAddr(sa);\n+                }\n+                sa = (const struct sockaddr*)((std::byte*)sa + ROUNDUP(sa->sa_len));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1612003469",
+      "id" : 1612003469,
+      "in_reply_to_id" : 1611731634,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gFTiN",
+      "original_commit_id" : "89ac09777d4d60a331fe1c482d87ecdd1aeb01a0",
+      "original_line" : 208,
+      "original_position" : 208,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : null,
+      "pull_request_review_id" : 2074495742,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612003469/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T16:31:11Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612003469",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=4",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "node_id" : "MDQ6VXNlcjEyNjY0Ng==",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1612015499"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612015499"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Currently i have the following, having changed the pointer arithmetic to byte offsets:\r\n```c++\r\n    // Iterate over messages (each message is a routing table entry).\r\n    for (size_t msgptr = 0; msgptr < buf.size(); ) {\r\n        Assume((msgptr + sizeof(rt_msghdr)) <= buf.size());\r\n        const struct rt_msghdr* rt = (const struct rt_msghdr*)(buf.data() + msgptr);\r\n        // Iterate over addresses within entry, get destination and gateway (if present).\r\n        // Pointer to address data within message, starts after header.\r\n        size_t saptr = msgptr + sizeof(rt_msghdr);\r\n        size_t next_msgptr = msgptr + rt->rtm_msglen;\r\n        Assume(next_msgptr <= buf.size());\r\n        std::optional<CNetAddr> dst;\r\n        std::optional<CNetAddr> gateway;\r\n        for (int i = 0; i < RTAX_MAX; i++) {\r\n            if (rt->rtm_addrs & (1 << i)) {\r\n                Assume((saptr + 1) <= next_msgptr);\r\n                const struct sockaddr* sa = (const struct sockaddr*)(buf.data() + saptr);\r\n                Assume((saptr + sa->sa_len) <= next_msgptr);\r\n                if (i == RTAX_DST) {\r\n                    dst = FromSockAddr(sa);\r\n                } else if (i == RTAX_GATEWAY) {\r\n                    gateway = FromSockAddr(sa);\r\n                }\r\n                // Skip to next address.\r\n                saptr += sa->sa_len;\r\n            }\r\n        }\r\n        // Found default gateway?\r\n        if (dst && gateway && dst->IsBindAny()) { // Route to 0.0.0.0 or :: ?\r\n            return *gateway;\r\n        }\r\n        // Skip to next message.\r\n        msgptr = next_msgptr;\r\n    }\r\n```\r\nEdit: add anti-overflow assumptions.",
+      "commit_id" : "82b1c25b9ca61f5b0382a5196e0ff7016b4d1429",
+      "created_at" : "2024-05-23T16:39:59Z",
+      "diff_hunk" : "@@ -0,0 +1,287 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+\n+// Linux and FreeBSD 13.2+\n+#if defined(__linux__) || (defined(__FreeBSD__) && __FreeBSD_version >= 1302000)\n+\n+#if defined(__linux__)\n+#include <linux/rtnetlink.h>\n+#elif defined(__FreeBSD__)\n+#include <netlink/netlink.h>\n+#include <netlink/netlink_route.h>\n+#endif\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    // Create a netlink socket.\n+    const int s{socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)};\n+    if (s < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"socket(AF_NETLINK): %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+    Sock sock{static_cast<SOCKET>(s)};\n+\n+    // Send request.\n+    struct {\n+        nlmsghdr hdr; ///< Request header.\n+        rtmsg data; ///< Request data, a \"route message\".\n+        nlattr dst_hdr; ///< One attribute, conveying the route destination address.\n+        char dst_data[16]; ///< Route destination address. To query the default route we use 0.0.0.0/0 or [::]/0. For IPv4 the first 4 bytes are used.\n+    } request{};\n+\n+    // Whether to use the first 4 or 16 bytes from request.attr_dst_data.\n+    const size_t dst_data_len = family == AF_INET ? 4 : 16;\n+\n+    request.hdr.nlmsg_type = RTM_GETROUTE;\n+    request.hdr.nlmsg_flags = NLM_F_REQUEST;\n+#ifdef __linux__\n+    // Linux IPv4 / IPv6 - this must be present, otherwise no gateway is found\n+    // FreeBSD IPv4 - does not matter, the gateway is found with or without this\n+    // FreeBSD IPv6 - this must be absent, otherwise no gateway is found\n+    request.hdr.nlmsg_flags |= NLM_F_DUMP;\n+#endif\n+    request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg) + sizeof(nlattr) + dst_data_len);\n+    request.hdr.nlmsg_seq = 0; // Sequence number, used to match which reply is to which request. Irrelevant for us because we send just one request.\n+    request.data.rtm_family = family;\n+    request.data.rtm_dst_len = 0; // Prefix length.\n+#ifdef __FreeBSD__\n+    // Linux IPv4 / IPv6 this must be absent, otherwise no gateway is found\n+    // FreeBSD IPv4 - does not matter, the gateway is found with or without this\n+    // FreeBSD IPv6 - this must be present, otherwise no gateway is found\n+    request.data.rtm_flags = RTM_F_PREFIX;\n+#endif\n+    request.dst_hdr.nla_type = RTA_DST;\n+    request.dst_hdr.nla_len = sizeof(nlattr) + dst_data_len;\n+\n+    if (sock.Send(&request, request.hdr.nlmsg_len, 0) != static_cast<ssize_t>(request.hdr.nlmsg_len)) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"send() to netlink socket: %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    // Receive response.\n+    char response[4096];\n+    ssize_t recv_result;\n+    do {\n+        recv_result = sock.Recv(response, sizeof(response), 0);\n+    } while (recv_result < 0 && (errno == EINTR || errno == EAGAIN));\n+    if (recv_result < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"recv() from netlink socket: %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    size_t response_len = static_cast<size_t>(recv_result);\n+    for (nlmsghdr* hdr = (nlmsghdr*)response; NLMSG_OK(hdr, response_len); hdr = NLMSG_NEXT(hdr, response_len)) {\n+        rtmsg* r = (rtmsg*)NLMSG_DATA(hdr);\n+        int remaining_len = RTM_PAYLOAD(hdr);\n+\n+        // Iterate over the attributes.\n+        rtattr *rta_gateway = nullptr;\n+        int scope_id = 0;\n+        for (rtattr* attr = RTM_RTA(r); RTA_OK(attr, remaining_len); attr = RTA_NEXT(attr, remaining_len)) {\n+            if (attr->rta_type == RTA_GATEWAY) {\n+                rta_gateway = attr;\n+            } else if (attr->rta_type == RTA_OIF) {\n+                Assume(sizeof(int) == RTA_PAYLOAD(attr));\n+                std::memcpy(&scope_id, RTA_DATA(attr), sizeof(scope_id));\n+            }\n+        }\n+\n+        // Found gateway?\n+        if (rta_gateway != nullptr) {\n+            if (family == AF_INET) {\n+                Assume(sizeof(in_addr) == RTA_PAYLOAD(rta_gateway));\n+                in_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw);\n+            } else if (family == AF_INET6) {\n+                Assume(sizeof(in6_addr) == RTA_PAYLOAD(rta_gateway));\n+                in6_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw, scope_id);\n+            }\n+        }\n+    }\n+\n+    return std::nullopt;\n+}\n+\n+#elif defined(WIN32)\n+\n+#include <iphlpapi.h>\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    NET_LUID interface_luid = {};\n+    SOCKADDR_INET destination_address = {};\n+    MIB_IPFORWARD_ROW2 best_route = {};\n+    SOCKADDR_INET best_source_address = {};\n+    DWORD best_if_idx = 0;\n+    DWORD status = 0;\n+\n+    // Pass empty destination address of the requested type (:: or 0.0.0.0) to get interface of default route.\n+    destination_address.si_family = family;\n+    status = GetBestInterfaceEx((sockaddr*)&destination_address, &best_if_idx);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best interface for default route: %s\\n\", NetworkErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    // Get best route to default gateway.\n+    // Leave interface_luid at all-zeros to use interface index instead.\n+    status = GetBestRoute2(&interface_luid, best_if_idx, nullptr, &destination_address, 0, &best_route, &best_source_address);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best route for default route for interface index %d: %s\\n\",\n+                best_if_idx, NetworkErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    Assume(best_route.NextHop.si_family == family);\n+    if (family == AF_INET) {\n+        return CNetAddr(best_route.NextHop.Ipv4.sin_addr);\n+    } else if(family == AF_INET6) {\n+        return CNetAddr(best_route.NextHop.Ipv6.sin6_addr, best_route.InterfaceIndex);\n+    }\n+    return std::nullopt;\n+}\n+\n+#elif defined(__APPLE__)\n+\n+#include <net/route.h>\n+#include <sys/sysctl.h>\n+\n+// Ensure correct alignment for sockaddrs.\n+#define ROUNDUP(a) \\\n+    ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))\n+\n+static std::optional<CNetAddr> FromSockAddr(const struct sockaddr* addr)\n+{\n+    // Fill in a CService from the sockaddr, then drop the port part.\n+    CService service;\n+    if (service.SetSockAddr(addr)) {\n+        return (CNetAddr)service;\n+    }\n+    return std::nullopt;\n+}\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    // MacOS: Get default gateway from route table.\n+    // See man page for route(4) for the format.\n+\n+    // net.route.0.inet[6].flags.gateway\n+    int mib[] = {CTL_NET, PF_ROUTE, 0, family, NET_RT_FLAGS, RTF_GATEWAY};\n+    size_t l = 0;\n+    if (sysctl(mib, sizeof(mib) / sizeof(int), 0, &l, 0, 0) < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get sysctl length of routing table: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    std::vector<std::byte> buf(l);\n+    if (sysctl(mib, sizeof(mib) / sizeof(int), buf.data(), &l, 0, 0) < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get sysctl data of routing table: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    const struct rt_msghdr* rt = nullptr;\n+    for (const std::byte* p = buf.data(); p < buf.data() + buf.size(); p += rt->rtm_msglen) {\n+        // Iterate over routing entry addresses, get destination and gateway (if present).\n+        rt = (const struct rt_msghdr*)p;\n+        const struct sockaddr* sa = (const struct sockaddr*)(rt + 1);\n+        std::optional<CNetAddr> dst;\n+        std::optional<CNetAddr> gateway;\n+        for (int i = 0; i < RTAX_MAX; i++) {\n+            if (rt->rtm_addrs & (1 << i)) {\n+                if (i == RTAX_DST) {\n+                    dst = FromSockAddr(sa);\n+                } else if (i == RTAX_GATEWAY) {\n+                    gateway = FromSockAddr(sa);\n+                }\n+                sa = (const struct sockaddr*)((std::byte*)sa + ROUNDUP(sa->sa_len));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1612015499",
+      "id" : 1612015499,
+      "in_reply_to_id" : 1611731634,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gFWeL",
+      "original_commit_id" : "89ac09777d4d60a331fe1c482d87ecdd1aeb01a0",
+      "original_line" : 208,
+      "original_position" : 208,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : null,
+      "pull_request_review_id" : 2074515775,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612015499/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T17:02:21Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612015499",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=4",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "node_id" : "MDQ6VXNlcjEyNjY0Ng==",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1612022021"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612022021"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "If it appears after the IPv4 gateway log message it's for the IPv4 gateway, if it's after the IPv6 one it's for the IPv6 gateway. No more than two gateways are ever used. i don't think adding it to every log message is worth it.\r\n\r\n> Update: this happens when I'm connected with a physical LAN cable and wifi. So the warning was safe to ignore, but I'm still curious about it.\r\n\r\nRight i think that's the reason-if you have multiple internet connections, then mapping the IPv6 addresses connected to the other one (that's not the default gateway) will fail. This is a scenario too complex for automatic mapping to handle, anyhow. Glad to hear some addresses were still mapped correctly.\r\n\r\n(fairly sure this issue does not arise with IPv4, because it maps one port on the internal address toward the default gateway)",
+      "commit_id" : "82b1c25b9ca61f5b0382a5196e0ff7016b4d1429",
+      "created_at" : "2024-05-23T16:45:35Z",
+      "diff_hunk" : "@@ -0,0 +1,517 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <util/pcp.h>\n+\n+#include <crypto/common.h>\n+#include <logging.h>\n+#include <netaddress.h>\n+#include <random.h>\n+#include <span.h>\n+#include <util/check.h>\n+#include <util/netif.h>\n+#include <util/readwritefile.h>\n+#include <util/sock.h>\n+#include <util/strencodings.h>\n+\n+// RFC6886 NAT-PMP and RFC6887 Port Control Protocol (PCP) implementation.\n+// NAT-PMP and PCP use network byte order (big-endian).\n+\n+// NAT-PMP (v0) protocol constants.\n+//! NAT-PMP uses a fixed server port number (RPC6887 section 1.1).\n+constexpr uint16_t NATPMP_SERVER_PORT = 5351;\n+//! Version byte for NATPMP (RFC6886 1.1)\n+constexpr uint8_t NATPMP_VERSION = 0;\n+//! Request opcode base (RFC6886 3).\n+constexpr uint8_t NATPMP_REQUEST = 0x00;\n+//! Response opcode base (RFC6886 3).\n+constexpr uint8_t NATPMP_RESPONSE = 0x80;\n+//! Get external address (RFC6886 3.2)\n+constexpr uint8_t NATPMP_OP_GETEXTERNAL = 0x00;\n+//! Map TCP port (RFC6886 3.3)\n+constexpr uint8_t NATPMP_OP_MAP_TCP = 0x02;\n+//! Shared request header size in bytes.\n+constexpr size_t NATPMP_REQUEST_HDR_SIZE = 2;\n+//! Shared response header (minimum) size in bytes.\n+constexpr size_t NATPMP_RESPONSE_HDR_SIZE = 8;\n+//! GETEXTERNAL request size in bytes, including header (RFC6886 3.2).\n+constexpr size_t NATPMP_GETEXTERNAL_REQUEST_SIZE = NATPMP_REQUEST_HDR_SIZE + 0;\n+//! GETEXTERNAL response size in bytes, including header (RFC6886 3.2).\n+constexpr size_t NATPMP_GETEXTERNAL_RESPONSE_SIZE = NATPMP_RESPONSE_HDR_SIZE + 4;\n+//! MAP request size in bytes, including header (RFC6886 3.3).\n+constexpr size_t NATPMP_MAP_REQUEST_SIZE = NATPMP_REQUEST_HDR_SIZE + 10;\n+//! MAP response size in bytes, including header (RFC6886 3.3).\n+constexpr size_t NATPMP_MAP_RESPONSE_SIZE = NATPMP_RESPONSE_HDR_SIZE + 8;\n+\n+// Shared header offsets (RFC6886 3.2, 3.3), relative to start of packet.\n+//!  Offset of version field in packets.\n+constexpr size_t NATPMP_HDR_VERSION_OFS = 0;\n+//!  Offset of opcode field in packets\n+constexpr size_t NATPMP_HDR_OP_OFS = 1;\n+//!  Offset of result code in packets. Result codes are 16 bit in NAT-PMP instead of 8 bit in PCP.\n+constexpr size_t NATPMP_RESPONSE_HDR_RESULT_OFS = 2;\n+\n+// GETEXTERNAL response offsets (RFC6886 3.2), relative to start of packet.\n+//!  Returned external address\n+constexpr size_t NATPMP_GETEXTERNAL_RESPONSE_IP_OFS = 8;\n+\n+// MAP request offsets (RFC6886 3.3), relative to start of packet.\n+//!  Internal port to be mapped.\n+constexpr size_t NATPMP_MAP_REQUEST_INTERNAL_PORT_OFS = 4;\n+//!  Suggested external port for mapping.\n+constexpr size_t NATPMP_MAP_REQUEST_EXTERNAL_PORT_OFS = 6;\n+//!  Requested port mapping lifetime in seconds.\n+constexpr size_t NATPMP_MAP_REQUEST_LIFETIME_OFS = 8;\n+\n+// MAP response offsets (RFC6886 3.3), relative to start of packet.\n+//!  Internal port for mapping (will match internal port of request).\n+constexpr size_t NATPMP_MAP_RESPONSE_INTERNAL_PORT_OFS = 8;\n+//!  External port for mapping.\n+constexpr size_t NATPMP_MAP_RESPONSE_EXTERNAL_PORT_OFS = 10;\n+//!  Created port mapping lifetime in seconds.\n+constexpr size_t NATPMP_MAP_RESPONSE_LIFETIME_OFS = 12;\n+\n+// Relevant NETPMP result codes (RFC6886 3.5).\n+//! Result code representing success status.\n+constexpr uint8_t NATPMP_RESULT_SUCCESS = 0;\n+//! Result code representing unsupported version.\n+constexpr uint8_t NATPMP_RESULT_UNSUPP_VERSION = 1;\n+//! Result code representing lack of resources.\n+constexpr uint8_t NATPMP_RESULT_NO_RESOURCES = 4;\n+\n+//! Mapping of NATPMP result code to string (RPC6886 3.5). Result codes <=2 match PCP.\n+static const std::map<uint8_t, std::string> NATPMP_RESULT_STR{\n+    {0,  \"SUCCESS\"},\n+    {1,  \"UNSUPP_VERSION\"},\n+    {2,  \"NOT_AUTHORIZED\"},\n+    {3,  \"NETWORK_FAILURE\"},\n+    {4,  \"NO_RESOURCES\"},\n+    {5,  \"UNSUPP_OPCODE\"},\n+};\n+\n+// PCP (v2) protocol constants.\n+//! Maximum packet size in bytes (RPC6887 section 7).\n+constexpr size_t PCP_MAX_SIZE = 1100;\n+//! PCP uses a fixed server port number (RPC6887 section 19.1). Shared with NAT-PMP.\n+constexpr uint16_t PCP_SERVER_PORT = NATPMP_SERVER_PORT;\n+//! Version byte. 0 is NAT-PMP (RFC6886), 1 is forbidden, 2 for PCP (RFC6887).\n+constexpr uint8_t PCP_VERSION = 2;\n+//! PCP Request Header. See RPC6887 section 7.1. Shared with NAT-PMP.\n+constexpr uint8_t PCP_REQUEST = NATPMP_REQUEST; // R = 0\n+//! PCP Response Header. See RPC6887 section 7.2. Shared with NAT-PMP.\n+constexpr uint8_t PCP_RESPONSE = NATPMP_RESPONSE; // R = 1\n+//! Map opcode. See RPC6887 section 19.2\n+constexpr uint8_t PCP_OP_MAP = 0x01;\n+//! TCP protocol number (IANA).\n+constexpr uint16_t PCP_PROTOCOL_TCP = 6;\n+//! Request and response header size in bytes (RPC6887 section 7.1).\n+constexpr size_t PCP_HDR_SIZE = 24;\n+//! Map request and response size in bytes (RPC6887 section 11.1).\n+constexpr size_t PCP_MAP_SIZE = 36;\n+\n+// Header offsets shared between request and responses (RFC6887 7.1, 7.2), relative to start of packet.\n+//!  Version field (1 byte).\n+constexpr size_t PCP_HDR_VERSION_OFS = NATPMP_HDR_VERSION_OFS;\n+//!  Opcode field (1 byte).\n+constexpr size_t PCP_HDR_OP_OFS = NATPMP_HDR_OP_OFS;\n+//!  Requested lifetime (request), granted lifetime (response) (2 bytes).\n+constexpr size_t PCP_HDR_LIFETIME_OFS = 4;\n+\n+// Request header offsets (RFC6887 7.1), relative to start of packet.\n+//!  PCP client's IP address (16 bytes).\n+constexpr size_t PCP_REQUEST_HDR_IP_OFS = 8;\n+\n+// Response header offsets (RFC6887 7.2), relative to start of packet.\n+//!  Result code (1 byte).\n+constexpr size_t PCP_RESPONSE_HDR_RESULT_OFS = 3;\n+\n+// MAP request/response offsets (RFC6887 11.1), relative to start of opcode-specific data.\n+//!  Mapping nonce (12 bytes).\n+constexpr size_t PCP_MAP_NONCE_OFS = 0;\n+//!  Protocol (1 byte).\n+constexpr size_t PCP_MAP_PROTOCOL_OFS = 12;\n+//!  Internal port for mapping (2 bytes).\n+constexpr size_t PCP_MAP_INTERNAL_PORT_OFS = 16;\n+//!  Suggested external port (request), assigned external port (response) (2 bytes).\n+constexpr size_t PCP_MAP_EXTERNAL_PORT_OFS = 18;\n+//!  Suggested external IP (request), assigned external IP (response) (16 bytes).\n+constexpr size_t PCP_MAP_EXTERNAL_IP_OFS = 20;\n+\n+//! Result code representing success (RPC6887 7.4), shared with NAT-PMP.\n+constexpr uint8_t PCP_RESULT_SUCCESS = NATPMP_RESULT_SUCCESS;\n+//! Result code representing lack of resources (RPC6887 7.4).\n+constexpr uint8_t PCP_RESULT_NO_RESOURCES = 8;\n+\n+//! Mapping of PCP result code to string (RPC6887 7.4). Result codes <=2 match NAT-PMP.\n+static const std::map<uint8_t, std::string> PCP_RESULT_STR{\n+    {0,  \"SUCCESS\"},\n+    {1,  \"UNSUPP_VERSION\"},\n+    {2,  \"NOT_AUTHORIZED\"},\n+    {3,  \"MALFORMED_REQUEST\"},\n+    {4,  \"UNSUPP_OPCODE\"},\n+    {5,  \"UNSUPP_OPTION\"},\n+    {6,  \"MALFORMED_OPTION\"},\n+    {7,  \"NETWORK_FAILURE\"},\n+    {8,  \"NO_RESOURCES\"},\n+    {9,  \"UNSUPP_PROTOCOL\"},\n+    {10, \"USER_EX_QUOTA\"},\n+    {11, \"CANNOT_PROVIDE_EXTERNAL\"},\n+    {12, \"ADDRESS_MISMATCH\"},\n+    {13, \"EXCESSIVE_REMOTE_PEER\"},\n+};\n+\n+//! Return human-readable string from NATPMP result code.\n+static std::string NATPMPResultString(uint8_t result_code)\n+{\n+    auto result_i = NATPMP_RESULT_STR.find(result_code);\n+    return strprintf(\"%s (code %d)\", result_i == NATPMP_RESULT_STR.end() ? \"(unknown)\" : result_i->second,  result_code);\n+}\n+\n+//! Return human-readable string from PCP result code.\n+static std::string PCPResultString(uint8_t result_code)\n+{\n+    auto result_i = PCP_RESULT_STR.find(result_code);\n+    return strprintf(\"%s (code %d)\", result_i == PCP_RESULT_STR.end() ? \"(unknown)\" : result_i->second,  result_code);\n+}\n+\n+//! Wrap address in IPv6 according to RPC6887. wrapped_addr needs to be able to store 16 bytes.\n+[[nodiscard]] static bool PCPWrapAddress(Span<uint8_t> wrapped_addr, const CNetAddr &addr)\n+{\n+    Assume(wrapped_addr.size() == ADDR_IPV6_SIZE);\n+    if (addr.IsIPv4()) {\n+        struct in_addr addr4;\n+        if (!addr.GetInAddr(&addr4)) return false;\n+        // Section 5: \"When the address field holds an IPv4 address, an IPv4-mapped IPv6 address [RFC4291] is used (::ffff:0:0/96).\"\n+        std::memcpy(wrapped_addr.data(), IPV4_IN_IPV6_PREFIX.data(), IPV4_IN_IPV6_PREFIX.size());\n+        std::memcpy(wrapped_addr.data() + IPV4_IN_IPV6_PREFIX.size(), &addr4, ADDR_IPV4_SIZE);\n+        return true;\n+    } else if (addr.IsIPv6()) {\n+        struct in6_addr addr6;\n+        if (!addr.GetIn6Addr(&addr6)) return false;\n+        std::memcpy(wrapped_addr.data(), &addr6, ADDR_IPV6_SIZE);\n+        return true;\n+    } else {\n+        return false;\n+    }\n+}\n+\n+//! Unwrap PCP-encoded address according to RPC6887.\n+static CNetAddr PCPUnwrapAddress(Span<const uint8_t> wrapped_addr)\n+{\n+    Assume(wrapped_addr.size() == ADDR_IPV6_SIZE);\n+    if (HasPrefix(wrapped_addr, IPV4_IN_IPV6_PREFIX)) {\n+        struct in_addr addr4;\n+        std::memcpy(&addr4, wrapped_addr.data() + IPV4_IN_IPV6_PREFIX.size(), ADDR_IPV4_SIZE);\n+        return CNetAddr(addr4);\n+    } else {\n+        struct in6_addr addr6;\n+        std::memcpy(&addr6, wrapped_addr.data(), ADDR_IPV6_SIZE);\n+        return CNetAddr(addr6);\n+    }\n+}\n+\n+//! PCP or NAT-PMP send-receive loop.\n+static std::optional<std::vector<uint8_t>> PCPSendRecv(Sock &sock, const std::string &protocol, Span<const uint8_t> request, int num_tries,\n+        std::function<bool(const Span<const uint8_t>)> check_packet)\n+{\n+    // UDP is a potentially lossy protocol, so we try to send again a few times.\n+    uint8_t response[PCP_MAX_SIZE];\n+    bool got_response = false;\n+    int recvsz = 0;\n+    for (int ntry = 0; !got_response && ntry < num_tries; ++ntry) {\n+        if (ntry > 0) {\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"%s: Retrying (%d)\\n\", protocol, ntry);\n+        }\n+        // Dispatch packet to gateway.\n+        if (sock.Send(request.data(), request.size(), 0) != static_cast<ssize_t>(request.size())) {\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Warning, \"%s: Could not send request: %s\\n\", protocol, NetworkErrorString(WSAGetLastError()));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1612022021",
+      "id" : 1612022021,
+      "in_reply_to_id" : 1611906833,
+      "line" : 228,
+      "node_id" : "PRRC_kwDOABII585gFYEF",
+      "original_commit_id" : "82b1c25b9ca61f5b0382a5196e0ff7016b4d1429",
+      "original_line" : 228,
+      "original_position" : 228,
+      "original_start_line" : null,
+      "path" : "src/util/pcp.cpp",
+      "position" : 228,
+      "pull_request_review_id" : 2074526400,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612022021/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T17:50:14Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612022021",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=4",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "node_id" : "MDQ6VXNlcjEyNjY0Ng==",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1612025592"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612025592"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "i moved the cast to the if() inside the inner loop.",
+      "commit_id" : "82b1c25b9ca61f5b0382a5196e0ff7016b4d1429",
+      "created_at" : "2024-05-23T16:48:22Z",
+      "diff_hunk" : "@@ -0,0 +1,287 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+\n+// Linux and FreeBSD 13.2+\n+#if defined(__linux__) || (defined(__FreeBSD__) && __FreeBSD_version >= 1302000)\n+\n+#if defined(__linux__)\n+#include <linux/rtnetlink.h>\n+#elif defined(__FreeBSD__)\n+#include <netlink/netlink.h>\n+#include <netlink/netlink_route.h>\n+#endif\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    // Create a netlink socket.\n+    const int s{socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)};\n+    if (s < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"socket(AF_NETLINK): %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+    Sock sock{static_cast<SOCKET>(s)};\n+\n+    // Send request.\n+    struct {\n+        nlmsghdr hdr; ///< Request header.\n+        rtmsg data; ///< Request data, a \"route message\".\n+        nlattr dst_hdr; ///< One attribute, conveying the route destination address.\n+        char dst_data[16]; ///< Route destination address. To query the default route we use 0.0.0.0/0 or [::]/0. For IPv4 the first 4 bytes are used.\n+    } request{};\n+\n+    // Whether to use the first 4 or 16 bytes from request.attr_dst_data.\n+    const size_t dst_data_len = family == AF_INET ? 4 : 16;\n+\n+    request.hdr.nlmsg_type = RTM_GETROUTE;\n+    request.hdr.nlmsg_flags = NLM_F_REQUEST;\n+#ifdef __linux__\n+    // Linux IPv4 / IPv6 - this must be present, otherwise no gateway is found\n+    // FreeBSD IPv4 - does not matter, the gateway is found with or without this\n+    // FreeBSD IPv6 - this must be absent, otherwise no gateway is found\n+    request.hdr.nlmsg_flags |= NLM_F_DUMP;\n+#endif\n+    request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg) + sizeof(nlattr) + dst_data_len);\n+    request.hdr.nlmsg_seq = 0; // Sequence number, used to match which reply is to which request. Irrelevant for us because we send just one request.\n+    request.data.rtm_family = family;\n+    request.data.rtm_dst_len = 0; // Prefix length.\n+#ifdef __FreeBSD__\n+    // Linux IPv4 / IPv6 this must be absent, otherwise no gateway is found\n+    // FreeBSD IPv4 - does not matter, the gateway is found with or without this\n+    // FreeBSD IPv6 - this must be present, otherwise no gateway is found\n+    request.data.rtm_flags = RTM_F_PREFIX;\n+#endif\n+    request.dst_hdr.nla_type = RTA_DST;\n+    request.dst_hdr.nla_len = sizeof(nlattr) + dst_data_len;\n+\n+    if (sock.Send(&request, request.hdr.nlmsg_len, 0) != static_cast<ssize_t>(request.hdr.nlmsg_len)) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"send() to netlink socket: %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    // Receive response.\n+    char response[4096];\n+    ssize_t recv_result;\n+    do {\n+        recv_result = sock.Recv(response, sizeof(response), 0);\n+    } while (recv_result < 0 && (errno == EINTR || errno == EAGAIN));\n+    if (recv_result < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"recv() from netlink socket: %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    size_t response_len = static_cast<size_t>(recv_result);\n+    for (nlmsghdr* hdr = (nlmsghdr*)response; NLMSG_OK(hdr, response_len); hdr = NLMSG_NEXT(hdr, response_len)) {\n+        rtmsg* r = (rtmsg*)NLMSG_DATA(hdr);\n+        int remaining_len = RTM_PAYLOAD(hdr);\n+\n+        // Iterate over the attributes.\n+        rtattr *rta_gateway = nullptr;\n+        int scope_id = 0;\n+        for (rtattr* attr = RTM_RTA(r); RTA_OK(attr, remaining_len); attr = RTA_NEXT(attr, remaining_len)) {\n+            if (attr->rta_type == RTA_GATEWAY) {\n+                rta_gateway = attr;\n+            } else if (attr->rta_type == RTA_OIF) {\n+                Assume(sizeof(int) == RTA_PAYLOAD(attr));\n+                std::memcpy(&scope_id, RTA_DATA(attr), sizeof(scope_id));\n+            }\n+        }\n+\n+        // Found gateway?\n+        if (rta_gateway != nullptr) {\n+            if (family == AF_INET) {\n+                Assume(sizeof(in_addr) == RTA_PAYLOAD(rta_gateway));\n+                in_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw);\n+            } else if (family == AF_INET6) {\n+                Assume(sizeof(in6_addr) == RTA_PAYLOAD(rta_gateway));\n+                in6_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw, scope_id);\n+            }\n+        }\n+    }\n+\n+    return std::nullopt;\n+}\n+\n+#elif defined(WIN32)\n+\n+#include <iphlpapi.h>\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    NET_LUID interface_luid = {};\n+    SOCKADDR_INET destination_address = {};\n+    MIB_IPFORWARD_ROW2 best_route = {};\n+    SOCKADDR_INET best_source_address = {};\n+    DWORD best_if_idx = 0;\n+    DWORD status = 0;\n+\n+    // Pass empty destination address of the requested type (:: or 0.0.0.0) to get interface of default route.\n+    destination_address.si_family = family;\n+    status = GetBestInterfaceEx((sockaddr*)&destination_address, &best_if_idx);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best interface for default route: %s\\n\", NetworkErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    // Get best route to default gateway.\n+    // Leave interface_luid at all-zeros to use interface index instead.\n+    status = GetBestRoute2(&interface_luid, best_if_idx, nullptr, &destination_address, 0, &best_route, &best_source_address);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best route for default route for interface index %d: %s\\n\",\n+                best_if_idx, NetworkErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    Assume(best_route.NextHop.si_family == family);\n+    if (family == AF_INET) {\n+        return CNetAddr(best_route.NextHop.Ipv4.sin_addr);\n+    } else if(family == AF_INET6) {\n+        return CNetAddr(best_route.NextHop.Ipv6.sin6_addr, best_route.InterfaceIndex);\n+    }\n+    return std::nullopt;\n+}\n+\n+#elif defined(__APPLE__)\n+\n+#include <net/route.h>\n+#include <sys/sysctl.h>\n+\n+// Ensure correct alignment for sockaddrs.\n+#define ROUNDUP(a) \\\n+    ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))\n+\n+static std::optional<CNetAddr> FromSockAddr(const struct sockaddr* addr)\n+{\n+    // Fill in a CService from the sockaddr, then drop the port part.\n+    CService service;\n+    if (service.SetSockAddr(addr)) {\n+        return (CNetAddr)service;\n+    }\n+    return std::nullopt;\n+}\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    // MacOS: Get default gateway from route table.\n+    // See man page for route(4) for the format.\n+\n+    // net.route.0.inet[6].flags.gateway\n+    int mib[] = {CTL_NET, PF_ROUTE, 0, family, NET_RT_FLAGS, RTF_GATEWAY};\n+    size_t l = 0;\n+    if (sysctl(mib, sizeof(mib) / sizeof(int), 0, &l, 0, 0) < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get sysctl length of routing table: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    std::vector<std::byte> buf(l);\n+    if (sysctl(mib, sizeof(mib) / sizeof(int), buf.data(), &l, 0, 0) < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get sysctl data of routing table: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    const struct rt_msghdr* rt = nullptr;\n+    for (const std::byte* p = buf.data(); p < buf.data() + buf.size(); p += rt->rtm_msglen) {\n+        // Iterate over routing entry addresses, get destination and gateway (if present).\n+        rt = (const struct rt_msghdr*)p;\n+        const struct sockaddr* sa = (const struct sockaddr*)(rt + 1);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1612025592",
+      "id" : 1612025592,
+      "in_reply_to_id" : 1611691990,
+      "line" : 194,
+      "node_id" : "PRRC_kwDOABII585gFY74",
+      "original_commit_id" : "89ac09777d4d60a331fe1c482d87ecdd1aeb01a0",
+      "original_line" : 198,
+      "original_position" : 198,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : 194,
+      "pull_request_review_id" : 2074533276,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612025592/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T16:48:23Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612025592",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=4",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "node_id" : "MDQ6VXNlcjEyNjY0Ng==",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1612076306"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612076306"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "That indeed looks better.\r\n\r\nThe *ptr variables are no longer actually pointers, so I suggest renaming them:\r\n\r\nmsgptr -> msg_pos\r\nwithin entry - within message\r\nsaptr -> sa_pos\r\nnext_msgptr -> next_msg_pos\r\n\r\nLet's set and check next_msgptr _before_ saptr and make it const.\r\n\r\n",
+      "commit_id" : "82b1c25b9ca61f5b0382a5196e0ff7016b4d1429",
+      "created_at" : "2024-05-23T17:32:37Z",
+      "diff_hunk" : "@@ -0,0 +1,287 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+\n+// Linux and FreeBSD 13.2+\n+#if defined(__linux__) || (defined(__FreeBSD__) && __FreeBSD_version >= 1302000)\n+\n+#if defined(__linux__)\n+#include <linux/rtnetlink.h>\n+#elif defined(__FreeBSD__)\n+#include <netlink/netlink.h>\n+#include <netlink/netlink_route.h>\n+#endif\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    // Create a netlink socket.\n+    const int s{socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)};\n+    if (s < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"socket(AF_NETLINK): %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+    Sock sock{static_cast<SOCKET>(s)};\n+\n+    // Send request.\n+    struct {\n+        nlmsghdr hdr; ///< Request header.\n+        rtmsg data; ///< Request data, a \"route message\".\n+        nlattr dst_hdr; ///< One attribute, conveying the route destination address.\n+        char dst_data[16]; ///< Route destination address. To query the default route we use 0.0.0.0/0 or [::]/0. For IPv4 the first 4 bytes are used.\n+    } request{};\n+\n+    // Whether to use the first 4 or 16 bytes from request.attr_dst_data.\n+    const size_t dst_data_len = family == AF_INET ? 4 : 16;\n+\n+    request.hdr.nlmsg_type = RTM_GETROUTE;\n+    request.hdr.nlmsg_flags = NLM_F_REQUEST;\n+#ifdef __linux__\n+    // Linux IPv4 / IPv6 - this must be present, otherwise no gateway is found\n+    // FreeBSD IPv4 - does not matter, the gateway is found with or without this\n+    // FreeBSD IPv6 - this must be absent, otherwise no gateway is found\n+    request.hdr.nlmsg_flags |= NLM_F_DUMP;\n+#endif\n+    request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg) + sizeof(nlattr) + dst_data_len);\n+    request.hdr.nlmsg_seq = 0; // Sequence number, used to match which reply is to which request. Irrelevant for us because we send just one request.\n+    request.data.rtm_family = family;\n+    request.data.rtm_dst_len = 0; // Prefix length.\n+#ifdef __FreeBSD__\n+    // Linux IPv4 / IPv6 this must be absent, otherwise no gateway is found\n+    // FreeBSD IPv4 - does not matter, the gateway is found with or without this\n+    // FreeBSD IPv6 - this must be present, otherwise no gateway is found\n+    request.data.rtm_flags = RTM_F_PREFIX;\n+#endif\n+    request.dst_hdr.nla_type = RTA_DST;\n+    request.dst_hdr.nla_len = sizeof(nlattr) + dst_data_len;\n+\n+    if (sock.Send(&request, request.hdr.nlmsg_len, 0) != static_cast<ssize_t>(request.hdr.nlmsg_len)) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"send() to netlink socket: %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    // Receive response.\n+    char response[4096];\n+    ssize_t recv_result;\n+    do {\n+        recv_result = sock.Recv(response, sizeof(response), 0);\n+    } while (recv_result < 0 && (errno == EINTR || errno == EAGAIN));\n+    if (recv_result < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"recv() from netlink socket: %s\\n\", NetworkErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    size_t response_len = static_cast<size_t>(recv_result);\n+    for (nlmsghdr* hdr = (nlmsghdr*)response; NLMSG_OK(hdr, response_len); hdr = NLMSG_NEXT(hdr, response_len)) {\n+        rtmsg* r = (rtmsg*)NLMSG_DATA(hdr);\n+        int remaining_len = RTM_PAYLOAD(hdr);\n+\n+        // Iterate over the attributes.\n+        rtattr *rta_gateway = nullptr;\n+        int scope_id = 0;\n+        for (rtattr* attr = RTM_RTA(r); RTA_OK(attr, remaining_len); attr = RTA_NEXT(attr, remaining_len)) {\n+            if (attr->rta_type == RTA_GATEWAY) {\n+                rta_gateway = attr;\n+            } else if (attr->rta_type == RTA_OIF) {\n+                Assume(sizeof(int) == RTA_PAYLOAD(attr));\n+                std::memcpy(&scope_id, RTA_DATA(attr), sizeof(scope_id));\n+            }\n+        }\n+\n+        // Found gateway?\n+        if (rta_gateway != nullptr) {\n+            if (family == AF_INET) {\n+                Assume(sizeof(in_addr) == RTA_PAYLOAD(rta_gateway));\n+                in_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw);\n+            } else if (family == AF_INET6) {\n+                Assume(sizeof(in6_addr) == RTA_PAYLOAD(rta_gateway));\n+                in6_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw, scope_id);\n+            }\n+        }\n+    }\n+\n+    return std::nullopt;\n+}\n+\n+#elif defined(WIN32)\n+\n+#include <iphlpapi.h>\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    NET_LUID interface_luid = {};\n+    SOCKADDR_INET destination_address = {};\n+    MIB_IPFORWARD_ROW2 best_route = {};\n+    SOCKADDR_INET best_source_address = {};\n+    DWORD best_if_idx = 0;\n+    DWORD status = 0;\n+\n+    // Pass empty destination address of the requested type (:: or 0.0.0.0) to get interface of default route.\n+    destination_address.si_family = family;\n+    status = GetBestInterfaceEx((sockaddr*)&destination_address, &best_if_idx);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best interface for default route: %s\\n\", NetworkErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    // Get best route to default gateway.\n+    // Leave interface_luid at all-zeros to use interface index instead.\n+    status = GetBestRoute2(&interface_luid, best_if_idx, nullptr, &destination_address, 0, &best_route, &best_source_address);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best route for default route for interface index %d: %s\\n\",\n+                best_if_idx, NetworkErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    Assume(best_route.NextHop.si_family == family);\n+    if (family == AF_INET) {\n+        return CNetAddr(best_route.NextHop.Ipv4.sin_addr);\n+    } else if(family == AF_INET6) {\n+        return CNetAddr(best_route.NextHop.Ipv6.sin6_addr, best_route.InterfaceIndex);\n+    }\n+    return std::nullopt;\n+}\n+\n+#elif defined(__APPLE__)\n+\n+#include <net/route.h>\n+#include <sys/sysctl.h>\n+\n+// Ensure correct alignment for sockaddrs.\n+#define ROUNDUP(a) \\\n+    ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))\n+\n+static std::optional<CNetAddr> FromSockAddr(const struct sockaddr* addr)\n+{\n+    // Fill in a CService from the sockaddr, then drop the port part.\n+    CService service;\n+    if (service.SetSockAddr(addr)) {\n+        return (CNetAddr)service;\n+    }\n+    return std::nullopt;\n+}\n+\n+static std::optional<CNetAddr> QueryDefaultGatewayImpl(sa_family_t family)\n+{\n+    // MacOS: Get default gateway from route table.\n+    // See man page for route(4) for the format.\n+\n+    // net.route.0.inet[6].flags.gateway\n+    int mib[] = {CTL_NET, PF_ROUTE, 0, family, NET_RT_FLAGS, RTF_GATEWAY};\n+    size_t l = 0;\n+    if (sysctl(mib, sizeof(mib) / sizeof(int), 0, &l, 0, 0) < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get sysctl length of routing table: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    std::vector<std::byte> buf(l);\n+    if (sysctl(mib, sizeof(mib) / sizeof(int), buf.data(), &l, 0, 0) < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get sysctl data of routing table: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    const struct rt_msghdr* rt = nullptr;\n+    for (const std::byte* p = buf.data(); p < buf.data() + buf.size(); p += rt->rtm_msglen) {\n+        // Iterate over routing entry addresses, get destination and gateway (if present).\n+        rt = (const struct rt_msghdr*)p;\n+        const struct sockaddr* sa = (const struct sockaddr*)(rt + 1);\n+        std::optional<CNetAddr> dst;\n+        std::optional<CNetAddr> gateway;\n+        for (int i = 0; i < RTAX_MAX; i++) {\n+            if (rt->rtm_addrs & (1 << i)) {\n+                if (i == RTAX_DST) {\n+                    dst = FromSockAddr(sa);\n+                } else if (i == RTAX_GATEWAY) {\n+                    gateway = FromSockAddr(sa);\n+                }\n+                sa = (const struct sockaddr*)((std::byte*)sa + ROUNDUP(sa->sa_len));",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1612076306",
+      "id" : 1612076306,
+      "in_reply_to_id" : 1611731634,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gFlUS",
+      "original_commit_id" : "89ac09777d4d60a331fe1c482d87ecdd1aeb01a0",
+      "original_line" : 208,
+      "original_position" : 208,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : null,
+      "pull_request_review_id" : 2074627014,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612076306/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T17:32:37Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1612076306",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
    }
 ]
