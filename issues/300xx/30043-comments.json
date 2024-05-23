@@ -4528,5 +4528,418 @@
          "type" : "User",
          "url" : "https://api.github.com/users/Sjors"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611410019"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611410019"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Alternatively you could store `net.route.0.inet[4].flags.gateway` here and use `sysctlbyname` below, avoiding the need to construct `mib[]`. Not sure if that's better though, because it's nice to be able to lookup constants like `NET_RT_FLAGS` in headers.",
+      "commit_id" : "48441655b7acd3def66a93a706cb2b64678aff99",
+      "created_at" : "2024-05-23T10:17:18Z",
+      "diff_hunk" : "@@ -0,0 +1,275 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+\n+#if defined(__linux__) || defined(__FreeBSD__)\n+\n+#if defined(__linux__)\n+#include <linux/rtnetlink.h>\n+#elif defined(__FreeBSD__)\n+#include <netlink/netlink.h>\n+#include <netlink/netlink_route.h>\n+#endif\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+\n+    // Create a netlink socket.\n+    const int s{socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)};\n+    if (s < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"socket(AF_NETLINK): %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    Sock sock{static_cast<SOCKET>(s)};\n+\n+    // Send request.\n+    struct {\n+        nlmsghdr hdr; ///< Request header.\n+        rtmsg data; ///< Request data, a \"route message\".\n+        nlattr dst_hdr; ///< One attribute, conveying the route destination address.\n+        char dst_data[16]; ///< Route destination address. To query the default route we use 0.0.0.0/0 or [::]/0. For IPv4 the first 4 bytes are used.\n+    } request{};\n+\n+    // Whether to use the first 4 or 16 bytes from request.attr_dst_data.\n+    const size_t dst_data_len = network == NET_IPV4 ? 4 : 16;\n+\n+    request.hdr.nlmsg_type = RTM_GETROUTE;\n+    request.hdr.nlmsg_flags = NLM_F_REQUEST;\n+#ifdef __linux__\n+    request.hdr.nlmsg_flags |= NLM_F_DUMP;\n+#endif\n+    request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg) + sizeof(nlattr) + dst_data_len);\n+    request.hdr.nlmsg_seq = 0; // Sequence number, used to match which reply is to which request. Irrelevant for us because we send just one request.\n+    request.data.rtm_family = network == NET_IPV4 ? AF_INET : AF_INET6;\n+    request.data.rtm_dst_len = 0; // Prefix length.\n+#ifdef __FreeBSD__\n+    request.data.rtm_flags = RTM_F_PREFIX;\n+#endif\n+    request.dst_hdr.nla_type = RTA_DST;\n+    request.dst_hdr.nla_len = sizeof(nlattr) + dst_data_len;\n+\n+    if (sock.Send(&request, request.hdr.nlmsg_len, 0) != static_cast<ssize_t>(request.hdr.nlmsg_len)) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"send() to netlink socket: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    // Receive response.\n+    char response[4096];\n+    ssize_t recv_result;\n+    do {\n+        recv_result = sock.Recv(response, sizeof(response), 0);\n+    } while (recv_result < 0 && (errno == EINTR || errno == EAGAIN));\n+    if (recv_result < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"recv() from netlink socket: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    size_t response_len = static_cast<size_t>(recv_result);\n+    for (nlmsghdr* hdr = (nlmsghdr*)response; NLMSG_OK(hdr, response_len); hdr = NLMSG_NEXT(hdr, response_len)) {\n+        rtmsg* r = (rtmsg*)NLMSG_DATA(hdr);\n+        int remaining_len = RTM_PAYLOAD(hdr);\n+\n+        // Iterate over the attributes.\n+        rtattr *rta_gateway = nullptr;\n+        int scope_id = 0;\n+        for (rtattr* attr = RTM_RTA(r); RTA_OK(attr, remaining_len); attr = RTA_NEXT(attr, remaining_len)) {\n+            if (attr->rta_type == RTA_GATEWAY) {\n+                rta_gateway = attr;\n+            } else if (attr->rta_type == RTA_OIF) {\n+                Assume(sizeof(int) == RTA_PAYLOAD(attr));\n+                std::memcpy(&scope_id, RTA_DATA(attr), sizeof(scope_id));\n+            }\n+        }\n+\n+        // Found gateway?\n+        if (rta_gateway != nullptr) {\n+            if (network == NET_IPV4) {\n+                Assume(sizeof(in_addr) == RTA_PAYLOAD(rta_gateway));\n+                in_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw);\n+            } else if (network == NET_IPV6) {\n+                Assume(sizeof(in6_addr) == RTA_PAYLOAD(rta_gateway));\n+                in6_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw, scope_id);\n+            }\n+        }\n+    }\n+\n+    return std::nullopt;\n+}\n+\n+#elif defined(WIN32)\n+\n+#include <iphlpapi.h>\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    NET_LUID interface_luid = {};\n+    SOCKADDR_INET destination_address = {};\n+    MIB_IPFORWARD_ROW2 best_route = {};\n+    SOCKADDR_INET best_source_address = {};\n+    DWORD best_if_idx = 0;\n+    DWORD status = 0;\n+\n+    // Pass empty destination address of the requested type (:: or 0.0.0.0) to get interface of default route.\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+    if (network == NET_IPV4) {\n+        destination_address.si_family = AF_INET;\n+    } else if(network == NET_IPV6) {\n+        destination_address.si_family = AF_INET6;\n+    } else {\n+        return std::nullopt;\n+    }\n+\n+    status = GetBestInterfaceEx((sockaddr*)&destination_address, &best_if_idx);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best interface for default route: %s\\n\", SysErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    // Get best route to default gateway.\n+    // Leave interface_luid at all-zeros to use interface index instead.\n+    status = GetBestRoute2(&interface_luid, best_if_idx, nullptr, &destination_address, 0, &best_route, &best_source_address);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best route for default route for interface index %d: %s\\n\",\n+                best_if_idx, SysErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    if (network == NET_IPV4) {\n+        Assume(best_route.NextHop.si_family == AF_INET);\n+        return CNetAddr(best_route.NextHop.Ipv4.sin_addr);\n+    } else if(network == NET_IPV6) {\n+        Assume(best_route.NextHop.si_family == AF_INET6);\n+        return CNetAddr(best_route.NextHop.Ipv6.sin6_addr, best_route.InterfaceIndex);\n+    }\n+    return std::nullopt;\n+}\n+\n+#elif defined(__APPLE__)\n+\n+#include <net/route.h>\n+#include <sys/sysctl.h>\n+\n+// Ensure correct alignment for sockaddrs.\n+#define ROUNDUP(a) \\\n+    ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))\n+\n+static std::optional<CNetAddr> FromSockAddr(const struct sockaddr* addr)\n+{\n+    // Fill in a CService from the sockaddr, then drop the port part.\n+    CService service;\n+    if (service.SetSockAddr(addr)) {\n+        return (CNetAddr)service;\n+    }\n+    return std::nullopt;\n+}\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    // MacOS: Get default gateway from route table.\n+    // See man page for route(4) for the format.\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+    int family;\n+    if (network == NET_IPV4) {\n+        family = AF_INET;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611410019",
+      "id" : 1611410019,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gDCpj",
+      "original_commit_id" : "82b0bff51fedff2ce5e47cae1c75b9172766d8ef",
+      "original_line" : 188,
+      "original_position" : 188,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : null,
+      "pull_request_review_id" : 2073514261,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611410019/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T10:17:19Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611410019",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/10217?v=4",
+         "events_url" : "https://api.github.com/users/Sjors/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/Sjors/followers",
+         "following_url" : "https://api.github.com/users/Sjors/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/Sjors/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/Sjors",
+         "id" : 10217,
+         "login" : "Sjors",
+         "node_id" : "MDQ6VXNlcjEwMjE3",
+         "organizations_url" : "https://api.github.com/users/Sjors/orgs",
+         "received_events_url" : "https://api.github.com/users/Sjors/received_events",
+         "repos_url" : "https://api.github.com/users/Sjors/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/Sjors/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/Sjors/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/Sjors"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611411388"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611411388"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Maybe a general \"is the default gateway address sane\" check might sense? though, up to some point if the OS returns a weird address who are we to question it. Can't get too paranoid about that. The worst that could happen is sending to 0.0.0.0, which wouldn't result in any bad things beyond an error.\r\n\r\nOr do you mean this from a \"what happens if there is no default gateway configured\" angle? yes, we'll have to check what it does in that case. Though i'd expect the call to `GetBestRoute` to fail.",
+      "commit_id" : "48441655b7acd3def66a93a706cb2b64678aff99",
+      "created_at" : "2024-05-23T10:18:30Z",
+      "diff_hunk" : "@@ -0,0 +1,275 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+\n+#if defined(__linux__) || defined(__FreeBSD__)\n+\n+#if defined(__linux__)\n+#include <linux/rtnetlink.h>\n+#elif defined(__FreeBSD__)\n+#include <netlink/netlink.h>\n+#include <netlink/netlink_route.h>\n+#endif\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+\n+    // Create a netlink socket.\n+    const int s{socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)};\n+    if (s < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"socket(AF_NETLINK): %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    Sock sock{static_cast<SOCKET>(s)};\n+\n+    // Send request.\n+    struct {\n+        nlmsghdr hdr; ///< Request header.\n+        rtmsg data; ///< Request data, a \"route message\".\n+        nlattr dst_hdr; ///< One attribute, conveying the route destination address.\n+        char dst_data[16]; ///< Route destination address. To query the default route we use 0.0.0.0/0 or [::]/0. For IPv4 the first 4 bytes are used.\n+    } request{};\n+\n+    // Whether to use the first 4 or 16 bytes from request.attr_dst_data.\n+    const size_t dst_data_len = network == NET_IPV4 ? 4 : 16;\n+\n+    request.hdr.nlmsg_type = RTM_GETROUTE;\n+    request.hdr.nlmsg_flags = NLM_F_REQUEST;\n+#ifdef __linux__\n+    request.hdr.nlmsg_flags |= NLM_F_DUMP;\n+#endif\n+    request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg) + sizeof(nlattr) + dst_data_len);\n+    request.hdr.nlmsg_seq = 0; // Sequence number, used to match which reply is to which request. Irrelevant for us because we send just one request.\n+    request.data.rtm_family = network == NET_IPV4 ? AF_INET : AF_INET6;\n+    request.data.rtm_dst_len = 0; // Prefix length.\n+#ifdef __FreeBSD__\n+    request.data.rtm_flags = RTM_F_PREFIX;\n+#endif\n+    request.dst_hdr.nla_type = RTA_DST;\n+    request.dst_hdr.nla_len = sizeof(nlattr) + dst_data_len;\n+\n+    if (sock.Send(&request, request.hdr.nlmsg_len, 0) != static_cast<ssize_t>(request.hdr.nlmsg_len)) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"send() to netlink socket: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    // Receive response.\n+    char response[4096];\n+    ssize_t recv_result;\n+    do {\n+        recv_result = sock.Recv(response, sizeof(response), 0);\n+    } while (recv_result < 0 && (errno == EINTR || errno == EAGAIN));\n+    if (recv_result < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"recv() from netlink socket: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    size_t response_len = static_cast<size_t>(recv_result);\n+    for (nlmsghdr* hdr = (nlmsghdr*)response; NLMSG_OK(hdr, response_len); hdr = NLMSG_NEXT(hdr, response_len)) {\n+        rtmsg* r = (rtmsg*)NLMSG_DATA(hdr);\n+        int remaining_len = RTM_PAYLOAD(hdr);\n+\n+        // Iterate over the attributes.\n+        rtattr *rta_gateway = nullptr;\n+        int scope_id = 0;\n+        for (rtattr* attr = RTM_RTA(r); RTA_OK(attr, remaining_len); attr = RTA_NEXT(attr, remaining_len)) {\n+            if (attr->rta_type == RTA_GATEWAY) {\n+                rta_gateway = attr;\n+            } else if (attr->rta_type == RTA_OIF) {\n+                Assume(sizeof(int) == RTA_PAYLOAD(attr));\n+                std::memcpy(&scope_id, RTA_DATA(attr), sizeof(scope_id));\n+            }\n+        }\n+\n+        // Found gateway?\n+        if (rta_gateway != nullptr) {\n+            if (network == NET_IPV4) {\n+                Assume(sizeof(in_addr) == RTA_PAYLOAD(rta_gateway));\n+                in_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw);\n+            } else if (network == NET_IPV6) {\n+                Assume(sizeof(in6_addr) == RTA_PAYLOAD(rta_gateway));\n+                in6_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw, scope_id);\n+            }\n+        }\n+    }\n+\n+    return std::nullopt;\n+}\n+\n+#elif defined(WIN32)\n+\n+#include <iphlpapi.h>\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    NET_LUID interface_luid = {};\n+    SOCKADDR_INET destination_address = {};\n+    MIB_IPFORWARD_ROW2 best_route = {};\n+    SOCKADDR_INET best_source_address = {};\n+    DWORD best_if_idx = 0;\n+    DWORD status = 0;\n+\n+    // Pass empty destination address of the requested type (:: or 0.0.0.0) to get interface of default route.\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+    if (network == NET_IPV4) {\n+        destination_address.si_family = AF_INET;\n+    } else if(network == NET_IPV6) {\n+        destination_address.si_family = AF_INET6;\n+    } else {\n+        return std::nullopt;\n+    }\n+\n+    status = GetBestInterfaceEx((sockaddr*)&destination_address, &best_if_idx);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best interface for default route: %s\\n\", SysErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    // Get best route to default gateway.\n+    // Leave interface_luid at all-zeros to use interface index instead.\n+    status = GetBestRoute2(&interface_luid, best_if_idx, nullptr, &destination_address, 0, &best_route, &best_source_address);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best route for default route for interface index %d: %s\\n\",\n+                best_if_idx, SysErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    if (network == NET_IPV4) {\n+        Assume(best_route.NextHop.si_family == AF_INET);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611411388",
+      "id" : 1611411388,
+      "in_reply_to_id" : 1611345455,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gDC-8",
+      "original_commit_id" : "82b0bff51fedff2ce5e47cae1c75b9172766d8ef",
+      "original_line" : 153,
+      "original_position" : 153,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : null,
+      "pull_request_review_id" : 2073516447,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611411388/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T10:28:10Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611411388",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=4",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "node_id" : "MDQ6VXNlcjEyNjY0Ng==",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611416943"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611416943"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "i prefer using constants to string based APIs, if given the choice. This avoids say, typos.",
+      "commit_id" : "48441655b7acd3def66a93a706cb2b64678aff99",
+      "created_at" : "2024-05-23T10:23:11Z",
+      "diff_hunk" : "@@ -0,0 +1,275 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+\n+#if defined(__linux__) || defined(__FreeBSD__)\n+\n+#if defined(__linux__)\n+#include <linux/rtnetlink.h>\n+#elif defined(__FreeBSD__)\n+#include <netlink/netlink.h>\n+#include <netlink/netlink_route.h>\n+#endif\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+\n+    // Create a netlink socket.\n+    const int s{socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)};\n+    if (s < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"socket(AF_NETLINK): %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    Sock sock{static_cast<SOCKET>(s)};\n+\n+    // Send request.\n+    struct {\n+        nlmsghdr hdr; ///< Request header.\n+        rtmsg data; ///< Request data, a \"route message\".\n+        nlattr dst_hdr; ///< One attribute, conveying the route destination address.\n+        char dst_data[16]; ///< Route destination address. To query the default route we use 0.0.0.0/0 or [::]/0. For IPv4 the first 4 bytes are used.\n+    } request{};\n+\n+    // Whether to use the first 4 or 16 bytes from request.attr_dst_data.\n+    const size_t dst_data_len = network == NET_IPV4 ? 4 : 16;\n+\n+    request.hdr.nlmsg_type = RTM_GETROUTE;\n+    request.hdr.nlmsg_flags = NLM_F_REQUEST;\n+#ifdef __linux__\n+    request.hdr.nlmsg_flags |= NLM_F_DUMP;\n+#endif\n+    request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg) + sizeof(nlattr) + dst_data_len);\n+    request.hdr.nlmsg_seq = 0; // Sequence number, used to match which reply is to which request. Irrelevant for us because we send just one request.\n+    request.data.rtm_family = network == NET_IPV4 ? AF_INET : AF_INET6;\n+    request.data.rtm_dst_len = 0; // Prefix length.\n+#ifdef __FreeBSD__\n+    request.data.rtm_flags = RTM_F_PREFIX;\n+#endif\n+    request.dst_hdr.nla_type = RTA_DST;\n+    request.dst_hdr.nla_len = sizeof(nlattr) + dst_data_len;\n+\n+    if (sock.Send(&request, request.hdr.nlmsg_len, 0) != static_cast<ssize_t>(request.hdr.nlmsg_len)) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"send() to netlink socket: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    // Receive response.\n+    char response[4096];\n+    ssize_t recv_result;\n+    do {\n+        recv_result = sock.Recv(response, sizeof(response), 0);\n+    } while (recv_result < 0 && (errno == EINTR || errno == EAGAIN));\n+    if (recv_result < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"recv() from netlink socket: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    size_t response_len = static_cast<size_t>(recv_result);\n+    for (nlmsghdr* hdr = (nlmsghdr*)response; NLMSG_OK(hdr, response_len); hdr = NLMSG_NEXT(hdr, response_len)) {\n+        rtmsg* r = (rtmsg*)NLMSG_DATA(hdr);\n+        int remaining_len = RTM_PAYLOAD(hdr);\n+\n+        // Iterate over the attributes.\n+        rtattr *rta_gateway = nullptr;\n+        int scope_id = 0;\n+        for (rtattr* attr = RTM_RTA(r); RTA_OK(attr, remaining_len); attr = RTA_NEXT(attr, remaining_len)) {\n+            if (attr->rta_type == RTA_GATEWAY) {\n+                rta_gateway = attr;\n+            } else if (attr->rta_type == RTA_OIF) {\n+                Assume(sizeof(int) == RTA_PAYLOAD(attr));\n+                std::memcpy(&scope_id, RTA_DATA(attr), sizeof(scope_id));\n+            }\n+        }\n+\n+        // Found gateway?\n+        if (rta_gateway != nullptr) {\n+            if (network == NET_IPV4) {\n+                Assume(sizeof(in_addr) == RTA_PAYLOAD(rta_gateway));\n+                in_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw);\n+            } else if (network == NET_IPV6) {\n+                Assume(sizeof(in6_addr) == RTA_PAYLOAD(rta_gateway));\n+                in6_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw, scope_id);\n+            }\n+        }\n+    }\n+\n+    return std::nullopt;\n+}\n+\n+#elif defined(WIN32)\n+\n+#include <iphlpapi.h>\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    NET_LUID interface_luid = {};\n+    SOCKADDR_INET destination_address = {};\n+    MIB_IPFORWARD_ROW2 best_route = {};\n+    SOCKADDR_INET best_source_address = {};\n+    DWORD best_if_idx = 0;\n+    DWORD status = 0;\n+\n+    // Pass empty destination address of the requested type (:: or 0.0.0.0) to get interface of default route.\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+    if (network == NET_IPV4) {\n+        destination_address.si_family = AF_INET;\n+    } else if(network == NET_IPV6) {\n+        destination_address.si_family = AF_INET6;\n+    } else {\n+        return std::nullopt;\n+    }\n+\n+    status = GetBestInterfaceEx((sockaddr*)&destination_address, &best_if_idx);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best interface for default route: %s\\n\", SysErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    // Get best route to default gateway.\n+    // Leave interface_luid at all-zeros to use interface index instead.\n+    status = GetBestRoute2(&interface_luid, best_if_idx, nullptr, &destination_address, 0, &best_route, &best_source_address);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best route for default route for interface index %d: %s\\n\",\n+                best_if_idx, SysErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    if (network == NET_IPV4) {\n+        Assume(best_route.NextHop.si_family == AF_INET);\n+        return CNetAddr(best_route.NextHop.Ipv4.sin_addr);\n+    } else if(network == NET_IPV6) {\n+        Assume(best_route.NextHop.si_family == AF_INET6);\n+        return CNetAddr(best_route.NextHop.Ipv6.sin6_addr, best_route.InterfaceIndex);\n+    }\n+    return std::nullopt;\n+}\n+\n+#elif defined(__APPLE__)\n+\n+#include <net/route.h>\n+#include <sys/sysctl.h>\n+\n+// Ensure correct alignment for sockaddrs.\n+#define ROUNDUP(a) \\\n+    ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))\n+\n+static std::optional<CNetAddr> FromSockAddr(const struct sockaddr* addr)\n+{\n+    // Fill in a CService from the sockaddr, then drop the port part.\n+    CService service;\n+    if (service.SetSockAddr(addr)) {\n+        return (CNetAddr)service;\n+    }\n+    return std::nullopt;\n+}\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    // MacOS: Get default gateway from route table.\n+    // See man page for route(4) for the format.\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+    int family;\n+    if (network == NET_IPV4) {\n+        family = AF_INET;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611416943",
+      "id" : 1611416943,
+      "in_reply_to_id" : 1611410019,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gDEVv",
+      "original_commit_id" : "82b0bff51fedff2ce5e47cae1c75b9172766d8ef",
+      "original_line" : 188,
+      "original_position" : 188,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : null,
+      "pull_request_review_id" : 2073525398,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611416943/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T10:23:12Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611416943",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=4",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "node_id" : "MDQ6VXNlcjEyNjY0Ng==",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611430621"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611430621"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "OK, you're right, this could happen: https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_ipforward_row2\r\n\r\n> NextHop\r\n>\r\n> Type: [SOCKADDR_INET](https://learn.microsoft.com/en-us/windows/desktop/api/ws2ipdef/ns-ws2ipdef-sockaddr_inet)\r\n>\r\n> For a remote route, the IP address of the next system or gateway en route. If the route is to a local loopback address or an IP address on the local link, the next hop is unspecified (all zeros). For a local loopback route, this member should be an IPv4 address of 0.0.0.0 for an IPv4 route entry or an IPv6 address of 0::0 for an IPv6 route entry.\r\n\r\nMaybe this is true for the other operating systems as well, if the gateway address is `.IsBindAny()` it should be considered as absent.\r\n\r\nEdit: done",
+      "commit_id" : "48441655b7acd3def66a93a706cb2b64678aff99",
+      "created_at" : "2024-05-23T10:30:46Z",
+      "diff_hunk" : "@@ -0,0 +1,275 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+\n+#if defined(__linux__) || defined(__FreeBSD__)\n+\n+#if defined(__linux__)\n+#include <linux/rtnetlink.h>\n+#elif defined(__FreeBSD__)\n+#include <netlink/netlink.h>\n+#include <netlink/netlink_route.h>\n+#endif\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+\n+    // Create a netlink socket.\n+    const int s{socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)};\n+    if (s < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"socket(AF_NETLINK): %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    Sock sock{static_cast<SOCKET>(s)};\n+\n+    // Send request.\n+    struct {\n+        nlmsghdr hdr; ///< Request header.\n+        rtmsg data; ///< Request data, a \"route message\".\n+        nlattr dst_hdr; ///< One attribute, conveying the route destination address.\n+        char dst_data[16]; ///< Route destination address. To query the default route we use 0.0.0.0/0 or [::]/0. For IPv4 the first 4 bytes are used.\n+    } request{};\n+\n+    // Whether to use the first 4 or 16 bytes from request.attr_dst_data.\n+    const size_t dst_data_len = network == NET_IPV4 ? 4 : 16;\n+\n+    request.hdr.nlmsg_type = RTM_GETROUTE;\n+    request.hdr.nlmsg_flags = NLM_F_REQUEST;\n+#ifdef __linux__\n+    request.hdr.nlmsg_flags |= NLM_F_DUMP;\n+#endif\n+    request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg) + sizeof(nlattr) + dst_data_len);\n+    request.hdr.nlmsg_seq = 0; // Sequence number, used to match which reply is to which request. Irrelevant for us because we send just one request.\n+    request.data.rtm_family = network == NET_IPV4 ? AF_INET : AF_INET6;\n+    request.data.rtm_dst_len = 0; // Prefix length.\n+#ifdef __FreeBSD__\n+    request.data.rtm_flags = RTM_F_PREFIX;\n+#endif\n+    request.dst_hdr.nla_type = RTA_DST;\n+    request.dst_hdr.nla_len = sizeof(nlattr) + dst_data_len;\n+\n+    if (sock.Send(&request, request.hdr.nlmsg_len, 0) != static_cast<ssize_t>(request.hdr.nlmsg_len)) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"send() to netlink socket: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    // Receive response.\n+    char response[4096];\n+    ssize_t recv_result;\n+    do {\n+        recv_result = sock.Recv(response, sizeof(response), 0);\n+    } while (recv_result < 0 && (errno == EINTR || errno == EAGAIN));\n+    if (recv_result < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"recv() from netlink socket: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    size_t response_len = static_cast<size_t>(recv_result);\n+    for (nlmsghdr* hdr = (nlmsghdr*)response; NLMSG_OK(hdr, response_len); hdr = NLMSG_NEXT(hdr, response_len)) {\n+        rtmsg* r = (rtmsg*)NLMSG_DATA(hdr);\n+        int remaining_len = RTM_PAYLOAD(hdr);\n+\n+        // Iterate over the attributes.\n+        rtattr *rta_gateway = nullptr;\n+        int scope_id = 0;\n+        for (rtattr* attr = RTM_RTA(r); RTA_OK(attr, remaining_len); attr = RTA_NEXT(attr, remaining_len)) {\n+            if (attr->rta_type == RTA_GATEWAY) {\n+                rta_gateway = attr;\n+            } else if (attr->rta_type == RTA_OIF) {\n+                Assume(sizeof(int) == RTA_PAYLOAD(attr));\n+                std::memcpy(&scope_id, RTA_DATA(attr), sizeof(scope_id));\n+            }\n+        }\n+\n+        // Found gateway?\n+        if (rta_gateway != nullptr) {\n+            if (network == NET_IPV4) {\n+                Assume(sizeof(in_addr) == RTA_PAYLOAD(rta_gateway));\n+                in_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw);\n+            } else if (network == NET_IPV6) {\n+                Assume(sizeof(in6_addr) == RTA_PAYLOAD(rta_gateway));\n+                in6_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw, scope_id);\n+            }\n+        }\n+    }\n+\n+    return std::nullopt;\n+}\n+\n+#elif defined(WIN32)\n+\n+#include <iphlpapi.h>\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    NET_LUID interface_luid = {};\n+    SOCKADDR_INET destination_address = {};\n+    MIB_IPFORWARD_ROW2 best_route = {};\n+    SOCKADDR_INET best_source_address = {};\n+    DWORD best_if_idx = 0;\n+    DWORD status = 0;\n+\n+    // Pass empty destination address of the requested type (:: or 0.0.0.0) to get interface of default route.\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+    if (network == NET_IPV4) {\n+        destination_address.si_family = AF_INET;\n+    } else if(network == NET_IPV6) {\n+        destination_address.si_family = AF_INET6;\n+    } else {\n+        return std::nullopt;\n+    }\n+\n+    status = GetBestInterfaceEx((sockaddr*)&destination_address, &best_if_idx);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best interface for default route: %s\\n\", SysErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    // Get best route to default gateway.\n+    // Leave interface_luid at all-zeros to use interface index instead.\n+    status = GetBestRoute2(&interface_luid, best_if_idx, nullptr, &destination_address, 0, &best_route, &best_source_address);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best route for default route for interface index %d: %s\\n\",\n+                best_if_idx, SysErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    if (network == NET_IPV4) {\n+        Assume(best_route.NextHop.si_family == AF_INET);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611430621",
+      "id" : 1611430621,
+      "in_reply_to_id" : 1611345455,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gDHrd",
+      "original_commit_id" : "82b0bff51fedff2ce5e47cae1c75b9172766d8ef",
+      "original_line" : 153,
+      "original_position" : 153,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : null,
+      "pull_request_review_id" : 2073546134,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611430621/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T11:36:58Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611430621",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=4",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "node_id" : "MDQ6VXNlcjEyNjY0Ng==",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611456690"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611456690"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Seems we could factor out `AddressFamilyFromNetwork` at least, this is repeated in literally every implementation ð \r\n\r\nEdit: in `netaddress.h` there is `CService::GetSAFamily()` -- so close but not... sigh.\r\nEdit: done",
+      "commit_id" : "48441655b7acd3def66a93a706cb2b64678aff99",
+      "created_at" : "2024-05-23T10:47:25Z",
+      "diff_hunk" : "@@ -0,0 +1,275 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+\n+#if defined(__linux__) || defined(__FreeBSD__)\n+\n+#if defined(__linux__)\n+#include <linux/rtnetlink.h>\n+#elif defined(__FreeBSD__)\n+#include <netlink/netlink.h>\n+#include <netlink/netlink_route.h>\n+#endif\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+\n+    // Create a netlink socket.\n+    const int s{socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)};\n+    if (s < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"socket(AF_NETLINK): %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+    Sock sock{static_cast<SOCKET>(s)};\n+\n+    // Send request.\n+    struct {\n+        nlmsghdr hdr; ///< Request header.\n+        rtmsg data; ///< Request data, a \"route message\".\n+        nlattr dst_hdr; ///< One attribute, conveying the route destination address.\n+        char dst_data[16]; ///< Route destination address. To query the default route we use 0.0.0.0/0 or [::]/0. For IPv4 the first 4 bytes are used.\n+    } request{};\n+\n+    // Whether to use the first 4 or 16 bytes from request.attr_dst_data.\n+    const size_t dst_data_len = network == NET_IPV4 ? 4 : 16;\n+\n+    request.hdr.nlmsg_type = RTM_GETROUTE;\n+    request.hdr.nlmsg_flags = NLM_F_REQUEST;\n+#ifdef __linux__\n+    request.hdr.nlmsg_flags |= NLM_F_DUMP;\n+#endif\n+    request.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(rtmsg) + sizeof(nlattr) + dst_data_len);\n+    request.hdr.nlmsg_seq = 0; // Sequence number, used to match which reply is to which request. Irrelevant for us because we send just one request.\n+    request.data.rtm_family = network == NET_IPV4 ? AF_INET : AF_INET6;\n+    request.data.rtm_dst_len = 0; // Prefix length.\n+#ifdef __FreeBSD__\n+    request.data.rtm_flags = RTM_F_PREFIX;\n+#endif\n+    request.dst_hdr.nla_type = RTA_DST;\n+    request.dst_hdr.nla_len = sizeof(nlattr) + dst_data_len;\n+\n+    if (sock.Send(&request, request.hdr.nlmsg_len, 0) != static_cast<ssize_t>(request.hdr.nlmsg_len)) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"send() to netlink socket: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    // Receive response.\n+    char response[4096];\n+    ssize_t recv_result;\n+    do {\n+        recv_result = sock.Recv(response, sizeof(response), 0);\n+    } while (recv_result < 0 && (errno == EINTR || errno == EAGAIN));\n+    if (recv_result < 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"recv() from netlink socket: %s\\n\", SysErrorString(errno));\n+        return std::nullopt;\n+    }\n+\n+    size_t response_len = static_cast<size_t>(recv_result);\n+    for (nlmsghdr* hdr = (nlmsghdr*)response; NLMSG_OK(hdr, response_len); hdr = NLMSG_NEXT(hdr, response_len)) {\n+        rtmsg* r = (rtmsg*)NLMSG_DATA(hdr);\n+        int remaining_len = RTM_PAYLOAD(hdr);\n+\n+        // Iterate over the attributes.\n+        rtattr *rta_gateway = nullptr;\n+        int scope_id = 0;\n+        for (rtattr* attr = RTM_RTA(r); RTA_OK(attr, remaining_len); attr = RTA_NEXT(attr, remaining_len)) {\n+            if (attr->rta_type == RTA_GATEWAY) {\n+                rta_gateway = attr;\n+            } else if (attr->rta_type == RTA_OIF) {\n+                Assume(sizeof(int) == RTA_PAYLOAD(attr));\n+                std::memcpy(&scope_id, RTA_DATA(attr), sizeof(scope_id));\n+            }\n+        }\n+\n+        // Found gateway?\n+        if (rta_gateway != nullptr) {\n+            if (network == NET_IPV4) {\n+                Assume(sizeof(in_addr) == RTA_PAYLOAD(rta_gateway));\n+                in_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw);\n+            } else if (network == NET_IPV6) {\n+                Assume(sizeof(in6_addr) == RTA_PAYLOAD(rta_gateway));\n+                in6_addr gw;\n+                std::memcpy(&gw, RTA_DATA(rta_gateway), sizeof(gw));\n+                return CNetAddr(gw, scope_id);\n+            }\n+        }\n+    }\n+\n+    return std::nullopt;\n+}\n+\n+#elif defined(WIN32)\n+\n+#include <iphlpapi.h>\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    NET_LUID interface_luid = {};\n+    SOCKADDR_INET destination_address = {};\n+    MIB_IPFORWARD_ROW2 best_route = {};\n+    SOCKADDR_INET best_source_address = {};\n+    DWORD best_if_idx = 0;\n+    DWORD status = 0;\n+\n+    // Pass empty destination address of the requested type (:: or 0.0.0.0) to get interface of default route.\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+    if (network == NET_IPV4) {\n+        destination_address.si_family = AF_INET;\n+    } else if(network == NET_IPV6) {\n+        destination_address.si_family = AF_INET6;\n+    } else {\n+        return std::nullopt;\n+    }\n+\n+    status = GetBestInterfaceEx((sockaddr*)&destination_address, &best_if_idx);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best interface for default route: %s\\n\", SysErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    // Get best route to default gateway.\n+    // Leave interface_luid at all-zeros to use interface index instead.\n+    status = GetBestRoute2(&interface_luid, best_if_idx, nullptr, &destination_address, 0, &best_route, &best_source_address);\n+    if (status != NO_ERROR) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, \"Could not get best route for default route for interface index %d: %s\\n\",\n+                best_if_idx, SysErrorString(status));\n+        return std::nullopt;\n+    }\n+\n+    if (network == NET_IPV4) {\n+        Assume(best_route.NextHop.si_family == AF_INET);\n+        return CNetAddr(best_route.NextHop.Ipv4.sin_addr);\n+    } else if(network == NET_IPV6) {\n+        Assume(best_route.NextHop.si_family == AF_INET6);\n+        return CNetAddr(best_route.NextHop.Ipv6.sin6_addr, best_route.InterfaceIndex);\n+    }\n+    return std::nullopt;\n+}\n+\n+#elif defined(__APPLE__)\n+\n+#include <net/route.h>\n+#include <sys/sysctl.h>\n+\n+// Ensure correct alignment for sockaddrs.\n+#define ROUNDUP(a) \\\n+    ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))\n+\n+static std::optional<CNetAddr> FromSockAddr(const struct sockaddr* addr)\n+{\n+    // Fill in a CService from the sockaddr, then drop the port part.\n+    CService service;\n+    if (service.SetSockAddr(addr)) {\n+        return (CNetAddr)service;\n+    }\n+    return std::nullopt;\n+}\n+\n+std::optional<CNetAddr> QueryDefaultGateway(Network network)\n+{\n+    // MacOS: Get default gateway from route table.\n+    // See man page for route(4) for the format.\n+    Assume(network == NET_IPV4 || network == NET_IPV6);\n+    int family;\n+    if (network == NET_IPV4) {\n+        family = AF_INET;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611456690",
+      "id" : 1611456690,
+      "in_reply_to_id" : 1611410019,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gDOCy",
+      "original_commit_id" : "82b0bff51fedff2ce5e47cae1c75b9172766d8ef",
+      "original_line" : 188,
+      "original_position" : 188,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : null,
+      "pull_request_review_id" : 2073590059,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611456690/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T11:36:42Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611456690",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=4",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "node_id" : "MDQ6VXNlcjEyNjY0Ng==",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611522537"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611522537"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "OK, i went for `QueryDefaultGatewayImpl` for now, with an outer function. Naming it different things on different platforms means having to repeat the `#ifdef` forest, which isn't really worth the slight increase in clarity imo.",
+      "commit_id" : "48441655b7acd3def66a93a706cb2b64678aff99",
+      "created_at" : "2024-05-23T11:40:08Z",
+      "diff_hunk" : "@@ -0,0 +1,275 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <config/bitcoin-config.h> // IWYU pragma: keep\n+\n+#include <util/netif.h>\n+\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/check.h>\n+#include <util/sock.h>\n+#include <util/syserror.h>\n+",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1611522537",
+      "id" : 1611522537,
+      "in_reply_to_id" : 1609954791,
+      "line" : 14,
+      "node_id" : "PRRC_kwDOABII585gDeHp",
+      "original_commit_id" : "bebfafcf98d8ed1432407b7603991d54f7cc26c2",
+      "original_line" : 14,
+      "original_position" : 14,
+      "original_start_line" : null,
+      "path" : "src/util/netif.cpp",
+      "position" : 14,
+      "pull_request_review_id" : 2073699412,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611522537/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-23T11:40:08Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1611522537",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/126646?v=4",
+         "events_url" : "https://api.github.com/users/laanwj/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/laanwj/followers",
+         "following_url" : "https://api.github.com/users/laanwj/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/laanwj/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/laanwj",
+         "id" : 126646,
+         "login" : "laanwj",
+         "node_id" : "MDQ6VXNlcjEyNjY0Ng==",
+         "organizations_url" : "https://api.github.com/users/laanwj/orgs",
+         "received_events_url" : "https://api.github.com/users/laanwj/received_events",
+         "repos_url" : "https://api.github.com/users/laanwj/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/laanwj/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/laanwj/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/laanwj"
+      }
    }
 ]
