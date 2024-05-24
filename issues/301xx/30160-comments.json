@@ -134,5 +134,280 @@
          "type" : "User",
          "url" : "https://api.github.com/users/theuni"
       }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30160#discussion_r1613558242"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30160"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613558242"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "`.Subset()` and `.Superset()`?\r\n\r\nWithout these comments, I would have to guess at the meanings (and I would have guessed wrong).",
+      "commit_id" : "692e533f0b698960c0fd87b47706f7542d467f5f",
+      "created_at" : "2024-05-24T14:17:56Z",
+      "diff_hunk" : "@@ -0,0 +1,510 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_BITSET_H\n+#define BITCOIN_UTIL_BITSET_H\n+\n+#include <util/check.h>\n+\n+#include <array>\n+#include <bit>\n+#include <cstdint>\n+#include <limits>\n+#include <type_traits>\n+\n+/* This file provides data types similar to std::bitset, but adds the following functionality:\n+ *\n+ * - Efficient iteration over all set bits (compatible with range-based for loops).\n+ * - Efficient search for the first and last set bit (First() and Last()).\n+ * - Efficient set subtraction: (a / b) implements \"a and not b\".\n+ * - Efficient non-strict subset/superset testing: (a <= b) and (a >= b).\n+ * - Efficient set overlap testing: a.Overlaps(b)\n+ * - Efficient construction of set containing 0..N-1 (S::Fill).\n+ * - Efficient construction of a single set (S::Singleton).\n+ * - Construction from initializer lists.\n+ *\n+ * Other differences:\n+ * - BitSet<N> is a bitset that supports at least N elements, but may support more (Size() reports\n+ *   the actual number). Because the actual number is unpredictable, there are no operations that\n+ *   affect all positions (like std::bitset's operator~, flip(), or all()).\n+ * - Various other unimplemented features.\n+ */\n+\n+namespace bitset_detail {\n+\n+/** Count the number of bits set in an unsigned integer type. */\n+template<typename I>\n+unsigned inline constexpr PopCount(I v)\n+{\n+    static_assert(std::is_integral_v<I> && std::is_unsigned_v<I> && std::numeric_limits<I>::radix == 2);\n+    constexpr auto BITS = std::numeric_limits<I>::digits;\n+    // Algorithms from https://en.wikipedia.org/wiki/Hamming_weight#Efficient_implementation.\n+    // These seem to be faster than __builtin_popcount when compiling for non-SSE4 on x86_64.\n+    if constexpr (BITS <= 32) {\n+        v -= (v >> 1) & 0x55555555;\n+        v = (v & 0x33333333) + ((v >> 2) & 0x33333333);\n+        v = (v + (v >> 4)) & 0x0f0f0f0f;\n+        if constexpr (BITS > 8) v += v >> 8;\n+        if constexpr (BITS > 16) v += v >> 16;\n+        return v & 0x3f;\n+    } else {\n+        static_assert(BITS <= 64);\n+        v -= (v >> 1) & 0x5555555555555555;\n+        v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);\n+        v = (v + (v >> 4)) & 0x0f0f0f0f0f0f0f0f;\n+        return (v * uint64_t{0x0101010101010101}) >> 56;\n+    }\n+}\n+\n+/** A bitset implementation backed by a single integer of type I. */\n+template<typename I>\n+class IntBitSet\n+{\n+    // Only binary, unsigned, integer, types allowed.\n+    static_assert(std::is_integral_v<I> && std::is_unsigned_v<I> && std::numeric_limits<I>::radix == 2);\n+    /** The maximum number of bits this bitset supports. */\n+    static constexpr unsigned MAX_SIZE = std::numeric_limits<I>::digits;\n+    /** Integer whose bits represent this bitset. */\n+    I m_val;\n+    /** Internal constructor with a given integer as contents. */\n+    IntBitSet(I val) noexcept : m_val{val} {}\n+    /** Dummy type to return using end(). Only used for comparing with Iterator. */\n+    class IteratorEnd\n+    {\n+        friend class IntBitSet;\n+        constexpr IteratorEnd() = default;\n+    public:\n+        constexpr IteratorEnd(const IteratorEnd&) = default;\n+    };\n+    /** Iterator type returned by begin(), which efficiently iterates all 1 positions. */\n+    class Iterator\n+    {\n+        friend class IntBitSet;\n+        I m_val; /**< The original integer's remaining bits. */\n+        unsigned m_pos; /** Last reported 1 position (if m_pos != 0). */\n+        constexpr Iterator(I val) noexcept : m_val(val), m_pos(0)\n+        {\n+            if (m_val != 0) m_pos = std::countr_zero(m_val);\n+        }\n+    public:\n+        /** Do not allow external code to construct an Iterator. */\n+        Iterator() = delete;\n+        // Copying is allowed.\n+        constexpr Iterator(const Iterator&) noexcept = default;\n+        constexpr Iterator& operator=(const Iterator&) noexcept = default;\n+        /** Test whether we are done (can only compare with IteratorEnd). */\n+        constexpr friend bool operator==(const Iterator& a, const IteratorEnd&) noexcept\n+        {\n+            return a.m_val == 0;\n+        }\n+        /** Progress to the next 1 bit (only if != IteratorEnd). */\n+        constexpr Iterator& operator++() noexcept\n+        {\n+            m_val &= m_val - I{1U};\n+            if (m_val != 0) m_pos = std::countr_zero(m_val);\n+            return *this;\n+        }\n+        /** Get the current bit position (only if != IteratorEnd). */\n+        constexpr const unsigned& operator*() const noexcept { return m_pos; }\n+    };\n+\n+public:\n+    /** Construct an all-zero bitset. */\n+    constexpr IntBitSet() noexcept : m_val{0} {}\n+    /** Copy construct a bitset. */\n+    constexpr IntBitSet(const IntBitSet&) noexcept = default;\n+    /** Construct from a list of values. */\n+    constexpr IntBitSet(std::initializer_list<unsigned> ilist) noexcept : m_val(0)\n+    {\n+        for (auto i : ilist) {\n+            Assume(i < MAX_SIZE);\n+            m_val |= I{1U} << i;\n+        }\n+    }\n+    /** Copy assign a bitset. */\n+    constexpr IntBitSet& operator=(const IntBitSet&) noexcept = default;\n+    /** Assign a list of values. */\n+    constexpr IntBitSet& operator=(std::initializer_list<unsigned> ilist) noexcept\n+    {\n+        m_val = 0;\n+        for (auto i : ilist) {\n+            Assume(i < MAX_SIZE);\n+            m_val |= I{1U} << i;\n+        }\n+        return *this;\n+    }\n+    /** Construct a bitset with the singleton i. */\n+    static constexpr IntBitSet Singleton(unsigned i) noexcept\n+    {\n+        Assume(i < MAX_SIZE);\n+        return IntBitSet(I(1U) << i);\n+    }\n+    /** Construct a bitset with bits 0..count-1 (inclusive) set to 1. */\n+    static constexpr IntBitSet Fill(unsigned count) noexcept\n+    {\n+        IntBitSet ret;\n+        Assume(count <= MAX_SIZE);\n+        if (count) ret.m_val = I(~I{0}) >> (MAX_SIZE - count);\n+        return ret;\n+    }\n+    /** Set a bit to 1. */\n+    constexpr void Set(unsigned pos) noexcept\n+    {\n+        Assume(pos < MAX_SIZE);\n+        m_val |= I{1U} << pos;\n+    }\n+    /** Set a bit to the specified value. */\n+    constexpr void Set(unsigned pos, bool val) noexcept\n+    {\n+        Assume(pos < MAX_SIZE);\n+        m_val = (m_val & ~I(I{1U} << pos)) | (I(val) << pos);\n+    }\n+    /** Set a bit to 0. */\n+    constexpr void Reset(unsigned pos) noexcept\n+    {\n+        Assume(pos < MAX_SIZE);\n+        m_val &= ~I(I{1U} << pos);\n+    }\n+    /** Retrieve a bit at the given position. */\n+    constexpr bool operator[](unsigned pos) const noexcept\n+    {\n+        Assume(pos < MAX_SIZE);\n+        return (m_val >> pos) & 1U;\n+    }\n+    /** Compute the number of 1 bits in the bitset. */\n+    constexpr unsigned Count() const noexcept { return PopCount(m_val); }\n+    /** Return the number of bits that this object holds. */\n+    static constexpr unsigned Size() noexcept { return MAX_SIZE; }\n+    /** Check if all bits are 0. */\n+    constexpr bool None() const noexcept { return m_val == 0; }\n+    /** Check if any bits are 1. */\n+    constexpr bool Any() const noexcept { return m_val != 0; }\n+    /** Return an object that iterates over all 1 bits (++ and * only allowed when != end()). */\n+    constexpr Iterator begin() const noexcept { return Iterator(m_val); }\n+    /** Return a dummy object to compare Iterators with. */\n+    constexpr IteratorEnd end() const noexcept { return IteratorEnd(); }\n+    /** Find the first element (requires Any()). */\n+    constexpr unsigned First() const noexcept { return std::countr_zero(m_val); }\n+    /** Find the last element (requires Any()). */\n+    constexpr unsigned Last() const noexcept { return std::bit_width(m_val) - 1; }\n+    /** Set this object's bits to be the binary AND between respective bits from this and a. */\n+    constexpr IntBitSet& operator|=(const IntBitSet& a) noexcept { m_val |= a.m_val; return *this; }\n+    /** Set this object's bits to be the binary OR between respective bits from this and a. */\n+    constexpr IntBitSet& operator&=(const IntBitSet& a) noexcept { m_val &= a.m_val; return *this; }\n+    /** Set this object's bits to be the binary AND NOT between respective bits from this and a. */\n+    constexpr IntBitSet& operator/=(const IntBitSet& a) noexcept { m_val &= ~a.m_val; return *this; }\n+    /** Set this object's bits to be the binary XOR between respective bits from this as a. */\n+    constexpr IntBitSet& operator^=(const IntBitSet& a) noexcept { m_val ^= a.m_val; return *this; }\n+    /** Check if the intersection between two sets is non-empty. */\n+    constexpr bool Overlaps(const IntBitSet& a) noexcept { return m_val & a.m_val; }\n+    /** Return an object with the binary AND between respective bits from a and b. */\n+    friend constexpr IntBitSet operator&(const IntBitSet& a, const IntBitSet& b) noexcept { return I(a.m_val & b.m_val); }\n+    /** Return an object with the binary OR between respective bits from a and b. */\n+    friend constexpr IntBitSet operator|(const IntBitSet& a, const IntBitSet& b) noexcept { return I(a.m_val | b.m_val); }\n+    /** Return an object with the binary AND NOT between respective bits from a and b. */\n+    friend constexpr IntBitSet operator/(const IntBitSet& a, const IntBitSet& b) noexcept { return I(a.m_val & ~b.m_val); }\n+    /** Return an object with the binary XOR between respective bits from a and b. */\n+    friend constexpr IntBitSet operator^(const IntBitSet& a, const IntBitSet& b) noexcept { return I(a.m_val ^ b.m_val); }\n+    /** Check if bitset a and bitset b are identical. */\n+    friend constexpr bool operator==(const IntBitSet& a, const IntBitSet& b) noexcept = default;\n+    /** Check if bitset a is a superset of bitset b (= every 1 bit in b is also in a). */\n+    friend constexpr bool operator>=(const IntBitSet& a, const IntBitSet& b) noexcept { return (b.m_val & ~a.m_val) == 0; }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30160#discussion_r1613558242",
+      "id" : 1613558242,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gLPHi",
+      "original_commit_id" : "797ea9aca05a6dafb70e224e6a7d89bb18294150",
+      "original_line" : 212,
+      "original_position" : 212,
+      "original_start_line" : null,
+      "path" : "src/util/bitset.h",
+      "position" : null,
+      "pull_request_review_id" : 2077061355,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30160",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613558242/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-24T14:17:56Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613558242",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/417043?v=4",
+         "events_url" : "https://api.github.com/users/theuni/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theuni/followers",
+         "following_url" : "https://api.github.com/users/theuni/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theuni/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theuni",
+         "id" : 417043,
+         "login" : "theuni",
+         "node_id" : "MDQ6VXNlcjQxNzA0Mw==",
+         "organizations_url" : "https://api.github.com/users/theuni/orgs",
+         "received_events_url" : "https://api.github.com/users/theuni/received_events",
+         "repos_url" : "https://api.github.com/users/theuni/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theuni/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theuni/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theuni"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30160#discussion_r1613674776"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30160"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613674776"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Done.",
+      "commit_id" : "692e533f0b698960c0fd87b47706f7542d467f5f",
+      "created_at" : "2024-05-24T15:37:28Z",
+      "diff_hunk" : "@@ -0,0 +1,463 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_BITSET_H\n+#define BITCOIN_UTIL_BITSET_H\n+\n+#include <array>\n+#include <bit>\n+#include <cstdint>\n+#include <limits>\n+#include <type_traits>\n+\n+/* This file provides data types similar to std::bitset, but adds the following functionality:\n+ *\n+ * - Efficient iteration over all set bits (compatible with range-based for loops).\n+ * - Efficient search for the first and last set bit (First() and Last()).\n+ * - Efficient set subtraction: (a / b) implements \"a and not b\".\n+ * - Efficient subset/superset testing: (a <= b) and (a >= b).\n+ * - Efficient set overlap testing: a && b\n+ * - Efficient construction of set containing 0..N-1 (S::Fill).\n+ * - Efficient construction of a single set (S::Singleton).\n+ * - Construction from initializer lists.\n+ *\n+ * Other differences:\n+ * - BitSet<N> is a bitset that supports at least N elements, but may support more (Size() reports\n+ *   the actual number). Because the actual number is unpredictable, there are no operations that\n+ *   affect all positions (like std::bitset's operator~, flip(), or all()).\n+ * - Various other unimplemented features.\n+ */\n+\n+namespace bitset_detail {\n+\n+/** Count the number of bits set in an unsigned integer type. */\n+template<typename I>\n+unsigned inline constexpr PopCount(I v)\n+{\n+    static_assert(std::is_integral_v<I> && std::is_unsigned_v<I> && std::numeric_limits<I>::radix == 2);\n+    constexpr auto BITS = std::numeric_limits<I>::digits;\n+    // Algorithms from https://en.wikipedia.org/wiki/Hamming_weight#Efficient_implementation.\n+    // These seem to be faster than __builtin_popcount when compiling for non-SSE4 on x86_64.\n+    if constexpr (BITS <= 32) {\n+        v -= (v >> 1) & 0x55555555;\n+        v = (v & 0x33333333) + ((v >> 2) & 0x33333333);\n+        v = (v + (v >> 4)) & 0x0f0f0f0f;\n+        if constexpr (BITS > 8) v += v >> 8;\n+        if constexpr (BITS > 16) v += v >> 16;\n+        return v & 0x3f;\n+    } else {\n+        static_assert(BITS <= 64);\n+        v -= (v >> 1) & 0x5555555555555555;\n+        v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);\n+        v = (v + (v >> 4)) & 0x0f0f0f0f0f0f0f0f;\n+        return (v * uint64_t{0x0101010101010101}) >> 56;\n+    }\n+}\n+\n+/** A bitset implementation backed by a single integer of type I. */\n+template<typename I>\n+class IntBitSet\n+{\n+    // Only binary, unsigned, integer, types allowed.\n+    static_assert(std::is_integral_v<I> && std::is_unsigned_v<I> && std::numeric_limits<I>::radix == 2);\n+    /** The maximum number of bits this bitset supports. */\n+    static constexpr unsigned MAX_SIZE = std::numeric_limits<I>::digits;\n+    /** Integer whose bits represent this bitset. */\n+    I m_val;\n+    /** Internal constructor with a given integer as contents. */\n+    IntBitSet(I val) noexcept : m_val{val} {}\n+    /** Dummy type to return using end(). Only used for comparing with Iterator. */\n+    class IteratorEnd\n+    {\n+        friend class IntBitSet;\n+        constexpr IteratorEnd() = default;\n+    public:\n+        constexpr IteratorEnd(const IteratorEnd&) = default;\n+    };\n+    /** Iterator type returned by begin(), which efficiently iterates all 1 positions. */\n+    class Iterator\n+    {\n+        friend class IntBitSet;\n+        I m_val; /**< The original integer's remaining bits. */\n+        unsigned m_pos; /** Last reported 1 position (if m_pos != 0). */\n+        constexpr Iterator(I val) noexcept : m_val(val), m_pos(0)\n+        {\n+            if (m_val != 0) m_pos = std::countr_zero(m_val);\n+        }\n+    public:\n+        /** Do not allow external code to construct an Iterator. */\n+        Iterator() = delete;\n+        // Copying is allowed.\n+        constexpr Iterator(const Iterator&) noexcept = default;\n+        constexpr Iterator& operator=(const Iterator&) noexcept = default;\n+        /** Test whether we are done (can only compare with IteratorEnd). */\n+        constexpr friend bool operator==(const Iterator& a, const IteratorEnd&) noexcept\n+        {\n+            return a.m_val == 0;\n+        }\n+        /** Progress to the next 1 bit (only if != IteratorEnd). */\n+        constexpr Iterator& operator++() noexcept\n+        {\n+            m_val &= m_val - I{1U};\n+            if (m_val != 0) m_pos = std::countr_zero(m_val);\n+            return *this;\n+        }\n+        /** Get the current bit position (only if != IteratorEnd). */\n+        constexpr const unsigned& operator*() const noexcept { return m_pos; }\n+    };\n+\n+public:\n+    /** Construct an all-zero bitset. */\n+    constexpr IntBitSet() noexcept : m_val{0} {}\n+    /** Copy construct a bitset. */\n+    constexpr IntBitSet(const IntBitSet&) noexcept = default;\n+    /** Construct from a list of values. */\n+    constexpr IntBitSet(std::initializer_list<unsigned> ilist) noexcept : m_val(0)\n+    {\n+        for (auto i : ilist) m_val |= I{1U} << i;\n+    }\n+    /** Copy assign a bitset. */\n+    constexpr IntBitSet& operator=(const IntBitSet&) noexcept = default;\n+    /** Assign a list of values. */\n+    constexpr IntBitSet& operator=(std::initializer_list<unsigned> ilist) noexcept\n+    {\n+        m_val = 0;\n+        for (auto i : ilist) m_val |= I{1U} << i;\n+        return *this;\n+    }\n+    /** Construct a bitset with the singleton i. */\n+    static constexpr IntBitSet Singleton(unsigned i) noexcept {\n+        return IntBitSet(I(1U) << i);\n+    }\n+    /** Construct a bitset with bits 0..count-1 (inclusive) set to 1. */\n+    static constexpr IntBitSet Fill(unsigned count) noexcept {\n+        IntBitSet ret;\n+        if (count) ret.m_val = I(~I{0}) >> (MAX_SIZE - count);\n+        return ret;\n+    }\n+    /** Compute the number of 1 bits in the bitset. */\n+    constexpr unsigned Count() const noexcept { return PopCount(m_val); }\n+    /** Return the number of bits that this object holds. */\n+    static constexpr unsigned Size() noexcept { return MAX_SIZE; }\n+    /** Set a bit to 1. */\n+    constexpr void Set(unsigned pos) noexcept { m_val |= I{1U} << pos; }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30160#discussion_r1613674776",
+      "id" : 1613674776,
+      "in_reply_to_id" : 1612232560,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gLrkY",
+      "original_commit_id" : "a12b4052dad2158cf21de07fded63fb224dba915",
+      "original_line" : 144,
+      "original_position" : 144,
+      "original_start_line" : null,
+      "path" : "src/util/bitset.h",
+      "position" : null,
+      "pull_request_review_id" : 2077267486,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30160",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613674776/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-24T15:37:28Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613674776",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30160#discussion_r1613675392"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30160"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613675392"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Replaced with `Overlaps()`.",
+      "commit_id" : "692e533f0b698960c0fd87b47706f7542d467f5f",
+      "created_at" : "2024-05-24T15:37:50Z",
+      "diff_hunk" : "@@ -0,0 +1,463 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_BITSET_H\n+#define BITCOIN_UTIL_BITSET_H\n+\n+#include <array>\n+#include <bit>\n+#include <cstdint>\n+#include <limits>\n+#include <type_traits>\n+\n+/* This file provides data types similar to std::bitset, but adds the following functionality:\n+ *\n+ * - Efficient iteration over all set bits (compatible with range-based for loops).\n+ * - Efficient search for the first and last set bit (First() and Last()).\n+ * - Efficient set subtraction: (a / b) implements \"a and not b\".\n+ * - Efficient subset/superset testing: (a <= b) and (a >= b).\n+ * - Efficient set overlap testing: a && b\n+ * - Efficient construction of set containing 0..N-1 (S::Fill).\n+ * - Efficient construction of a single set (S::Singleton).\n+ * - Construction from initializer lists.\n+ *\n+ * Other differences:\n+ * - BitSet<N> is a bitset that supports at least N elements, but may support more (Size() reports\n+ *   the actual number). Because the actual number is unpredictable, there are no operations that\n+ *   affect all positions (like std::bitset's operator~, flip(), or all()).\n+ * - Various other unimplemented features.\n+ */\n+\n+namespace bitset_detail {\n+\n+/** Count the number of bits set in an unsigned integer type. */\n+template<typename I>\n+unsigned inline constexpr PopCount(I v)\n+{\n+    static_assert(std::is_integral_v<I> && std::is_unsigned_v<I> && std::numeric_limits<I>::radix == 2);\n+    constexpr auto BITS = std::numeric_limits<I>::digits;\n+    // Algorithms from https://en.wikipedia.org/wiki/Hamming_weight#Efficient_implementation.\n+    // These seem to be faster than __builtin_popcount when compiling for non-SSE4 on x86_64.\n+    if constexpr (BITS <= 32) {\n+        v -= (v >> 1) & 0x55555555;\n+        v = (v & 0x33333333) + ((v >> 2) & 0x33333333);\n+        v = (v + (v >> 4)) & 0x0f0f0f0f;\n+        if constexpr (BITS > 8) v += v >> 8;\n+        if constexpr (BITS > 16) v += v >> 16;\n+        return v & 0x3f;\n+    } else {\n+        static_assert(BITS <= 64);\n+        v -= (v >> 1) & 0x5555555555555555;\n+        v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);\n+        v = (v + (v >> 4)) & 0x0f0f0f0f0f0f0f0f;\n+        return (v * uint64_t{0x0101010101010101}) >> 56;\n+    }\n+}\n+\n+/** A bitset implementation backed by a single integer of type I. */\n+template<typename I>\n+class IntBitSet\n+{\n+    // Only binary, unsigned, integer, types allowed.\n+    static_assert(std::is_integral_v<I> && std::is_unsigned_v<I> && std::numeric_limits<I>::radix == 2);\n+    /** The maximum number of bits this bitset supports. */\n+    static constexpr unsigned MAX_SIZE = std::numeric_limits<I>::digits;\n+    /** Integer whose bits represent this bitset. */\n+    I m_val;\n+    /** Internal constructor with a given integer as contents. */\n+    IntBitSet(I val) noexcept : m_val{val} {}\n+    /** Dummy type to return using end(). Only used for comparing with Iterator. */\n+    class IteratorEnd\n+    {\n+        friend class IntBitSet;\n+        constexpr IteratorEnd() = default;\n+    public:\n+        constexpr IteratorEnd(const IteratorEnd&) = default;\n+    };\n+    /** Iterator type returned by begin(), which efficiently iterates all 1 positions. */\n+    class Iterator\n+    {\n+        friend class IntBitSet;\n+        I m_val; /**< The original integer's remaining bits. */\n+        unsigned m_pos; /** Last reported 1 position (if m_pos != 0). */\n+        constexpr Iterator(I val) noexcept : m_val(val), m_pos(0)\n+        {\n+            if (m_val != 0) m_pos = std::countr_zero(m_val);\n+        }\n+    public:\n+        /** Do not allow external code to construct an Iterator. */\n+        Iterator() = delete;\n+        // Copying is allowed.\n+        constexpr Iterator(const Iterator&) noexcept = default;\n+        constexpr Iterator& operator=(const Iterator&) noexcept = default;\n+        /** Test whether we are done (can only compare with IteratorEnd). */\n+        constexpr friend bool operator==(const Iterator& a, const IteratorEnd&) noexcept\n+        {\n+            return a.m_val == 0;\n+        }\n+        /** Progress to the next 1 bit (only if != IteratorEnd). */\n+        constexpr Iterator& operator++() noexcept\n+        {\n+            m_val &= m_val - I{1U};\n+            if (m_val != 0) m_pos = std::countr_zero(m_val);\n+            return *this;\n+        }\n+        /** Get the current bit position (only if != IteratorEnd). */\n+        constexpr const unsigned& operator*() const noexcept { return m_pos; }\n+    };\n+\n+public:\n+    /** Construct an all-zero bitset. */\n+    constexpr IntBitSet() noexcept : m_val{0} {}\n+    /** Copy construct a bitset. */\n+    constexpr IntBitSet(const IntBitSet&) noexcept = default;\n+    /** Construct from a list of values. */\n+    constexpr IntBitSet(std::initializer_list<unsigned> ilist) noexcept : m_val(0)\n+    {\n+        for (auto i : ilist) m_val |= I{1U} << i;\n+    }\n+    /** Copy assign a bitset. */\n+    constexpr IntBitSet& operator=(const IntBitSet&) noexcept = default;\n+    /** Assign a list of values. */\n+    constexpr IntBitSet& operator=(std::initializer_list<unsigned> ilist) noexcept\n+    {\n+        m_val = 0;\n+        for (auto i : ilist) m_val |= I{1U} << i;\n+        return *this;\n+    }\n+    /** Construct a bitset with the singleton i. */\n+    static constexpr IntBitSet Singleton(unsigned i) noexcept {\n+        return IntBitSet(I(1U) << i);\n+    }\n+    /** Construct a bitset with bits 0..count-1 (inclusive) set to 1. */\n+    static constexpr IntBitSet Fill(unsigned count) noexcept {\n+        IntBitSet ret;\n+        if (count) ret.m_val = I(~I{0}) >> (MAX_SIZE - count);\n+        return ret;\n+    }\n+    /** Compute the number of 1 bits in the bitset. */\n+    constexpr unsigned Count() const noexcept { return PopCount(m_val); }\n+    /** Return the number of bits that this object holds. */\n+    static constexpr unsigned Size() noexcept { return MAX_SIZE; }\n+    /** Set a bit to 1. */\n+    constexpr void Set(unsigned pos) noexcept { m_val |= I{1U} << pos; }\n+    /** Set a bit to the specified value. */\n+    constexpr void Set(unsigned pos, bool val) noexcept { m_val = (m_val & ~I(I{1U} << pos)) | (I(val) << pos); }\n+    /** Set a bit to 0. */\n+    constexpr void Reset(unsigned pos) noexcept { m_val &= ~I(I{1U} << pos); }\n+    /** Retrieve a bit at the given position. */\n+    constexpr bool operator[](unsigned pos) const noexcept { return (m_val >> pos) & 1U; }\n+    /** Check if all bits are 0. */\n+    constexpr bool None() const noexcept { return m_val == 0; }\n+    /** Check if any bits are 1. */\n+    constexpr bool Any() const noexcept { return m_val != 0; }\n+    /** Return an object that iterates over all 1 bits (++ and * only allowed when != end()). */\n+    constexpr Iterator begin() const noexcept { return Iterator(m_val); }\n+    /** Return a dummy object to compare Iterators with. */\n+    constexpr IteratorEnd end() const noexcept { return IteratorEnd(); }\n+    /** Find the first element (requires Any()). */\n+    constexpr unsigned First() const noexcept { return std::countr_zero(m_val); }\n+    /** Find the last element (requires Any()). */\n+    constexpr unsigned Last() const noexcept { return std::bit_width(m_val) - 1; }\n+    /** Set this object's bits to be the binary AND between respective bits from this and a. */\n+    constexpr IntBitSet& operator|=(const IntBitSet& a) noexcept { m_val |= a.m_val; return *this; }\n+    /** Set this object's bits to be the binary OR between respective bits from this and a. */\n+    constexpr IntBitSet& operator&=(const IntBitSet& a) noexcept { m_val &= a.m_val; return *this; }\n+    /** Set this object's bits to be the binary AND NOT between respective bits from this and a. */\n+    constexpr IntBitSet& operator/=(const IntBitSet& a) noexcept { m_val &= ~a.m_val; return *this; }\n+    /** Set this object's bits to be the binary XOR between respective bits from this as a. */\n+    constexpr IntBitSet& operator^=(const IntBitSet& a) noexcept { m_val ^= a.m_val; return *this; }\n+    /** Check if the intersection between two sets is non-empty. */\n+    friend constexpr bool operator&&(const IntBitSet& a, const IntBitSet& b) noexcept { return a.m_val & b.m_val; }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30160#discussion_r1613675392",
+      "id" : 1613675392,
+      "in_reply_to_id" : 1612240218,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gLruA",
+      "original_commit_id" : "a12b4052dad2158cf21de07fded63fb224dba915",
+      "original_line" : 172,
+      "original_position" : 172,
+      "original_start_line" : null,
+      "path" : "src/util/bitset.h",
+      "position" : null,
+      "pull_request_review_id" : 2077268563,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30160",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613675392/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-24T15:37:50Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613675392",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30160#discussion_r1613675918"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30160"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613675918"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Replaced with `IsSubsetOf()` and `IsSupersetOf()`.",
+      "commit_id" : "692e533f0b698960c0fd87b47706f7542d467f5f",
+      "created_at" : "2024-05-24T15:38:09Z",
+      "diff_hunk" : "@@ -0,0 +1,510 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_BITSET_H\n+#define BITCOIN_UTIL_BITSET_H\n+\n+#include <util/check.h>\n+\n+#include <array>\n+#include <bit>\n+#include <cstdint>\n+#include <limits>\n+#include <type_traits>\n+\n+/* This file provides data types similar to std::bitset, but adds the following functionality:\n+ *\n+ * - Efficient iteration over all set bits (compatible with range-based for loops).\n+ * - Efficient search for the first and last set bit (First() and Last()).\n+ * - Efficient set subtraction: (a / b) implements \"a and not b\".\n+ * - Efficient non-strict subset/superset testing: (a <= b) and (a >= b).\n+ * - Efficient set overlap testing: a.Overlaps(b)\n+ * - Efficient construction of set containing 0..N-1 (S::Fill).\n+ * - Efficient construction of a single set (S::Singleton).\n+ * - Construction from initializer lists.\n+ *\n+ * Other differences:\n+ * - BitSet<N> is a bitset that supports at least N elements, but may support more (Size() reports\n+ *   the actual number). Because the actual number is unpredictable, there are no operations that\n+ *   affect all positions (like std::bitset's operator~, flip(), or all()).\n+ * - Various other unimplemented features.\n+ */\n+\n+namespace bitset_detail {\n+\n+/** Count the number of bits set in an unsigned integer type. */\n+template<typename I>\n+unsigned inline constexpr PopCount(I v)\n+{\n+    static_assert(std::is_integral_v<I> && std::is_unsigned_v<I> && std::numeric_limits<I>::radix == 2);\n+    constexpr auto BITS = std::numeric_limits<I>::digits;\n+    // Algorithms from https://en.wikipedia.org/wiki/Hamming_weight#Efficient_implementation.\n+    // These seem to be faster than __builtin_popcount when compiling for non-SSE4 on x86_64.\n+    if constexpr (BITS <= 32) {\n+        v -= (v >> 1) & 0x55555555;\n+        v = (v & 0x33333333) + ((v >> 2) & 0x33333333);\n+        v = (v + (v >> 4)) & 0x0f0f0f0f;\n+        if constexpr (BITS > 8) v += v >> 8;\n+        if constexpr (BITS > 16) v += v >> 16;\n+        return v & 0x3f;\n+    } else {\n+        static_assert(BITS <= 64);\n+        v -= (v >> 1) & 0x5555555555555555;\n+        v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);\n+        v = (v + (v >> 4)) & 0x0f0f0f0f0f0f0f0f;\n+        return (v * uint64_t{0x0101010101010101}) >> 56;\n+    }\n+}\n+\n+/** A bitset implementation backed by a single integer of type I. */\n+template<typename I>\n+class IntBitSet\n+{\n+    // Only binary, unsigned, integer, types allowed.\n+    static_assert(std::is_integral_v<I> && std::is_unsigned_v<I> && std::numeric_limits<I>::radix == 2);\n+    /** The maximum number of bits this bitset supports. */\n+    static constexpr unsigned MAX_SIZE = std::numeric_limits<I>::digits;\n+    /** Integer whose bits represent this bitset. */\n+    I m_val;\n+    /** Internal constructor with a given integer as contents. */\n+    IntBitSet(I val) noexcept : m_val{val} {}\n+    /** Dummy type to return using end(). Only used for comparing with Iterator. */\n+    class IteratorEnd\n+    {\n+        friend class IntBitSet;\n+        constexpr IteratorEnd() = default;\n+    public:\n+        constexpr IteratorEnd(const IteratorEnd&) = default;\n+    };\n+    /** Iterator type returned by begin(), which efficiently iterates all 1 positions. */\n+    class Iterator\n+    {\n+        friend class IntBitSet;\n+        I m_val; /**< The original integer's remaining bits. */\n+        unsigned m_pos; /** Last reported 1 position (if m_pos != 0). */\n+        constexpr Iterator(I val) noexcept : m_val(val), m_pos(0)\n+        {\n+            if (m_val != 0) m_pos = std::countr_zero(m_val);\n+        }\n+    public:\n+        /** Do not allow external code to construct an Iterator. */\n+        Iterator() = delete;\n+        // Copying is allowed.\n+        constexpr Iterator(const Iterator&) noexcept = default;\n+        constexpr Iterator& operator=(const Iterator&) noexcept = default;\n+        /** Test whether we are done (can only compare with IteratorEnd). */\n+        constexpr friend bool operator==(const Iterator& a, const IteratorEnd&) noexcept\n+        {\n+            return a.m_val == 0;\n+        }\n+        /** Progress to the next 1 bit (only if != IteratorEnd). */\n+        constexpr Iterator& operator++() noexcept\n+        {\n+            m_val &= m_val - I{1U};\n+            if (m_val != 0) m_pos = std::countr_zero(m_val);\n+            return *this;\n+        }\n+        /** Get the current bit position (only if != IteratorEnd). */\n+        constexpr const unsigned& operator*() const noexcept { return m_pos; }\n+    };\n+\n+public:\n+    /** Construct an all-zero bitset. */\n+    constexpr IntBitSet() noexcept : m_val{0} {}\n+    /** Copy construct a bitset. */\n+    constexpr IntBitSet(const IntBitSet&) noexcept = default;\n+    /** Construct from a list of values. */\n+    constexpr IntBitSet(std::initializer_list<unsigned> ilist) noexcept : m_val(0)\n+    {\n+        for (auto i : ilist) {\n+            Assume(i < MAX_SIZE);\n+            m_val |= I{1U} << i;\n+        }\n+    }\n+    /** Copy assign a bitset. */\n+    constexpr IntBitSet& operator=(const IntBitSet&) noexcept = default;\n+    /** Assign a list of values. */\n+    constexpr IntBitSet& operator=(std::initializer_list<unsigned> ilist) noexcept\n+    {\n+        m_val = 0;\n+        for (auto i : ilist) {\n+            Assume(i < MAX_SIZE);\n+            m_val |= I{1U} << i;\n+        }\n+        return *this;\n+    }\n+    /** Construct a bitset with the singleton i. */\n+    static constexpr IntBitSet Singleton(unsigned i) noexcept\n+    {\n+        Assume(i < MAX_SIZE);\n+        return IntBitSet(I(1U) << i);\n+    }\n+    /** Construct a bitset with bits 0..count-1 (inclusive) set to 1. */\n+    static constexpr IntBitSet Fill(unsigned count) noexcept\n+    {\n+        IntBitSet ret;\n+        Assume(count <= MAX_SIZE);\n+        if (count) ret.m_val = I(~I{0}) >> (MAX_SIZE - count);\n+        return ret;\n+    }\n+    /** Set a bit to 1. */\n+    constexpr void Set(unsigned pos) noexcept\n+    {\n+        Assume(pos < MAX_SIZE);\n+        m_val |= I{1U} << pos;\n+    }\n+    /** Set a bit to the specified value. */\n+    constexpr void Set(unsigned pos, bool val) noexcept\n+    {\n+        Assume(pos < MAX_SIZE);\n+        m_val = (m_val & ~I(I{1U} << pos)) | (I(val) << pos);\n+    }\n+    /** Set a bit to 0. */\n+    constexpr void Reset(unsigned pos) noexcept\n+    {\n+        Assume(pos < MAX_SIZE);\n+        m_val &= ~I(I{1U} << pos);\n+    }\n+    /** Retrieve a bit at the given position. */\n+    constexpr bool operator[](unsigned pos) const noexcept\n+    {\n+        Assume(pos < MAX_SIZE);\n+        return (m_val >> pos) & 1U;\n+    }\n+    /** Compute the number of 1 bits in the bitset. */\n+    constexpr unsigned Count() const noexcept { return PopCount(m_val); }\n+    /** Return the number of bits that this object holds. */\n+    static constexpr unsigned Size() noexcept { return MAX_SIZE; }\n+    /** Check if all bits are 0. */\n+    constexpr bool None() const noexcept { return m_val == 0; }\n+    /** Check if any bits are 1. */\n+    constexpr bool Any() const noexcept { return m_val != 0; }\n+    /** Return an object that iterates over all 1 bits (++ and * only allowed when != end()). */\n+    constexpr Iterator begin() const noexcept { return Iterator(m_val); }\n+    /** Return a dummy object to compare Iterators with. */\n+    constexpr IteratorEnd end() const noexcept { return IteratorEnd(); }\n+    /** Find the first element (requires Any()). */\n+    constexpr unsigned First() const noexcept { return std::countr_zero(m_val); }\n+    /** Find the last element (requires Any()). */\n+    constexpr unsigned Last() const noexcept { return std::bit_width(m_val) - 1; }\n+    /** Set this object's bits to be the binary AND between respective bits from this and a. */\n+    constexpr IntBitSet& operator|=(const IntBitSet& a) noexcept { m_val |= a.m_val; return *this; }\n+    /** Set this object's bits to be the binary OR between respective bits from this and a. */\n+    constexpr IntBitSet& operator&=(const IntBitSet& a) noexcept { m_val &= a.m_val; return *this; }\n+    /** Set this object's bits to be the binary AND NOT between respective bits from this and a. */\n+    constexpr IntBitSet& operator/=(const IntBitSet& a) noexcept { m_val &= ~a.m_val; return *this; }\n+    /** Set this object's bits to be the binary XOR between respective bits from this as a. */\n+    constexpr IntBitSet& operator^=(const IntBitSet& a) noexcept { m_val ^= a.m_val; return *this; }\n+    /** Check if the intersection between two sets is non-empty. */\n+    constexpr bool Overlaps(const IntBitSet& a) noexcept { return m_val & a.m_val; }\n+    /** Return an object with the binary AND between respective bits from a and b. */\n+    friend constexpr IntBitSet operator&(const IntBitSet& a, const IntBitSet& b) noexcept { return I(a.m_val & b.m_val); }\n+    /** Return an object with the binary OR between respective bits from a and b. */\n+    friend constexpr IntBitSet operator|(const IntBitSet& a, const IntBitSet& b) noexcept { return I(a.m_val | b.m_val); }\n+    /** Return an object with the binary AND NOT between respective bits from a and b. */\n+    friend constexpr IntBitSet operator/(const IntBitSet& a, const IntBitSet& b) noexcept { return I(a.m_val & ~b.m_val); }\n+    /** Return an object with the binary XOR between respective bits from a and b. */\n+    friend constexpr IntBitSet operator^(const IntBitSet& a, const IntBitSet& b) noexcept { return I(a.m_val ^ b.m_val); }\n+    /** Check if bitset a and bitset b are identical. */\n+    friend constexpr bool operator==(const IntBitSet& a, const IntBitSet& b) noexcept = default;\n+    /** Check if bitset a is a superset of bitset b (= every 1 bit in b is also in a). */\n+    friend constexpr bool operator>=(const IntBitSet& a, const IntBitSet& b) noexcept { return (b.m_val & ~a.m_val) == 0; }",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30160#discussion_r1613675918",
+      "id" : 1613675918,
+      "in_reply_to_id" : 1613558242,
+      "line" : null,
+      "node_id" : "PRRC_kwDOABII585gLr2O",
+      "original_commit_id" : "797ea9aca05a6dafb70e224e6a7d89bb18294150",
+      "original_line" : 212,
+      "original_position" : 212,
+      "original_start_line" : null,
+      "path" : "src/util/bitset.h",
+      "position" : null,
+      "pull_request_review_id" : 2077269480,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30160",
+      "reactions" : {
+         "+1" : 1,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 1,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613675918/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-24T15:38:09Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1613675918",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
    }
 ]
