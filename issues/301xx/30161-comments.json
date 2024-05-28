@@ -1735,6 +1735,144 @@
       }
    },
    {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30161#discussion_r1614029973"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30161"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1614029973"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Just adding for posterity because I went down a rabbit hole for this:\r\n\r\nIt seems clang's `__is_trivially_equality_comparable` builtin would do what we want here:\r\n> Returns true if comparing two objects of the provided type is known to be equivalent to comparing their object representations. Note that types containing padding bytes are never trivially equality comparable.\r\n\r\n[From libc++](https://github.com/llvm/llvm-project/blob/main/libcxx/include/__type_traits/is_equality_comparable.h#L36C1-L37C41):\r\n```c++\r\n// A type is_trivially_equality_comparable if the expression `a == b` is equivalent to `std::memcmp(&a, &b, sizeof(T))`\r\n// (with `a` and `b` being of type `T`).\r\n```\r\nNot that it's worth using here.",
+      "commit_id" : "82258f0fd0239f0e17fae75cbf7479befd25e0fa",
+      "created_at" : "2024-05-24T21:14:50Z",
+      "diff_hunk" : "@@ -0,0 +1,261 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_VECDEQUE_H\n+#define BITCOIN_UTIL_VECDEQUE_H\n+\n+#include <util/check.h>\n+\n+#include <cstring>\n+#include <memory>\n+\n+/** Data structure largely mimicking std::deque, but using single preallocated ring buffer.\n+ *\n+ * - More efficient and better memory locality than std::deque.\n+ * - Most operations ({push_,pop_,emplace_,}{front,back}(), operator[], ...) are O(1),\n+ *   unless reallocation is needed (in which case they are O(n)).\n+ * - Supports reserve(), capacity(), shrink_to_fit() like vectors.\n+ * - No iterator support.\n+ * - Data is not stored in a single contiguous block, so no data().\n+ */\n+template<typename T>\n+class VecDeque\n+{\n+    /** Pointer to allocated memory. Can contain constructed and uninitialized T objects. */\n+    T* m_buffer{nullptr};\n+    /** m_buffer + m_offset points to first object. m_offset < m_capacity. */\n+    size_t m_offset{0};\n+    /** Number of objects in the container. m_size < m_capacity. */\n+    size_t m_size{0};\n+    /** The size of m_buffer, expressed as a multiple of the size of T. */\n+    size_t m_capacity{0};\n+\n+    size_t FirstPart() const noexcept { return std::min(m_capacity - m_offset, m_size); }\n+\n+    void Reallocate(size_t capacity)\n+    {\n+        Assume(capacity >= m_size);\n+        Assume(m_capacity == 0 || m_offset < m_capacity);\n+        // Allocate new buffer.\n+        T* new_buffer = capacity ? std::allocator<T>().allocate(capacity) : nullptr;\n+        if (capacity) {\n+            if constexpr (std::is_trivially_copyable_v<T>) {\n+                // When T is trivially copyable, just copy the data over from old to new buffer.\n+                size_t first_part = FirstPart();\n+                if (first_part != 0) {\n+                    std::memcpy(new_buffer, m_buffer + m_offset, first_part * sizeof(T));\n+                }\n+                if (first_part != m_size) {\n+                    std::memcpy(new_buffer + first_part, m_buffer, (m_size - first_part) * sizeof(T));\n+                }\n+            } else {\n+                // Otherwise move-construct in place in the new buffer, and destroy old buffer objects.\n+                size_t old_pos = m_offset;\n+                for (size_t new_pos = 0; new_pos < m_size; ++new_pos) {\n+                    std::construct_at<T>(new_buffer + new_pos, std::move(*(m_buffer + old_pos)));\n+                    std::destroy_at<T>(m_buffer + old_pos);\n+                    ++old_pos;\n+                    if (old_pos == m_capacity) old_pos = 0;\n+                }\n+            }\n+        }\n+        // Deallocate old buffer and update housekeeping.\n+        std::allocator<T>().deallocate(m_buffer, m_capacity);\n+        m_buffer = new_buffer;\n+        m_offset = 0;\n+        m_capacity = capacity;\n+    }\n+\n+    /** What index in the buffer does logical entry number pos have? */\n+    size_t Index(size_t pos) const noexcept\n+    {\n+        if (pos >= m_capacity - m_offset) {\n+            return pos - (m_capacity - m_offset);\n+        } else {\n+            return pos + m_offset;\n+        }\n+    }\n+\n+    /** Specialization of resize() that can only shrink. Separate so that clear() can call it\n+     *  without requiring a default T constructor. */\n+    void ResizeDown(size_t size)\n+    {\n+        Assume(size <= m_size);\n+        if constexpr (std::is_trivially_destructible_v<T>) {\n+            // If T is trivially destructible, we do not need to do anything but update the\n+            // housekeeping record. Default constructor or zero-filling will be used when\n+            // the space is reused.\n+            m_size = size;\n+        } else {\n+            // If not, we need to invoke the destructor for every element separately.\n+            while (m_size > size) {\n+                std::destroy_at<T>(m_buffer + Index(m_size - 1));\n+                --m_size;\n+            }\n+        }\n+    }\n+\n+public:\n+    VecDeque() noexcept = default;\n+\n+    void resize(size_t size)\n+    {\n+        if (size < m_size) {\n+            // Delegate to ResizeDown when shrinking.\n+            ResizeDown(size);\n+        } else if (size > m_size) {\n+            // When growing, first see if we need to allocate more space.\n+            if (size > m_capacity) Reallocate(size);\n+            if constexpr (std::is_trivially_constructible_v<T>) {\n+                // If T is trivially constructible, just zero-initialize the area being used.\n+                size_t first_part = std::min(m_capacity - Index(m_size), size - m_size);\n+                if (first_part) std::fill(m_buffer + Index(m_size), m_buffer + Index(m_size) + first_part, 0);\n+                if (first_part < size - m_size) std::fill(m_buffer, m_buffer + size - m_size - first_part, 0);\n+                m_size = size;\n+            } else {\n+                // Otherwise invoke the default constructor for every element separately.\n+                while (m_size < size) {\n+                    std::construct_at<T>(m_buffer + Index(m_size));\n+                    ++m_size;\n+                }\n+            }\n+        }\n+    }\n+\n+    void clear() { ResizeDown(0); }\n+\n+    ~VecDeque()\n+    {\n+        clear();\n+        Reallocate(0);\n+    }\n+\n+    VecDeque& operator=(const VecDeque& other)\n+    {\n+        clear();\n+        Reallocate(other.m_size);\n+        if constexpr (std::is_trivially_copyable_v<T>) {\n+            size_t first_part = other.FirstPart();\n+            if (first_part != 0) {\n+                std::memcpy(m_buffer, other.m_buffer + other.m_offset, first_part * sizeof(T));\n+            }\n+            if (first_part != other.m_size) {\n+                std::memcpy(m_buffer + first_part, other.m_buffer, (other.m_size - first_part) * sizeof(T));\n+            }\n+            m_size = other.m_size;\n+        } else {\n+            while (m_size < other.m_size) {\n+                std::construct_at<T>(m_buffer + Index(m_size), other[m_size]);\n+                ++m_size;\n+            }\n+        }\n+        return *this;\n+    }\n+\n+    void swap(VecDeque& other) noexcept\n+    {\n+        std::swap(m_buffer, other.m_buffer);\n+        std::swap(m_offset, other.m_offset);\n+        std::swap(m_size, other.m_size);\n+        std::swap(m_capacity, other.m_capacity);\n+    }\n+\n+    friend void swap(VecDeque& a, VecDeque& b) noexcept { a.swap(b); }\n+    VecDeque& operator=(VecDeque&& other) noexcept { swap(other); return *this; }\n+    VecDeque(const VecDeque& other) { *this = other; }\n+    VecDeque(VecDeque&& other) noexcept { swap(other); }\n+\n+    bool friend operator==(const VecDeque& a, const VecDeque& b)\n+    {\n+        if (a.m_size != b.m_size) return false;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30161#discussion_r1614029973",
+      "id" : 1614029973,
+      "in_reply_to_id" : 1613915882,
+      "line" : 162,
+      "node_id" : "PRRC_kwDOABII585gNCSV",
+      "original_commit_id" : "f4d6f4a8548c63dbed72aa618d64b7ac2e7fcbad",
+      "original_line" : 162,
+      "original_position" : 171,
+      "original_start_line" : null,
+      "path" : "src/util/vecdeque.h",
+      "position" : 162,
+      "pull_request_review_id" : 2078066616,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30161",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1614029973/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-24T22:11:25Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1614029973",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/417043?v=4",
+         "events_url" : "https://api.github.com/users/theuni/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/theuni/followers",
+         "following_url" : "https://api.github.com/users/theuni/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/theuni/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/theuni",
+         "id" : 417043,
+         "login" : "theuni",
+         "node_id" : "MDQ6VXNlcjQxNzA0Mw==",
+         "organizations_url" : "https://api.github.com/users/theuni/orgs",
+         "received_events_url" : "https://api.github.com/users/theuni/received_events",
+         "repos_url" : "https://api.github.com/users/theuni/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/theuni/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/theuni/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/theuni"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30161#discussion_r1614066880"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30161"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1614066880"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "Interesting!",
+      "commit_id" : "82258f0fd0239f0e17fae75cbf7479befd25e0fa",
+      "created_at" : "2024-05-24T21:56:18Z",
+      "diff_hunk" : "@@ -0,0 +1,261 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_VECDEQUE_H\n+#define BITCOIN_UTIL_VECDEQUE_H\n+\n+#include <util/check.h>\n+\n+#include <cstring>\n+#include <memory>\n+\n+/** Data structure largely mimicking std::deque, but using single preallocated ring buffer.\n+ *\n+ * - More efficient and better memory locality than std::deque.\n+ * - Most operations ({push_,pop_,emplace_,}{front,back}(), operator[], ...) are O(1),\n+ *   unless reallocation is needed (in which case they are O(n)).\n+ * - Supports reserve(), capacity(), shrink_to_fit() like vectors.\n+ * - No iterator support.\n+ * - Data is not stored in a single contiguous block, so no data().\n+ */\n+template<typename T>\n+class VecDeque\n+{\n+    /** Pointer to allocated memory. Can contain constructed and uninitialized T objects. */\n+    T* m_buffer{nullptr};\n+    /** m_buffer + m_offset points to first object. m_offset < m_capacity. */\n+    size_t m_offset{0};\n+    /** Number of objects in the container. m_size < m_capacity. */\n+    size_t m_size{0};\n+    /** The size of m_buffer, expressed as a multiple of the size of T. */\n+    size_t m_capacity{0};\n+\n+    size_t FirstPart() const noexcept { return std::min(m_capacity - m_offset, m_size); }\n+\n+    void Reallocate(size_t capacity)\n+    {\n+        Assume(capacity >= m_size);\n+        Assume(m_capacity == 0 || m_offset < m_capacity);\n+        // Allocate new buffer.\n+        T* new_buffer = capacity ? std::allocator<T>().allocate(capacity) : nullptr;\n+        if (capacity) {\n+            if constexpr (std::is_trivially_copyable_v<T>) {\n+                // When T is trivially copyable, just copy the data over from old to new buffer.\n+                size_t first_part = FirstPart();\n+                if (first_part != 0) {\n+                    std::memcpy(new_buffer, m_buffer + m_offset, first_part * sizeof(T));\n+                }\n+                if (first_part != m_size) {\n+                    std::memcpy(new_buffer + first_part, m_buffer, (m_size - first_part) * sizeof(T));\n+                }\n+            } else {\n+                // Otherwise move-construct in place in the new buffer, and destroy old buffer objects.\n+                size_t old_pos = m_offset;\n+                for (size_t new_pos = 0; new_pos < m_size; ++new_pos) {\n+                    std::construct_at<T>(new_buffer + new_pos, std::move(*(m_buffer + old_pos)));\n+                    std::destroy_at<T>(m_buffer + old_pos);\n+                    ++old_pos;\n+                    if (old_pos == m_capacity) old_pos = 0;\n+                }\n+            }\n+        }\n+        // Deallocate old buffer and update housekeeping.\n+        std::allocator<T>().deallocate(m_buffer, m_capacity);\n+        m_buffer = new_buffer;\n+        m_offset = 0;\n+        m_capacity = capacity;\n+    }\n+\n+    /** What index in the buffer does logical entry number pos have? */\n+    size_t Index(size_t pos) const noexcept\n+    {\n+        if (pos >= m_capacity - m_offset) {\n+            return pos - (m_capacity - m_offset);\n+        } else {\n+            return pos + m_offset;\n+        }\n+    }\n+\n+    /** Specialization of resize() that can only shrink. Separate so that clear() can call it\n+     *  without requiring a default T constructor. */\n+    void ResizeDown(size_t size)\n+    {\n+        Assume(size <= m_size);\n+        if constexpr (std::is_trivially_destructible_v<T>) {\n+            // If T is trivially destructible, we do not need to do anything but update the\n+            // housekeeping record. Default constructor or zero-filling will be used when\n+            // the space is reused.\n+            m_size = size;\n+        } else {\n+            // If not, we need to invoke the destructor for every element separately.\n+            while (m_size > size) {\n+                std::destroy_at<T>(m_buffer + Index(m_size - 1));\n+                --m_size;\n+            }\n+        }\n+    }\n+\n+public:\n+    VecDeque() noexcept = default;\n+\n+    void resize(size_t size)\n+    {\n+        if (size < m_size) {\n+            // Delegate to ResizeDown when shrinking.\n+            ResizeDown(size);\n+        } else if (size > m_size) {\n+            // When growing, first see if we need to allocate more space.\n+            if (size > m_capacity) Reallocate(size);\n+            if constexpr (std::is_trivially_constructible_v<T>) {\n+                // If T is trivially constructible, just zero-initialize the area being used.\n+                size_t first_part = std::min(m_capacity - Index(m_size), size - m_size);\n+                if (first_part) std::fill(m_buffer + Index(m_size), m_buffer + Index(m_size) + first_part, 0);\n+                if (first_part < size - m_size) std::fill(m_buffer, m_buffer + size - m_size - first_part, 0);\n+                m_size = size;\n+            } else {\n+                // Otherwise invoke the default constructor for every element separately.\n+                while (m_size < size) {\n+                    std::construct_at<T>(m_buffer + Index(m_size));\n+                    ++m_size;\n+                }\n+            }\n+        }\n+    }\n+\n+    void clear() { ResizeDown(0); }\n+\n+    ~VecDeque()\n+    {\n+        clear();\n+        Reallocate(0);\n+    }\n+\n+    VecDeque& operator=(const VecDeque& other)\n+    {\n+        clear();\n+        Reallocate(other.m_size);\n+        if constexpr (std::is_trivially_copyable_v<T>) {\n+            size_t first_part = other.FirstPart();\n+            if (first_part != 0) {\n+                std::memcpy(m_buffer, other.m_buffer + other.m_offset, first_part * sizeof(T));\n+            }\n+            if (first_part != other.m_size) {\n+                std::memcpy(m_buffer + first_part, other.m_buffer, (other.m_size - first_part) * sizeof(T));\n+            }\n+            m_size = other.m_size;\n+        } else {\n+            while (m_size < other.m_size) {\n+                std::construct_at<T>(m_buffer + Index(m_size), other[m_size]);\n+                ++m_size;\n+            }\n+        }\n+        return *this;\n+    }\n+\n+    void swap(VecDeque& other) noexcept\n+    {\n+        std::swap(m_buffer, other.m_buffer);\n+        std::swap(m_offset, other.m_offset);\n+        std::swap(m_size, other.m_size);\n+        std::swap(m_capacity, other.m_capacity);\n+    }\n+\n+    friend void swap(VecDeque& a, VecDeque& b) noexcept { a.swap(b); }\n+    VecDeque& operator=(VecDeque&& other) noexcept { swap(other); return *this; }\n+    VecDeque(const VecDeque& other) { *this = other; }\n+    VecDeque(VecDeque&& other) noexcept { swap(other); }\n+\n+    bool friend operator==(const VecDeque& a, const VecDeque& b)\n+    {\n+        if (a.m_size != b.m_size) return false;",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30161#discussion_r1614066880",
+      "id" : 1614066880,
+      "in_reply_to_id" : 1613915882,
+      "line" : 162,
+      "node_id" : "PRRC_kwDOABII585gNLTA",
+      "original_commit_id" : "f4d6f4a8548c63dbed72aa618d64b7ac2e7fcbad",
+      "original_line" : 162,
+      "original_position" : 171,
+      "original_start_line" : null,
+      "path" : "src/util/vecdeque.h",
+      "position" : 162,
+      "pull_request_review_id" : 2078108333,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30161",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1614066880/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-24T21:56:18Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1614066880",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/548488?v=4",
+         "events_url" : "https://api.github.com/users/sipa/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/sipa/followers",
+         "following_url" : "https://api.github.com/users/sipa/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/sipa/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/sipa",
+         "id" : 548488,
+         "login" : "sipa",
+         "node_id" : "MDQ6VXNlcjU0ODQ4OA==",
+         "organizations_url" : "https://api.github.com/users/sipa/orgs",
+         "received_events_url" : "https://api.github.com/users/sipa/received_events",
+         "repos_url" : "https://api.github.com/users/sipa/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/sipa/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/sipa/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/sipa"
+      }
+   },
+   {
       "author_association" : "MEMBER",
       "body" : "Apparently `std::is_trivially_default_constructible_v<T>` does not imply you can just memset 0 to construct the objects (or at least, I can't find evidence of that). So I've dropped that branch.",
       "created_at" : "2024-05-26T00:01:14Z",
@@ -1845,6 +1983,142 @@
       },
       "updated_at" : "2024-05-27T12:59:30Z",
       "url" : "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2133434672",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/32963518?v=4",
+         "events_url" : "https://api.github.com/users/hebasto/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/hebasto/followers",
+         "following_url" : "https://api.github.com/users/hebasto/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/hebasto/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/hebasto",
+         "id" : 32963518,
+         "login" : "hebasto",
+         "node_id" : "MDQ6VXNlcjMyOTYzNTE4",
+         "organizations_url" : "https://api.github.com/users/hebasto/orgs",
+         "received_events_url" : "https://api.github.com/users/hebasto/received_events",
+         "repos_url" : "https://api.github.com/users/hebasto/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/hebasto/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/hebasto/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/hebasto"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30161#discussion_r1616905695"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30161"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1616905695"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "nit: \r\n```suggestion\r\n    /** Number of objects in the container. m_size <= m_capacity. */\r\n```",
+      "commit_id" : "82258f0fd0239f0e17fae75cbf7479befd25e0fa",
+      "created_at" : "2024-05-28T09:30:29Z",
+      "diff_hunk" : "@@ -0,0 +1,252 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_VECDEQUE_H\n+#define BITCOIN_UTIL_VECDEQUE_H\n+\n+#include <util/check.h>\n+\n+#include <cstring>\n+#include <memory>\n+\n+/** Data structure largely mimicking std::deque, but using single preallocated ring buffer.\n+ *\n+ * - More efficient and better memory locality than std::deque.\n+ * - Most operations ({push_,pop_,emplace_,}{front,back}(), operator[], ...) are O(1),\n+ *   unless reallocation is needed (in which case they are O(n)).\n+ * - Supports reserve(), capacity(), shrink_to_fit() like vectors.\n+ * - No iterator support.\n+ * - Data is not stored in a single contiguous block, so no data().\n+ */\n+template<typename T>\n+class VecDeque\n+{\n+    /** Pointer to allocated memory. Can contain constructed and uninitialized T objects. */\n+    T* m_buffer{nullptr};\n+    /** m_buffer + m_offset points to first object. m_offset < m_capacity. */\n+    size_t m_offset{0};\n+    /** Number of objects in the container. m_size < m_capacity. */",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30161#discussion_r1616905695",
+      "id" : 1616905695,
+      "line" : 29,
+      "node_id" : "PRRC_kwDOABII585gYAXf",
+      "original_commit_id" : "82258f0fd0239f0e17fae75cbf7479befd25e0fa",
+      "original_line" : 29,
+      "original_position" : 29,
+      "original_start_line" : null,
+      "path" : "src/util/vecdeque.h",
+      "position" : 29,
+      "pull_request_review_id" : 2082248884,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30161",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1616905695/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-28T09:30:29Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1616905695",
+      "user" : {
+         "avatar_url" : "https://avatars.githubusercontent.com/u/32963518?v=4",
+         "events_url" : "https://api.github.com/users/hebasto/events{/privacy}",
+         "followers_url" : "https://api.github.com/users/hebasto/followers",
+         "following_url" : "https://api.github.com/users/hebasto/following{/other_user}",
+         "gists_url" : "https://api.github.com/users/hebasto/gists{/gist_id}",
+         "gravatar_id" : "",
+         "html_url" : "https://github.com/hebasto",
+         "id" : 32963518,
+         "login" : "hebasto",
+         "node_id" : "MDQ6VXNlcjMyOTYzNTE4",
+         "organizations_url" : "https://api.github.com/users/hebasto/orgs",
+         "received_events_url" : "https://api.github.com/users/hebasto/received_events",
+         "repos_url" : "https://api.github.com/users/hebasto/repos",
+         "site_admin" : false,
+         "starred_url" : "https://api.github.com/users/hebasto/starred{/owner}{/repo}",
+         "subscriptions_url" : "https://api.github.com/users/hebasto/subscriptions",
+         "type" : "User",
+         "url" : "https://api.github.com/users/hebasto"
+      }
+   },
+   {
+      "_links" : {
+         "html" : {
+            "href" : "https://github.com/bitcoin/bitcoin/pull/30161#discussion_r1616940538"
+         },
+         "pull_request" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30161"
+         },
+         "self" : {
+            "href" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1616940538"
+         }
+      },
+      "author_association" : "MEMBER",
+      "body" : "What is the purpose of this line here? It doesn't look like a pre-condition for the function arguments. It seems it should be used as a post-condition for `m_capacity` mutators (including this function) and `m_offset` mutators, no?",
+      "commit_id" : "82258f0fd0239f0e17fae75cbf7479befd25e0fa",
+      "created_at" : "2024-05-28T09:55:18Z",
+      "diff_hunk" : "@@ -0,0 +1,252 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_VECDEQUE_H\n+#define BITCOIN_UTIL_VECDEQUE_H\n+\n+#include <util/check.h>\n+\n+#include <cstring>\n+#include <memory>\n+\n+/** Data structure largely mimicking std::deque, but using single preallocated ring buffer.\n+ *\n+ * - More efficient and better memory locality than std::deque.\n+ * - Most operations ({push_,pop_,emplace_,}{front,back}(), operator[], ...) are O(1),\n+ *   unless reallocation is needed (in which case they are O(n)).\n+ * - Supports reserve(), capacity(), shrink_to_fit() like vectors.\n+ * - No iterator support.\n+ * - Data is not stored in a single contiguous block, so no data().\n+ */\n+template<typename T>\n+class VecDeque\n+{\n+    /** Pointer to allocated memory. Can contain constructed and uninitialized T objects. */\n+    T* m_buffer{nullptr};\n+    /** m_buffer + m_offset points to first object. m_offset < m_capacity. */\n+    size_t m_offset{0};\n+    /** Number of objects in the container. m_size < m_capacity. */\n+    size_t m_size{0};\n+    /** The size of m_buffer, expressed as a multiple of the size of T. */\n+    size_t m_capacity{0};\n+\n+    size_t FirstPart() const noexcept { return std::min(m_capacity - m_offset, m_size); }\n+\n+    void Reallocate(size_t capacity)\n+    {\n+        Assume(capacity >= m_size);\n+        Assume(m_capacity == 0 || m_offset < m_capacity);",
+      "html_url" : "https://github.com/bitcoin/bitcoin/pull/30161#discussion_r1616940538",
+      "id" : 1616940538,
+      "line" : 39,
+      "node_id" : "PRRC_kwDOABII585gYI36",
+      "original_commit_id" : "82258f0fd0239f0e17fae75cbf7479befd25e0fa",
+      "original_line" : 39,
+      "original_position" : 39,
+      "original_start_line" : null,
+      "path" : "src/util/vecdeque.h",
+      "position" : 39,
+      "pull_request_review_id" : 2082303692,
+      "pull_request_url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/30161",
+      "reactions" : {
+         "+1" : 0,
+         "-1" : 0,
+         "confused" : 0,
+         "eyes" : 0,
+         "heart" : 0,
+         "hooray" : 0,
+         "laugh" : 0,
+         "rocket" : 0,
+         "total_count" : 0,
+         "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1616940538/reactions"
+      },
+      "side" : "RIGHT",
+      "start_line" : null,
+      "start_side" : null,
+      "subject_type" : "line",
+      "updated_at" : "2024-05-28T09:55:18Z",
+      "url" : "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1616940538",
       "user" : {
          "avatar_url" : "https://avatars.githubusercontent.com/u/32963518?v=4",
          "events_url" : "https://api.github.com/users/hebasto/events{/privacy}",
